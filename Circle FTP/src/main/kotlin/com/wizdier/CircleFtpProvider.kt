@@ -1,31 +1,21 @@
 package com.wizdier
 
-import com.lagradost.cloudstream3.Actor
-import com.lagradost.cloudstream3.Episode
-import com.lagradost.cloudstream3.HomePageResponse
-import com.lagradost.cloudstream3.LoadResponse
-import com.lagradost.cloudstream3.LoadResponse.Companion.addActors
+import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.LoadResponse.Companion.addAniListId
 import com.lagradost.cloudstream3.LoadResponse.Companion.addMalId
-import com.lagradost.cloudstream3.MainAPI
-import com.lagradost.cloudstream3.MainPageRequest
-import com.lagradost.cloudstream3.SearchQuality
-import com.lagradost.cloudstream3.SearchResponse
-import com.lagradost.cloudstream3.Score
-import com.lagradost.cloudstream3.SubtitleFile
-import com.lagradost.cloudstream3.TvType
-import com.lagradost.cloudstream3.addDubStatus
-import com.lagradost.cloudstream3.app
-import com.lagradost.cloudstream3.getDurationFromString
-import com.lagradost.cloudstream3.mainPageOf
-import com.lagradost.cloudstream3.newAnimeSearchResponse
-import com.lagradost.cloudstream3.newEpisode
-import com.lagradost.cloudstream3.newHomePageResponse
-import com.lagradost.cloudstream3.newMovieLoadResponse
-import com.lagradost.cloudstream3.newTvSeriesLoadResponse
-import com.lagradost.cloudstream3.utils.AppUtils.parseJson
+import com.lagradost.cloudstream3.LoadResponse.Companion.addKitsuId
+import com.lagradost.cloudstream3.LoadResponse.Companion.addSimklId
+import com.lagradost.cloudstream3.LoadResponse.Companion.addImdbId
+import com.lagradost.cloudstream3.LoadResponse.Companion.addTraktId
+import com.lagradost.cloudstream3.syncproviders.SyncIdName
+import com.lagradost.cloudstream3.utils.AppUtils
+import com.lagradost.cloudstream3.utils.AppUtils.toJson
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.newExtractorLink
+import com.lagradost.nicehttp.RequestBodyTypes
+import okhttp3.MediaType.Companion.toMediaTypeOrNull
+import okhttp3.RequestBody.Companion.toRequestBody
+import org.json.JSONObject
 import java.net.URLEncoder
 
 class CircleFtpProvider : MainAPI() {
@@ -38,6 +28,16 @@ class CircleFtpProvider : MainAPI() {
     override val hasDownloadSupport = true
     override val hasQuickSearch = false
     override val hasChromecastSupport = true
+
+    override val supportedSyncNames = setOf(
+        SyncIdName.Anilist,
+        SyncIdName.MyAnimeList,
+        SyncIdName.Kitsu,
+        SyncIdName.Simkl,
+        SyncIdName.Imdb,
+        SyncIdName.Trakt
+    )
+
     override val supportedTypes = setOf(
         TvType.Movie,
         TvType.TvSeries,
@@ -49,12 +49,6 @@ class CircleFtpProvider : MainAPI() {
         TvType.OVA,
         TvType.Others
     )
-
-    private val tmdbApiKey = "0b2d522346f5ecbafa42ae4b0141c774"
-    private val tmdbBaseUrl = "https://api.themoviedb.org/3"
-    private val tmdbImageBaseUrl = "https://image.tmdb.org/t/p"
-
-    private val animeCategoryIds = setOf("80", "1")
 
     override val mainPage = mainPageOf(
         "80" to "Featured",
@@ -74,6 +68,331 @@ class CircleFtpProvider : MainAPI() {
         "15" to "WWE"
     )
 
+    // ══════════════════════════════════════════════════════════════════════════
+    //  Config
+    // ══════════════════════════════════════════════════════════════════════════
+
+    // FIX #3 — Only category 21 (Anime Series) is anime for series detection.
+    // Category 1 (Animation Movies) catches non-anime cartoons like
+    // Family Guy, Simpsons, Avatar etc. which then wrongly triggers
+    // Kitsu / MAL / AniList tracking.
+    private val animeCategoryIds = setOf(21)
+
+    private val anilistApi = "https://graphql.anilist.co"
+    private val tmdbApi = "https://api.themoviedb.org/3"
+    private val tmdbKey = BuildConfig.TMDB_API
+    private val tmdbImageBase = "https://image.tmdb.org/t/p/w500"
+    private val tmdbBackdropBase = "https://image.tmdb.org/t/p/original"
+
+    // ══════════════════════════════════════════════════════════════════════════
+    //  FIX #2 — Title cleaning: strip noise for accurate AniList / TMDB matching
+    // ══════════════════════════════════════════════════════════════════════════
+
+    /**
+     * "Jujutsu Kaisen 0 (2022) [1080p] [HEVC] Dual Audio" → "Jujutsu Kaisen 0"
+     * "One Piece S02E01 [720p] [WEBRip]"                    → "One Piece"
+     */
+    private fun cleanTitle(raw: String): String {
+        return raw
+            // Remove everything inside [square brackets] and (parentheses)
+            .replace(Regex("""[\[\(][^]\)]*[\]\)]"""), "")
+            // Remove resolution: 1080p, 720p, 480p, 2160p
+            .replace(Regex("""\b\d{3,4}[piP]\b"""), "")
+            // Remove codec / format tags
+            .replace(
+                Regex(
+                    """(?i)\b(hevc|h\.?264|h\.?265|x264|x265|aac|ac3|ddp|dts|atmos|hdr|dv|sdr|web-?dl|web-?rip|bluray|blu-?ray|remux|proper|repack|hdcam|hdrip|camrip|dvdscr|pre\d+)\b"""
+                ), ""
+            )
+            // Remove audio / language tags
+            .replace(
+                Regex(
+                    """(?i)\b(dual\s*audio|multi\s*audio|japanese|english|hindi|korean|chinese|dubbed|subbed|uncut|uncensored|extended|theatrical|unrated)\b"""
+                ), ""
+            )
+            // Remove season / episode markers
+            .replace(Regex("""(?i)\b(s\d+|season\s*\d+|episode\s*\d+|ep\.?\s*\d+)\b"""), "")
+            // Remove standalone 4-digit year (but keep year that is part of a title like "2001 A Space Odyssey")
+            .replace(Regex("""\s+\(\d{4}\)"""), "")
+            .replace(Regex("""\s+\d{4}\s"""), " ")
+            // Collapse whitespace
+            .replace(Regex("""\s{2,}"""), " ")
+            .trim()
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    //  AniList — search with CLEANED title + GraphQL variables (safe injection)
+    // ══════════════════════════════════════════════════════════════════════════
+
+    private suspend fun getAniListMeta(title: String): AniListMeta? {
+        val cleaned = cleanTitle(title)
+        if (cleaned.length < 2) return null
+        return try {
+            val query = """
+                query (${'$'}search: String) {
+                  Media(search: ${'$'}search, type: ANIME) {
+                    id
+                    idMal
+                    coverImage { extraLarge large }
+                    bannerImage
+                    averageScore
+                    genres
+                    description(asHtml: false)
+                    title { romaji english native }
+                    synonyms
+                    startDate { year }
+                    format
+                    episodes
+                    studios(isMain: true) { nodes { name } }
+                  }
+                }
+            """.trimIndent()
+
+            val body = mapOf(
+                "query" to query,
+                "variables" to mapOf("search" to cleaned)
+            ).toJson().toRequestBody(RequestBodyTypes.JSON.toMediaTypeOrNull())
+
+            val response = app.post(
+                anilistApi,
+                requestBody = body,
+                headers = mapOf(
+                    "Accept" to "application/json",
+                    "Content-Type" to "application/json"
+                ),
+                cacheTime = 3600
+            )
+            AppUtils.parseJson<AniListResponse>(response.text).data?.Media
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    //  ani.zip — AniList ID → TMDB, Kitsu, MAL, Simkl IDs
+    // ══════════════════════════════════════════════════════════════════════════
+
+    private suspend fun getAniZipMeta(anilistId: Int): AniZipMeta? {
+        return try {
+            val json = JSONObject(
+                app.get(
+                    "https://api.ani.zip/mappings?anilist_id=$anilistId",
+                    cacheTime = 3600
+                ).text
+            )
+            val m = json.optJSONObject("mappings") ?: return null
+            AniZipMeta(
+                themoviedbId = m.optString("themoviedb_id", null).ifBlank { null },
+                kitsuid = m.optString("kitsu_id", null).ifBlank { null },
+                malId = if (m.has("mal_id") && m.optString("mal_id").isNotBlank())
+                    m.optInt("mal_id") else null,
+                simklId = if (m.has("simkl_id") && m.optString("simkl_id").isNotBlank())
+                    m.optInt("simkl_id") else null
+            )
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    //  FIX #1 — TMDB direct search for anime (fallback when ani.zip has no mapping)
+    // ══════════════════════════════════════════════════════════════════════════
+
+    /**
+     * Searches TMDB using the AniList English/Romaji title.
+     * Tries "tv" first (most anime), then "movie" as fallback.
+     * This bridges the gap when ani.zip has no TMDB mapping for an anime.
+     */
+    private suspend fun searchTmdbForAnime(
+        anilistTitle: String?,
+        isMovie: Boolean
+    ): Int? {
+        if (anilistTitle.isNullOrBlank() || tmdbKey.isBlank()) return null
+        return try {
+            // Anime series → try TV first.  Anime movies → try movie first.
+            val types = if (isMovie) listOf("movie", "tv") else listOf("tv", "movie")
+            for (type in types) {
+                val url = "$tmdbApi/search/$type?api_key=$tmdbKey" +
+                        "&query=${URLEncoder.encode(anilistTitle, "UTF-8")}" +
+                        "&language=en-US&page=1"
+                val results = AppUtils.parseJson<TmdbSearchResponse>(
+                    app.get(url, cacheTime = 3600).text
+                ).results?.firstOrNull()
+                if (results?.id != null) return results.id
+            }
+            null
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    //  TMDB — extract logo from a logos JSONArray
+    // ══════════════════════════════════════════════════════════════════════════
+
+    /**
+     * Picks the best logo: English non-SVG > English SVG > any non-SVG > any SVG.
+     * Returns full URL or null.
+     */
+    private fun extractLogoFromJson(logos: org.json.JSONArray?): String? {
+        if (logos == null || logos.length() == 0) return null
+
+        var enNonSvg: String? = null
+        var enSvg: String? = null
+        var anyNonSvg: String? = null
+        var anySvg: String? = null
+
+        for (i in 0 until logos.length()) {
+            val logo = logos.optJSONObject(i) ?: continue
+            val path = logo.optString("file_path", "")
+            if (path.isBlank()) continue
+            val lang = logo.optString("iso_639_1", "")
+            val isEn = lang == "en" || lang.isEmpty()
+            val isSvg = path.endsWith(".svg", true)
+
+            when {
+                isEn && !isSvg -> if (enNonSvg == null) enNonSvg = path
+                isEn && isSvg -> if (enSvg == null) enSvg = path
+                !isEn && !isSvg -> if (anyNonSvg == null) anyNonSvg = path
+                else -> if (anySvg == null) anySvg = path
+            }
+        }
+
+        return enNonSvg?.let { "$tmdbImageBase$it" }
+            ?: enSvg?.let { "$tmdbImageBase$it" }
+            ?: anyNonSvg?.let { "$tmdbImageBase$it" }
+            ?: anySvg?.let { "$tmdbImageBase$it" }
+    }
+
+    /** Standalone TMDB logo fetch (used for anime when TMDB ID comes from ani.zip / fallback search). */
+    private suspend fun fetchTmdbLogo(tmdbId: Int?, isSeries: Boolean): String? {
+        if (tmdbId == null || tmdbKey.isBlank()) return null
+        return try {
+            val type = if (isSeries) "tv" else "movie"
+            val json = JSONObject(
+                app.get("$tmdbApi/$type/$tmdbId/images?api_key=$tmdbKey", cacheTime = 3600).text
+            )
+            extractLogoFromJson(json.optJSONArray("logos"))
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    //  TMDB — search for non-anime (poster / backdrop / overview / logo / IMDB)
+    // ══════════════════════════════════════════════════════════════════════════
+
+    private suspend fun getTmdbMeta(
+        title: String,
+        year: Int?,
+        isSeries: Boolean
+    ): TmdbMeta? {
+        if (tmdbKey.isBlank()) return null
+        val cleaned = cleanTitle(title)
+        if (cleaned.length < 2) return null
+        return try {
+            val type = if (isSeries) "tv" else "movie"
+            val searchUrl = "$tmdbApi/search/$type?api_key=$tmdbKey" +
+                    "&query=${URLEncoder.encode(cleaned, "UTF-8")}" +
+                    "&language=en-US&page=1"
+            val first = AppUtils.parseJson<TmdbSearchResponse>(
+                app.get(searchUrl, cacheTime = 3600).text
+            ).results?.firstOrNull() ?: return null
+
+            // Fetch details in one call: external_ids + images
+            val detailUrl = "$tmdbApi/$type/${first.id}" +
+                    "?api_key=$tmdbKey&language=en-US" +
+                    "&append_to_response=external_ids,images"
+            val detail = JSONObject(app.get(detailUrl, cacheTime = 3600).text)
+
+            val imdbId = detail
+                .optJSONObject("external_ids")
+                ?.optString("imdb_id", null)
+                ?.ifBlank { null }
+
+            // Genres
+            val genresArr = detail.optJSONArray("genres")
+            val genres = if (genresArr != null) {
+                (0 until genresArr.length()).mapNotNull {
+                    genresArr.optJSONObject(it)?.optString("name")
+                }.ifEmpty { null }
+            } else null
+
+            // Runtime
+            val runtime = if (isSeries) {
+                detail.optJSONArray("episode_run_time")?.optInt(0)
+            } else {
+                detail.optInt("runtime", 0).takeIf { it > 0 }
+            }
+
+            // Logo from images
+            val logoUrl = extractLogoFromJson(
+                detail.optJSONObject("images")?.optJSONArray("logos")
+            )
+
+            TmdbMeta(
+                poster = first.posterPath?.let { "$tmdbImageBase$it" },
+                backdrop = first.backdropPath?.let { "$tmdbBackdropBase$it" },
+                rating = first.voteAverage,
+                overview = first.overview,
+                logoUrl = logoUrl,
+                imdbId = imdbId,
+                genres = genres,
+                duration = runtime
+            )
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    //  Kitsu — fallback search
+    // ══════════════════════════════════════════════════════════════════════════
+
+    private suspend fun searchKitsu(title: String): String? {
+        val cleaned = cleanTitle(title)
+        if (cleaned.length < 2) return null
+        return try {
+            val response = app.get(
+                "https://kitsu.io/api/edge/anime?filter[text]=${URLEncoder.encode(cleaned, "UTF-8")}",
+                headers = mapOf("Accept" to "application/vnd.api+json"),
+                cacheTime = 3600
+            )
+            JSONObject(response.text)
+                .getJSONArray("data")
+                .optJSONObject(0)
+                ?.getString("id")
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    //  Simkl — fallback search
+    // ══════════════════════════════════════════════════════════════════════════
+
+    private suspend fun searchSimkl(title: String): Int? {
+        val cleaned = cleanTitle(title)
+        if (cleaned.length < 2) return null
+        return try {
+            val response = app.get(
+                "https://api.simkl.com/search/anime?q=${URLEncoder.encode(cleaned, "UTF-8")}&client_id=YOUR_CLIENT_ID",
+                cacheTime = 3600
+            )
+            val arr = org.json.JSONArray(response.text)
+            if (arr.length() > 0) arr.getJSONObject(0)
+                .optJSONObject("show")
+                ?.optJSONObject("ids")
+                ?.optInt("simkl") else null
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    //  Main page + Search
+    // ══════════════════════════════════════════════════════════════════════════
+
     override suspend fun getMainPage(
         page: Int,
         request: MainPageRequest
@@ -81,45 +400,40 @@ class CircleFtpProvider : MainAPI() {
         val json = try {
             app.get(
                 "$mainApiUrl/api/posts?categoryExact=${request.data}&page=$page&order=desc&limit=10",
-                verify = false,
-                cacheTime = 60
+                verify = false, cacheTime = 60
             )
         } catch (_: Exception) {
             app.get(
                 "$apiUrl/api/posts?categoryExact=${request.data}&page=$page&order=desc&limit=10",
-                verify = false,
-                cacheTime = 60
+                verify = false, cacheTime = 60
             )
         }
-        val home = parseJson<PageData>(json.text).posts.mapNotNull { post ->
-            toSearchResult(post, request.data)
-        }
+        val home = AppUtils.parseJson<PageData>(json.text)
+            .posts.mapNotNull { toSearchResult(it, request.data) }
         return newHomePageResponse(request.name, home, true)
     }
 
     private fun toSearchResult(post: Post, categoryId: String? = null): SearchResponse? {
         if (post.type == "singleVideo" || post.type == "series") {
             val tvType = when {
-                categoryId in animeCategoryIds -> TvType.Anime
+                categoryId == "21" -> TvType.Anime
+                categoryId == "1" -> TvType.Cartoon
                 post.title.contains("anime", ignoreCase = true) -> TvType.Anime
                 post.title.contains("cartoon", ignoreCase = true) -> TvType.Cartoon
-                post.title.contains("animation", ignoreCase = true) -> TvType.Cartoon
-                categoryId == "1" -> TvType.Cartoon
                 post.type == "singleVideo" -> TvType.Movie
                 else -> TvType.TvSeries
             }
 
-            return newAnimeSearchResponse(post.title, "$mainUrl/content/${post.id}", tvType) {
+            return newAnimeSearchResponse(
+                post.title,
+                "$mainUrl/content/${post.id}",
+                tvType
+            ) {
                 this.posterUrl = "$mainApiUrl/uploads/${post.imageSm}"
                 val check = post.title.lowercase()
                 this.quality = getSearchQuality(check)
                 addDubStatus(
-                    dubExist = when {
-                        "dubbed" in check -> true
-                        "dual audio" in check -> true
-                        "multi audio" in check -> true
-                        else -> false
-                    },
+                    dubExist = "dubbed" in check || "dual audio" in check || "multi audio" in check,
                     subExist = false
                 )
             }
@@ -131,184 +445,192 @@ class CircleFtpProvider : MainAPI() {
         val json = try {
             app.get(
                 "$mainApiUrl/api/posts?searchTerm=$query&order=desc",
-                verify = false,
-                cacheTime = 60
+                verify = false, cacheTime = 60
             )
         } catch (_: Exception) {
             app.get(
                 "$apiUrl/api/posts?searchTerm=$query&order=desc",
-                verify = false,
-                cacheTime = 60
+                verify = false, cacheTime = 60
             )
         }
-        return parseJson<PageData>(json.text).posts.mapNotNull { post ->
-            toSearchResult(post)
-        }
+        return AppUtils.parseJson<PageData>(json.text)
+            .posts.mapNotNull { toSearchResult(it) }
     }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    //  Load — the big one
+    // ══════════════════════════════════════════════════════════════════════════
 
     override suspend fun load(url: String): LoadResponse {
         val json = try {
             app.get(
                 url.replace("$mainUrl/content/", "$mainApiUrl/api/posts/"),
-                verify = false,
-                cacheTime = 60
+                verify = false, cacheTime = 60
             )
         } catch (_: Exception) {
             app.get(
                 url.replace("$mainUrl/content/", "$apiUrl/api/posts/"),
-                verify = false,
-                cacheTime = 60
+                verify = false, cacheTime = 60
             )
         }
         val urlCheck = json.url.contains(mainApiUrl)
-        val loadData = parseJson<Data>(json.text)
-        val providerTitle = loadData.title
-        val providerPoster = "$apiUrl/uploads/${loadData.image}"
-        val providerDescription = loadData.metaData
+        val loadData = AppUtils.parseJson<Data>(json.text)
+        val providerTitle = loadData.name?.ifBlank { loadData.title } ?: loadData.title
+        val fallbackPoster = "$apiUrl/uploads/${loadData.image}"
         val year = selectUntilNonInt(loadData.year)
+        val isMovie = loadData.type == "singleVideo"
 
-        val isAnime = providerTitle.contains("anime", ignoreCase = true) ||
-                providerTitle.contains("Animation", ignoreCase = true) &&
-                (loadData.type == "series" || !providerTitle.contains("movie", ignoreCase = true))
-
-        // ──────────────────────────────────────────────
-        // Fetch enriched metadata from TMDB and AniList
-        // ──────────────────────────────────────────────
-        val tmdbData = fetchTmdbMetadata(providerTitle, year, loadData.type)
-        val animeData = if (isAnime) resolveAnimeMetadata(providerTitle) else null
-
-        // ── Title: AniList English > AniList Romaji > TMDB > Provider ──
-        val enrichedTitle = when {
-            animeData?.titleEnglish != null -> animeData.titleEnglish
-            animeData?.titleRomaji != null -> animeData.titleRomaji
-            tmdbData?.title != null -> tmdbData.title
-            else -> providerTitle
+        // ── FIX #3: Anime detection ───────────────────────────────────────────
+        // Series: only category 21 (Anime Series) → prevents Family Guy / Avatar
+        //         from being treated as anime.
+        // Movies: categories 1 + 21 → Ghibli / anime movies in Animation category
+        //         are still detected; AniList search acts as confirmation since
+        //         non-anime animation won't match on AniList.
+        val isAnime = if (isMovie) {
+            loadData.categories?.any { it.id in setOf(1, 21) } == true
+        } else {
+            loadData.categories?.any { it.id in animeCategoryIds } == true
         }
 
-        // ── Poster: AniList cover (anime) > TMDB poster > Provider poster ──
-        val finalPoster = when {
-            isAnime && !animeData?.coverImage.isNullOrBlank() -> animeData.coverImage
-            !tmdbData?.posterUrl.isNullOrBlank() -> tmdbData.posterUrl
-            else -> providerPoster
+        // ── Fetch metadata ────────────────────────────────────────────────────
+        // Anime: AniList → ani.zip → TMDB fallback
+        // Non-anime: TMDB only (no AniList / Kitsu / Simkl)
+        val aniMeta = if (isAnime) getAniListMeta(providerTitle) else null
+        val aniZip = if (aniMeta?.id != null) getAniZipMeta(aniMeta.id) else null
+        val tmdbMeta = getTmdbMeta(providerTitle, year, isSeries = !isMovie)
+
+        // ── Resolve tracker IDs ──────────────────────────────────────────────
+        // Anime gets AniList + MAL + Kitsu + Simkl
+        // Non-anime gets IMDB + Trakt only
+        val anilistId = aniMeta?.id
+        val malId = aniMeta?.idMal ?: aniZip?.malId
+        val kitsuId = if (isAnime) {
+            aniZip?.kitsuid ?: searchKitsu(providerTitle)
+        } else null
+        val simklId = if (isAnime) {
+            aniZip?.simklId ?: searchSimkl(providerTitle)
+        } else null
+        val imdbId = tmdbMeta?.imdbId
+
+        // ── FIX #1: Anime logo resolution ────────────────────────────────────
+        // Chain: ani.zip TMDB ID → search TMDB with AniList title → null
+        val tmdbIdForLogo = if (isAnime) {
+            aniZip?.themoviedbId?.toIntOrNull()
+                ?: searchTmdbForAnime(
+                    aniMeta?.title?.english
+                        ?: aniMeta?.title?.romaji
+                        ?: cleanTitle(providerTitle),
+                    isMovie
+                )
+        } else null
+
+        val logoUrl = if (isAnime) {
+            fetchTmdbLogo(tmdbIdForLogo, isSeries = !isMovie)
+        } else {
+            tmdbMeta?.logoUrl
         }
 
-        // ── Background: AniList banner (anime) > TMDB backdrop ──
-        val backgroundPoster = when {
-            isAnime && !animeData?.bannerImage.isNullOrBlank() -> animeData.bannerImage
-            !tmdbData?.backdropUrl.isNullOrBlank() -> tmdbData.backdropUrl
+        // ── Title enrichment (anime only) ───────────────────────────────────
+        val displayTitle = if (isAnime) {
+            aniMeta?.title?.english
+                ?: aniMeta?.title?.romaji
+                ?: providerTitle
+        } else {
+            providerTitle
+        }
+
+        // ── Poster ───────────────────────────────────────────────────────────
+        val posterUrl = if (isAnime) {
+            aniMeta?.coverImage?.extraLarge
+                ?: aniMeta?.coverImage?.large
+                ?: tmdbMeta?.poster
+                ?: fallbackPoster
+        } else {
+            tmdbMeta?.poster ?: fallbackPoster
+        }
+
+        // ── Background ───────────────────────────────────────────────────────
+        val backgroundUrl = if (isAnime) {
+            aniMeta?.bannerImage ?: tmdbMeta?.backdrop
+        } else {
+            tmdbMeta?.backdrop
+        }
+
+        // ── Plot ─────────────────────────────────────────────────────────────
+        val plot = if (isAnime) {
+            aniMeta?.description
+                ?.replace(Regex("<[^>]*>"), "")
+                ?.replace(Regex("\\n{3,}"), "\n\n")
+                ?.trim()
+                ?: tmdbMeta?.overview
+                ?: loadData.metaData
+        } else {
+            tmdbMeta?.overview ?: loadData.metaData
+        }
+
+        // ── Genres / Tags ────────────────────────────────────────────────────
+        val tags = if (isAnime) {
+            val list = mutableListOf<String>()
+            aniMeta?.genres?.let { list.addAll(it) }
+            aniMeta?.studios?.nodes
+                ?.mapNotNull { it?.name }
+                ?.let { list.addAll(it) }
+            list.ifEmpty { null }
+        } else {
+            tmdbMeta?.genres
+        }
+
+        // ── Score ────────────────────────────────────────────────────────────
+        val score = when {
+            isAnime && aniMeta?.averageScore != null -> Score.from100(aniMeta.averageScore)
+            tmdbMeta?.rating != null -> Score.from10(tmdbMeta.rating)
             else -> null
         }
 
-        // ── Logo: TMDB only ──
-        val logoUrl = tmdbData?.logoUrl
+        // ── Year ─────────────────────────────────────────────────────────────
+        val enrichedYear = aniMeta?.startDate?.year ?: year
 
-        // ── Plot: AniList (anime) > TMDB > Provider ──
-        val enrichedPlot = when {
-            isAnime && !animeData?.description.isNullOrBlank() -> animeData.description
-            !tmdbData?.overview.isNullOrBlank() -> tmdbData.overview
-            else -> providerDescription
-        }
-
-        // ── Year: AniList > TMDB > Provider ──
-        val enrichedYear = animeData?.year ?: tmdbData?.year ?: year
-
-        // ── Duration: TMDB > Provider ──
-        val enrichedDuration = tmdbData?.duration ?: getDurationFromString(loadData.watchTime)
-
-        // ── Genres: AniList (anime) > TMDB ──
-        val genres = when {
-            isAnime -> animeData?.genres ?: tmdbData?.genres
-            else -> tmdbData?.genres
-        }
-
-        // ── Rating: AniList averageScore (anime, 0-100) > TMDB (0-100) ──
-        val rating = when {
-            isAnime && animeData?.averageScore != null -> animeData.averageScore
-            tmdbData?.rating != null -> tmdbData.rating
-            else -> null
-        }
-
-        // ── Actors: TMDB only ──
-        val actors = tmdbData?.actors
-
-        // ── Tracker IDs ──
-        val malId = animeData?.malId
-        val aniListId = animeData?.aniListId
-        val imdbId = tmdbData?.imdbId
-        val tmdbId = tmdbData?.tmdbId
-
-        // ──────────────────────────────────────────────
-        // Build LoadResponse
-        // ──────────────────────────────────────────────
-        if (loadData.type == "singleVideo") {
-            val movieData = parseJson<Movies>(json.text)
-            val movieUrl = movieData.content
+        // ── Build LoadResponse ───────────────────────────────────────────────
+        if (isMovie) {
+            val movieUrl = json.parsed<Movies>().content
             val link = if (urlCheck) movieUrl else linkToIp(movieUrl)
             val duration = getDurationFromString(loadData.watchTime)
 
-            val movieType = when {
-                isAnime -> TvType.AnimeMovie
-                providerTitle.contains("cartoon", ignoreCase = true) -> TvType.Cartoon
-                providerTitle.contains("animation", ignoreCase = true) -> TvType.Cartoon
-                else -> TvType.Movie
-            }
-
-            return newMovieLoadResponse(enrichedTitle, url, movieType, link) {
-                this.posterUrl = finalPoster
-                this.backgroundPosterUrl = backgroundPoster
-                try { this.logoUrl = logoUrl } catch (_: Throwable) {}
-                this.year = enrichedYear
-                this.plot = enrichedPlot
-                this.duration = enrichedDuration ?: duration
-                this.score = rating?.let { Score.from10(it.toDouble() / 10) }
-                this.tags = genres
-                actors?.let { addActors(it) }
-
-                // ── Tracker IDs ──
-                addMalId(malId)
-                addAniListId(aniListId)
-                // IMDB ID enables Simkl tracking (Simkl resolves via IMDB)
-                try {
-                    if (!imdbId.isNullOrBlank()) {
-                        // Try the standard CS3 method if available
-                        try {
-                            @Suppress("UNCHECKED_CAST")
-                            val addImdbId = LoadResponse.Companion::class.java
-                                .getMethod("addImdbId", String::class.java)
-                            addImdbId.invoke(this, imdbId)
-                        } catch (_: Throwable) {
-                            // Fallback: store in the LoadResponse imdbId field directly
-                            try {
-                                val field = this.javaClass.superclass
-                                    .getDeclaredField("imdbId")
-                                field.isAccessible = true
-                                field.set(this, imdbId)
-                            } catch (_: Throwable) {}
-                        }
-                    }
-                } catch (_: Throwable) {}
-
-                // TMDB ID
-                try {
-                    if (tmdbId != null) {
-                        try {
-                            @Suppress("UNCHECKED_CAST")
-                            val addTmdbId = LoadResponse.Companion::class.java
-                                .getMethod("addTmdbId", Int::class.javaPrimitiveType)
-                            addTmdbId.invoke(this, tmdbId)
-                        } catch (_: Throwable) {
-                            try {
-                                val field = this.javaClass.superclass
-                                    .getDeclaredField("tmdbId")
-                                field.isAccessible = true
-                                field.set(this, tmdbId)
-                            } catch (_: Throwable) {}
-                        }
-                    }
-                } catch (_: Throwable) {}
+            return if (isAnime) {
+                newAnimeLoadResponse(displayTitle, url, TvType.AnimeMovie) {
+                    this.posterUrl = posterUrl
+                    this.backgroundPosterUrl = backgroundUrl
+                    this.year = enrichedYear
+                    this.plot = plot
+                    this.tags = tags
+                    this.score = score
+                    this.duration = duration
+                    try { this.logoUrl = logoUrl } catch (_: Throwable) {}
+                    // ── Tracker IDs (anime) ──
+                    addAniListId(anilistId)
+                    addMalId(malId)
+                    try { addKitsuId(kitsuId) } catch (_: Throwable) {}
+                    try { addSimklId(simklId) } catch (_: Throwable) {}
+                    try { if (!imdbId.isNullOrBlank()) addImdbId(imdbId) } catch (_: Throwable) {}
+                    addEpisodes(DubStatus.None, listOf(newEpisode(link ?: "")))
+                }
+            } else {
+                newMovieLoadResponse(displayTitle, url, TvType.Movie, link) {
+                    this.posterUrl = posterUrl
+                    this.backgroundPosterUrl = backgroundUrl
+                    this.year = enrichedYear
+                    this.plot = plot
+                    this.tags = tags
+                    this.score = score
+                    this.duration = duration
+                    try { this.logoUrl = logoUrl } catch (_: Throwable) {}
+                    // ── Tracker IDs (non-anime: IMDB only) ──
+                    try { if (!imdbId.isNullOrBlank()) addImdbId(imdbId) } catch (_: Throwable) {}
+                }
             }
         } else {
-            val tvData = parseJson<TvSeries>(json.text)
+            // ── TV Series / Anime Series ─────────────────────────────────────
+            val tvData = json.parsed<TvSeries>()
             val episodesData = mutableListOf<Episode>()
             var seasonNum = 0
             tvData.content.forEach { season ->
@@ -316,218 +638,52 @@ class CircleFtpProvider : MainAPI() {
                 var episodeNum = 0
                 season.episodes.forEach {
                     episodeNum++
-                    val episodeUrl = it.link
-                    val link = if (urlCheck) episodeUrl else linkToIp(episodeUrl)
+                    val link = if (urlCheck) it.link else linkToIp(it.link)
                     episodesData.add(
                         newEpisode(link) {
                             this.episode = episodeNum
                             this.season = seasonNum
-                            this.name =
-                                it.title.takeIf { t -> t.isNotBlank() } ?: "Episode $episodeNum"
                         }
                     )
                 }
             }
 
-            val tvType = when {
-                isAnime -> TvType.Anime
-                providerTitle.contains("cartoon", ignoreCase = true) -> TvType.Cartoon
-                providerTitle.contains("animation", ignoreCase = true) -> TvType.Cartoon
-                else -> TvType.TvSeries
-            }
-
-            return newTvSeriesLoadResponse(enrichedTitle, url, tvType, episodesData) {
-                this.posterUrl = finalPoster
-                this.backgroundPosterUrl = backgroundPoster
-                try { this.logoUrl = logoUrl } catch (_: Throwable) {}
-                this.year = enrichedYear
-                this.plot = enrichedPlot
-                this.score = rating?.let { Score.from10(it.toDouble() / 10) }
-                this.tags = genres
-                actors?.let { addActors(it) }
-
-                // ── Tracker IDs ──
-                addMalId(malId)
-                addAniListId(aniListId)
-                // IMDB ID enables Simkl tracking
-                try {
-                    if (!imdbId.isNullOrBlank()) {
-                        try {
-                            @Suppress("UNCHECKED_CAST")
-                            val addImdbId = LoadResponse.Companion::class.java
-                                .getMethod("addImdbId", String::class.java)
-                            addImdbId.invoke(this, imdbId)
-                        } catch (_: Throwable) {
-                            try {
-                                val field = this.javaClass.superclass
-                                    .getDeclaredField("imdbId")
-                                field.isAccessible = true
-                                field.set(this, imdbId)
-                            } catch (_: Throwable) {}
-                        }
-                    }
-                } catch (_: Throwable) {}
-
-                // TMDB ID
-                try {
-                    if (tmdbId != null) {
-                        try {
-                            @Suppress("UNCHECKED_CAST")
-                            val addTmdbId = LoadResponse.Companion::class.java
-                                .getMethod("addTmdbId", Int::class.javaPrimitiveType)
-                            addTmdbId.invoke(this, tmdbId)
-                        } catch (_: Throwable) {
-                            try {
-                                val field = this.javaClass.superclass
-                                    .getDeclaredField("tmdbId")
-                                field.isAccessible = true
-                                field.set(this, tmdbId)
-                            } catch (_: Throwable) {}
-                        }
-                    }
-                } catch (_: Throwable) {}
-            }
-        }
-    }
-
-    // ════════════════════════════════════════════════════════
-    //  TMDB Metadata Fetcher (enhanced with IMDB + TMDB IDs)
-    // ════════════════════════════════════════════════════════
-    private suspend fun fetchTmdbMetadata(
-        title: String,
-        year: Int?,
-        type: String?
-    ): TmdbMetadata? {
-        return try {
-            val searchType = if (type == "singleVideo") "movie" else "tv"
-            val yearQuery = year?.let { "&year=$it" } ?: ""
-
-            val searchResponse = app.get(
-                "$tmdbBaseUrl/search/$searchType?api_key=$tmdbApiKey&query=${title.encodeUri()}&language=en-US&page=1$yearQuery",
-                verify = false,
-                cacheTime = 3600
-            )
-
-            val searchResults = parseJson<TmdbSearchResponse>(searchResponse.text)
-            val bestMatch = searchResults.results.firstOrNull() ?: return null
-
-            val tmdbId = bestMatch.id
-            val tmdbTitle = bestMatch.title ?: bestMatch.name
-
-            val detailsResponse = app.get(
-                "$tmdbBaseUrl/$searchType/$tmdbId?api_key=$tmdbApiKey&language=en-US&append_to_response=credits,images,external_ids",
-                verify = false,
-                cacheTime = 3600
-            )
-
-            val details = parseJson<TmdbDetails>(detailsResponse.text)
-
-            val cast = details.credits?.cast?.take(10)?.map {
-                Actor(it.name, it.profilePath?.let { p -> "$tmdbImageBaseUrl/w185$p" }) to it.character
-            }
-
-            val logoPath = details.images?.logos?.firstOrNull {
-                it.iso6391 == "en" || it.iso6391 == null
-            }?.filePath
-
-            TmdbMetadata(
-                tmdbId = tmdbId,
-                imdbId = details.externalIds?.imdbId,
-                title = tmdbTitle,
-                posterUrl = bestMatch.posterPath?.let { "$tmdbImageBaseUrl/w500$it" },
-                backdropUrl = bestMatch.backdropPath?.let { "$tmdbImageBaseUrl/original$it" },
-                logoUrl = logoPath?.let { "$tmdbImageBaseUrl/w500$it" },
-                overview = details.overview,
-                year = details.releaseDate?.take(4)?.toIntOrNull()
-                    ?: details.firstAirDate?.take(4)?.toIntOrNull(),
-                duration = details.runtime ?: details.episodeRunTime?.firstOrNull(),
-                genres = details.genres?.map { it.name },
-                rating = details.voteAverage?.let { (it * 10).toInt() },
-                actors = cast
-            )
-        } catch (e: Exception) {
-            null
-        }
-    }
-
-    // ════════════════════════════════════════════════════════
-    //  AniList Metadata Fetcher (enriched with full info)
-    //  Also provides MAL ID (needed for Kitsu cross-ref)
-    // ════════════════════════════════════════════════════════
-    private suspend fun resolveAnimeMetadata(title: String): AnimeMetadata? {
-        // Escape special characters in title for safe GraphQL string interpolation
-        val safeTitle = title.escapeGraphQL()
-
-        val query = """
-            query {
-                Page(perPage: 1) {
-                    media(search: "$safeTitle", type: ANIME) {
-                        id
-                        idMal
-                        title { romaji english native }
-                        coverImage { large extraLarge }
-                        bannerImage
-                        description(asHtml: false)
-                        synonyms
-                        startDate { year month day }
-                        format
-                        genres
-                        averageScore
-                        episodes
-                        duration
-                        studios(isMain: true) { nodes { name } }
-                        siteUrl
-                    }
+            return if (isAnime) {
+                newAnimeLoadResponse(displayTitle, url, TvType.Anime) {
+                    this.posterUrl = posterUrl
+                    this.backgroundPosterUrl = backgroundUrl
+                    this.year = enrichedYear
+                    this.plot = plot
+                    this.tags = tags
+                    this.score = score
+                    try { this.logoUrl = logoUrl } catch (_: Throwable) {}
+                    // ── Tracker IDs (anime) ──
+                    addAniListId(anilistId)
+                    addMalId(malId)
+                    try { addKitsuId(kitsuId) } catch (_: Throwable) {}
+                    try { addSimklId(simklId) } catch (_: Throwable) {}
+                    try { if (!imdbId.isNullOrBlank()) addImdbId(imdbId) } catch (_: Throwable) {}
+                    addEpisodes(DubStatus.Subbed, episodesData)
+                }
+            } else {
+                newTvSeriesLoadResponse(displayTitle, url, TvType.TvSeries, episodesData) {
+                    this.posterUrl = posterUrl
+                    this.backgroundPosterUrl = backgroundUrl
+                    this.year = enrichedYear
+                    this.plot = plot
+                    this.tags = tags
+                    this.score = score
+                    try { this.logoUrl = logoUrl } catch (_: Throwable) {}
+                    // ── Tracker IDs (non-anime: IMDB only) ──
+                    try { if (!imdbId.isNullOrBlank()) addImdbId(imdbId) } catch (_: Throwable) {}
                 }
             }
-        """.trimIndent()
-
-        return try {
-            val response = app.post(
-                "https://graphql.anilist.co",
-                verify = false,
-                headers = mapOf("Content-Type" to "application/json"),
-                data = mapOf("query" to query)
-            )
-            val result = parseJson<AniListSearchResult>(response.text)
-            val media = result?.data?.page?.media?.firstOrNull() ?: return null
-
-            // Clean HTML from description
-            val cleanDescription = media.description
-                ?.replace(Regex("<[^>]*>"), "")
-                ?.replace(Regex("\\n\\s*"), "\n")
-                ?.trim()
-
-            AnimeMetadata(
-                aniListId = media.id,
-                malId = media.idMal,
-                titleEnglish = media.title?.english,
-                titleRomaji = media.title?.romaji,
-                titleNative = media.title?.native,
-                coverImage = media.coverImage?.extraLarge ?: media.coverImage?.large,
-                bannerImage = media.bannerImage,
-                description = cleanDescription,
-                year = media.startDate?.year,
-                averageScore = media.averageScore,
-                genres = media.genres,
-                episodeCount = media.episodes,
-                episodeDuration = media.duration,
-                studios = media.studios?.nodes?.mapNotNull { it?.name },
-                anilistUrl = media.siteUrl
-            )
-        } catch (e: Exception) {
-            null
         }
     }
 
-    // ════════════════════════════════════════════════════════
-    //  Helper Utilities
-    // ════════════════════════════════════════════════════════
-    private fun String.encodeUri(): String = URLEncoder.encode(this, "UTF-8")
-
-    /** Escapes backslashes and double-quotes for safe GraphQL string interpolation. */
-    private fun String.escapeGraphQL(): String =
-        this.replace("\\", "\\\\").replace("\"", "\\\"")
+    // ══════════════════════════════════════════════════════════════════════════
+    //  Utilities
+    // ══════════════════════════════════════════════════════════════════════════
 
     private fun linkToIp(data: String?): String {
         if (data != null) {
@@ -560,172 +716,111 @@ class CircleFtpProvider : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         callback.invoke(
-            newExtractorLink(
-                source = this.name,
-                name = this.name,
-                url = data
-            )
+            newExtractorLink(source = this.name, name = this.name, url = data)
         )
         return true
     }
 
     private fun selectUntilNonInt(string: String?): Int? {
         return string?.let {
-            Regex("^.*?(?=\\D|\$)").find(it)?.value?.toIntOrNull()
+            Regex("""^.*?(?=\D|$)""").find(it)?.value?.toIntOrNull()
         }
     }
 
     private fun getSearchQuality(check: String?): SearchQuality? {
-        val lowercaseCheck = check?.lowercase()
-        if (lowercaseCheck != null) {
-            return when {
-                lowercaseCheck.contains("webrip") || lowercaseCheck.contains("web-dl") -> SearchQuality.WebRip
-                lowercaseCheck.contains("bluray") -> SearchQuality.BlueRay
-                lowercaseCheck.contains("hdts") || lowercaseCheck.contains("hdcam") || lowercaseCheck.contains("hdtc") -> SearchQuality.HdCam
-                lowercaseCheck.contains("dvd") -> SearchQuality.DVD
-                lowercaseCheck.contains("cam") -> SearchQuality.Cam
-                lowercaseCheck.contains("camrip") || lowercaseCheck.contains("rip") -> SearchQuality.CamRip
-                lowercaseCheck.contains("hdrip") || lowercaseCheck.contains("hd") || lowercaseCheck.contains("hdtv") -> SearchQuality.HD
-                lowercaseCheck.contains("telesync") -> SearchQuality.Telesync
-                lowercaseCheck.contains("telecine") -> SearchQuality.Telecine
-                else -> null
-            }
+        val c = check?.lowercase() ?: return null
+        return when {
+            c.contains("webrip") || c.contains("web-dl") -> SearchQuality.WebRip
+            c.contains("bluray") -> SearchQuality.BlueRay
+            c.contains("hdts") || c.contains("hdcam") || c.contains("hdtc") -> SearchQuality.HdCam
+            c.contains("dvd") -> SearchQuality.DVD
+            c.contains("cam") -> SearchQuality.Cam
+            c.contains("camrip") || c.contains("rip") -> SearchQuality.CamRip
+            c.contains("hdrip") || c.contains("hd") || c.contains("hdtv") -> SearchQuality.HD
+            c.contains("telesync") -> SearchQuality.Telesync
+            c.contains("telecine") -> SearchQuality.Telecine
+            else -> null
         }
-        return null
     }
 
-    // ════════════════════════════════════════════════════════
-    //  Data Classes — Provider API
-    // ════════════════════════════════════════════════════════
+    // ══════════════════════════════════════════════════════════════════════════
+    //  Data classes — Provider API
+    // ══════════════════════════════════════════════════════════════════════════
+
     data class PageData(val posts: List<Post>)
     data class Post(
-        val id: Int,
-        val type: String,
-        val imageSm: String,
-        val title: String,
-        val name: String?
+        val id: Int, val type: String, val imageSm: String,
+        val title: String, val name: String?
     )
     data class Data(
-        val type: String,
-        val imageSm: String,
-        val title: String,
-        val image: String,
-        val metaData: String?,
-        val name: String,
-        val quality: String?,
-        val year: String?,
-        val watchTime: String?
+        val type: String, val imageSm: String, val title: String, val image: String,
+        val metaData: String?, val name: String?, val quality: String?,
+        val year: String?, val watchTime: String?, val categories: List<Category>?
     )
+    data class Category(val id: Int, val name: String?)
     data class TvSeries(val content: List<Content>)
     data class Content(val episodes: List<EpisodeData>, val seasonName: String)
     data class EpisodeData(val link: String, val title: String)
     data class Movies(val content: String?)
 
-    // ════════════════════════════════════════════════════════
-    //  Data Classes — Enriched Metadata
-    // ════════════════════════════════════════════════════════
+    // ══════════════════════════════════════════════════════════════════════════
+    //  Data classes — AniList
+    // ══════════════════════════════════════════════════════════════════════════
 
-    /** Holds enriched metadata fetched from AniList GraphQL. */
-    data class AnimeMetadata(
-        val aniListId: Int?,
-        val malId: Int?,
-        val titleEnglish: String?,
-        val titleRomaji: String?,
-        val titleNative: String?,
-        val coverImage: String?,
-        val bannerImage: String?,
-        val description: String?,
-        val year: Int?,
-        val averageScore: Int?,      // 0-100
-        val genres: List<String>?,
-        val episodeCount: Int?,
-        val episodeDuration: Int?,    // minutes per episode
-        val studios: List<String>?,
-        val anilistUrl: String?
-    )
-
-    /** Holds enriched metadata fetched from TMDB API. */
-    data class TmdbMetadata(
-        val tmdbId: Int?,
-        val imdbId: String?,          // "tt1234567" — enables Simkl tracking
-        val title: String?,
-        val posterUrl: String?,
-        val backdropUrl: String?,
-        val logoUrl: String?,
-        val overview: String?,
-        val year: Int?,
-        val duration: Int?,           // minutes
-        val genres: List<String>?,
-        val rating: Int?,             // 0-100 scale
-        val actors: List<Pair<Actor, String?>>?
-    )
-
-    // ════════════════════════════════════════════════════════
-    //  Data Classes — TMDB API Responses
-    // ════════════════════════════════════════════════════════
-    data class TmdbSearchResponse(val results: List<TmdbSearchResult>)
-    data class TmdbSearchResult(
-        val id: Int,
-        val posterPath: String?,
-        val backdropPath: String?,
-        val title: String?,
-        val name: String?,
-        val releaseDate: String?,
-        val firstAirDate: String?
-    )
-    data class TmdbDetails(
-        val overview: String?,
-        val runtime: Int?,
-        val episodeRunTime: List<Int>?,
-        val releaseDate: String?,
-        val firstAirDate: String?,
-        val voteAverage: Double?,
-        val genres: List<TmdbGenre>?,
-        val credits: TmdbCredits?,
-        val images: TmdbImages?,
-        val externalIds: TmdbExternalIds?
-    )
-    data class TmdbGenre(val name: String)
-    data class TmdbCredits(val cast: List<TmdbCast>)
-    data class TmdbCast(
-        val name: String,
-        val profilePath: String?,
-        val character: String?
-    )
-    data class TmdbImages(val logos: List<TmdbLogo>?)
-    data class TmdbLogo(val filePath: String?, val iso6391: String?)
-    data class TmdbExternalIds(val imdbId: String?)
-
-    // ════════════════════════════════════════════════════════
-    //  Data Classes — AniList GraphQL Responses
-    // ════════════════════════════════════════════════════════
-    data class AniListSearchResult(val data: AniListData?)
-    data class AniListData(val page: AniListPage?)
-    data class AniListPage(val media: List<AniListMedia>?)
-    data class AniListMedia(
-        val id: Int,
+    data class AniListResponse(val data: AniListData?)
+    data class AniListData(val Media: AniListMeta?)
+    data class AniListMeta(
+        val id: Int?,
         val idMal: Int?,
-        val title: AniListTitle?,
         val coverImage: AniListCoverImage?,
         val bannerImage: String?,
-        val description: String?,
-        val synonyms: List<String>?,
-        val startDate: AniListDate?,
-        val format: String?,
-        val genres: List<String>?,
         val averageScore: Int?,
+        val genres: List<String>?,
+        val description: String?,
+        val title: AniListTitle?,
+        val synonyms: List<String>?,
+        val startDate: AniListStartDate?,
+        val format: String?,
         val episodes: Int?,
-        val duration: Int?,
-        val studios: AniListStudioConnection?,
-        val siteUrl: String?
+        val studios: AniListStudioConnection?
     )
-    data class AniListTitle(
-        val romaji: String?,
-        val english: String?,
-        val native: String?
-    )
-    data class AniListCoverImage(val large: String?, val extraLarge: String?)
-    data class AniListDate(val year: Int?, val month: Int?, val day: Int?)
+    data class AniListCoverImage(val extraLarge: String?, val large: String?)
+    data class AniListTitle(val romaji: String?, val english: String?, val native: String?)
+    data class AniListStartDate(val year: Int?, val month: Int?, val day: Int?)
     data class AniListStudioConnection(val nodes: List<AniListStudioNode?>?)
     data class AniListStudioNode(val name: String?)
+
+    // ══════════════════════════════════════════════════════════════════════════
+    //  Data classes — ani.zip
+    // ══════════════════════════════════════════════════════════════════════════
+
+    data class AniZipMeta(
+        val themoviedbId: String?,
+        val kitsuid: String?,
+        val malId: Int?,
+        val simklId: Int?
+    )
+
+    // ══════════════════════════════════════════════════════════════════════════
+    //  Data classes — TMDB
+    // ══════════════════════════════════════════════════════════════════════════
+
+    data class TmdbSearchResponse(val results: List<TmdbResult>?)
+    data class TmdbResult(
+        val id: Int?,
+        val posterPath: String?,
+        val backdropPath: String?,
+        val voteAverage: Double?,
+        val overview: String?
+    )
+    data class TmdbMeta(
+        val poster: String?,
+        val backdrop: String?,
+        val rating: Double?,
+        val overview: String?,
+        val logoUrl: String?,
+        val imdbId: String?,
+        val genres: List<String>?,
+        val duration: Int?
+    )
 }
