@@ -1,4 +1,4 @@
-package com.redowan
+package com.wizdier
 
 import com.lagradost.cloudstream3.Actor
 import com.lagradost.cloudstream3.ActorData
@@ -178,8 +178,8 @@ class CircleFtpProvider : MainAPI() {
         val enrichedDuration = tmdbData?.duration ?: getDurationFromString(loadData.watchTime)
         val genres = tmdbData?.genres
         val rating = tmdbData?.rating
-        val actors = tmdbData?.actors?.map { 
-            ActorData(Actor(it.name, it.profilePath), roleString = it.character) 
+        val actors = tmdbData?.actors?.map {
+            ActorData(Actor(it.name, it.profilePath), roleString = it.character)
         }
 
         val isAnime = title.contains("anime", ignoreCase = true) ||
@@ -463,6 +463,6 @@ class CircleFtpProvider : MainAPI() {
 
     data class AniListSearchResult(val data: AniListData?)
     data class AniListData(val page: AniListPage?)
-    data class AniListPage(val media: List <AniListMedia>?)
+    data class AniListPage(val media: List<AniListMedia>?)
     data class AniListMedia(val id: Int, val idMal: Int?)
 }
