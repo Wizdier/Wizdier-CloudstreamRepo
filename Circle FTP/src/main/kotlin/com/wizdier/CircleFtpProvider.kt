@@ -318,18 +318,15 @@ class CircleFtpProvider : MainAPI() {
     private fun toSearchResult(post: Post): SearchResponse? {
         val url = "$mainUrl/content/${post.id}"
         val quality = getSearchQuality(post.title.lowercase())
-        val dub = listOf("dubbed", "dual audio", "multi audio").any { post.title.lowercase().contains(it) }
         return if (post.type == "series") {
             newTvSeriesSearchResponse(post.title, url, TvType.TvSeries) {
                 this.posterUrl = "$mainApiUrl/uploads/${post.imageSm}"
                 this.quality = quality
-                addDubStatus(dubExist = dub, subExist = !dub)
             }
         } else {
             newMovieSearchResponse(post.title, url, TvType.Movie) {
                 this.posterUrl = "$mainApiUrl/uploads/${post.imageSm}"
                 this.quality = quality
-                addDubStatus(dubExist = dub, subExist = !dub)
             }
         }
     }
