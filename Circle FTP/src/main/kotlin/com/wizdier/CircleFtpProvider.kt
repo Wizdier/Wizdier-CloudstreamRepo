@@ -78,8 +78,9 @@ class CircleFtpProvider : MainAPI() {
     private val tmdbKey = BuildConfig.TMDB_API
     private val tmdbImageBase = "https://image.tmdb.org/t/p/w500"
     private val tmdbBackdropBase = "https://image.tmdb.org/t/p/original"
+    private val malApi = "https://api.myanimelist.net/v2"
 
-    // Common anime title keywords to help identify anime content
+    // Common anime title keywords
     private val animeKeywords = listOf(
         "anime", "naruto", "dragon ball", "one piece", "attack on titan",
         "demon slayer", "my hero academia", "boruto", "bleach", "fairy tail",
@@ -89,7 +90,7 @@ class CircleFtpProvider : MainAPI() {
         "spy x family", "dandadan", "kaiju no. 8", "blue lock", "solo leveling"
     )
 
-    // Common non-anime keywords to exclude from anime detection
+    // Common non-anime keywords
     private val nonAnimeKeywords = listOf(
         "cartoon", "animation", "animated", "pixar", "disney", "dreamworks"
     )
@@ -133,26 +134,49 @@ class CircleFtpProvider : MainAPI() {
         return null
     }
 
-    // ── Smart anime detection based on category and title ────────────────────
+    // ── MAL: Fallback search for MAL ID (with retry) ──────────────────────────
+    private suspend fun searchMalId(title: String, retryCount: Int = 2): Int? {
+        repeat(retryCount) { attempt ->
+            try {
+                val response = app.get(
+                    "https://api.jikan.moe/v4/anime?q=${URLEncoder.encode(title, "UTF-8")}&limit=1",
+                    cacheTime = 60
+                )
+                val json = JSONObject(response.text)
+                val data = json.optJSONArray("data")
+                if (data != null && data.length() > 0) {
+                    return data.optJSONObject(0)?.optInt("mal_id")
+                }
+            } catch (_: Exception) {
+                // Try alternative MAL API
+                try {
+                    val response = app.get(
+                        "https://myanimelist.p.rapidapi.com/anime/search/${URLEncoder.encode(title, "UTF-8")}/1",
+                        headers = mapOf(
+                            "X-RapidAPI-Key" to "demo",
+                            "X-RapidAPI-Host" to "myanimelist.p.rapidapi.com"
+                        ),
+                        cacheTime = 60
+                    )
+                    val json = JSONObject(response.text)
+                    val malId = json.optInt("mal_id", -1)
+                    if (malId > 0) return malId
+                } catch (_: Exception) {}
+            }
+            if (attempt < retryCount - 1) kotlinx.coroutines.delay(100L * (attempt + 1))
+        }
+        return null
+    }
+
+    // ── Smart anime detection ────────────────────────────────────────────────
     private fun isAnimeContent(categories: List<Category>?, title: String): Boolean {
         val titleLower = title.lowercase()
-
-        // First check: explicit anime category
-        if (categories?.any { it.id in animeCategories } == true) {
-            return true
-        }
-
-        // Second check: possibly anime category (Animation Movies) - use title verification
+        if (categories?.any { it.id in animeCategories } == true) return true
         if (categories?.any { it.id in possiblyAnimeCategories } == true) {
-            if (nonAnimeKeywords.any { titleLower.contains(it) }) {
-                return false
-            }
-            if (animeKeywords.any { titleLower.contains(it) }) {
-                return true
-            }
+            if (nonAnimeKeywords.any { titleLower.contains(it) }) return false
+            if (animeKeywords.any { titleLower.contains(it) }) return true
             return true
         }
-
         return false
     }
 
@@ -257,7 +281,7 @@ class CircleFtpProvider : MainAPI() {
         } catch (_: Exception) { null }
     }
 
-    // ── TMDB: Search for poster/backdrop/overview for non-anime ──────────────
+    // ── TMDB: Search for poster/backdrop/overview and get TMDB ID ─────────────
     private suspend fun getTmdbMeta(title: String, year: Int?, isSeries: Boolean): TmdbMeta? {
         if (tmdbKey.isBlank()) return null
         return try {
@@ -284,8 +308,27 @@ class CircleFtpProvider : MainAPI() {
                 rating = first.voteAverage,
                 overview = first.overview,
                 logoUrl = logoUrl,
-                imdbId = imdbId
+                imdbId = imdbId,
+                tmdbId = first.id
             )
+        } catch (_: Exception) { null }
+    }
+
+    // ── Trakt: Search for Trakt ID (for non-anime) ───────────────────────────
+    private suspend fun searchTrakt(title: String, isSeries: Boolean): Int? {
+        return try {
+            val type = if (isSeries) "shows" else "movies"
+            val response = app.get(
+                "https://api.trakt.tv/search/${type}?query=${URLEncoder.encode(title, "UTF-8")}",
+                headers = mapOf(
+                    "Content-Type" to "application/json",
+                    "trakt-api-version" to "2",
+                    "trakt-api-key" to "YOUR_TRAKT_CLIENT_ID"
+                ),
+                cacheTime = 60
+            )
+            val json = JSONObject(response.text)
+            json.optJSONArray("results")?.optJSONObject(0)?.optInt("trakt")
         } catch (_: Exception) { null }
     }
 
@@ -345,11 +388,18 @@ class CircleFtpProvider : MainAPI() {
                 val meta = getAniListMeta(title)
                 val aniZip = if (meta?.id != null) getAniZipMeta(meta.id) else null
                 val tmdbId = aniZip?.themoviedbId?.toIntOrNull()
-                val logoUrl = if (tmdbId != null) {
-                    fetchTmdbLogo(tmdbId, isSeries = false)
-                } else {
-                    fetchTmdbLogoForAnime(title, isSeries = false)
+
+                // Get logo - try TMDB ID first, then fallback to search
+                var logoUrl: String? = null
+                if (tmdbId != null) {
+                    logoUrl = fetchTmdbLogo(tmdbId, isSeries = false)
                 }
+                if (logoUrl == null) {
+                    logoUrl = fetchTmdbLogoForAnime(title, isSeries = false)
+                }
+
+                // Get MAL ID - from AniList first, then from ani.zip, then fallback to search
+                val malId = meta?.idMal ?: aniZip?.malId ?: searchMalId(title)
                 val kitsuId = aniZip?.kitsuid ?: searchKitsu(title)
                 val simklId = aniZip?.simklId ?: searchSimkl(title)
 
@@ -361,9 +411,9 @@ class CircleFtpProvider : MainAPI() {
                     this.tags = meta?.genres
                     this.score = Score.from100(meta?.averageScore)
                     this.duration = duration
-                    try { this.logoUrl = logoUrl } catch (_: Throwable) {}
+                    this.logoUrl = logoUrl
                     addAniListId(meta?.id)
-                    addMalId(meta?.idMal ?: aniZip?.malId)
+                    addMalId(malId)
                     kitsuId?.let { addKitsuId(it) }
                     simklId?.let { addSimklId(it) }
                     try { addImdbId(null) } catch (_: Throwable) {}
@@ -379,12 +429,15 @@ class CircleFtpProvider : MainAPI() {
                     this.plot = meta?.overview ?: loadData.metaData
                     this.score = Score.from10(meta?.rating)
                     this.duration = duration
-                    try { this.logoUrl = meta?.logoUrl } catch (_: Throwable) {}
+                    this.logoUrl = meta?.logoUrl
+                    // Non-anime: add IMDB sync, try to get Trakt ID
+                    val traktId = searchTrakt(title, isSeries = false)
                     try { addAniListId(null) } catch (_: Throwable) {}
                     try { addMalId(null) } catch (_: Throwable) {}
                     try { addKitsuId(null as String?) } catch (_: Throwable) {}
                     try { addSimklId(null) } catch (_: Throwable) {}
                     try { addImdbId(meta?.imdbId) } catch (_: Throwable) {}
+                    try { traktId?.let { addTraktId(it) } } catch (_: Throwable) {}
                 }
             }
         } else {
@@ -408,11 +461,18 @@ class CircleFtpProvider : MainAPI() {
                 val meta = getAniListMeta(title)
                 val aniZip = if (meta?.id != null) getAniZipMeta(meta.id) else null
                 val tmdbId = aniZip?.themoviedbId?.toIntOrNull()
-                val logoUrl = if (tmdbId != null) {
-                    fetchTmdbLogo(tmdbId, isSeries = true)
-                } else {
-                    fetchTmdbLogoForAnime(title, isSeries = true)
+
+                // Get logo - try TMDB ID first, then fallback to search
+                var logoUrl: String? = null
+                if (tmdbId != null) {
+                    logoUrl = fetchTmdbLogo(tmdbId, isSeries = true)
                 }
+                if (logoUrl == null) {
+                    logoUrl = fetchTmdbLogoForAnime(title, isSeries = true)
+                }
+
+                // Get MAL ID - from AniList first, then from ani.zip, then fallback to search
+                val malId = meta?.idMal ?: aniZip?.malId ?: searchMalId(title)
                 val kitsuId = aniZip?.kitsuid ?: searchKitsu(title)
                 val simklId = aniZip?.simklId ?: searchSimkl(title)
 
@@ -423,9 +483,9 @@ class CircleFtpProvider : MainAPI() {
                     this.plot = meta?.description?.replace(Regex("<[^>]*>"), "") ?: loadData.metaData
                     this.tags = meta?.genres
                     this.score = Score.from100(meta?.averageScore)
-                    try { this.logoUrl = logoUrl } catch (_: Throwable) {}
+                    this.logoUrl = logoUrl
                     addAniListId(meta?.id)
-                    addMalId(meta?.idMal ?: aniZip?.malId)
+                    addMalId(malId)
                     kitsuId?.let { addKitsuId(it) }
                     simklId?.let { addSimklId(it) }
                     try { addImdbId(null) } catch (_: Throwable) {}
@@ -440,12 +500,15 @@ class CircleFtpProvider : MainAPI() {
                     this.year = year
                     this.plot = meta?.overview ?: loadData.metaData
                     this.score = Score.from10(meta?.rating)
-                    try { this.logoUrl = meta?.logoUrl } catch (_: Throwable) {}
+                    this.logoUrl = meta?.logoUrl
+                    // Non-anime: add IMDB sync, try to get Trakt ID
+                    val traktId = searchTrakt(title, isSeries = true)
                     try { addAniListId(null) } catch (_: Throwable) {}
                     try { addMalId(null) } catch (_: Throwable) {}
                     try { addKitsuId(null as String?) } catch (_: Throwable) {}
                     try { addSimklId(null) } catch (_: Throwable) {}
                     try { addImdbId(meta?.imdbId) } catch (_: Throwable) {}
+                    try { traktId?.let { addTraktId(it) } } catch (_: Throwable) {}
                 }
             }
         }
@@ -549,6 +612,6 @@ class CircleFtpProvider : MainAPI() {
     data class TmdbMeta(
         val poster: String?, val backdrop: String?,
         val rating: Double?, val overview: String?,
-        val logoUrl: String?, val imdbId: String?
+        val logoUrl: String?, val imdbId: String?, val tmdbId: Int?
     )
 }
