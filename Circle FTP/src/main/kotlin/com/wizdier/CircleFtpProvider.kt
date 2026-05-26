@@ -51,7 +51,7 @@ class CircleFtpProvider : MainAPI() {
         TvType.Others
     )
 
-    private val tmdbApiKey = "YOUR_TMDB_API_KEY"
+    private val tmdbApiKey = "0b2d522346f5ecbafa42ae4b0141c774"
     private val tmdbBaseUrl = "https://api.themoviedb.org/3"
     private val tmdbImageBaseUrl = "https://image.tmdb.org/t/p"
 
