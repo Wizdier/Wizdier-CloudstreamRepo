@@ -463,6 +463,6 @@ class CircleFtpProvider : MainAPI() {
 
     data class AniListSearchResult(val data: AniListData?)
     data class AniListData(val page: AniListPage?)
-    data class AniListPage(val media: List<AniListMedia>?)
+    data class AniListPage(val media: List<<AniListMedia>?)
     data class AniListMedia(val id: Int, val idMal: Int?)
 }
