@@ -1,8 +1,0 @@
-{
-    "name": "Wizdier BDIX Repository",
-    "description": "CircleFTP extension with MAL/AniList tracking",
-    "manifestVersion": 1,
-    "pluginLists": [
-        "https://raw.githubusercontent.com/Wizdier/Wizdier-CloudstreamRepo/builds/plugins.json"
-    ]
-}
