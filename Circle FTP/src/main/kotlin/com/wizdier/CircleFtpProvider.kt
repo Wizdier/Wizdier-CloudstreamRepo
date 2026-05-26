@@ -91,8 +91,7 @@ class CircleFtpProvider : MainAPI() {
 
     // Common non-anime keywords to exclude from anime detection
     private val nonAnimeKeywords = listOf(
-        "cartoon", "animation", "animated", "pixar", "disney", "dreamworks",
-        "梦工厂", "迪士尼", "皮克斯", "卡通"
+        "cartoon", "animation", "animated", "pixar", "disney", "dreamworks"
     )
 
     // ── AniList: Search for anime metadata + IDs (with retry) ─────────────────
@@ -260,7 +259,8 @@ class CircleFtpProvider : MainAPI() {
 
     // ── TMDB: Search for poster/backdrop/overview for non-anime ──────────────
     private suspend fun getTmdbMeta(title: String, year: Int?, isSeries: Boolean): TmdbMeta? {
-        if (tmdbKey.isBlank()) return null return try {
+        if (tmdbKey.isBlank()) return null
+        return try {
             val type = if (isSeries) "tv" else "movie"
             val url = "$tmdbApi/search/$type?api_key=$tmdbKey&query=${URLEncoder.encode(title, "UTF-8")}&language=en-US&page=1"
             val first = AppUtils.parseJson<TmdbSearchResponse>(
@@ -364,8 +364,8 @@ class CircleFtpProvider : MainAPI() {
                     try { this.logoUrl = logoUrl } catch (_: Throwable) {}
                     addAniListId(meta?.id)
                     addMalId(meta?.idMal ?: aniZip?.malId)
-                    try { addKitsuId(kitsuId) } catch (_: Throwable) {}
-                    try { addSimklId(simklId) } catch (_: Throwable) {}
+                    kitsuId?.let { addKitsuId(it) }
+                    simklId?.let { addSimklId(it) }
                     try { addImdbId(null) } catch (_: Throwable) {}
                     addEpisodes(DubStatus.None, listOf(newEpisode(link ?: "")))
                 }
@@ -382,7 +382,7 @@ class CircleFtpProvider : MainAPI() {
                     try { this.logoUrl = meta?.logoUrl } catch (_: Throwable) {}
                     try { addAniListId(null) } catch (_: Throwable) {}
                     try { addMalId(null) } catch (_: Throwable) {}
-                    try { addKitsuId(null) } catch (_: Throwable) {}
+                    try { addKitsuId(null as String?) } catch (_: Throwable) {}
                     try { addSimklId(null) } catch (_: Throwable) {}
                     try { addImdbId(meta?.imdbId) } catch (_: Throwable) {}
                 }
@@ -426,8 +426,8 @@ class CircleFtpProvider : MainAPI() {
                     try { this.logoUrl = logoUrl } catch (_: Throwable) {}
                     addAniListId(meta?.id)
                     addMalId(meta?.idMal ?: aniZip?.malId)
-                    try { addKitsuId(kitsuId) } catch (_: Throwable) {}
-                    try { addSimklId(simklId) } catch (_: Throwable) {}
+                    kitsuId?.let { addKitsuId(it) }
+                    simklId?.let { addSimklId(it) }
                     try { addImdbId(null) } catch (_: Throwable) {}
                     addEpisodes(DubStatus.Subbed, episodesData)
                 }
@@ -443,7 +443,7 @@ class CircleFtpProvider : MainAPI() {
                     try { this.logoUrl = meta?.logoUrl } catch (_: Throwable) {}
                     try { addAniListId(null) } catch (_: Throwable) {}
                     try { addMalId(null) } catch (_: Throwable) {}
-                    try { addKitsuId(null) } catch (_: Throwable) {}
+                    try { addKitsuId(null as String?) } catch (_: Throwable) {}
                     try { addSimklId(null) } catch (_: Throwable) {}
                     try { addImdbId(meta?.imdbId) } catch (_: Throwable) {}
                 }
@@ -454,18 +454,24 @@ class CircleFtpProvider : MainAPI() {
     private fun linkToIp(data: String?): String {
         if (data != null) {
             return when {
-                "index.circleftp.net" in data -> data.replace("index.circleftp.net", "15.1.4.2")
-                "index2.circleftp.net" in data -> data.replace("index2.circleftp.net", "15.1.4.5")
-                "index1.circleftp.net" in data -> data.replace("index1.circleftp.net", "15.1.4.9")
-                "ftp3.circleftp.net" in data -> data.replace("ftp3.circleftp.net", "15.1.4.7")
-                "ftp4.circleftp.net" in data -> data.replace("ftp4.circleftp.net", "15.1.1.5")
-                ["ftp5.circleftp.net", "ftp6.circleftp.net", "ftp7.circleftp.net", "ftp8.circleftp.net",
-                 "ftp9.circleftp.net", "ftp10.circleftp.net", "ftp11.circleftp.net", "ftp12.circleftp.net",
-                 "ftp13.circleftp.net", "ftp15.circleftp.net", "ftp17.circleftp.net"].any { it in data } -> {
-                    data.replaceFirst(".circleftp.net") { ".circleftp.net".replace("index", "15.1") }
- .let { d -> d.replace("index", "15.1") }
-                }
-                else -> data }
+                data.contains("index.circleftp.net") -> data.replace("index.circleftp.net", "15.1.4.2")
+                data.contains("index2.circleftp.net") -> data.replace("index2.circleftp.net", "15.1.4.5")
+                data.contains("index1.circleftp.net") -> data.replace("index1.circleftp.net", "15.1.4.9")
+                data.contains("ftp3.circleftp.net") -> data.replace("ftp3.circleftp.net", "15.1.4.7")
+                data.contains("ftp4.circleftp.net") -> data.replace("ftp4.circleftp.net", "15.1.1.5")
+                data.contains("ftp5.circleftp.net") -> data.replace("ftp5.circleftp.net", "15.1.1.15")
+                data.contains("ftp6.circleftp.net") -> data.replace("ftp6.circleftp.net", "15.1.2.3")
+                data.contains("ftp7.circleftp.net") -> data.replace("ftp7.circleftp.net", "15.1.4.8")
+                data.contains("ftp8.circleftp.net") -> data.replace("ftp8.circleftp.net", "15.1.2.2")
+                data.contains("ftp9.circleftp.net") -> data.replace("ftp9.circleftp.net", "15.1.2.12")
+                data.contains("ftp10.circleftp.net") -> data.replace("ftp10.circleftp.net", "15.1.4.3")
+                data.contains("ftp11.circleftp.net") -> data.replace("ftp11.circleftp.net", "15.1.2.6")
+                data.contains("ftp12.circleftp.net") -> data.replace("ftp12.circleftp.net", "15.1.2.1")
+                data.contains("ftp13.circleftp.net") -> data.replace("ftp13.circleftp.net", "15.1.1.18")
+                data.contains("ftp15.circleftp.net") -> data.replace("ftp15.circleftp.net", "15.1.4.12")
+                data.contains("ftp17.circleftp.net") -> data.replace("ftp17.circleftp.net", "15.1.3.8")
+                else -> data
+            }
         } else return ""
     }
 
