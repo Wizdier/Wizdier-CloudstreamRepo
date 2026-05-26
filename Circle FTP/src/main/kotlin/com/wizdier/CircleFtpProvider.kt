@@ -92,7 +92,7 @@ class CircleFtpProvider : MainAPI() {
                 cacheTime = 60
             )
         }
-        val home = parseJson<<PageData>(json.text).posts.mapNotNull { post ->
+        val home = parseJson<PageData>(json.text).posts.mapNotNull { post ->
             toSearchResult(post, request.data)
         }
         return newHomePageResponse(request.name, home, true)
@@ -128,7 +128,7 @@ class CircleFtpProvider : MainAPI() {
         return null
     }
 
-    override suspend fun search(query: String): List<<SearchResponse> {
+    override suspend fun search(query: String): List<SearchResponse> {
         val json = try {
             app.get(
                 "$mainApiUrl/api/posts?searchTerm=$query&order=desc",
@@ -142,7 +142,7 @@ class CircleFtpProvider : MainAPI() {
                 cacheTime = 60
             )
         }
-        return parseJson<<PageData>(json.text).posts.mapNotNull { post ->
+        return parseJson<PageData>(json.text).posts.mapNotNull { post ->
             toSearchResult(post)
         }
     }
@@ -194,7 +194,7 @@ class CircleFtpProvider : MainAPI() {
         }
 
         if (loadData.type == "singleVideo") {
-            val movieData = json.parsed<Movies>()
+            val movieData = parseJson<Movies>(json.text)
             val movieUrl = movieData.content
             val link = if(urlCheck) movieUrl else linkToIp(movieUrl)
             val duration = getDurationFromString(loadData.watchTime)
@@ -220,8 +220,8 @@ class CircleFtpProvider : MainAPI() {
                 addAniListId(aniListId)
             }
         } else {
-            val tvData = json.parsed<TvSeries>()
-            val episodesData = mutableListOf<<Episode>()
+            val tvData = parseJson<TvSeries>(json.text)
+            val episodesData = mutableListOf<Episode>()
             var seasonNum = 0
             tvData.content.forEach { season ->
                 seasonNum++
@@ -333,7 +333,7 @@ class CircleFtpProvider : MainAPI() {
                 headers = mapOf("Content-Type" to "application/json"),
                 data = mapOf("query" to query)
             )
-            parseJson<<AniListSearchResult>(response.text)
+            parseJson<AniListSearchResult>(response.text)
         } catch (e: Exception) {
             null
         }
@@ -411,11 +411,11 @@ class CircleFtpProvider : MainAPI() {
         return null
     }
 
-    data class PageData(val posts: List<<Post>)
+    data class PageData(val posts: List<Post>)
     data class Post(val id: Int, val type: String, val imageSm: String, val title: String, val name: String?)
     data class Data(val type: String, val imageSm: String, val title: String, val image: String, val metaData: String?, val name: String, val quality: String?, val year: String?, val watchTime: String?)
-    data class TvSeries(val content: List<<Content>)
-    data class Content(val episodes: List<<EpisodeData>, val seasonName: String)
+    data class TvSeries(val content: List<Content>)
+    data class Content(val episodes: List<EpisodeData>, val seasonName: String)
     data class EpisodeData(val link: String, val title: String)
     data class Movies(val content: String?)
 
@@ -428,7 +428,7 @@ class CircleFtpProvider : MainAPI() {
         val duration: Int?,
         val genres: List<String>?,
         val rating: Int?,
-        val actors: List<<ActorData>?
+        val actors: List<ActorData>?
     )
 
     data class TmdbSearchResponse(val results: List<TmdbSearchResult>)
@@ -464,6 +464,6 @@ class CircleFtpProvider : MainAPI() {
 
     data class AniListSearchResult(val data: AniListData?)
     data class AniListData(val page: AniListPage?)
-    data class AniListPage(val media: List<<AniListMedia>?)
+    data class AniListPage(val media: List<AniListMedia>?)
     data class AniListMedia(val id: Int, val idMal: Int?)
 }
