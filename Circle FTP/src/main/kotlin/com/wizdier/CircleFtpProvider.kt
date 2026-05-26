@@ -1,7 +1,6 @@
 package com.wizdier
 
 import com.lagradost.cloudstream3.Actor
-import com.lagradost.cloudstream3.ActorData
 import com.lagradost.cloudstream3.Episode
 import com.lagradost.cloudstream3.HomePageResponse
 import com.lagradost.cloudstream3.LoadResponse
@@ -287,10 +286,7 @@ class CircleFtpProvider : MainAPI() {
             val details = parseJson<TmdbDetails>(detailsResponse.text)
 
             val cast = details.credits?.cast?.take(10)?.map {
-                ActorData(
-                    Actor(it.name, it.profilePath?.let { p -> "$tmdbImageBaseUrl/w185$p" }),
-                    roleString = it.character
-                )
+                Actor(it.name, it.profilePath?.let { p -> "$tmdbImageBaseUrl/w185$p" }) to it.character
             }
 
             val logoPath = details.images?.logos?.firstOrNull {
@@ -428,7 +424,7 @@ class CircleFtpProvider : MainAPI() {
         val duration: Int?,
         val genres: List<String>?,
         val rating: Int?,
-        val actors: List<ActorData>?
+        val actors: List<Pair<Actor, String?>>?
     )
 
     data class TmdbSearchResponse(val results: List<TmdbSearchResult>)
