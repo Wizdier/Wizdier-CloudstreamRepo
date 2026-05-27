@@ -94,7 +94,7 @@ class CircleFtpProvider : MainAPI() {
         t = t.replace(Regex("""[\[\(].*?[\]\)]"""), "")
         t = t.replace(Regex("""[:\-–—]"""), " ")
         t = t.replace(Regex("""\s{2,}"""), " ")
-        return t.trim
+        return t.trim()
 }
 
     private fun stripAudioTags(title: String): String {
