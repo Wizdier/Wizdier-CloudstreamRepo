@@ -94,8 +94,8 @@ class CircleFtpProvider : MainAPI() {
         t = t.replace(Regex("""[\[\(].*?[\]\)]"""), "")
         t = t.replace(Regex("""[:\-–—]"""), " ")
         t = t.replace(Regex("""\s{2,}"""), " ")
-        return t.trim()
-    }
+        return t.trim
+}
 
     private fun stripAudioTags(title: String): String {
         return title.replace(Regex("""(?i)\b(hindi|english|tamil|telugu|malayalam|kannada|bengali|marathi|dual audio|multi audio|dubbed|subbed|eng\+jap)\b"""), "")
@@ -127,7 +127,6 @@ class CircleFtpProvider : MainAPI() {
         val t = title.lowercase()
         val tagList = tags?.lowercase() ?: ""
         
-        // Strict category and explicit tag detection only. This kills false positives.
         if (categories?.any { it.id == 21 } == true) return true
         if (tagList.contains("anime") || t.contains("anime")) return true
         
@@ -566,14 +565,13 @@ class CircleFtpProvider : MainAPI() {
     }
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        val jsonText = fetchPostJson(-1) // Using a dummy ID logic bypass here to fetch the page URL directly
         val json = try {
             app.get("$mainApiUrl/api/posts?categoryExact=${request.data}&page=$page&order=desc&limit=10", verify = false, cacheTime = 60).text
         } catch (_: Exception) {
             try { app.get("$apiUrl/api/posts?categoryExact=${request.data}&page=$page&order=desc&limit=10", verify = false, cacheTime = 60).text } catch(_: Exception) { "{}" }
         }
         
-        val posts = try { AppUtils.parseJson<PageData>(json).posts } catch(_: Exception) { emptyList() }
+        val posts = try { AppUtils.parseJson<PageData>(json).posts ?: emptyList() } catch(_: Exception) { emptyList() }
         val groupedPosts = posts.groupBy {
             val clean = stripAudioTags(it.name?.ifBlank { it.title } ?: it.title ?: "").lowercase()
             "$clean|${it.type}|${selectUntilNonInt(it.year) ?: 0}"
@@ -594,7 +592,7 @@ class CircleFtpProvider : MainAPI() {
             try { app.get("$apiUrl/api/posts?searchTerm=$query&order=desc", verify = false, cacheTime = 60).text } catch(_: Exception) { "{}" }
         }
         
-        val posts = try { AppUtils.parseJson<PageData>(json).posts } catch(_: Exception) { emptyList() }
+        val posts = try { AppUtils.parseJson<PageData>(json).posts ?: emptyList() } catch(_: Exception) { emptyList() }
         val groupedPosts = posts.groupBy {
             val clean = stripAudioTags(it.name?.ifBlank { it.title } ?: it.title ?: "").lowercase()
             "$clean|${it.type}|${selectUntilNonInt(it.year) ?: 0}"
@@ -613,14 +611,14 @@ class CircleFtpProvider : MainAPI() {
         
         if (postIds.isEmpty()) throw ErrorLoadingException("No matching IDs found for $url")
 
-        // Fetch all grouped items robustly (skipping completely broken responses instead of crashing)
-        val allData = postIds.mapNotNull { id ->
-            val jsonText = fetchPostJson(id) ?: return@mapNotNull null
+        val allData = mutableListOf<Triple<Int, Data, String>>()
+        for (id in postIds) {
+            val jsonText = fetchPostJson(id) ?: continue
             try {
                 val pData = AppUtils.parseJson<Data>(jsonText)
-                Triple(id, pData, jsonText)
+                allData.add(Triple(id, pData, jsonText))
             } catch (e: Exception) {
-                null
+                // Ignore broken entries gracefully
             }
         }
         
@@ -641,9 +639,9 @@ class CircleFtpProvider : MainAPI() {
                 val meta = resolveAnimeMetaCached(baseTitle, year, false, 1)
                 val episodesData = mutableListOf<Episode>()
                 
-                allData.forEach { (id, pData, jsonText) ->
+                for ((_, pData, jsonText) in allData) {
                     val movie = try { AppUtils.parseJson<Movies>(jsonText) } catch(_: Exception) { null }
-                    val linkStr = movie?.content ?: return@forEach
+                    val linkStr = movie?.content ?: continue
                     val link = if (linkStr.contains(mainApiUrl)) linkStr else linkToIp(linkStr)
                     val audioTag = extractAudioTag(pData.title ?: "")
                     
@@ -677,9 +675,9 @@ class CircleFtpProvider : MainAPI() {
                 val actors = fetchTmdbActors(meta?.tmdbId, false)
                 val episodesData = mutableListOf<Episode>()
 
-                allData.forEach { (id, pData, jsonText) ->
+                for ((_, pData, jsonText) in allData) {
                     val movie = try { AppUtils.parseJson<Movies>(jsonText) } catch(_: Exception) { null }
-                    val linkStr = movie?.content ?: return@forEach
+                    val linkStr = movie?.content ?: continue
                     val link = if (linkStr.contains(mainApiUrl)) linkStr else linkToIp(linkStr)
                     val audioTag = extractAudioTag(pData.title ?: "")
                     
@@ -703,12 +701,10 @@ class CircleFtpProvider : MainAPI() {
                 }
             }
         } else {
-            // TV SERIES
             val targetSeasonIndex = selectedSeason ?: 0
             val seasonNumberForMeta = targetSeasonIndex + 1
 
             if (isAnime) {
-                // Get all seasons from primary item for recommendations mapping
                 val primaryTvSeries = try { AppUtils.parseJson<TvSeries>(allData.first().third) } catch(_: Exception) { null }
                 val allSeasons = primaryTvSeries?.content ?: emptyList()
                 val metaTitle = titleForSeason(baseTitle, allSeasons.getOrNull(targetSeasonIndex)?.seasonName, seasonNumberForMeta)
@@ -725,13 +721,14 @@ class CircleFtpProvider : MainAPI() {
                 }
 
                 val episodesData = mutableListOf<Episode>()
-                allData.forEach { (id, pData, jsonText) ->
-                    val tvSeries = try { AppUtils.parseJson<TvSeries>(jsonText) } catch(_: Exception) { null } ?: return@forEach
-                    val seasonToLoad = tvSeries.content?.getOrNull(targetSeasonIndex) ?: return@forEach
+                for ((_, pData, jsonText) in allData) {
+                    val tvSeries = try { AppUtils.parseJson<TvSeries>(jsonText) } catch(_: Exception) { null } ?: continue
+                    val seasonToLoad = tvSeries.content?.getOrNull(targetSeasonIndex) ?: continue
                     val audioTag = extractAudioTag(pData.title ?: "")
                     
-                    seasonToLoad.episodes?.forEachIndexed { idx, ep ->
-                        val linkStr = ep.link ?: return@forEachIndexed
+                    val episodes = seasonToLoad.episodes ?: emptyList()
+                    for ((idx, ep) in episodes.withIndex()) {
+                        val linkStr = ep.link ?: continue
                         val link = if (linkStr.contains(mainApiUrl)) linkStr else linkToIp(linkStr)
                         val aniEp = meta.anilistEpisodes?.getOrNull(idx)
                         
@@ -772,126 +769,19 @@ class CircleFtpProvider : MainAPI() {
                 val actors = fetchTmdbActors(tmdbId, true)
                 val episodesData = mutableListOf<Episode>()
 
-                allData.forEach { (id, pData, jsonText) ->
-                    val tvSeries = try { AppUtils.parseJson<TvSeries>(jsonText) } catch(_: Exception) { null } ?: return@forEach
+                for ((_, pData, jsonText) in allData) {
+                    val tvSeries = try { AppUtils.parseJson<TvSeries>(jsonText) } catch(_: Exception) { null } ?: continue
                     var seasonNum = 0
                     val audioTag = extractAudioTag(pData.title ?: "")
                     
-                    tvSeries.content?.forEach { season ->
+                    val contentList = tvSeries.content ?: emptyList()
+                    for (season in contentList) {
                         seasonNum++
                         val tmdbEpisodes = tmdbId?.let { fetchTmdbSeasonEpisodes(it, seasonNum) } ?: emptyList()
-                        season.episodes?.forEachIndexed { idx, ep ->
-                            val linkStr = ep.link ?: return@forEachIndexed
-                            val link = if (linkStr.contains(mainApiUrl)) linkStr else linkToIp(linkStr)
-                            val tmdbEp = tmdbEpisodes.getOrNull(idx)
-                            
-                            val episodeData = LinkData(url = link, tag = audioTag).toJson()
-                            episodesData.add(newEpisode(episodeData) {
-                                this.episode = idx + 1
-                                this.season = seasonNum
-                                val resolvedName = tmdbEp?.name ?: ep.title?.takeIf { it.isNotBlank() } ?: "Episode ${idx + 1}"
-                                this.name = if (allData.size > 1) "[$audioTag] $resolvedName" else resolvedName
-                                this.posterUrl = tmdbEp?.stillPath?.let { "$tmdbImageBase$it" }
-                                this.description = tmdbEp?.overview
-                                tmdbEp?.airDate?.let { addDate(it) }
-                            })
-                        }
-                    }
-                }
-
-                return newTvSeriesLoadResponse(baseTitle, url, TvType.TvSeries, episodesData) {
-                    this.posterUrl = meta?.poster ?: fallbackPoster
-                    this.backgroundPosterUrl = meta?.backdrop ?: fallbackPoster
-                    this.year = year
-                    this.plot = meta?.overview ?: primaryData.metaData
-                    this.score = Score.from10(meta?.rating)
-                    this.duration = duration
-                    this.actors = actors
-                    this.logoUrl = meta?.logoUrl
-                    trailer?.let { addTrailer(it) }
-                    meta?.imdbId?.let { addImdbId(it) }
-                }
-            }
-        } else {
-            // TV SERIES
-            val targetSeasonIndex = selectedSeason ?: 0
-            val seasonNumberForMeta = targetSeasonIndex + 1
-
-            if (isAnime) {
-                // Get all seasons from primary item for recommendations mapping
-                val primaryTvSeries = try { AppUtils.parseJson<TvSeries>(allData.first().third) } catch(_: Exception) { null }
-                val allSeasons = primaryTvSeries?.content ?: emptyList()
-                val metaTitle = titleForSeason(baseTitle, allSeasons.getOrNull(targetSeasonIndex)?.seasonName, seasonNumberForMeta)
-                val meta = resolveAnimeMetaCached(metaTitle, year, true, seasonNumberForMeta)
-                
-                val recommendations = allSeasons.mapIndexedNotNull { index, season ->
-                    if (index == targetSeasonIndex) return@mapIndexedNotNull null
-                    val recSeasonNumber = index + 1
-                    val recTitle = titleForSeason(baseTitle, season.seasonName, recSeasonNumber)
-                    val recUrl = "$mainUrl/content/$idString?season=$index"
-                    newAnimeSearchResponse(recTitle, recUrl, TvType.Anime) {
-                        this.posterUrl = meta.poster ?: fallbackPoster 
-                    }
-                }
-
-                val episodesData = mutableListOf<Episode>()
-                allData.forEach { (id, pData, jsonText) ->
-                    val tvSeries = try { AppUtils.parseJson<TvSeries>(jsonText) } catch(_: Exception) { null } ?: return@forEach
-                    val seasonToLoad = tvSeries.content?.getOrNull(targetSeasonIndex) ?: return@forEach
-                    val audioTag = extractAudioTag(pData.title ?: "")
-                    
-                    seasonToLoad.episodes?.forEachIndexed { idx, ep ->
-                        val linkStr = ep.link ?: return@forEachIndexed
-                        val link = if (linkStr.contains(mainApiUrl)) linkStr else linkToIp(linkStr)
-                        val aniEp = meta.anilistEpisodes?.getOrNull(idx)
                         
-                        val episodeData = LinkData(url = link, tag = audioTag).toJson()
-                        episodesData.add(newEpisode(episodeData) {
-                            this.episode = idx + 1
-                            this.season = if (selectedSeason != null) 1 else seasonNumberForMeta
-                            
-                            val resolvedName = aniEp?.title ?: ep.title?.takeIf { it.isNotBlank() } ?: "Episode ${idx + 1}"
-                            this.name = if (allData.size > 1) "[$audioTag] $resolvedName" else resolvedName
-                            this.posterUrl = aniEp?.thumbnail
-                        })
-                    }
-                }
-
-                return newAnimeLoadResponse(meta.title.ifBlank { metaTitle }, url, TvType.Anime) {
-                    this.posterUrl = meta.poster ?: fallbackPoster
-                    this.backgroundPosterUrl = meta.background ?: fallbackPoster
-                    this.year = year
-                    this.plot = meta.plot ?: primaryData.metaData
-                    this.tags = meta.tags
-                    this.score = Score.from100(meta.score100)
-                    this.actors = meta.actors
-                    this.logoUrl = meta.logoUrl
-                    this.recommendations = recommendations
-                    meta.trailer?.let { addTrailer(it) }
-                    meta.anilistId?.let { addAniListId(it) }
-                    meta.malId?.let { addMalId(it) }
-                    meta.kitsuId?.let { addKitsuId(it) }
-                    meta.simklId?.let { addSimklId(it) }
-                    meta.imdbId?.let { addImdbId(it) }
-                    addEpisodes(if (isDubbedGlobal) DubStatus.Dubbed else DubStatus.Subbed, episodesData)
-                }
-            } else {
-                val meta = getTmdbMetaCached(cleanTitle(baseTitle), year, true)
-                val tmdbId = meta?.tmdbId
-                val trailer = fetchTmdbTrailer(tmdbId, true)
-                val actors = fetchTmdbActors(tmdbId, true)
-                val episodesData = mutableListOf<Episode>()
-
-                allData.forEach { (id, pData, jsonText) ->
-                    val tvSeries = try { AppUtils.parseJson<TvSeries>(jsonText) } catch(_: Exception) { null } ?: return@forEach
-                    var seasonNum = 0
-                    val audioTag = extractAudioTag(pData.title ?: "")
-                    
-                    tvSeries.content?.forEach { season ->
-                        seasonNum++
-                        val tmdbEpisodes = tmdbId?.let { fetchTmdbSeasonEpisodes(it, seasonNum) } ?: emptyList()
-                        season.episodes?.forEachIndexed { idx, ep ->
-                            val linkStr = ep.link ?: return@forEachIndexed
+                        val epList = season.episodes ?: emptyList()
+                        for ((idx, ep) in epList.withIndex()) {
+                            val linkStr = ep.link ?: continue
                             val link = if (linkStr.contains(mainApiUrl)) linkStr else linkToIp(linkStr)
                             val tmdbEp = tmdbEpisodes.getOrNull(idx)
                             
@@ -948,12 +838,10 @@ class CircleFtpProvider : MainAPI() {
     }
 
     override suspend fun loadLinks(data: String, isCasting: Boolean, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit): Boolean {
-        // Parse the custom wrapper injected during load()
         val parsed = try { AppUtils.parseJson<LinkData>(data) } catch (_: Exception) { null }
         val url = parsed?.url ?: data
         val tag = parsed?.tag
         
-        // Inject the [Dub]/[Sub] tag directly into the source server name
         val sourceName = if (tag.isNullOrBlank() || tag == "Src") this.name else "${this.name} [$tag]"
         
         callback.invoke(newExtractorLink(source = sourceName, name = sourceName, url = url))
