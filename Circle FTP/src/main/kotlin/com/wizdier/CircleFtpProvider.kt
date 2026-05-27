@@ -9,6 +9,7 @@ import com.lagradost.cloudstream3.LoadResponse.Companion.addImdbId
 import com.lagradost.cloudstream3.LoadResponse.Companion.addTrailer
 import com.lagradost.cloudstream3.syncproviders.SyncIdName
 import com.lagradost.cloudstream3.utils.AppUtils
+import com.lagradost.cloudstream3.utils.AppUtils.toJson
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.Qualities
@@ -177,8 +178,8 @@ class CircleFtpProvider : MainAPI() {
                       }
                     }
                 """.trimIndent()
-                val body = AppUtils.toJson(mapOf("query" to query, "variables" to mapOf("search" to title)))
-                    .toRequestBody(RequestBodyTypes.JSON.toMediaTypeOrNull())
+                val body = mapOf("query" to query, "variables" to mapOf("search" to title))
+                    .toJson().toRequestBody(RequestBodyTypes.JSON.toMediaTypeOrNull())
                 val res = app.post(anilistApi, requestBody = body, headers = mapOf("Content-Type" to "application/json"), cacheTime = 3600)
                 return AppUtils.parseJson<AniListResponse>(res.text).data?.Media
             } catch (_: Exception) {
@@ -223,8 +224,8 @@ class CircleFtpProvider : MainAPI() {
                   }
                 }
             """.trimIndent()
-            val body = AppUtils.toJson(mapOf("query" to query, "variables" to mapOf("id" to id)))
-                .toRequestBody(RequestBodyTypes.JSON.toMediaTypeOrNull())
+            val body = mapOf("query" to query, "variables" to mapOf("id" to id))
+                .toJson().toRequestBody(RequestBodyTypes.JSON.toMediaTypeOrNull())
             val res = app.post(anilistApi, requestBody = body, headers = mapOf("Content-Type" to "application/json"), cacheTime = 86400)
             AppUtils.parseJson<AniListResponse>(res.text).data?.Media
         } catch (_: Exception) { null }
