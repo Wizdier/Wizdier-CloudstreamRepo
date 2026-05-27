@@ -6,10 +6,14 @@ import com.lagradost.cloudstream3.LoadResponse.Companion.addMalId
 import com.lagradost.cloudstream3.LoadResponse.Companion.addKitsuId
 import com.lagradost.cloudstream3.LoadResponse.Companion.addSimklId
 import com.lagradost.cloudstream3.LoadResponse.Companion.addImdbId
+import com.lagradost.cloudstream3.LoadResponse.Companion.addTrailer
+import com.lagradost.cloudstream3.mapper
 import com.lagradost.cloudstream3.syncproviders.SyncIdName
 import com.lagradost.cloudstream3.utils.AppUtils
+import com.lagradost.cloudstream3.utils.AppUtils.toJson
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
+import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.newExtractorLink
 import com.lagradost.nicehttp.RequestBodyTypes
 import okhttp3.MediaType.Companion.toMediaTypeOrNull
@@ -175,7 +179,7 @@ class CircleFtpProvider : MainAPI() {
                       }
                     }
                 """.trimIndent()
-                val body = AppUtils.mapper.writeValueAsString(mapOf("query" to query, "variables" to mapOf("search" to title)))
+                val body = mapper.writeValueAsString(mapOf("query" to query, "variables" to mapOf("search" to title)))
                     .toRequestBody(RequestBodyTypes.JSON.toMediaTypeOrNull())
                 val res = app.post(anilistApi, requestBody = body, headers = mapOf("Content-Type" to "application/json"), cacheTime = 3600)
                 return AppUtils.parseJson<AniListResponse>(res.text).data?.Media
@@ -221,7 +225,7 @@ class CircleFtpProvider : MainAPI() {
                   }
                 }
             """.trimIndent()
-            val body = AppUtils.mapper.writeValueAsString(mapOf("query" to query, "variables" to mapOf("id" to id)))
+            val body = mapper.writeValueAsString(mapOf("query" to query, "variables" to mapOf("id" to id)))
                 .toRequestBody(RequestBodyTypes.JSON.toMediaTypeOrNull())
             val res = app.post(anilistApi, requestBody = body, headers = mapOf("Content-Type" to "application/json"), cacheTime = 86400)
             AppUtils.parseJson<AniListResponse>(res.text).data?.Media
@@ -670,7 +674,7 @@ class CircleFtpProvider : MainAPI() {
                     this.duration = duration
                     this.actors = meta.actors
                     this.logoUrl = meta.logoUrl
-                    this.trailerUrl = meta.trailer
+                    meta.trailer?.let { addTrailer(it) }
                     meta.anilistId?.let { addAniListId(it) }
                     meta.malId?.let { addMalId(it) }
                     meta.kitsuId?.let { addKitsuId(it) }
@@ -691,7 +695,7 @@ class CircleFtpProvider : MainAPI() {
                     this.duration = duration
                     this.actors = actors
                     this.logoUrl = meta?.logoUrl
-                    this.trailerUrl = trailer
+                    trailer?.let { addTrailer(it) }
                     meta?.imdbId?.let { addImdbId(it) }
                 }
             }
@@ -757,7 +761,7 @@ class CircleFtpProvider : MainAPI() {
                     this.actors = meta.actors
                     this.logoUrl = meta.logoUrl
                     this.recommendations = recommendations
-                    this.trailerUrl = meta.trailer
+                    meta.trailer?.let { addTrailer(it) }
                     meta.anilistId?.let { addAniListId(it) }
                     meta.malId?.let { addMalId(it) }
                     meta.kitsuId?.let { addKitsuId(it) }
@@ -822,7 +826,7 @@ class CircleFtpProvider : MainAPI() {
                     this.score = Score.from10(meta?.rating)
                     this.actors = actors
                     this.logoUrl = meta?.logoUrl
-                    this.trailerUrl = trailer
+                    trailer?.let { addTrailer(it) }
                     meta?.imdbId?.let { addImdbId(it) }
                 }
             }
@@ -868,7 +872,10 @@ class CircleFtpProvider : MainAPI() {
                             name = sourceName,
                             url = url,
                             type = if (url.endsWith(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
-                        )
+                        ) {
+                            this.referer = "" // Blank prevents BDIX FTP blocks
+                            this.quality = Qualities.Unknown.value
+                        }
                     )
                 }
             }
@@ -879,7 +886,10 @@ class CircleFtpProvider : MainAPI() {
                     name = this.name,
                     url = data,
                     type = if (data.endsWith(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
-                )
+                ) {
+                    this.referer = "" // Blank prevents BDIX FTP blocks
+                    this.quality = Qualities.Unknown.value
+                }
             )
         }
         return true
