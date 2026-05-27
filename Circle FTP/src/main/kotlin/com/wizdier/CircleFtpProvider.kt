@@ -6,7 +6,6 @@ import com.lagradost.cloudstream3.LoadResponse.Companion.addMalId
 import com.lagradost.cloudstream3.LoadResponse.Companion.addKitsuId
 import com.lagradost.cloudstream3.LoadResponse.Companion.addSimklId
 import com.lagradost.cloudstream3.LoadResponse.Companion.addImdbId
-import com.lagradost.cloudstream3.LoadResponse.Companion.addTraktId
 import com.lagradost.cloudstream3.LoadResponse.Companion.addTrailer
 import com.lagradost.cloudstream3.syncproviders.SyncIdName
 import com.lagradost.cloudstream3.utils.AppUtils
@@ -20,7 +19,9 @@ import org.json.JSONObject
 import java.net.URLEncoder
 import java.util.Collections
 import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
 
 class CircleFtpProvider : MainAPI() {
 
@@ -33,6 +34,7 @@ class CircleFtpProvider : MainAPI() {
     override val hasDownloadSupport = true
     override val hasQuickSearch = false
     override val hasChromecastSupport = true
+
     override val supportedSyncNames = setOf(
         SyncIdName.Anilist,
         SyncIdName.MyAnimeList,
@@ -41,6 +43,7 @@ class CircleFtpProvider : MainAPI() {
         SyncIdName.Imdb,
         SyncIdName.Trakt
     )
+    
     override val supportedTypes = setOf(
         TvType.Movie,
         TvType.TvSeries,
@@ -92,13 +95,10 @@ class CircleFtpProvider : MainAPI() {
         "cartoon", "animation", "animated", "pixar", "disney", "dreamworks"
     )
 
-    // Small in-memory caches keep home/search smooth and avoid repeated metadata calls.
     private val tmdbMetaCache = Collections.synchronizedMap(mutableMapOf<String, TmdbMeta?>())
     private val animeMetaCache = Collections.synchronizedMap(mutableMapOf<String, ResolvedAnimeMeta>())
     private val kitsuMetaCache = Collections.synchronizedMap(mutableMapOf<String, KitsuMeta?>())
-    private val postTvDataCache = Collections.synchronizedMap(mutableMapOf<Int, TvSeries?>())
 
-    // ── Clean title for better matching ─────────────────────────────────────
     private fun cleanTitle(title: String): String {
         var t = title
         t = t.replace(Regex("""(?i)S\d{1,2}E\d{1,2}"""), "")
@@ -112,7 +112,29 @@ class CircleFtpProvider : MainAPI() {
         return t.trim()
     }
 
-    // ── AniList ──────────────────────────────────────────────────────────────
+    private fun stripAudioTags(title: String): String {
+        return title.replace(Regex("""(?i)\b(hindi|english|tamil|telugu|malayalam|kannada|bengali|marathi|dual audio|multi audio|dubbed|subbed|eng\+jap)\b"""), "")
+            .replace(Regex("""[\[\(\]-]"""), " ")
+            .replace(Regex("""\s{2,}"""), " ")
+            .trim()
+    }
+    
+    private fun extractAudioTag(title: String): String {
+        val t = title.lowercase()
+        return when {
+            t.contains("dual audio") -> "Dual Audio"
+            t.contains("multi audio") -> "Multi Audio"
+            t.contains("dubbed") || t.contains("hindi") || t.contains("english") -> "Dubbed"
+            t.contains("subbed") -> "Subbed"
+            else -> "Source"
+        }
+    }
+
+    private fun isDubTitle(title: String): Boolean {
+        val t = title.lowercase()
+        return listOf("dubbed", "dual audio", "multi audio", "eng+jap", "english+japanese", "hindi", "english").any { t.contains(it) }
+    }
+
     private suspend fun getAniListMeta(title: String, retryCount: Int = 2): AniListMeta? {
         repeat(retryCount) { attempt ->
             try {
@@ -154,7 +176,7 @@ class CircleFtpProvider : MainAPI() {
                 return AppUtils.parseJson<AniListResponse>(res.text).data?.Media
             } catch (_: Exception) {
                 if (attempt == retryCount - 1) return null
-                kotlinx.coroutines.delay(150)
+                delay(150)
             }
         }
         return null
@@ -216,7 +238,6 @@ class CircleFtpProvider : MainAPI() {
         return animeKeywords.any { t.contains(it) }
     }
 
-    // ── ani.zip ─────────────────────────────────────────────────────────────
     private suspend fun getAniZipMeta(anilistId: Int): AniZipMeta? = try {
         val json = JSONObject(app.get("https://api.ani.zip/mappings?anilist_id=$anilistId", cacheTime = 86400).text)
         val m = json.optJSONObject("mappings")
@@ -235,32 +256,60 @@ class CircleFtpProvider : MainAPI() {
         )
     } catch (_: Exception) { null }
 
-    private suspend fun searchKitsu(title: String): String? = try {
-        val res = app.get("https://kitsu.io/api/edge/anime?filter[text]=${URLEncoder.encode(title, "UTF-8")}", headers = mapOf("Accept" to "application/vnd.api+json"), cacheTime = 3600)
-        JSONObject(res.text).getJSONArray("data").optJSONObject(0)?.getString("id")
+    private suspend fun getAniZipByKitsuId(kitsuId: String): AniZipFull? = try {
+        val json = JSONObject(app.get("https://api.ani.zip/mappings?kitsu_id=$kitsuId", cacheTime = 86400).text)
+        val m = json.optJSONObject("mappings")
+        AniZipFull(
+            anilistId = json.optInt("anilist_id").takeIf { it != 0 },
+            malId = m?.optInt("mal_id")?.takeIf { it != 0 },
+            kitsuId = kitsuId,
+            simklId = m?.optInt("simkl_id")?.takeIf { it != 0 },
+            tmdbId = m?.optString("themoviedb_id")?.takeIf { it.isNotBlank() }
+        )
     } catch (_: Exception) { null }
 
-    private suspend fun searchSimkl(title: String): Int? = try {
-        val arr = org.json.JSONArray(app.get("https://api.simkl.com/search/anime?q=${URLEncoder.encode(title, "UTF-8")}&client_id=YOUR_CLIENT_ID", cacheTime = 3600).text)
-        arr.optJSONObject(0)?.optJSONObject("show")?.optJSONObject("ids")?.optInt("simkl")
+    private suspend fun getAniZipByMalId(malId: Int): AniZipFull? = try {
+        val json = JSONObject(app.get("https://api.ani.zip/mappings?mal_id=$malId", cacheTime = 86400).text)
+        val m = json.optJSONObject("mappings")
+        AniZipFull(
+            anilistId = json.optInt("anilist_id").takeIf { it != 0 },
+            malId = malId,
+            kitsuId = m?.optString("kitsu_id")?.takeIf { it.isNotBlank() },
+            simklId = m?.optInt("simkl_id")?.takeIf { it != 0 },
+            tmdbId = m?.optString("themoviedb_id")?.takeIf { it.isNotBlank() }
+        )
     } catch (_: Exception) { null }
-
-    // ── TMDB ────────────────────────────────────────────────────────────────
-    private suspend fun fetchTmdbLogo(tmdbId: Int?, isSeries: Boolean): String? {
-        if (tmdbId == null) return null
+    
+    private suspend fun fetchTmdbImages(tmdbId: Int?, isSeries: Boolean): Pair<String?, String?> {
+        if (tmdbId == null) return null to null
         return try {
             val type = if (isSeries) "tv" else "movie"
             val json = JSONObject(app.get("$tmdbApi/$type/$tmdbId/images?api_key=$tmdbKey", cacheTime = 86400).text)
-            val logos = json.optJSONArray("logos") ?: return null
-            for (i in 0 until logos.length()) {
-                val l = logos.getJSONObject(i)
-                val path = l.optString("file_path")
-                if (path.isNotBlank() && (l.optString("iso_639_1") == "en" || l.optString("iso_639_1").isEmpty())) {
-                    if (!path.endsWith(".svg")) return "$tmdbImageBase$path"
+            
+            val logos = json.optJSONArray("logos")
+            var logoUrl: String? = null
+            if (logos != null) {
+                for (i in 0 until logos.length()) {
+                    val l = logos.getJSONObject(i)
+                    val path = l.optString("file_path")
+                    if (path.isNotBlank() && (l.optString("iso_639_1") == "en" || l.optString("iso_639_1").isEmpty())) {
+                        if (!path.endsWith(".svg")) {
+                            logoUrl = "$tmdbImageBase$path"
+                            break
+                        }
+                    }
                 }
             }
-            null
-        } catch (_: Exception) { null }
+            
+            val backdrops = json.optJSONArray("backdrops")
+            var backdropUrl: String? = null
+            if (backdrops != null && backdrops.length() > 0) {
+                val b = backdrops.getJSONObject(0)
+                backdropUrl = "$tmdbBackdropBase${b.optString("file_path")}"
+            }
+            
+            logoUrl to backdropUrl
+        } catch (_: Exception) { null to null }
     }
 
     private suspend fun getTmdbMeta(title: String, year: Int?, isSeries: Boolean): TmdbMeta? {
@@ -269,12 +318,14 @@ class CircleFtpProvider : MainAPI() {
             val yearParam = year?.let { if (isSeries) "&first_air_date_year=$it" else "&year=$it" } ?: ""
             val url = "$tmdbApi/search/$type?api_key=$tmdbKey&query=${URLEncoder.encode(title, "UTF-8")}$yearParam&language=en-US"
             val first = AppUtils.parseJson<TmdbSearchResponse>(app.get(url, cacheTime = 86400).text).results?.firstOrNull() ?: return null
-            val logo = fetchTmdbLogo(first.id, isSeries)
+            
+            val (logo, _) = fetchTmdbImages(first.id, isSeries)
             var imdbId: String? = null
             try {
                 val detail = JSONObject(app.get("$tmdbApi/$type/${first.id}?api_key=$tmdbKey&append_to_response=external_ids", cacheTime = 86400).text)
                 imdbId = detail.optJSONObject("external_ids")?.optString("imdb_id")
             } catch (_: Exception) {}
+            
             TmdbMeta(
                 poster = first.posterPath?.let { "$tmdbImageBase$it" },
                 backdrop = first.backdropPath?.let { "$tmdbBackdropBase$it" },
@@ -294,7 +345,6 @@ class CircleFtpProvider : MainAPI() {
             val json = JSONObject(app.get("$tmdbApi/$type/$tmdbId/videos?api_key=$tmdbKey&language=en-US", cacheTime = 86400).text)
             val results = json.optJSONArray("results") ?: return null
             var key: String? = null
-            // Prefer official trailer, then any trailer, then teaser
             for (priority in listOf("Trailer", "Teaser")) {
                 for (i in 0 until results.length()) {
                     val v = results.getJSONObject(i)
@@ -360,34 +410,6 @@ class CircleFtpProvider : MainAPI() {
         return value
     }
 
-    private suspend fun fetchPostTvDataCached(postId: Int): TvSeries? {
-        if (postTvDataCache.containsKey(postId)) return postTvDataCache[postId]
-        val value = fetchPostTvData(postId)
-        postTvDataCache[postId] = value
-        return value
-    }
-
-    private suspend fun resolveAnimeMetaCached(title: String, year: Int? = null, isSeries: Boolean = true): ResolvedAnimeMeta {
-        val key = "${isSeries}|${year ?: 0}|${title.lowercase()}"
-        animeMetaCache[key]?.let { return it }
-        val value = resolveAnimeMeta(title, year, isSeries)
-        animeMetaCache[key] = value
-        return value
-    }
-
-    private fun isDubTitle(title: String): Boolean {
-        val t = title.lowercase()
-        return listOf("dubbed", "dual audio", "multi audio", "eng+jap", "english+japanese").any { t.contains(it) }
-    }
-
-    private fun makeContentUrl(postId: Int, seasonIndex: Int? = null): String {
-        return if (seasonIndex == null) {
-            "$mainUrl/content/$postId"
-        } else {
-            "$mainUrl/content/$postId?season=$seasonIndex"
-        }
-    }
-
     private fun selectedSeasonIndex(url: String): Int? {
         return Regex("""[?&]season=(\d+)""").find(url)?.groupValues?.getOrNull(1)?.toIntOrNull()
     }
@@ -397,7 +419,7 @@ class CircleFtpProvider : MainAPI() {
     }
 
     private fun titleForSeason(baseTitle: String, seasonName: String?, seasonNumber: Int): String {
-        val base = cleanTitle(baseTitle)
+        val base = stripAudioTags(cleanTitle(baseTitle))
             .replace(Regex("""(?i)\banime\b"""), "")
             .replace(Regex("""\s{2,}"""), " ")
             .trim()
@@ -412,16 +434,24 @@ class CircleFtpProvider : MainAPI() {
         }
     }
 
+    private fun stripSeasonSuffixForAnime(title: String): String {
+        return cleanTitle(title)
+            .replace(Regex("""(?i)\banime\b"""), "")
+            .replace(Regex("""(?i)\bseason\s*\d+\b"""), "")
+            .replace(Regex("""\s{2,}"""), " ")
+            .trim()
+    }
+
+    private fun sequelOf(meta: AniListMeta?): AniListMeta? {
+        return meta?.relations?.edges
+            ?.firstOrNull { it.relationType.equals("SEQUEL", ignoreCase = true) && it.node != null }
+            ?.node
+    }
+
     private suspend fun fetchPostResponse(postId: Int) = try {
         app.get("$mainApiUrl/api/posts/$postId", verify = false, cacheTime = 60)
     } catch (_: Exception) {
         app.get("$apiUrl/api/posts/$postId", verify = false, cacheTime = 60)
-    }
-
-    private suspend fun fetchPostTvData(postId: Int): TvSeries? = try {
-        fetchPostResponse(postId).parsed<TvSeries>()
-    } catch (_: Exception) {
-        null
     }
 
     private suspend fun getKitsuMeta(title: String): KitsuMeta? = try {
@@ -438,12 +468,10 @@ class CircleFtpProvider : MainAPI() {
             ?: titles?.optString("en_jp")?.takeIf { it.isNotBlank() }
             ?: attr.optString("canonicalTitle").takeIf { it.isNotBlank() }
         val poster = attr.optJSONObject("posterImage")?.let { img ->
-            img.optString("original").takeIf { it.isNotBlank() }
-                ?: img.optString("large").takeIf { it.isNotBlank() }
+            img.optString("original").takeIf { it.isNotBlank() } ?: img.optString("large").takeIf { it.isNotBlank() }
         }
         val cover = attr.optJSONObject("coverImage")?.let { img ->
-            img.optString("original").takeIf { it.isNotBlank() }
-                ?: img.optString("large").takeIf { it.isNotBlank() }
+            img.optString("original").takeIf { it.isNotBlank() } ?: img.optString("large").takeIf { it.isNotBlank() }
         }
         KitsuMeta(
             id = id,
@@ -453,169 +481,101 @@ class CircleFtpProvider : MainAPI() {
             synopsis = attr.optString("synopsis").takeIf { it.isNotBlank() },
             averageRating = attr.optString("averageRating").toDoubleOrNull()
         )
-    } catch (_: Exception) {
-        null
+    } catch (_: Exception) { null }
+
+    private suspend fun resolveAnimeMetaCached(title: String, year: Int? = null, isSeries: Boolean = true, seasonNumber: Int = 1): ResolvedAnimeMeta {
+        val key = "${isSeries}|${year ?: 0}|${title.lowercase()}|$seasonNumber"
+        animeMetaCache[key]?.let { return it }
+        val value = resolveAnimeMeta(title, year, isSeries, seasonNumber)
+        animeMetaCache[key] = value
+        return value
     }
 
-    private suspend fun getAniZipByKitsuId(kitsuId: String): AniZipFull? = try {
-        val json = JSONObject(app.get("https://api.ani.zip/mappings?kitsu_id=$kitsuId", cacheTime = 86400).text)
-        val m = json.optJSONObject("mappings")
-        AniZipFull(
-            anilistId = json.optInt("anilist_id").takeIf { it != 0 },
-            malId = m?.optInt("mal_id")?.takeIf { it != 0 },
-            kitsuId = kitsuId,
-            simklId = m?.optInt("simkl_id")?.takeIf { it != 0 },
-            tmdbId = m?.optString("themoviedb_id")?.takeIf { it.isNotBlank() }
-        )
-    } catch (_: Exception) {
-        null
-    }
+    private suspend fun resolveAnimeMeta(title: String, year: Int?, isSeries: Boolean, seasonNumber: Int): ResolvedAnimeMeta {
+        val cleaned = stripSeasonSuffixForAnime(stripAudioTags(title))
+        val baseTmdbMeta = getTmdbMetaCached(cleaned, year, isSeries)
+        var aniList = getAniListMeta(cleaned) ?: getAniListMeta(title)
 
-    private suspend fun getAniZipByMalId(malId: Int): AniZipFull? = try {
-        val json = JSONObject(app.get("https://api.ani.zip/mappings?mal_id=$malId", cacheTime = 86400).text)
-        val m = json.optJSONObject("mappings")
-        AniZipFull(
-            anilistId = json.optInt("anilist_id").takeIf { it != 0 },
-            malId = malId,
-            kitsuId = m?.optString("kitsu_id")?.takeIf { it.isNotBlank() },
-            simklId = m?.optInt("simkl_id")?.takeIf { it != 0 },
-            tmdbId = m?.optString("themoviedb_id")?.takeIf { it.isNotBlank() }
-        )
-    } catch (_: Exception) {
-        null
-    }
+        if (seasonNumber > 1 && aniList != null) {
+            repeat(seasonNumber - 1) {
+                val next = sequelOf(aniList) ?: return@repeat
+                aniList = next.id?.let { getAniListMetaById(it) } ?: next
+            }
+        }
 
-    private suspend fun resolveAnimeMeta(title: String, year: Int? = null, isSeries: Boolean = true): ResolvedAnimeMeta {
-        val cleaned = cleanTitle(title)
-            .replace(Regex("""(?i)\banime\b"""), "")
-            .replace(Regex("""\s{2,}"""), " ")
-            .trim()
-
-        var kitsu = getKitsuMetaCached(cleaned) ?: getKitsuMetaCached(title)
-        var zipFromKitsu = kitsu?.id?.let { getAniZipByKitsuId(it) }
-
-        val tmdbMeta = getTmdbMeta(cleaned, year, isSeries)
-        val tmdbZip = tmdbMeta?.tmdbId?.let { getAniZipByTmdbId(it) }
-
-        // Start with the most reliable mappings to Anilist ID
-        val targetAnilistId = zipFromKitsu?.anilistId ?: tmdbZip?.anilistId
+        val aniZip = aniList?.id?.let { getAniZipMeta(it) }
+        val malId = aniList?.idMal ?: aniZip?.malId ?: searchMalId(cleaned)
+        val zipFromMal = if (aniZip == null && malId != null) getAniZipByMalId(malId) else null
         
-        var aniList = targetAnilistId?.let { getAniListMetaById(it) }
-            ?: getAniListMeta(cleaned)
-            ?: getAniListMeta(title)
+        val kitsuId = aniZip?.kitsuid ?: zipFromMal?.kitsuId
+        val kitsu = kitsuId?.let { getKitsuMeta(cleaned) } ?: getKitsuMetaCached(cleaned)
 
-        var aniZip = aniList?.id?.let { getAniZipMeta(it) }
+        val tmdbIdFromZip = aniZip?.themoviedbId?.toIntOrNull() ?: zipFromMal?.tmdbId?.toIntOrNull() ?: baseTmdbMeta?.tmdbId
+        val (logoUrl, backdropUrl) = fetchTmdbImages(tmdbIdFromZip, isSeries)
+        val trailerUrl = fetchTmdbTrailer(tmdbIdFromZip, isSeries) ?: getAniListTrailerUrl(aniList?.trailer)
 
-        val mal = aniList?.idMal ?: aniZip?.malId ?: zipFromKitsu?.malId ?: tmdbZip?.malId ?: searchMalId(cleaned)
-        val zipFromMal = if (targetAnilistId == null && mal != null) getAniZipByMalId(mal) else null
-
-        if (aniList == null) {
-            aniList = zipFromMal?.anilistId?.let { getAniListMetaById(it) }
-        }
-        if (aniZip == null && aniList?.id != null) {
-            aniZip = getAniZipMeta(aniList.id)
-        }
-
-        val tmdbFromZip = aniZip?.themoviedbId?.toIntOrNull()
-            ?: tmdbZip?.tmdbId?.toIntOrNull()
-            ?: zipFromKitsu?.tmdbId?.toIntOrNull()
-            ?: zipFromMal?.tmdbId?.toIntOrNull()
-
-        val finalTmdb = tmdbMeta ?: tmdbFromZip?.let { id ->
-            TmdbMeta(
-                poster = null,
-                backdrop = null,
-                rating = null,
-                overview = null,
-                logoUrl = fetchTmdbLogo(id, isSeries),
-                imdbId = null,
-                tmdbId = id
-            )
-        }
-
-        val displayTitle = aniList?.title?.english
-            ?: aniList?.title?.romaji
-            ?: kitsu?.title
-            ?: cleaned
+        val displayTitle = aniList?.title?.english ?: aniList?.title?.romaji ?: kitsu?.title ?: cleaned
 
         return ResolvedAnimeMeta(
             title = displayTitle,
-            poster = aniList?.coverImage?.extraLarge?.takeIf { it.isNotBlank() }
-                ?: aniList?.coverImage?.large?.takeIf { it.isNotBlank() }
-                ?: kitsu?.poster?.takeIf { it.isNotBlank() }
-                ?: finalTmdb?.poster?.takeIf { it.isNotBlank() },
-            background = aniList?.bannerImage?.takeIf { it.isNotBlank() }
-                ?: kitsu?.cover?.takeIf { it.isNotBlank() }
-                ?: finalTmdb?.backdrop?.takeIf { it.isNotBlank() },
-            plot = aniList?.description?.replace(Regex("<[^>]*>"), "")?.takeIf { it.isNotBlank() }
-                ?: kitsu?.synopsis?.takeIf { it.isNotBlank() }
-                ?: finalTmdb?.overview?.takeIf { it.isNotBlank() },
+            poster = aniList?.coverImage?.extraLarge ?: aniList?.coverImage?.large ?: kitsu?.poster ?: baseTmdbMeta?.poster,
+            background = aniList?.bannerImage ?: backdropUrl ?: kitsu?.cover ?: baseTmdbMeta?.backdrop,
+            plot = aniList?.description?.replace(Regex("<[^>]*>"), "") ?: kitsu?.synopsis ?: baseTmdbMeta?.overview,
             score100 = aniList?.averageScore ?: kitsu?.averageRating?.toInt(),
             tags = aniList?.genres,
-            trailer = fetchTmdbTrailer(finalTmdb?.tmdbId, isSeries)?.takeIf { it.isNotBlank() } ?: getAniListTrailerUrl(aniList?.trailer)?.takeIf { it.isNotBlank() },
+            trailer = trailerUrl,
             anilistEpisodes = aniList?.streamingEpisodes,
-            logoUrl = finalTmdb?.logoUrl ?: fetchTmdbLogo(tmdbFromZip, isSeries),
+            logoUrl = logoUrl ?: baseTmdbMeta?.logoUrl,
             actors = aniList?.characters?.edges?.mapNotNull {
                 it.node?.name?.full?.let { actorName -> ActorData(Actor(actorName, it.node.image?.large)) }
             },
-            anilistId = aniList?.id ?: tmdbZip?.anilistId ?: zipFromKitsu?.anilistId ?: zipFromMal?.anilistId,
-            malId = aniList?.idMal ?: aniZip?.malId ?: tmdbZip?.malId ?: zipFromKitsu?.malId ?: zipFromMal?.malId ?: mal,
-            kitsuId = aniZip?.kitsuid ?: tmdbZip?.kitsuId ?: zipFromKitsu?.kitsuId ?: zipFromMal?.kitsuId ?: kitsu?.id,
-            simklId = aniZip?.simklId ?: tmdbZip?.simklId ?: zipFromKitsu?.simklId ?: zipFromMal?.simklId,
-            imdbId = finalTmdb?.imdbId,
-            tmdbId = finalTmdb?.tmdbId
+            anilistId = aniList?.id,
+            malId = malId,
+            kitsuId = kitsuId ?: kitsu?.id,
+            simklId = aniZip?.simklId ?: zipFromMal?.simklId,
+            imdbId = baseTmdbMeta?.imdbId
         )
     }
 
-    private suspend fun createSearchResult(
-        post: Post,
-        overrideTitle: String? = null,
-        seasonIndex: Int? = null,
-        posterOverride: String? = null
-    ): SearchResponse? {
-        val rawTitle = overrideTitle ?: post.name?.ifBlank { post.title } ?: post.title
-        val url = makeContentUrl(post.id, seasonIndex)
-        val quality = getSearchQuality((post.quality ?: post.title).lowercase())
-        val isSeries = post.type == "series"
-        val isAnime = isAnimeContent(post.categories, post.title) || post.title.contains("anime", true)
-        val fallbackPoster = "$mainApiUrl/uploads/${post.imageSm}"
-        val year = selectUntilNonInt(post.year)
+    private suspend fun createMergedSearchResult(posts: List<Post>): SearchResponse? {
+        if (posts.isEmpty()) return null
+        val first = posts.first()
+        val rawTitle = stripAudioTags(first.name?.ifBlank { first.title } ?: first.title)
+        
+        // Combine IDs for load grouping
+        val ids = posts.joinToString(",") { it.id.toString() }
+        val url = "$mainUrl/content/$ids"
+        val quality = getSearchQuality((first.quality ?: first.title).lowercase())
+        val isSeries = first.type == "series"
+        val isAnime = isAnimeContent(first.categories, first.title) || first.title.contains("anime", true)
+        val fallbackPoster = "$mainApiUrl/uploads/${first.imageSm}"
+        val year = selectUntilNonInt(first.year)
 
-        val cachedAnimePoster = animeMetaCache["${isSeries}|${year ?: 0}|${rawTitle.lowercase()}"]?.poster
-        val cachedTmdbPoster = tmdbMetaCache["${isSeries}|${year ?: 0}|${cleanTitle(rawTitle).lowercase()}"]?.poster
+        val cachedPoster = if (isAnime) {
+            animeMetaCache["${isSeries}|${year ?: 0}|${rawTitle.lowercase()}|1"]?.poster
+        } else {
+            tmdbMetaCache["${isSeries}|${year ?: 0}|${cleanTitle(rawTitle).lowercase()}"]?.poster
+        }
+
+        val hasDub = posts.any { isDubTitle(it.title) }
 
         return if (isAnime) {
             newAnimeSearchResponse(rawTitle, url, if (isSeries) TvType.Anime else TvType.AnimeMovie) {
-                this.posterUrl = posterOverride ?: cachedAnimePoster ?: fallbackPoster
+                this.posterUrl = cachedPoster ?: fallbackPoster
                 this.quality = quality
-                addDubStatus(dubExist = isDubTitle(post.title), subExist = true)
+                addDubStatus(dubExist = hasDub, subExist = true)
             }
         } else if (isSeries) {
             newTvSeriesSearchResponse(rawTitle, url, TvType.TvSeries) {
-                this.posterUrl = posterOverride ?: cachedTmdbPoster ?: fallbackPoster
+                this.posterUrl = cachedPoster ?: fallbackPoster
                 this.quality = quality
             }
         } else {
             newMovieSearchResponse(rawTitle, url, TvType.Movie) {
-                this.posterUrl = posterOverride ?: cachedTmdbPoster ?: fallbackPoster
+                this.posterUrl = cachedPoster ?: fallbackPoster
                 this.quality = quality
             }
         }
-    }
-
-    private suspend fun toSearchResults(post: Post): List<SearchResponse> {
-        val isAnime = isAnimeContent(post.categories, post.title) || post.title.contains("anime", true)
-        if (post.type == "series" && isAnime) {
-            val tvData = fetchPostTvDataCached(post.id)
-            val seasons = tvData?.content.orEmpty()
-            if (seasons.isNotEmpty()) {
-                val baseTitle = post.name?.ifBlank { post.title } ?: post.title
-                // Just map everything to the very first season for home page to avoid redundant chaining
-                return listOfNotNull(createSearchResult(post, titleForSeason(baseTitle, seasons.first().seasonName, 1), 0))
-            }
-        }
-
-        return listOfNotNull(createSearchResult(post))
     }
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
@@ -624,10 +584,17 @@ class CircleFtpProvider : MainAPI() {
         } catch (_: Exception) {
             app.get("$apiUrl/api/posts?categoryExact=${request.data}&page=$page&order=desc&limit=10", verify = false, cacheTime = 60)
         }
+        
+        val posts = AppUtils.parseJson<PageData>(json.text).posts
+        val groupedPosts = posts.groupBy {
+            val clean = stripAudioTags(it.name?.ifBlank { it.title } ?: it.title).lowercase()
+            "$clean|${it.type}|${selectUntilNonInt(it.year) ?: 0}"
+        }.values.toList()
+
         val home = coroutineScope {
-            AppUtils.parseJson<PageData>(json.text).posts
-                .map { post -> async { toSearchResults(post) } }
-                .flatMap { it.await() }
+            groupedPosts.map { group -> async { createMergedSearchResult(group) } }
+                .awaitAll()
+                .filterNotNull()
         }
         return newHomePageResponse(request.name, home, true)
     }
@@ -638,37 +605,54 @@ class CircleFtpProvider : MainAPI() {
         } catch (_: Exception) {
             app.get("$apiUrl/api/posts?searchTerm=$query&order=desc", verify = false, cacheTime = 60)
         }
+        
+        val posts = AppUtils.parseJson<PageData>(json.text).posts
+        val groupedPosts = posts.groupBy {
+            val clean = stripAudioTags(it.name?.ifBlank { it.title } ?: it.title).lowercase()
+            "$clean|${it.type}|${selectUntilNonInt(it.year) ?: 0}"
+        }.values.toList()
+
         return coroutineScope {
-            AppUtils.parseJson<PageData>(json.text).posts
-                .map { post -> async { toSearchResults(post) } }
-                .flatMap { it.await() }
+            groupedPosts.map { group -> async { createMergedSearchResult(group) } }
+                .awaitAll()
+                .filterNotNull()
         }
     }
 
     override suspend fun load(url: String): LoadResponse {
-        val json = try {
-            app.get(cleanApiUrl(url).replace("$mainUrl/content/", "$mainApiUrl/api/posts/"), verify = false, cacheTime = 60)
-        } catch (_: Exception) {
-            app.get(cleanApiUrl(url).replace("$mainUrl/content/", "$apiUrl/api/posts/"), verify = false, cacheTime = 60)
-        }
-        val urlCheck = json.url.contains(mainApiUrl)
-        val loadData = AppUtils.parseJson<Data>(json.text)
-        val title = loadData.name?.ifBlank { loadData.title } ?: loadData.title
-        val cleanedTitle = cleanTitle(title)
+        val urlCheck = url.contains(mainApiUrl)
+        val idString = cleanApiUrl(url).substringAfterLast("/").substringBefore("?")
+        val postIds = idString.split(",").mapNotNull { it.toIntOrNull() }
+        
+        if (postIds.isEmpty()) throw ErrorLoadingException("No matching IDs found")
+
+        val primaryJson = fetchPostResponse(postIds.first())
+        val loadData = AppUtils.parseJson<Data>(primaryJson.text)
+        val baseTitle = stripAudioTags(loadData.name?.ifBlank { loadData.title } ?: loadData.title)
         val fallbackPoster = "$apiUrl/uploads/${loadData.image}"
         val year = selectUntilNonInt(loadData.year)
-        val isAnime = isAnimeContent(loadData.categories, title)
+        val isAnime = isAnimeContent(loadData.categories, baseTitle)
         val selectedSeason = selectedSeasonIndex(url)
+        val isDubbedGlobal = postIds.any { id -> isDubTitle(fetchPostResponse(id).parsed<Data>().title) }
 
         if (loadData.type == "singleVideo") {
-            val movieUrl = json.parsed<Movies>().content
-            val link = if (urlCheck) movieUrl else linkToIp(movieUrl)
             val duration = getDurationFromString(loadData.watchTime)
+            
+            if (isAnime) {
+                val meta = resolveAnimeMetaCached(baseTitle, year, false, 1)
+                val episodesData = mutableListOf<Episode>()
+                
+                postIds.forEach { id ->
+                    val js = fetchPostResponse(id)
+                    val pData = AppUtils.parseJson<Data>(js.text)
+                    val link = if (urlCheck) js.parsed<Movies>().content else linkToIp(js.parsed<Movies>().content)
+                    val audioTag = extractAudioTag(pData.title)
+                    episodesData.add(newEpisode(link ?: "") {
+                        this.name = "$audioTag Version"
+                    })
+                }
 
-            return if (isAnime) {
-                val meta = resolveAnimeMetaCached(cleanedTitle, year, false)
-
-                newAnimeLoadResponse(meta.title.ifBlank { title }, url, TvType.AnimeMovie) {
+                return newAnimeLoadResponse(meta.title.ifBlank { baseTitle }, url, TvType.AnimeMovie) {
                     this.posterUrl = meta.poster ?: fallbackPoster
                     this.backgroundPosterUrl = meta.background ?: fallbackPoster
                     this.year = year
@@ -684,15 +668,25 @@ class CircleFtpProvider : MainAPI() {
                     meta.kitsuId?.let { addKitsuId(it) }
                     meta.simklId?.let { addSimklId(it) }
                     meta.imdbId?.let { addImdbId(it) }
-                    addEpisodes(if (isDubTitle(title)) DubStatus.Dubbed else DubStatus.Subbed, listOf(newEpisode(link ?: "")))
+                    addEpisodes(if (isDubbedGlobal) DubStatus.Dubbed else DubStatus.Subbed, episodesData)
                 }
             } else {
-                // MOVIE
-                val meta = getTmdbMetaCached(cleanedTitle, year, false)
+                val meta = getTmdbMetaCached(cleanTitle(baseTitle), year, false)
                 val trailer = fetchTmdbTrailer(meta?.tmdbId, false)
                 val actors = fetchTmdbActors(meta?.tmdbId, false)
+                val episodesData = mutableListOf<Episode>()
 
-                newMovieLoadResponse(title, url, TvType.Movie, link) {
+                postIds.forEach { id ->
+                    val js = fetchPostResponse(id)
+                    val pData = AppUtils.parseJson<Data>(js.text)
+                    val link = if (urlCheck) js.parsed<Movies>().content else linkToIp(js.parsed<Movies>().content)
+                    val audioTag = extractAudioTag(pData.title)
+                    episodesData.add(newEpisode(link ?: "") {
+                        this.name = "$audioTag Version"
+                    })
+                }
+
+                return newMovieLoadResponse(baseTitle, url, TvType.Movie, episodesData) {
                     this.posterUrl = meta?.poster ?: fallbackPoster
                     this.backgroundPosterUrl = meta?.backdrop ?: fallbackPoster
                     this.year = year
@@ -701,69 +695,58 @@ class CircleFtpProvider : MainAPI() {
                     this.duration = duration
                     this.actors = actors
                     this.logoUrl = meta?.logoUrl
-                    trailer?.takeIf { it.isNotBlank() }?.let { addTrailer(it) }
+                    trailer?.let { addTrailer(it) }
                     meta?.imdbId?.let { addImdbId(it) }
                 }
             }
         } else {
-            val tvData = json.parsed<TvSeries>()
+            val allTvData = postIds.mapNotNull { id ->
+                val js = fetchPostResponse(id)
+                val pData = AppUtils.parseJson<Data>(js.text)
+                val tv = js.parsed<TvSeries>()
+                Pair(pData, tv)
+            }
+            
+            val primaryTvData = allTvData.firstOrNull()?.second ?: throw ErrorLoadingException("Failed to fetch Series content")
+            val targetSeasonIndex = selectedSeason ?: 0
+            val seasonNumberForMeta = targetSeasonIndex + 1
 
-            return if (isAnime) {
-                val allSeasons = tvData.content
-                val currentSeasonIdx = selectedSeason ?: 0
-                val seasonsToUse = allSeasons.getOrNull(currentSeasonIdx)?.let { listOf(currentSeasonIdx to it) } ?: emptyList()
-                val seasonNumberForMeta = currentSeasonIdx + 1
-                val metaTitle = titleForSeason(title, seasonsToUse.firstOrNull()?.second?.seasonName, seasonNumberForMeta)
-
-                val meta = resolveAnimeMetaCached(metaTitle, year, true)
-
-                // Recommendations layer purely handles moving between separate seasons
-                val recommendationsList = mutableListOf<SearchResponse>()
-                if (allSeasons.size > 1) {
-                    val basePostId = cleanApiUrl(url).substringAfterLast("/")
-                    allSeasons.forEachIndexed { idx, season ->
-                        if (idx != currentSeasonIdx) {
-                            val seasonTitle = titleForSeason(title, season.seasonName, idx + 1)
-                            val seasonUrl = "$mainUrl/content/$basePostId?season=$idx"
-                            val recPoster = animeMetaCache["true|0|${seasonTitle.lowercase()}"]?.poster ?: meta.poster ?: fallbackPoster
-                            
-                            recommendationsList.add(
-                                newAnimeSearchResponse(seasonTitle, seasonUrl, TvType.Anime) {
-                                    this.posterUrl = recPoster
-                                }
-                            )
-                        }
+            if (isAnime) {
+                val allSeasons = primaryTvData.content
+                val metaTitle = titleForSeason(baseTitle, allSeasons.getOrNull(targetSeasonIndex)?.seasonName, seasonNumberForMeta)
+                val meta = resolveAnimeMetaCached(metaTitle, year, true, seasonNumberForMeta)
+                
+                val recommendations = allSeasons.mapIndexedNotNull { index, season ->
+                    if (index == targetSeasonIndex) return@mapIndexedNotNull null
+                    val recSeasonNumber = index + 1
+                    val recTitle = titleForSeason(baseTitle, season.seasonName, recSeasonNumber)
+                    val recUrl = "$mainUrl/content/$idString?season=$index"
+                    newAnimeSearchResponse(recTitle, recUrl, TvType.Anime) {
+                        this.posterUrl = meta.poster ?: fallbackPoster 
                     }
                 }
 
                 val episodesData = mutableListOf<Episode>()
-                val tmdbEpisodes = meta.tmdbId?.let { id -> fetchTmdbSeasonEpisodes(id, seasonNumberForMeta) } ?: emptyList()
-
-                seasonsToUse.forEach { (_, season) ->
-                    season.episodes.forEachIndexed { idx, ep ->
+                allTvData.forEach { (pData, tvSeries) ->
+                    val seasonToLoad = tvSeries.content.getOrNull(targetSeasonIndex) ?: return@forEach
+                    val audioTag = extractAudioTag(pData.title)
+                    
+                    seasonToLoad.episodes.forEachIndexed { idx, ep ->
                         val link = if (urlCheck) ep.link else linkToIp(ep.link)
                         val aniEp = meta.anilistEpisodes?.getOrNull(idx)
-                        val tmdbEp = tmdbEpisodes.getOrNull(idx)
                         
                         episodesData.add(newEpisode(link) {
                             this.episode = idx + 1
-                            this.season = 1 // Flatten visual to season 1 natively bypassing standard TV pickers, matching ID trackers natively
+                            this.season = if (selectedSeason != null) 1 else seasonNumberForMeta
                             
-                            var epName = tmdbEp?.name?.takeIf { it.isNotBlank() && !it.startsWith("Episode", true) } 
-                                ?: aniEp?.title?.takeIf { it.isNotBlank() } 
-                                ?: ep.title
-                                
-                            if (epName.startsWith("Episode", true) && epName.contains("-")) { epName = epName.substringAfter("-").trim() }
-                            
-                            this.name = epName.takeIf { it.isNotBlank() } ?: "Episode ${idx + 1}"
-                            this.description = tmdbEp?.overview?.takeIf { it.isNotBlank() }
-                            this.posterUrl = tmdbEp?.stillPath?.let { "$tmdbImageBase$it" } ?: aniEp?.thumbnail?.takeIf { it.isNotBlank() }
-                            tmdbEp?.airDate?.let { addDate(it) }
+                            val resolvedName = aniEp?.title ?: ep.title.takeIf { it.isNotBlank() } ?: "Episode ${idx + 1}"
+                            this.name = if (postIds.size > 1) "[$audioTag] $resolvedName" else resolvedName
+                            this.posterUrl = aniEp?.thumbnail
                         })
                     }
                 }
 
-                newAnimeLoadResponse(meta.title.ifBlank { metaTitle }, url, TvType.Anime) {
+                return newAnimeLoadResponse(meta.title.ifBlank { metaTitle }, url, TvType.Anime) {
                     this.posterUrl = meta.poster ?: fallbackPoster
                     this.backgroundPosterUrl = meta.background ?: fallbackPoster
                     this.year = year
@@ -772,44 +755,47 @@ class CircleFtpProvider : MainAPI() {
                     this.score = Score.from100(meta.score100)
                     this.actors = meta.actors
                     this.logoUrl = meta.logoUrl
-                    meta.trailer?.takeIf { it.isNotBlank() }?.let { addTrailer(it) }
-                    
+                    this.recommendations = recommendations
+                    meta.trailer?.let { addTrailer(it) }
                     addAniListId(meta.anilistId)
                     addMalId(meta.malId)
                     meta.kitsuId?.let { addKitsuId(it) }
                     meta.simklId?.let { addSimklId(it) }
                     meta.imdbId?.let { addImdbId(it) }
-                    
-                    this.recommendations = recommendationsList
-                    addEpisodes(if (isDubTitle(title)) DubStatus.Dubbed else DubStatus.Subbed, episodesData)
+                    addEpisodes(if (isDubbedGlobal) DubStatus.Dubbed else DubStatus.Subbed, episodesData)
                 }
             } else {
-                // TV SERIES - Standard Native TV series processing without separation
-                val meta = getTmdbMetaCached(cleanedTitle, year, true)
+                val meta = getTmdbMetaCached(cleanTitle(baseTitle), year, true)
                 val tmdbId = meta?.tmdbId
                 val trailer = fetchTmdbTrailer(tmdbId, true)
                 val actors = fetchTmdbActors(tmdbId, true)
-
                 val episodesData = mutableListOf<Episode>()
-                var seasonNum = 0
-                tvData.content.forEach { season ->
-                    seasonNum++
-                    val tmdbEpisodes = tmdbId?.let { fetchTmdbSeasonEpisodes(it, seasonNum) } ?: emptyList()
-                    season.episodes.forEachIndexed { idx, ep ->
-                        val link = if (urlCheck) ep.link else linkToIp(ep.link)
-                        val tmdbEp = tmdbEpisodes.getOrNull(idx)
-                        episodesData.add(newEpisode(link) {
-                            this.episode = idx + 1
-                            this.season = seasonNum
-                            this.name = tmdbEp?.name?.takeIf { it.isNotBlank() } ?: ep.title
-                            this.posterUrl = tmdbEp?.stillPath?.let { "$tmdbImageBase$it" }
-                            this.description = tmdbEp?.overview?.takeIf { it.isNotBlank() }
-                            tmdbEp?.airDate?.let { addDate(it) }
-                        })
+
+                allTvData.forEach { (pData, tvSeries) ->
+                    var seasonNum = 0
+                    val audioTag = extractAudioTag(pData.title)
+                    
+                    tvSeries.content.forEach { season ->
+                        seasonNum++
+                        val tmdbEpisodes = tmdbId?.let { fetchTmdbSeasonEpisodes(it, seasonNum) } ?: emptyList()
+                        season.episodes.forEachIndexed { idx, ep ->
+                            val link = if (urlCheck) ep.link else linkToIp(ep.link)
+                            val tmdbEp = tmdbEpisodes.getOrNull(idx)
+                            
+                            episodesData.add(newEpisode(link) {
+                                this.episode = idx + 1
+                                this.season = seasonNum
+                                val resolvedName = tmdbEp?.name ?: ep.title.takeIf { it.isNotBlank() } ?: "Episode ${idx + 1}"
+                                this.name = if (postIds.size > 1) "[$audioTag] $resolvedName" else resolvedName
+                                this.posterUrl = tmdbEp?.stillPath?.let { "$tmdbImageBase$it" }
+                                this.description = tmdbEp?.overview
+                                tmdbEp?.airDate?.let { addDate(it) }
+                            })
+                        }
                     }
                 }
 
-                newTvSeriesLoadResponse(title, url, TvType.TvSeries, episodesData) {
+                return newTvSeriesLoadResponse(baseTitle, url, TvType.TvSeries, episodesData) {
                     this.posterUrl = meta?.poster ?: fallbackPoster
                     this.backgroundPosterUrl = meta?.backdrop ?: fallbackPoster
                     this.year = year
@@ -817,7 +803,7 @@ class CircleFtpProvider : MainAPI() {
                     this.score = Score.from10(meta?.rating)
                     this.actors = actors
                     this.logoUrl = meta?.logoUrl
-                    trailer?.takeIf { it.isNotBlank() }?.let { addTrailer(it) }
+                    trailer?.let { addTrailer(it) }
                     meta?.imdbId?.let { addImdbId(it) }
                 }
             }
@@ -853,6 +839,7 @@ class CircleFtpProvider : MainAPI() {
     }
 
     private fun selectUntilNonInt(string: String?): Int? = string?.let { Regex("""\d{4}""").find(it)?.value?.toIntOrNull() }
+    
     private fun getSearchQuality(check: String?): SearchQuality? {
         val c = check?.lowercase() ?: return null
         return when {
@@ -869,50 +856,11 @@ class CircleFtpProvider : MainAPI() {
         }
     }
 
-    // ── Data classes ────────────────────────────────────────────────────────
+    // Data classes
     data class PageData(val posts: List<Post>)
-
-    data class KitsuMeta(
-        val id: String?,
-        val title: String?,
-        val poster: String?,
-        val cover: String?,
-        val synopsis: String?,
-        val averageRating: Double?
-    )
-
-    data class ResolvedAnimeMeta(
-        val title: String,
-        val poster: String?,
-        val background: String?,
-        val plot: String?,
-        val score100: Int?,
-        val tags: List<String>?,
-        val trailer: String?,
-        val anilistEpisodes: List<AniListStreamingEpisode>?,
-        val logoUrl: String?,
-        val actors: List<ActorData>?,
-        val anilistId: Int?,
-        val malId: Int?,
-        val kitsuId: String?,
-        val simklId: Int?,
-        val imdbId: String?,
-        val tmdbId: Int?
-    )
-
-    data class Post(
-        val id: Int,
-        val type: String,
-        val imageSm: String,
-        val title: String,
-        val name: String? = null,
-        val image: String? = null,
-        val cover: String? = null,
-        val quality: String? = null,
-        val year: String? = null,
-        val tags: String? = null,
-        val categories: List<Category>? = null
-    )
+    data class KitsuMeta(val id: String?, val title: String?, val poster: String?, val cover: String?, val synopsis: String?, val averageRating: Double?)
+    data class ResolvedAnimeMeta(val title: String, val poster: String?, val background: String?, val plot: String?, val score100: Int?, val tags: List<String>?, val trailer: String?, val anilistEpisodes: List<AniListStreamingEpisode>?, val logoUrl: String?, val actors: List<ActorData>?, val anilistId: Int?, val malId: Int?, val kitsuId: String?, val simklId: Int?, val imdbId: String?)
+    data class Post(val id: Int, val type: String, val imageSm: String, val title: String, val name: String? = null, val image: String? = null, val cover: String? = null, val quality: String? = null, val year: String? = null, val tags: String? = null, val categories: List<Category>? = null)
     data class Data(val type: String, val imageSm: String, val title: String, val image: String, val metaData: String?, val name: String?, val quality: String?, val year: String?, val watchTime: String?, val categories: List<Category>?)
     data class Category(val id: Int, val name: String?)
     data class TvSeries(val content: List<Content>)
@@ -940,5 +888,3 @@ class CircleFtpProvider : MainAPI() {
     data class TmdbMeta(val poster: String?, val backdrop: String?, val rating: Double?, val overview: String?, val logoUrl: String?, val imdbId: String?, val tmdbId: Int?)
     data class TmdbEpisode(val name: String?, val overview: String?, val stillPath: String?, val airDate: String?, val rating: Double?)
 }
-
-      
