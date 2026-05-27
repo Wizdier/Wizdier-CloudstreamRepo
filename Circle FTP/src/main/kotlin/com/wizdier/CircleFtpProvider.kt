@@ -533,7 +533,7 @@ class CircleFtpProvider : MainAPI() {
             ?: getAniListMeta(cleaned)
             ?: getAniListMeta(title)
 
-        var aniZip = aniList?.id?.let { getAniZipMeta(it) }
+        val aniZip = ani.id?.toIntOrNull()?.let { getAniZipMeta(it) }
         var kitsu = getKitsuMetaCached(cleaned) ?: getKitsuMetaCached(title)
         var zipFromKitsu = kitsu?.id?.let { getAniZipByKitsuId(it) }
 
