@@ -5,13 +5,7 @@ android {
     buildFeatures {
         buildConfig = true
     }
-    defaultConfig {
-        buildConfigField(
-            "String",
-            "TMDB_API",
-            "\"${System.getenv("TMDB_API") ?: ""}\""
-        )
-    }
+    
 }
 
 cloudstream {
