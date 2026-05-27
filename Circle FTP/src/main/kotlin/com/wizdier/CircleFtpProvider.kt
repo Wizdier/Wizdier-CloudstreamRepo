@@ -9,8 +9,8 @@ import com.lagradost.cloudstream3.LoadResponse.Companion.addImdbId
 import com.lagradost.cloudstream3.LoadResponse.Companion.addTrailer
 import com.lagradost.cloudstream3.syncproviders.SyncIdName
 import com.lagradost.cloudstream3.utils.AppUtils
-import com.lagradost.cloudstream3.utils.AppUtils.toJson
 import com.lagradost.cloudstream3.utils.ExtractorLink
+import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.newExtractorLink
 import com.lagradost.nicehttp.RequestBodyTypes
@@ -177,8 +177,8 @@ class CircleFtpProvider : MainAPI() {
                       }
                     }
                 """.trimIndent()
-                val body = mapOf("query" to query, "variables" to mapOf("search" to title))
-                    .toJson().toRequestBody(RequestBodyTypes.JSON.toMediaTypeOrNull())
+                val body = AppUtils.toJson(mapOf("query" to query, "variables" to mapOf("search" to title)))
+                    .toRequestBody(RequestBodyTypes.JSON.toMediaTypeOrNull())
                 val res = app.post(anilistApi, requestBody = body, headers = mapOf("Content-Type" to "application/json"), cacheTime = 3600)
                 return AppUtils.parseJson<AniListResponse>(res.text).data?.Media
             } catch (_: Exception) {
@@ -223,8 +223,8 @@ class CircleFtpProvider : MainAPI() {
                   }
                 }
             """.trimIndent()
-            val body = mapOf("query" to query, "variables" to mapOf("id" to id))
-                .toJson().toRequestBody(RequestBodyTypes.JSON.toMediaTypeOrNull())
+            val body = AppUtils.toJson(mapOf("query" to query, "variables" to mapOf("id" to id)))
+                .toRequestBody(RequestBodyTypes.JSON.toMediaTypeOrNull())
             val res = app.post(anilistApi, requestBody = body, headers = mapOf("Content-Type" to "application/json"), cacheTime = 86400)
             AppUtils.parseJson<AniListResponse>(res.text).data?.Media
         } catch (_: Exception) { null }
@@ -870,10 +870,11 @@ class CircleFtpProvider : MainAPI() {
                             source = sourceName,
                             name = sourceName,
                             url = url,
-                            referer = mainUrl,
-                            quality = Qualities.Unknown.value,
-                            isM3u8 = url.endsWith(".m3u8")
-                        )
+                            type = if (url.endsWith(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+                        ) {
+                            this.referer = mainUrl
+                            this.quality = Qualities.Unknown.value
+                        }
                     )
                 }
             }
@@ -883,10 +884,11 @@ class CircleFtpProvider : MainAPI() {
                     source = this.name,
                     name = this.name,
                     url = data,
-                    referer = mainUrl,
-                    quality = Qualities.Unknown.value,
-                    isM3u8 = data.endsWith(".m3u8")
-                )
+                    type = if (data.endsWith(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+                ) {
+                    this.referer = mainUrl
+                    this.quality = Qualities.Unknown.value
+                }
             )
         }
         return true
