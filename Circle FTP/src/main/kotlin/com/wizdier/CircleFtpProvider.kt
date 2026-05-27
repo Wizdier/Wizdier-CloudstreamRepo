@@ -178,8 +178,10 @@ class CircleFtpProvider : MainAPI() {
                       }
                     }
                 """.trimIndent()
-                val body = toJson(mapOf("query" to query, "variables" to mapOf("search" to title)))
+                val body = mapOf("query" to query, "variables" to mapOf("search" to title))
+                    .toJson()
                     .toRequestBody(RequestBodyTypes.JSON.toMediaTypeOrNull())
+
                 val res = app.post(anilistApi, requestBody = body, headers = mapOf("Content-Type" to "application/json"), cacheTime = 3600)
                 return AppUtils.parseJson<AniListResponse>(res.text).data?.Media
             } catch (_: Exception) {
@@ -224,8 +226,10 @@ class CircleFtpProvider : MainAPI() {
                   }
                 }
             """.trimIndent()
-            val body = toJson(mapOf("query" to query, "variables" to mapOf("id" to id)))
+            val body = mapOf("query" to query, "variables" to mapOf("id" to id))
+                .toJson()
                 .toRequestBody(RequestBodyTypes.JSON.toMediaTypeOrNull())
+
             val res = app.post(anilistApi, requestBody = body, headers = mapOf("Content-Type" to "application/json"), cacheTime = 86400)
             AppUtils.parseJson<AniListResponse>(res.text).data?.Media
         } catch (_: Exception) { null }
