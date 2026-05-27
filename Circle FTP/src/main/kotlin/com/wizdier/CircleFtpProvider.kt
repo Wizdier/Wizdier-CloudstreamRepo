@@ -6,13 +6,10 @@ import com.lagradost.cloudstream3.LoadResponse.Companion.addMalId
 import com.lagradost.cloudstream3.LoadResponse.Companion.addKitsuId
 import com.lagradost.cloudstream3.LoadResponse.Companion.addSimklId
 import com.lagradost.cloudstream3.LoadResponse.Companion.addImdbId
-import com.lagradost.cloudstream3.LoadResponse.Companion.addTrailer
 import com.lagradost.cloudstream3.syncproviders.SyncIdName
 import com.lagradost.cloudstream3.utils.AppUtils
-import com.lagradost.cloudstream3.utils.AppUtils.toJson
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
-import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.newExtractorLink
 import com.lagradost.nicehttp.RequestBodyTypes
 import okhttp3.MediaType.Companion.toMediaTypeOrNull
@@ -178,8 +175,8 @@ class CircleFtpProvider : MainAPI() {
                       }
                     }
                 """.trimIndent()
-                val body = mapOf("query" to query, "variables" to mapOf("search" to title))
-                    .toJson().toRequestBody(RequestBodyTypes.JSON.toMediaTypeOrNull())
+                val body = AppUtils.mapper.writeValueAsString(mapOf("query" to query, "variables" to mapOf("search" to title)))
+                    .toRequestBody(RequestBodyTypes.JSON.toMediaTypeOrNull())
                 val res = app.post(anilistApi, requestBody = body, headers = mapOf("Content-Type" to "application/json"), cacheTime = 3600)
                 return AppUtils.parseJson<AniListResponse>(res.text).data?.Media
             } catch (_: Exception) {
@@ -224,8 +221,8 @@ class CircleFtpProvider : MainAPI() {
                   }
                 }
             """.trimIndent()
-            val body = mapOf("query" to query, "variables" to mapOf("id" to id))
-                .toJson().toRequestBody(RequestBodyTypes.JSON.toMediaTypeOrNull())
+            val body = AppUtils.mapper.writeValueAsString(mapOf("query" to query, "variables" to mapOf("id" to id)))
+                .toRequestBody(RequestBodyTypes.JSON.toMediaTypeOrNull())
             val res = app.post(anilistApi, requestBody = body, headers = mapOf("Content-Type" to "application/json"), cacheTime = 86400)
             AppUtils.parseJson<AniListResponse>(res.text).data?.Media
         } catch (_: Exception) { null }
@@ -481,31 +478,31 @@ class CircleFtpProvider : MainAPI() {
     private suspend fun resolveAnimeMeta(title: String, year: Int?, isSeries: Boolean, seasonNumber: Int): ResolvedAnimeMeta {
         val cleaned = stripSeasonSuffixForAnime(stripAudioTags(title))
         val baseTmdbMeta = getTmdbMetaCached(cleaned, year, isSeries)
-        val exactSeasonTitle = titleForSeason(cleaned, null, seasonNumber)
         
-        var aniList: AniListMeta? = null
-        var malId: Int? = null
-
-        // Priority 1: Accurate Jikan MAL lookup for exact S2+ title to get proper multi-season AniList ID
-        if (seasonNumber > 1) {
-            malId = searchMalId(exactSeasonTitle)
-            if (malId != null) {
-                val zip = getAniZipByMalId(malId)
-                if (zip?.anilistId != null) {
-                    aniList = getAniListMetaById(zip.anilistId)
+        var aniList = getAniListMeta(cleaned) ?: getAniListMeta(title)
+        
+        // Accurate Tracker Sync: Follow the sequel graph to find Season 2, Season 3 precisely.
+        if (seasonNumber > 1 && aniList != null) {
+            var currentSeason = 1
+            while (currentSeason < seasonNumber) {
+                val sequelId = aniList?.relations?.edges?.firstOrNull { 
+                    it.relationType.equals("SEQUEL", ignoreCase = true) 
+                }?.node?.id
+                
+                if (sequelId != null) {
+                    aniList = getAniListMetaById(sequelId)
+                    currentSeason++
+                } else {
+                    // Fallback to exact string match query
+                    val exactList = getAniListMeta(titleForSeason(cleaned, null, seasonNumber))
+                    if (exactList != null) aniList = exactList
+                    break
                 }
             }
         }
-        
-        // Priority 2: Standard title search
-        if (aniList == null) {
-            aniList = getAniListMeta(if (seasonNumber > 1) exactSeasonTitle else cleaned) 
-                ?: getAniListMeta(cleaned) 
-                ?: getAniListMeta(title)
-        }
 
         val aniZip = aniList?.id?.let { getAniZipMeta(it) }
-        malId = malId ?: aniList?.idMal ?: aniZip?.malId ?: searchMalId(cleaned)
+        val malId = aniList?.idMal ?: aniZip?.malId ?: searchMalId(cleaned)
         val zipFromMal = if (aniZip == null && malId != null) getAniZipByMalId(malId) else null
         
         val kitsuId = aniZip?.kitsuid ?: zipFromMal?.kitsuId
@@ -653,8 +650,8 @@ class CircleFtpProvider : MainAPI() {
                 val audioTag = extractAudioTag(pData.title ?: "")
                 links.add(audioTag to link)
             }
-            // Delimiter string to group tracks in one episode smoothly without JSON errors
-            val episodeData = links.joinToString(",") { "${it.first}|||${it.second}" }
+            
+            val episodeData = links.joinToString("%%%") { "${it.first}|||${it.second}" }
             
             val episodesData = mutableListOf<Episode>()
             episodesData.add(newEpisode(episodeData) {
@@ -673,7 +670,7 @@ class CircleFtpProvider : MainAPI() {
                     this.duration = duration
                     this.actors = meta.actors
                     this.logoUrl = meta.logoUrl
-                    meta.trailer?.let { addTrailer(it) }
+                    this.trailerUrl = meta.trailer
                     meta.anilistId?.let { addAniListId(it) }
                     meta.malId?.let { addMalId(it) }
                     meta.kitsuId?.let { addKitsuId(it) }
@@ -694,7 +691,7 @@ class CircleFtpProvider : MainAPI() {
                     this.duration = duration
                     this.actors = actors
                     this.logoUrl = meta?.logoUrl
-                    trailer?.let { addTrailer(it) }
+                    this.trailerUrl = trailer
                     meta?.imdbId?.let { addImdbId(it) }
                 }
             }
@@ -718,7 +715,6 @@ class CircleFtpProvider : MainAPI() {
                     }
                 }
                 
-                // Group audio links by episode index into a single list
                 val episodesMap = mutableMapOf<Int, Pair<String?, MutableList<Pair<String, String>>>>()
                 for ((_, pData, jsonText) in allData) {
                     val tvSeries = try { AppUtils.parseJson<TvSeries>(jsonText) } catch(_: Exception) { null } ?: continue
@@ -740,11 +736,12 @@ class CircleFtpProvider : MainAPI() {
                     val idx = entryData.key
                     val (epTitle, linksList) = entryData.value
                     val aniEp = meta.anilistEpisodes?.getOrNull(idx)
-                    val episodeData = linksList.joinToString(",") { "${it.first}|||${it.second}" }
+                    val episodeData = linksList.joinToString("%%%") { "${it.first}|||${it.second}" }
                     
                     episodesData.add(newEpisode(episodeData) {
                         this.episode = idx + 1
-                        this.season = seasonNumberForMeta // Do not reset to 1. Ensures correct episode ID mapping.
+                        // Set season = 1. Trackers treat isolated AniList anime sequel IDs as exactly "Season 1" of themselves.
+                        this.season = 1
                         this.name = aniEp?.title ?: epTitle ?: "Episode ${idx + 1}"
                         this.posterUrl = aniEp?.thumbnail
                     })
@@ -760,7 +757,7 @@ class CircleFtpProvider : MainAPI() {
                     this.actors = meta.actors
                     this.logoUrl = meta.logoUrl
                     this.recommendations = recommendations
-                    meta.trailer?.let { addTrailer(it) }
+                    this.trailerUrl = meta.trailer
                     meta.anilistId?.let { addAniListId(it) }
                     meta.malId?.let { addMalId(it) }
                     meta.kitsuId?.let { addKitsuId(it) }
@@ -805,7 +802,7 @@ class CircleFtpProvider : MainAPI() {
                         tmdbSeasonCache[seasonNum] = fetchTmdbSeasonEpisodes(tmdbId, seasonNum)
                     }
                     val tmdbEp = tmdbSeasonCache[seasonNum]?.getOrNull(idx)
-                    val episodeData = linksList.joinToString(",") { "${it.first}|||${it.second}" }
+                    val episodeData = linksList.joinToString("%%%") { "${it.first}|||${it.second}" }
                     
                     episodesData.add(newEpisode(episodeData) {
                         this.episode = idx + 1
@@ -825,7 +822,7 @@ class CircleFtpProvider : MainAPI() {
                     this.score = Score.from10(meta?.rating)
                     this.actors = actors
                     this.logoUrl = meta?.logoUrl
-                    trailer?.let { addTrailer(it) }
+                    this.trailerUrl = trailer
                     meta?.imdbId?.let { addImdbId(it) }
                 }
             }
@@ -856,9 +853,8 @@ class CircleFtpProvider : MainAPI() {
     }
 
     override suspend fun loadLinks(data: String, isCasting: Boolean, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit): Boolean {
-        // String delimited tags natively handles loading arrays of links into the video player
         if (data.contains("|||")) {
-            val links = data.split(",")
+            val links = data.split("%%%")
             for (linkItem in links) {
                 val parts = linkItem.split("|||")
                 if (parts.size >= 2) {
@@ -872,10 +868,7 @@ class CircleFtpProvider : MainAPI() {
                             name = sourceName,
                             url = url,
                             type = if (url.endsWith(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
-                        ) {
-                            this.referer = mainUrl
-                            this.quality = Qualities.Unknown.value
-                        }
+                        )
                     )
                 }
             }
@@ -886,10 +879,7 @@ class CircleFtpProvider : MainAPI() {
                     name = this.name,
                     url = data,
                     type = if (data.endsWith(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
-                ) {
-                    this.referer = mainUrl
-                    this.quality = Qualities.Unknown.value
-                }
+                )
             )
         }
         return true
