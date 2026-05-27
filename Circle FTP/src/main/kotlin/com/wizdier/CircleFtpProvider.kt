@@ -893,7 +893,6 @@ class CircleFtpProvider : MainAPI() {
         }
         return true
     }
-
     private fun selectUntilNonInt(string: String?): Int? = string?.let { Regex("""\d{4}""").find(it)?.value?.toIntOrNull() }
 
     private fun getSearchQuality(check: String?): SearchQuality? {
