@@ -412,33 +412,6 @@ class CircleFtpProvider : MainAPI() {
         }
     }
 
-
-    private fun stripSeasonSuffixForAnime(title: String): String {
-        return cleanTitle(title)
-            .replace(Regex("""(?i)\banime\b"""), "")
-            .replace(Regex("""(?i)\bseason\s*\d+\b"""), "")
-            .replace(Regex("""\s{2,}"""), " ")
-            .trim()
-    }
-
-    private fun sequelOf(meta: AniListMeta?): AniListMeta? {
-        return meta?.relations?.edges
-            ?.firstOrNull { it.relationType.equals("SEQUEL", ignoreCase = true) && it.node != null }
-            ?.node
-    }
-
-    private suspend fun getAniListMetaForSeason(baseTitle: String, seasonNumber: Int): AniListMeta? {
-        val base = stripSeasonSuffixForAnime(baseTitle)
-        var meta = getAniListMeta(base) ?: getAniListMeta(baseTitle)
-        if (seasonNumber <= 1) return meta
-
-        repeat(seasonNumber - 1) {
-            val next = sequelOf(meta) ?: return meta
-            meta = next.id?.let { getAniListMetaById(it) } ?: next
-        }
-        return meta
-    }
-
     private suspend fun fetchPostResponse(postId: Int) = try {
         app.get("$mainApiUrl/api/posts/$postId", verify = false, cacheTime = 60)
     } catch (_: Exception) {
@@ -518,22 +491,23 @@ class CircleFtpProvider : MainAPI() {
             .replace(Regex("""\s{2,}"""), " ")
             .trim()
 
+        var kitsu = getKitsuMetaCached(cleaned) ?: getKitsuMetaCached(title)
+        var zipFromKitsu = kitsu?.id?.let { getAniZipByKitsuId(it) }
+
         val tmdbMeta = getTmdbMeta(cleaned, year, isSeries)
         val tmdbZip = tmdbMeta?.tmdbId?.let { getAniZipByTmdbId(it) }
-        var aniList = tmdbZip?.anilistId?.let { getAniListMetaById(it) }
+
+        // Start with the most reliable mappings to Anilist ID
+        val targetAnilistId = zipFromKitsu?.anilistId ?: tmdbZip?.anilistId
+        
+        var aniList = targetAnilistId?.let { getAniListMetaById(it) }
             ?: getAniListMeta(cleaned)
             ?: getAniListMeta(title)
 
         var aniZip = aniList?.id?.let { getAniZipMeta(it) }
-        var kitsu = getKitsuMetaCached(cleaned) ?: getKitsuMetaCached(title)
-        var zipFromKitsu = kitsu?.id?.let { getAniZipByKitsuId(it) }
 
-        if (aniList == null) {
-            aniList = zipFromKitsu?.anilistId?.let { getAniListMetaById(it) }
-        }
-
-        val mal = aniList?.idMal ?: aniZip?.malId ?: tmdbZip?.malId ?: zipFromKitsu?.malId ?: searchMalId(cleaned)
-        val zipFromMal = if ((aniList == null || aniZip == null) && mal != null) getAniZipByMalId(mal) else null
+        val mal = aniList?.idMal ?: aniZip?.malId ?: zipFromKitsu?.malId ?: tmdbZip?.malId ?: searchMalId(cleaned)
+        val zipFromMal = if (targetAnilistId == null && mal != null) getAniZipByMalId(mal) else null
 
         if (aniList == null) {
             aniList = zipFromMal?.anilistId?.let { getAniListMetaById(it) }
@@ -566,19 +540,19 @@ class CircleFtpProvider : MainAPI() {
 
         return ResolvedAnimeMeta(
             title = displayTitle,
-            poster = aniList?.coverImage?.extraLarge
-                ?: aniList?.coverImage?.large
-                ?: kitsu?.poster
-                ?: finalTmdb?.poster,
-            background = aniList?.bannerImage
-                ?: kitsu?.cover
-                ?: finalTmdb?.backdrop,
-            plot = aniList?.description?.replace(Regex("<[^>]*>"), "")
-                ?: kitsu?.synopsis
-                ?: finalTmdb?.overview,
+            poster = aniList?.coverImage?.extraLarge?.takeIf { it.isNotBlank() }
+                ?: aniList?.coverImage?.large?.takeIf { it.isNotBlank() }
+                ?: kitsu?.poster?.takeIf { it.isNotBlank() }
+                ?: finalTmdb?.poster?.takeIf { it.isNotBlank() },
+            background = aniList?.bannerImage?.takeIf { it.isNotBlank() }
+                ?: kitsu?.cover?.takeIf { it.isNotBlank() }
+                ?: finalTmdb?.backdrop?.takeIf { it.isNotBlank() },
+            plot = aniList?.description?.replace(Regex("<[^>]*>"), "")?.takeIf { it.isNotBlank() }
+                ?: kitsu?.synopsis?.takeIf { it.isNotBlank() }
+                ?: finalTmdb?.overview?.takeIf { it.isNotBlank() },
             score100 = aniList?.averageScore ?: kitsu?.averageRating?.toInt(),
             tags = aniList?.genres,
-            trailer = fetchTmdbTrailer(finalTmdb?.tmdbId, isSeries) ?: getAniListTrailerUrl(aniList?.trailer),
+            trailer = fetchTmdbTrailer(finalTmdb?.tmdbId, isSeries)?.takeIf { it.isNotBlank() } ?: getAniListTrailerUrl(aniList?.trailer)?.takeIf { it.isNotBlank() },
             anilistEpisodes = aniList?.streamingEpisodes,
             logoUrl = finalTmdb?.logoUrl ?: fetchTmdbLogo(tmdbFromZip, isSeries),
             actors = aniList?.characters?.edges?.mapNotNull {
@@ -588,7 +562,8 @@ class CircleFtpProvider : MainAPI() {
             malId = aniList?.idMal ?: aniZip?.malId ?: tmdbZip?.malId ?: zipFromKitsu?.malId ?: zipFromMal?.malId ?: mal,
             kitsuId = aniZip?.kitsuid ?: tmdbZip?.kitsuId ?: zipFromKitsu?.kitsuId ?: zipFromMal?.kitsuId ?: kitsu?.id,
             simklId = aniZip?.simklId ?: tmdbZip?.simklId ?: zipFromKitsu?.simklId ?: zipFromMal?.simklId,
-            imdbId = finalTmdb?.imdbId
+            imdbId = finalTmdb?.imdbId,
+            tmdbId = finalTmdb?.tmdbId
         )
     }
 
@@ -606,8 +581,6 @@ class CircleFtpProvider : MainAPI() {
         val fallbackPoster = "$mainApiUrl/uploads/${post.imageSm}"
         val year = selectUntilNonInt(post.year)
 
-        // Home/search must not wait for external APIs. If metadata is already cached from a previous load,
-        // use the external poster instantly; otherwise fall back to CircleFTP's own poster.
         val cachedAnimePoster = animeMetaCache["${isSeries}|${year ?: 0}|${rawTitle.lowercase()}"]?.poster
         val cachedTmdbPoster = tmdbMetaCache["${isSeries}|${year ?: 0}|${cleanTitle(rawTitle).lowercase()}"]?.poster
 
@@ -635,17 +608,10 @@ class CircleFtpProvider : MainAPI() {
         if (post.type == "series" && isAnime) {
             val tvData = fetchPostTvDataCached(post.id)
             val seasons = tvData?.content.orEmpty()
-            if (seasons.size > 1) {
+            if (seasons.isNotEmpty()) {
                 val baseTitle = post.name?.ifBlank { post.title } ?: post.title
-                return seasons.mapIndexedNotNull { index, season ->
-                    val seasonNumber = index + 1
-                    val seasonTitle = titleForSeason(baseTitle, season.seasonName, seasonNumber)
-                    createSearchResult(
-                        post = post,
-                        overrideTitle = seasonTitle,
-                        seasonIndex = index
-                    )
-                }
+                // Just map everything to the very first season for home page to avoid redundant chaining
+                return listOfNotNull(createSearchResult(post, titleForSeason(baseTitle, seasons.first().seasonName, 1), 0))
             }
         }
 
@@ -721,7 +687,7 @@ class CircleFtpProvider : MainAPI() {
                     addEpisodes(if (isDubTitle(title)) DubStatus.Dubbed else DubStatus.Subbed, listOf(newEpisode(link ?: "")))
                 }
             } else {
-                // MOVIE - TMDB only, no anime IDs
+                // MOVIE
                 val meta = getTmdbMetaCached(cleanedTitle, year, false)
                 val trailer = fetchTmdbTrailer(meta?.tmdbId, false)
                 val actors = fetchTmdbActors(meta?.tmdbId, false)
@@ -735,7 +701,7 @@ class CircleFtpProvider : MainAPI() {
                     this.duration = duration
                     this.actors = actors
                     this.logoUrl = meta?.logoUrl
-                    trailer?.let { addTrailer(it) }
+                    trailer?.takeIf { it.isNotBlank() }?.let { addTrailer(it) }
                     meta?.imdbId?.let { addImdbId(it) }
                 }
             }
@@ -744,51 +710,55 @@ class CircleFtpProvider : MainAPI() {
 
             return if (isAnime) {
                 val allSeasons = tvData.content
-                val seasonsToUse = selectedSeason?.let { idx -> allSeasons.getOrNull(idx)?.let { listOf(idx to it) } }
-                    ?: allSeasons.mapIndexed { idx, season -> idx to season }
-                val seasonNumberForMeta = selectedSeason?.plus(1) ?: 1
-                val metaTitle = selectedSeason?.let { idx ->
-                    titleForSeason(title, allSeasons.getOrNull(idx)?.seasonName, idx + 1)
-                } ?: cleanedTitle
+                val currentSeasonIdx = selectedSeason ?: 0
+                val seasonsToUse = allSeasons.getOrNull(currentSeasonIdx)?.let { listOf(currentSeasonIdx to it) } ?: emptyList()
+                val seasonNumberForMeta = currentSeasonIdx + 1
+                val metaTitle = titleForSeason(title, seasonsToUse.firstOrNull()?.second?.seasonName, seasonNumberForMeta)
 
-                // First try AniList's sequel chain for true per-season tracking IDs.
-                val anilistSeasonMeta = if (selectedSeason != null) getAniListMetaForSeason(title, seasonNumberForMeta) else null
-                val meta = anilistSeasonMeta?.let { ani ->
-                    val aniZip = ani.id?.let { getAniZipMeta(it) }
-                    val kitsuFallback = aniZip?.kitsuid?.let { getKitsuMetaCached(metaTitle) }
-                    ResolvedAnimeMeta(
-                        title = ani.title?.english ?: ani.title?.romaji ?: metaTitle,
-                        poster = ani.coverImage?.extraLarge ?: ani.coverImage?.large ?: kitsuFallback?.poster,
-                        background = ani.bannerImage ?: kitsuFallback?.cover,
-                        plot = ani.description?.replace(Regex("<[^>]*>"), "") ?: kitsuFallback?.synopsis,
-                        score100 = ani.averageScore ?: kitsuFallback?.averageRating?.toInt(),
-                        tags = ani.genres,
-                        trailer = getAniListTrailerUrl(ani.trailer),
-                        anilistEpisodes = ani.streamingEpisodes,
-                        logoUrl = null,
-                        actors = ani.characters?.edges?.mapNotNull {
-                            it.node?.name?.full?.let { actorName -> ActorData(Actor(actorName, it.node.image?.large)) }
-                        },
-                        anilistId = ani.id,
-                        malId = ani.idMal ?: aniZip?.malId,
-                        kitsuId = aniZip?.kitsuid,
-                        simklId = aniZip?.simklId,
-                        imdbId = null
-                    )
-                } ?: resolveAnimeMetaCached(metaTitle, year, true)
+                val meta = resolveAnimeMetaCached(metaTitle, year, true)
+
+                // Recommendations layer purely handles moving between separate seasons
+                val recommendationsList = mutableListOf<SearchResponse>()
+                if (allSeasons.size > 1) {
+                    val basePostId = cleanApiUrl(url).substringAfterLast("/")
+                    allSeasons.forEachIndexed { idx, season ->
+                        if (idx != currentSeasonIdx) {
+                            val seasonTitle = titleForSeason(title, season.seasonName, idx + 1)
+                            val seasonUrl = "$mainUrl/content/$basePostId?season=$idx"
+                            val recPoster = animeMetaCache["true|0|${seasonTitle.lowercase()}"]?.poster ?: meta.poster ?: fallbackPoster
+                            
+                            recommendationsList.add(
+                                newAnimeSearchResponse(seasonTitle, seasonUrl, TvType.Anime) {
+                                    this.posterUrl = recPoster
+                                }
+                            )
+                        }
+                    }
+                }
 
                 val episodesData = mutableListOf<Episode>()
-                seasonsToUse.forEach { (seasonIndex, season) ->
-                    val realSeasonNumber = seasonIndex + 1
-                    val episodeSeasonNumber = if (selectedSeason != null) 1 else realSeasonNumber
+                val tmdbEpisodes = meta.tmdbId?.let { id -> fetchTmdbSeasonEpisodes(id, seasonNumberForMeta) } ?: emptyList()
+
+                seasonsToUse.forEach { (_, season) ->
                     season.episodes.forEachIndexed { idx, ep ->
                         val link = if (urlCheck) ep.link else linkToIp(ep.link)
                         val aniEp = meta.anilistEpisodes?.getOrNull(idx)
+                        val tmdbEp = tmdbEpisodes.getOrNull(idx)
+                        
                         episodesData.add(newEpisode(link) {
                             this.episode = idx + 1
-                            this.season = episodeSeasonNumber
-                            this.name = aniEp?.title ?: ep.title
-                            this.posterUrl = aniEp?.thumbnail
+                            this.season = 1 // Flatten visual to season 1 natively bypassing standard TV pickers, matching ID trackers natively
+                            
+                            var epName = tmdbEp?.name?.takeIf { it.isNotBlank() && !it.startsWith("Episode", true) } 
+                                ?: aniEp?.title?.takeIf { it.isNotBlank() } 
+                                ?: ep.title
+                                
+                            if (epName.startsWith("Episode", true) && epName.contains("-")) { epName = epName.substringAfter("-").trim() }
+                            
+                            this.name = epName.takeIf { it.isNotBlank() } ?: "Episode ${idx + 1}"
+                            this.description = tmdbEp?.overview?.takeIf { it.isNotBlank() }
+                            this.posterUrl = tmdbEp?.stillPath?.let { "$tmdbImageBase$it" } ?: aniEp?.thumbnail?.takeIf { it.isNotBlank() }
+                            tmdbEp?.airDate?.let { addDate(it) }
                         })
                     }
                 }
@@ -802,16 +772,19 @@ class CircleFtpProvider : MainAPI() {
                     this.score = Score.from100(meta.score100)
                     this.actors = meta.actors
                     this.logoUrl = meta.logoUrl
-                    meta.trailer?.let { addTrailer(it) }
+                    meta.trailer?.takeIf { it.isNotBlank() }?.let { addTrailer(it) }
+                    
                     addAniListId(meta.anilistId)
                     addMalId(meta.malId)
                     meta.kitsuId?.let { addKitsuId(it) }
                     meta.simklId?.let { addSimklId(it) }
                     meta.imdbId?.let { addImdbId(it) }
+                    
+                    this.recommendations = recommendationsList
                     addEpisodes(if (isDubTitle(title)) DubStatus.Dubbed else DubStatus.Subbed, episodesData)
                 }
             } else {
-                // TV SERIES - TMDB only, NO anime sync
+                // TV SERIES - Standard Native TV series processing without separation
                 val meta = getTmdbMetaCached(cleanedTitle, year, true)
                 val tmdbId = meta?.tmdbId
                 val trailer = fetchTmdbTrailer(tmdbId, true)
@@ -828,9 +801,9 @@ class CircleFtpProvider : MainAPI() {
                         episodesData.add(newEpisode(link) {
                             this.episode = idx + 1
                             this.season = seasonNum
-                            this.name = tmdbEp?.name ?: ep.title
+                            this.name = tmdbEp?.name?.takeIf { it.isNotBlank() } ?: ep.title
                             this.posterUrl = tmdbEp?.stillPath?.let { "$tmdbImageBase$it" }
-                            this.description = tmdbEp?.overview
+                            this.description = tmdbEp?.overview?.takeIf { it.isNotBlank() }
                             tmdbEp?.airDate?.let { addDate(it) }
                         })
                     }
@@ -844,7 +817,7 @@ class CircleFtpProvider : MainAPI() {
                     this.score = Score.from10(meta?.rating)
                     this.actors = actors
                     this.logoUrl = meta?.logoUrl
-                    trailer?.let { addTrailer(it) }
+                    trailer?.takeIf { it.isNotBlank() }?.let { addTrailer(it) }
                     meta?.imdbId?.let { addImdbId(it) }
                 }
             }
@@ -923,7 +896,8 @@ class CircleFtpProvider : MainAPI() {
         val malId: Int?,
         val kitsuId: String?,
         val simklId: Int?,
-        val imdbId: String?
+        val imdbId: String?,
+        val tmdbId: Int?
     )
 
     data class Post(
@@ -966,3 +940,5 @@ class CircleFtpProvider : MainAPI() {
     data class TmdbMeta(val poster: String?, val backdrop: String?, val rating: Double?, val overview: String?, val logoUrl: String?, val imdbId: String?, val tmdbId: Int?)
     data class TmdbEpisode(val name: String?, val overview: String?, val stillPath: String?, val airDate: String?, val rating: Double?)
 }
+
+      
