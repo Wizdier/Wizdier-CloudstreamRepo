@@ -93,10 +93,17 @@ class CircleFtpProvider : MainAPI() {
         "cartoon", "animation", "animated", "pixar", "disney", "dreamworks"
     )
 
-    private val tmdbMetaCache = Collections.synchronizedMap(mutableMapOf<String, TmdbMeta?>())
-    private val animeMetaCache = Collections.synchronizedMap(mutableMapOf<String, ResolvedAnimeMeta>())
-    private val kitsuMetaCache = Collections.synchronizedMap(mutableMapOf<String, KitsuMeta?>())
-    private val postTvDataCache = Collections.synchronizedMap(mutableMapOf<Int, TvSeries?>())
+private val tmdbMetaCache: MutableMap<String, TmdbMeta?> =
+    Collections.synchronizedMap(mutableMapOf<String, TmdbMeta?>())
+
+private val animeMetaCache: MutableMap<String, ResolvedAnimeMeta> =
+    Collections.synchronizedMap(mutableMapOf<String, ResolvedAnimeMeta>())
+
+private val kitsuMetaCache: MutableMap<String, KitsuMeta?> =
+    Collections.synchronizedMap(mutableMapOf<String, KitsuMeta?>())
+
+private val postTvDataCache: MutableMap<Int, TvSeries?> =
+    Collections.synchronizedMap(mutableMapOf<Int, TvSeries?>())
 
     private fun cleanTitle(title: String): String {
         var t = title
