@@ -941,21 +941,19 @@ class CircleFtpProvider : MainAPI() {
         }
 
         if (relationNode != null && relationId != null && relationId != baseMeta.anilistId) {
-            val hasEpisodes = (relationNode.episodes ?: 0) > 0 || (relationNode.streamingEpisodes?.size ?: 0) > 0
-            if (hasEpisodes) {
-                val seasonMeta = resolvedAnimeMetaFromAniListNode(relationNode, relationZip, baseMeta, true)
-                return SeasonAnimeResolution(
-                    meta = seasonMeta,
-                    ids = SeasonIds(
-                        anilistId = relationNode.id,
-                        malId = relationZip?.malId ?: relationNode.idMal,
-                        kitsuId = relationZip?.kitsuId,
-                        simklId = relationZip?.simklId
-                    ),
-                    aniListNode = relationNode,
-                    aniZip = relationZip
-                )
-            }
+    val seasonMeta = resolvedAnimeMetaFromAniListNode(relationNode, relationZip, baseMeta, true)
+    return SeasonAnimeResolution(
+        meta = seasonMeta,
+        ids = SeasonIds(
+            anilistId = relationNode.id,
+            malId = relationZip?.malId ?: relationNode.idMal,
+            kitsuId = relationZip?.kitsuId,
+            simklId = relationZip?.simklId
+        ),
+        aniListNode = relationNode,
+        aniZip = relationZip
+    )
+ 
         }
 
         // Strategy 2: parallel candidate title search (fallback)
@@ -970,16 +968,8 @@ class CircleFtpProvider : MainAPI() {
             }.awaitAll()
         }
 
-        val selected = candidates.firstOrNull { (aniListNode, aniZip) ->
-            aniListNode?.id != null &&
-                aniListNode.id != baseMeta.anilistId &&
-                (
-                    aniZip?.malId != null ||
-                        aniZip?.kitsuId != null ||
-                        aniZip?.simklId != null ||
-                        aniZip?.tmdbId != null ||
-                        aniListNode.idMal != null
-                    )
+                val selected = candidates.firstOrNull { (aniListNode, _) ->
+            aniListNode?.id != null && aniListNode.id != baseMeta.anilistId
         }
 
         if (selected != null) {
