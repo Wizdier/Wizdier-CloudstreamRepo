@@ -533,7 +533,7 @@ class CircleFtpProvider : MainAPI() {
             ?: getAniListMeta(cleaned)
             ?: getAniListMeta(title)
 
-        val aniZip = ani.id?.toIntOrNull()?.let { getAniZipMeta(it) }
+        var aniZip = aniList?.id?.let { getAniZipMeta(it) }
         var kitsu = getKitsuMetaCached(cleaned) ?: getKitsuMetaCached(title)
         var zipFromKitsu = kitsu?.id?.let { getAniZipByKitsuId(it) }
 
@@ -1016,4 +1016,4 @@ class CircleFtpProvider : MainAPI() {
     data class TmdbResult(val id: Int?, val posterPath: String?, val backdropPath: String?, val voteAverage: Double?, val overview: String?)
     data class TmdbMeta(val poster: String?, val backdrop: String?, val rating: Double?, val overview: String?, val logoUrl: String?, val imdbId: String?, val tmdbId: Int?)
     data class TmdbEpisode(val name: String?, val overview: String?, val stillPath: String?, val airDate: String?, val rating: Double?)
-} 
+}
