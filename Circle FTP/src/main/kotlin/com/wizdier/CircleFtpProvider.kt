@@ -122,7 +122,7 @@ class CircleFtpProvider : MainAPI() {
         t = t.replace(Regex("""(?i)\b(web[- ]?dl|webrip|bluray|hdrip|brrip|dvdrip|hdtv|hdcam|hdts|camrip|hdtc|hq|hd|uhd)\b"""), "")
         t = t.replace(Regex("""(?i)\b(1080p|720p|480p|2160p|4k|hevc|x264|x265|10bit|hdr|dv)\b"""), "")
         t = t.replace(Regex("""[\[\(].*?[\]\)]"""), "")
-        t = t.replace(Regex(""":[\-–—]"""), " ")
+        t = t.replace(Regex("""[:\-–—]"""), " ")
         t = t.replace(Regex("""\s{2,}"""), " ")
         return t.trim()
     }
@@ -297,7 +297,7 @@ class CircleFtpProvider : MainAPI() {
         )
         v = v.replace(Regex("""[\[\(][\s\-_,]*[\]\)]"""), "")
         v = v.replace(Regex("""[\[\(].*?[\]\)]"""), "")
-        v = v.replace(Regex(""":[\-–—]"""), " ")
+        v = v.replace(Regex("""[:\-–—]"""), " ")
         v = v.replace(Regex("""\s{2,}"""), " ")
         return v.trim().lowercase()
     }
