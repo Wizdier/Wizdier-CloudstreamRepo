@@ -1011,7 +1011,7 @@ private val postTvDataCache: MutableMap<Int, TvSeries?> =
         val categories: List<Category>? = null
     )
     
-    data class Data(val type: String, val imageSm: String, val title: String, val image: String, val metaData: String?, val name: String?, val quality: String?, val year: String?, val watchTime: String?, val categories: List<Category>?)
+    data class Data(val id: Int, val type: String, val imageSm: String, val title: String, val image: String, val metaData: String?, val name: String?, val quality: String?, val year: String?, val watchTime: String?, val categories: List<Category>?)
     data class Category(val id: Int, val name: String?)
     data class TvSeries(val content: List<Content>)
     data class Content(val episodes: List<EpisodeData>, val seasonName: String)
