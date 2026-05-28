@@ -787,17 +787,20 @@ class CircleFtpProvider : MainAPI() {
                 // Resolve seasonal database keys cleanly via structural mapping
                 if (realSeasonNumber > 1 && baseMeta.anilistId != null) {
                     val alternateSeasonMeta = getAniListMetaForSeason(title, realSeasonNumber)
-                    alternateSeasonMeta?.let {
-                        currentAnilistId = it.id ?: currentAnilistId
-                        currentMalId = it.idMal ?: currentMalId
-                        val individualZip = it.id?.let { id -> getAniZipMeta(id) }
-                        individualZip?.let { zip ->
-                            currentKitsuId = zip.kitsuid ?: currentKitsuId
-                            currentMalId = zip.malId ?: currentMalId
-                            currentSimklId = zip.simklId ?: currentSimklId
-                        }
-                    }
-                }
+                    alternateSeasonMeta?.let { seasonMeta ->
+    currentAnilistId = seasonMeta.id ?: currentAnilistId
+    currentMalId = seasonMeta.idMal ?: currentMalId
+
+    val individualZip = seasonMeta.id?.let { animeId ->
+        getAniZipMeta(animeId)
+    }
+
+    individualZip?.let { zip ->
+        currentKitsuId = zip.kitsuid ?: currentKitsuId
+        currentMalId = zip.malId ?: currentMalId
+        currentSimklId = zip.simklId ?: currentSimklId
+    }
+}
 
                 val targetMeta = if (realSeasonNumber > 1) {
                     resolveAnimeMetaCached(metaTitle, year, true)
