@@ -793,21 +793,32 @@ private val postTvDataCache: MutableMap<Int, TvSeries?> =
 
                 // Resolve seasonal database keys cleanly via structural mapping
                 if (realSeasonNumber > 1 && baseMeta.anilistId != null) {
-                    val alternateSeasonMeta = getAniListMetaForSeason(title, realSeasonNumber)
-                    alternateSeasonMeta?.let { seasonMeta ->
-    currentAnilistId = seasonMeta.id ?: currentAnilistId
-    currentMalId = seasonMeta.idMal ?: currentMalId
 
-    val individualZip = seasonMeta.id?.let { animeId ->
-        getAniZipMeta(animeId)
-    }
+    val alternateSeasonMeta = getAniListMetaForSeason(title, realSeasonNumber)
 
-    individualZip?.let { zip ->
-        currentKitsuId = zip.kitsuid ?: currentKitsuId
-        currentMalId = zip.malId ?: currentMalId
-        currentSimklId = zip.simklId ?: currentSimklId
+    if (alternateSeasonMeta != null) {
+
+        if (alternateSeasonMeta.id != null) {
+            currentAnilistId = alternateSeasonMeta.id
+        }
+
+        if (alternateSeasonMeta.idMal != null) {
+            currentMalId = alternateSeasonMeta.idMal
+        }
+
+        val individualZip =
+            if (alternateSeasonMeta.id != null) {
+                getAniZipMeta(alternateSeasonMeta.id)
+            } else {
+                null
+            }
+
+        if (individualZip != null) {
+            currentKitsuId = individualZip.kitsuid ?: currentKitsuId
+            currentMalId = individualZip.malId ?: currentMalId
+            currentSimklId = individualZip.simklId ?: currentSimklId
+        }
     }
-}
                 }                    
                 val targetMeta = if (realSeasonNumber > 1) {
                     resolveAnimeMetaCached(metaTitle, year, true)
