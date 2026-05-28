@@ -310,7 +310,6 @@ class CircleFtpProvider : MainAPI() {
         } else {
             normalizeMergeTitle(rawTitle)
         }
-        // For anime series, ignore year so that different seasons group together
         val isSeries = post.type.lowercase() == "series"
         return MergeKey(
             title = cleanedTitle,
@@ -895,7 +894,7 @@ class CircleFtpProvider : MainAPI() {
             )
         }
 
-        // ── Strategy 1: follow AniList SEQUEL relation chain ─────────────────
+        // Strategy 1: follow AniList SEQUEL relation chain
         var relationNode: AniListMeta? = null
         val baseNode = baseMeta.anilistId?.let { alId -> getAniListMetaById(alId) }
         if (baseNode != null) {
@@ -916,7 +915,6 @@ class CircleFtpProvider : MainAPI() {
         }
 
         if (relationNode != null && relationId != null && relationId != baseMeta.anilistId) {
-            // Only accept the sequel if it looks like a real season (has episodes data)
             val hasEpisodes = (relationNode.episodes ?: 0) > 0 || (relationNode.streamingEpisodes?.size ?: 0) > 0
             if (hasEpisodes) {
                 val seasonMeta = resolvedAnimeMetaFromAniListNode(relationNode, relationZip, baseMeta, true)
@@ -934,7 +932,7 @@ class CircleFtpProvider : MainAPI() {
             }
         }
 
-        // ── Strategy 2: parallel candidate title search (fallback) ─────────────
+        // Strategy 2: parallel candidate title search (fallback)
         val candidateTitles = animeSeasonSearchTitles(baseTitle, seasonName, seasonNumber)
 
         val candidates: List<Pair<AniListMeta?, AniZipFull?>> = coroutineScope {
@@ -1013,11 +1011,11 @@ class CircleFtpProvider : MainAPI() {
             }
         }
 
-        return variantsByEpisode.entries.map { (epNum, variants) ->
+        return variantsByEpisode.entries.map { entry ->
             MergedEpisodeData(
-                episodeNumber = epNum,
-                title         = titleByEpisode[epNum],
-                variants      = variants.distinctBy { v -> v.url }
+                episodeNumber = entry.key,
+                title         = titleByEpisode[entry.key],
+                variants      = entry.value.distinctBy { v -> v.url }
             )
         }
     }
@@ -1063,15 +1061,13 @@ class CircleFtpProvider : MainAPI() {
     }
 
     /**
-     * Anime = one base tile (season index 0).  All other types stay stacked as a single tile.
+     * Anime series = ONE base tile (season index 0). Everything else stays stacked as a single tile.
      */
     private suspend fun toSearchResults(post: Post, groupedPostIds: List<Int> = emptyList()): List<SearchResponse> {
         val isAnime   = isAnimeContent(post.categories, post.title) || post.title.contains("anime", true)
         val baseTitle = post.name?.ifBlank { post.title } ?: post.title
 
         return if (post.type == "series" && isAnime) {
-            // Anime series: expose ONE entry pointing to seasonIndex=0.
-            // Further seasons are navigable via recommendations from load().
             listOfNotNull(
                 createSearchResult(
                     post          = post,
@@ -1081,7 +1077,6 @@ class CircleFtpProvider : MainAPI() {
                 )
             )
         } else {
-            // TV non-anime, Movies, Cartoon, etc.: single stacked entry (never split per season)
             listOfNotNull(
                 createSearchResult(
                     post           = post,
@@ -1091,12 +1086,6 @@ class CircleFtpProvider : MainAPI() {
                 )
             )
         }
-    }
-
-    private fun extractSeasonNumberFromTitle(title: String): Int {
-        return Regex("""(?i)\bseason\s*(\d+)\b""").find(title)?.groupValues?.getOrNull(1)?.toIntOrNull()
-            ?: Regex("""(?i)\bs(\d+)\b""").find(title)?.groupValues?.getOrNull(1)?.toIntOrNull()
-            ?: 1
     }
 
     private suspend fun createMergedSearchResult(posts: List<Post>): List<SearchResponse> {
@@ -1150,13 +1139,6 @@ class CircleFtpProvider : MainAPI() {
                 .flatten()
         }
     }
-
-    private data class AnimeSeasonSlot(
-        val uiIndex: Int,
-        val seasonNum: Int,
-        val seasonName: String?,
-        val sourceIndices: List<Int>
-    )
 
     override suspend fun load(url: String): LoadResponse {
         val postIds = groupedVariantPostIds(url)
@@ -1250,58 +1232,38 @@ class CircleFtpProvider : MainAPI() {
 
         return if (isAnime) {
 
-            // Parse all grouped responses to detect layout (stacked vs separate folders)
             val allParsedTv: List<TvSeries?> = responses.map { r ->
                 try { r.parsed<TvSeries>() } catch (_: Exception) { null }
             }
 
-            val primaryTv = allParsedTv.firstOrNull()
-            val isStackedLayout = (primaryTv?.content?.size ?: 0) > 1
+            // Detect layout: stacked = one post with multiple contents; split = each post is its own season
+            val isStacked = (tvData.content.size > 1)
 
-            val seasonSlots: List<AnimeSeasonSlot> = if (isStackedLayout) {
-                // Layout A: every post contains the same season list; posts are quality/audio variants
-                val count = primaryTv!!.content.size
-                List(count) { seasonIdx ->
-                    val sName = primaryTv.content.getOrNull(seasonIdx)?.seasonName
-                    val indices = allParsedTv.indices.filter { rIdx ->
-                        allParsedTv[rIdx]?.content?.getOrNull(seasonIdx) != null
-                    }
-                    AnimeSeasonSlot(
-                        uiIndex = seasonIdx,
-                        seasonNum = seasonIdx + 1,
-                        seasonName = sName,
-                        sourceIndices = indices
-                    )
+            val allSeasons: List<Content>
+            val seasonVariants: List<List<Content>>
+
+            if (isStacked) {
+                allSeasons = tvData.content
+                seasonVariants = List(allSeasons.size) { sIdx ->
+                    allParsedTv.mapNotNull { tv -> tv?.content?.getOrNull(sIdx) }
                 }
             } else {
-                // Layout B: each post may be a distinct season (or variant of same season)
-                val postMeta = allParsedTv.mapIndexed { idx, tv ->
-                    val data = loadDataList.getOrNull(idx)
-                    val postTitle = data?.name ?: data?.title ?: ""
-                    val content = tv?.content?.firstOrNull()
-                    val sName = content?.seasonName ?: ""
-                    val sNum = extractSeasonNumberFromTitle("$postTitle $sName") ?: 1
-                    Triple(idx, sNum, sName)
-                }
-                postMeta.groupBy { it.second }.toSortedMap().mapIndexed { _, (sNum, triples) ->
-                    AnimeSeasonSlot(
-                        uiIndex = triples.first().first, // provisional, re-mapped below
-                        seasonNum = sNum,
-                        seasonName = triples.firstOrNull { it.third.isNotBlank() }?.third,
-                        sourceIndices = triples.map { it.first }
-                    )
-                }.mapIndexed { finalIdx, slot -> slot.copy(uiIndex = finalIdx) }
+                allSeasons = allParsedTv.mapNotNull { tv -> tv?.content?.firstOrNull() }
+                seasonVariants = allSeasons.map { content -> listOf(content) }
             }
 
-            val targetSlot = seasonSlots.getOrNull(selectedSeason ?: 0) ?: seasonSlots.first()
-            val realSeasonNumber = targetSlot.seasonNum
+            val targetIndex = selectedSeason ?: 0
+            val currentSeasonData = allSeasons.getOrNull(targetIndex) ?: allSeasons.firstOrNull()
+                ?: return newAnimeLoadResponse(title, url, TvType.Anime) {}
 
-            val metaTitle    = titleForSeason(title, targetSlot.seasonName, realSeasonNumber)
+            val realSeasonNumber = targetIndex + 1
+
+            val metaTitle    = titleForSeason(title, currentSeasonData.seasonName, realSeasonNumber)
             val baseMeta     = resolveAnimeMetaCached(cleanedTitle, year, true)
 
             val seasonResolution = resolveAnimeSeasonDynamically(
                 baseTitle    = title,
-                seasonName   = targetSlot.seasonName,
+                seasonName   = currentSeasonData.seasonName,
                 seasonNumber = realSeasonNumber,
                 year         = year,
                 baseMeta     = baseMeta
@@ -1330,25 +1292,22 @@ class CircleFtpProvider : MainAPI() {
                 ?.let { alId -> getAniZipEpisodeTitles(alId) }
                 ?: emptyMap()
 
-            // Gather contents, source titles, and url-checks for the target season only
-            val slotContents = if (isStackedLayout) {
-                targetSlot.sourceIndices.mapNotNull { rIdx ->
-                    allParsedTv[rIdx]?.content?.getOrNull(targetSlot.uiIndex)
-                }
+            // For episode merging: use the correct variant list for this season
+            val slotContents = seasonVariants.getOrNull(targetIndex) ?: emptyList()
+
+            val sourceTitles = if (isStacked) {
+                loadDataList.map { d -> d.name ?: d.title }
             } else {
-                targetSlot.sourceIndices.mapNotNull { rIdx ->
-                    allParsedTv[rIdx]?.content?.firstOrNull()
-                }
+                listOf(loadDataList.getOrNull(targetIndex)?.let { d -> d.name ?: d.title } ?: title)
             }
 
-            val slotSourceTitles = targetSlot.sourceIndices.map { sIdx ->
-                loadDataList[sIdx].name ?: loadDataList[sIdx].title
-            }
-            val slotUrlChecks = targetSlot.sourceIndices.map { sIdx ->
-                urlChecks.getOrNull(sIdx) ?: false
+            val slotUrlChecks = if (isStacked) {
+                urlChecks
+            } else {
+                listOf(urlChecks.getOrNull(targetIndex) ?: false)
             }
 
-            val mergedEpisodes = mergeEpisodeStreamsForSeason(slotContents, slotUrlChecks, slotSourceTitles)
+            val mergedEpisodes = mergeEpisodeStreamsForSeason(slotContents, slotUrlChecks, sourceTitles)
 
             val episodesData: List<Episode> = mergedEpisodes.mapIndexed { idx, mergedEpisode ->
                 val epNum        = mergedEpisode.episodeNumber
@@ -1369,13 +1328,19 @@ class CircleFtpProvider : MainAPI() {
                 }
             }
 
-            // Recommendation links for every OTHER season slot
-            val recommendationItems: List<SearchResponse> = seasonSlots.mapNotNull { slot ->
-                if (slot.uiIndex == targetSlot.uiIndex) return@mapNotNull null
-                val seasonTitle = titleForSeason(title, slot.seasonName, slot.seasonNum)
+            // Recommendation links for OTHER seasons
+            val recommendationItems: List<SearchResponse> = allSeasons.mapIndexedNotNull { index, _ ->
+                if (index == targetIndex) return@mapIndexedNotNull null
+                val seasonNum   = index + 1
+                val seasonTitle = titleForSeason(title, allSeasons.getOrNull(index)?.seasonName, seasonNum)
+                val recUrl = if (isStacked) {
+                    makeContentUrl(loadData.id, index, postIds)
+                } else {
+                    makeContentUrl(postIds.getOrNull(index) ?: loadData.id, 0, emptyList())
+                }
                 newAnimeSearchResponse(
                     seasonTitle,
-                    makeContentUrl(loadData.id, slot.uiIndex, postIds),
+                    recUrl,
                     TvType.Anime
                 ) {
                     this.posterUrl = targetMeta.poster ?: fallbackPoster
