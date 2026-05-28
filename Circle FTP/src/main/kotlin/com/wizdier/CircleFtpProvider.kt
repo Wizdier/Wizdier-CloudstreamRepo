@@ -122,7 +122,7 @@ class CircleFtpProvider : MainAPI() {
         t = t.replace(Regex("""(?i)\b(web[- ]?dl|webrip|bluray|hdrip|brrip|dvdrip|hdtv|hdcam|hdts|camrip|hdtc|hq|hd|uhd)\b"""), "")
         t = t.replace(Regex("""(?i)\b(1080p|720p|480p|2160p|4k|hevc|x264|x265|10bit|hdr|dv)\b"""), "")
         t = t.replace(Regex("""[\[\(].*?[\]\)]"""), "")
-        t = t.replace(Regex("""[:\-–—]"""), " ")
+        t = t.replace(Regex(""":[\-–—]"""), " ")
         t = t.replace(Regex("""\s{2,}"""), " ")
         return t.trim()
     }
@@ -297,7 +297,7 @@ class CircleFtpProvider : MainAPI() {
         )
         v = v.replace(Regex("""[\[\(][\s\-_,]*[\]\)]"""), "")
         v = v.replace(Regex("""[\[\(].*?[\]\)]"""), "")
-        v = v.replace(Regex("""[:\-–—]"""), " ")
+        v = v.replace(Regex(""":[\-–—]"""), " ")
         v = v.replace(Regex("""\s{2,}"""), " ")
         return v.trim().lowercase()
     }
@@ -1236,7 +1236,6 @@ class CircleFtpProvider : MainAPI() {
                 try { r.parsed<TvSeries>() } catch (_: Exception) { null }
             }
 
-            // Detect layout: stacked = one post with multiple contents; split = each post is its own season
             val isStacked = (tvData.content.size > 1)
 
             val allSeasons: List<Content>
@@ -1292,7 +1291,6 @@ class CircleFtpProvider : MainAPI() {
                 ?.let { alId -> getAniZipEpisodeTitles(alId) }
                 ?: emptyMap()
 
-            // For episode merging: use the correct variant list for this season
             val slotContents = seasonVariants.getOrNull(targetIndex) ?: emptyList()
 
             val sourceTitles = if (isStacked) {
@@ -1300,7 +1298,6 @@ class CircleFtpProvider : MainAPI() {
             } else {
                 listOf(loadDataList.getOrNull(targetIndex)?.let { d -> d.name ?: d.title } ?: title)
             }
-
             val slotUrlChecks = if (isStacked) {
                 urlChecks
             } else {
@@ -1328,7 +1325,6 @@ class CircleFtpProvider : MainAPI() {
                 }
             }
 
-            // Recommendation links for OTHER seasons
             val recommendationItems: List<SearchResponse> = allSeasons.mapIndexedNotNull { index, _ ->
                 if (index == targetIndex) return@mapIndexedNotNull null
                 val seasonNum   = index + 1
