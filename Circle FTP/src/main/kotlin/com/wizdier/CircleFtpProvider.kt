@@ -452,8 +452,7 @@ class CircleFtpProvider : MainAPI() {
         return AniZipFull(
             anilistId = fallbackAnilistId ?: json.optInt("anilist_id").takeIf { n -> n != 0 }
                 ?: m?.optInt("anilist_id")?.takeIf { n -> n != 0 },
-            malId = fallbackMalId ?: m?.optInt("mal_id")?.takeIf { n -> n != 0 },
-            kitsuId = fallbackKitsuId ?: m?.optString("kitsu_id")?.takeIf { s -> s.isNotBlank() },
+            malId = fallbackMalId ?: m?.optString("kitsu_id")?.takeIf { s -> s.isNotBlank() },
             simklId = m?.optInt("simkl_id")?.takeIf { n -> n != 0 },
             tmdbId = fallbackTmdbId ?: m?.optString("themoviedb_id")?.takeIf { s -> s.isNotBlank() }
         )
@@ -892,7 +891,7 @@ class CircleFtpProvider : MainAPI() {
                 val charName = edge.node?.name?.full
                 val charImage = edge.node?.image?.large
                 charName?.let { n -> ActorData(Actor(n, charImage)) }
-            } ?: fallback.actors,
+             } ?: fallback.actors,
             anilistId = aniList.id,
             malId = aniZip?.malId ?: aniList.idMal,
             kitsuId = aniZip?.kitsuId,
@@ -941,19 +940,21 @@ class CircleFtpProvider : MainAPI() {
         }
 
         if (relationNode != null && relationId != null && relationId != baseMeta.anilistId) {
-    val seasonMeta = resolvedAnimeMetaFromAniListNode(relationNode, relationZip, baseMeta, true)
-    return SeasonAnimeResolution(
-        meta = seasonMeta,
-        ids = SeasonIds(
-            anilistId = relationNode.id,
-            malId = relationZip?.malId ?: relationNode.idMal,
-            kitsuId = relationZip?.kitsuId,
-            simklId = relationZip?.simklId
-        ),
-        aniListNode = relationNode,
-        aniZip = relationZip
-    )
- 
+            val hasEpisodes = (relationNode.episodes ?: 0) > 0 || (relationNode.streamingEpisodes?.size ?: 0) > 0
+            if (hasEpisodes) {
+                val seasonMeta = resolvedAnimeMetaFromAniListNode(relationNode, relationZip, baseMeta, true)
+                return SeasonAnimeResolution(
+                    meta = seasonMeta,
+                    ids = SeasonIds(
+                        anilistId = relationNode.id,
+                        malId = relationZip?.malId ?: relationNode.idMal,
+                        kitsuId = relationZip?.kitsuId,
+                        simklId = relationZip?.simklId
+                    ),
+                    aniListNode = relationNode,
+                    aniZip = relationZip
+                )
+            }
         }
 
         // Strategy 2: parallel candidate title search (fallback)
@@ -968,8 +969,16 @@ class CircleFtpProvider : MainAPI() {
             }.awaitAll()
         }
 
-                val selected = candidates.firstOrNull { (aniListNode, _) ->
-            aniListNode?.id != null && aniListNode.id != baseMeta.anilistId
+        val selected = candidates.firstOrNull { (aniListNode, aniZip) ->
+            aniListNode?.id != null &&
+                aniListNode.id != baseMeta.anilistId &&
+                (
+                    aniZip?.malId != null ||
+                        aniZip?.kitsuId != null ||
+                        aniZip?.simklId != null ||
+                        aniZip?.tmdbId != null ||
+                        aniListNode.idMal != null
+                    )
         }
 
         if (selected != null) {
@@ -1260,8 +1269,7 @@ class CircleFtpProvider : MainAPI() {
             loadDataList.forEach { data ->
                 extractSeasonNumberOrNull(data.name ?: data.title)?.let { n -> if (n > 0) detectedSeasonNumbers += n }
             }
-            val isMultiSeasonAnime = isStacked || allSeasons.size > 1 || detectedSeasonNumbers.size > 1
-
+            val isMultiSeasonAnime = isStacked || detectedSeasonNumbers.size > 1
 
             val targetIndex = selectedSeason ?: 0
             val currentSeasonData = allSeasons.getOrNull(targetIndex) ?: allSeasons.firstOrNull()
@@ -1328,7 +1336,7 @@ class CircleFtpProvider : MainAPI() {
                 val aniZipTitle = aniZipEpTitles[epNum]
                 val aniListTitle = targetMeta.anilistEpisodes?.getOrNull(idx)?.title
                 val serverTitle = mergedEpisode.title
-                    ?.replace(Regex("(?i)Episode\\s*\\d+"), "")
+        ?.replace(Regex("(?i)Episode\\s*\\d+"), "")
                     ?.trim()
                     ?.ifBlank { null }
                 val epTitle = aniZipTitle ?: aniListTitle ?: serverTitle ?: "Episode $epNum"
