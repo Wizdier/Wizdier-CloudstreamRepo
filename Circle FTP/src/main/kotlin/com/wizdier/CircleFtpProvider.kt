@@ -1270,7 +1270,8 @@ class CircleFtpProvider : MainAPI() {
             loadDataList.forEach { data ->
                 extractSeasonNumberOrNull(data.name ?: data.title)?.let { n -> if (n > 0) detectedSeasonNumbers += n }
             }
-            val isMultiSeasonAnime = isStacked || detectedSeasonNumbers.size > 1
+            val isMultiSeasonAnime = isStacked || allSeasons.size > 1 || detectedSeasonNumbers.size > 1
+
 
             val targetIndex = selectedSeason ?: 0
             val currentSeasonData = allSeasons.getOrNull(targetIndex) ?: allSeasons.firstOrNull()
