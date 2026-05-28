@@ -152,6 +152,12 @@ class CircleFtpProvider : MainAPI() {
         }
     }
 
+    private fun extractSeasonNumberFromTitle(title: String): Int {
+        return Regex("""(?i)\bseason\s*(\d+)\b""").find(title)?.groupValues?.getOrNull(1)?.toIntOrNull()
+            ?: Regex("""(?i)\bs(\d+)\b""").find(title)?.groupValues?.getOrNull(1)?.toIntOrNull()
+            ?: 1
+    }
+
     private fun isDubTitle(title: String): Boolean {
         val t = title.lowercase()
         return listOf("dubbed", "dual audio", "multi audio", "eng+jap", "english+japanese", "hindi").any { kw -> t.contains(kw) }
@@ -298,10 +304,18 @@ class CircleFtpProvider : MainAPI() {
 
     private fun mergeKeyForPost(post: Post): MergeKey {
         val rawTitle = post.name?.ifBlank { post.title } ?: post.title
+        val isAnime = isAnimeContent(post.categories, post.title) || post.title.contains("anime", true)
+        val cleanedTitle = if (isAnime) {
+            cleanTitle(rawTitle).lowercase()
+        } else {
+            normalizeMergeTitle(rawTitle)
+        }
+        // For anime series, ignore year so that different seasons group together
+        val isSeries = post.type.lowercase() == "series"
         return MergeKey(
-            title = normalizeMergeTitle(rawTitle),
+            title = cleanedTitle,
             type = post.type.lowercase(),
-            year = selectUntilNonInt(post.year)
+            year = if (isSeries && isAnime) null else selectUntilNonInt(post.year)
         )
     }
 
@@ -414,19 +428,13 @@ class CircleFtpProvider : MainAPI() {
         """.trimIndent()
     }
 
-    /**
-     * Converts a raw AniList trailer object into a full playback URL.
-     * Raw IDs from AniList are YouTube video hashes; we always format them
-     * into a complete https://www.youtube.com/watch?v=… URL here.
-     */
     private fun getAniListTrailerUrl(trailer: AniListTrailer?): String? {
         val trailerId = trailer?.id?.takeIf { tid -> tid.isNotBlank() } ?: return null
-        // Already a full URL – return as-is
         if (trailerId.startsWith("http://") || trailerId.startsWith("https://")) return trailerId
         return when (trailer.site?.lowercase()) {
             "youtube"     -> "https://www.youtube.com/watch?v=$trailerId"
             "dailymotion" -> "https://www.dailymotion.com/video/$trailerId"
-            else          -> "https://www.youtube.com/watch?v=$trailerId" // assume YouTube if unknown
+            else          -> "https://www.youtube.com/watch?v=$trailerId"
         }
     }
 
@@ -549,7 +557,6 @@ class CircleFtpProvider : MainAPI() {
             app.get(searchUrl, cacheTime = 86400).text
         ).results?.firstOrNull() ?: return null
         val logo = fetchTmdbLogo(first.id, isSeries)
-        // Fetch detailed info including external_ids for IMDB and high-res backdrop
         var imdbId: String? = null
         var backdrop = first.backdropPath?.let { p -> "$tmdbBackdropBase$p" }
         try {
@@ -617,10 +624,6 @@ class CircleFtpProvider : MainAPI() {
         } catch (_: Exception) { null }
     }
 
-    /**
-     * Fetches an official trailer from TMDB and always returns a complete URL.
-     * Priority: official YouTube Trailer → any YouTube Trailer → YouTube Teaser → Dailymotion.
-     */
     private suspend fun fetchTmdbTrailer(tmdbId: Int?, isSeries: Boolean): String? {
         if (tmdbId == null) return null
         return try {
@@ -644,7 +647,6 @@ class CircleFtpProvider : MainAPI() {
                 v.optString("site").equals("Dailymotion", true)
             }
             val key = preferred?.optString("key")?.takeIf { k -> k.isNotBlank() } ?: return null
-            // Always produce a full URL – never return a bare hash
             when (preferred.optString("site").lowercase()) {
                 "youtube"     -> "https://www.youtube.com/watch?v=$key"
                 "dailymotion" -> "https://www.dailymotion.com/video/$key"
@@ -739,7 +741,6 @@ class CircleFtpProvider : MainAPI() {
 
         if (aniList == null) aniList = zipFromMal?.anilistId?.let { alId -> getAniListMetaById(alId) }
 
-        // Compiler-safety: avoid !! by extracting to an explicit val
         val safeAniListId = aniList?.id
         if (aniZip == null && safeAniListId != null) aniZip = getAniZipFullCached(safeAniListId)
 
@@ -871,10 +872,6 @@ class CircleFtpProvider : MainAPI() {
         )
     }
 
-    /**
-     * For seasons > 1 this performs cross-referenced AniList + AniZip lookups using
-     * multiple candidate title strings so each season gets its own unique IDs.
-     */
     private suspend fun resolveAnimeSeasonDynamically(
         baseTitle: String,
         seasonName: String?,
@@ -898,9 +895,48 @@ class CircleFtpProvider : MainAPI() {
             )
         }
 
+        // ── Strategy 1: follow AniList SEQUEL relation chain ─────────────────
+        var relationNode: AniListMeta? = null
+        val baseNode = baseMeta.anilistId?.let { alId -> getAniListMetaById(alId) }
+        if (baseNode != null) {
+            var current: AniListMeta? = baseNode
+            repeat(seasonNumber - 1) {
+                val next = current?.relations?.edges
+                    ?.firstOrNull { edge -> edge.relationType.equals("SEQUEL", ignoreCase = true) }
+                    ?.node
+                current = next
+            }
+            relationNode = current
+        }
+
+        var relationZip: AniZipFull? = null
+        val relationId = relationNode?.id
+        if (relationId != null && relationId != baseMeta.anilistId) {
+            relationZip = getAniZipFullCached(relationId)
+        }
+
+        if (relationNode != null && relationId != null && relationId != baseMeta.anilistId) {
+            // Only accept the sequel if it looks like a real season (has episodes data)
+            val hasEpisodes = (relationNode.episodes ?: 0) > 0 || (relationNode.streamingEpisodes?.size ?: 0) > 0
+            if (hasEpisodes) {
+                val seasonMeta = resolvedAnimeMetaFromAniListNode(relationNode, relationZip, baseMeta, true)
+                return SeasonAnimeResolution(
+                    meta = seasonMeta,
+                    ids  = SeasonIds(
+                        anilistId = relationNode.id,
+                        malId     = relationZip?.malId ?: relationNode.idMal,
+                        kitsuId   = relationZip?.kitsuId,
+                        simklId   = relationZip?.simklId
+                    ),
+                    aniListNode = relationNode,
+                    aniZip      = relationZip
+                )
+            }
+        }
+
+        // ── Strategy 2: parallel candidate title search (fallback) ─────────────
         val candidateTitles = animeSeasonSearchTitles(baseTitle, seasonName, seasonNumber)
 
-        // Fan out all candidate lookups in parallel
         val candidates: List<Pair<AniListMeta?, AniZipFull?>> = coroutineScope {
             candidateTitles.map { candidateTitle ->
                 async {
@@ -911,8 +947,6 @@ class CircleFtpProvider : MainAPI() {
             }.awaitAll()
         }
 
-        // Pick the first result that has a distinct AniList ID and at least one
-        // cross-reference ID so we know it really is a different season entry
         val selected = candidates.firstOrNull { (aniListNode, aniZip) ->
             aniListNode?.id != null &&
                 aniListNode.id != baseMeta.anilistId &&
@@ -926,23 +960,25 @@ class CircleFtpProvider : MainAPI() {
         }
 
         if (selected != null) {
-            val (aniListNode, aniZip) = selected
-            val seasonMeta = resolvedAnimeMetaFromAniListNode(aniListNode!!, aniZip, baseMeta, true)
-            return SeasonAnimeResolution(
-                meta = seasonMeta,
-                ids  = SeasonIds(
-                    anilistId = aniListNode.id,
-                    malId     = aniZip?.malId ?: aniListNode.idMal,
-                    kitsuId   = aniZip?.kitsuId,
-                    simklId   = aniZip?.simklId
-                ),
-                aniListNode = aniListNode,
-                aniZip      = aniZip
-            )
+            val selectedNode = selected.first
+            val selectedZip  = selected.second
+            if (selectedNode != null) {
+                val seasonMeta = resolvedAnimeMetaFromAniListNode(selectedNode, selectedZip, baseMeta, true)
+                return SeasonAnimeResolution(
+                    meta = seasonMeta,
+                    ids  = SeasonIds(
+                        anilistId = selectedNode.id,
+                        malId     = selectedZip?.malId ?: selectedNode.idMal,
+                        kitsuId   = selectedZip?.kitsuId,
+                        simklId   = selectedZip?.simklId
+                    ),
+                    aniListNode = selectedNode,
+                    aniZip      = selectedZip
+                )
+            }
         }
 
-        // Graceful fallback – reuse the base series meta but clear IDs so we don't
-        // accidentally tag a different season with Season 1's tracking IDs
+        // Graceful fallback: clear IDs so we don't tag a different season with S1 IDs
         return SeasonAnimeResolution(
             meta = baseMeta,
             ids  = SeasonIds(),
@@ -1003,7 +1039,6 @@ class CircleFtpProvider : MainAPI() {
         val fallbackPoster = "$mainApiUrl/uploads/${post.imageSm}"
         val year = selectUntilNonInt(post.year)
 
-        // Align cache keys with the cleaned titles used during resolution in load()
         val cleanedForCache = cleanTitle(rawTitle).lowercase()
         val cachedAnimePoster = animeMetaCache["${isSeries}|${year ?: 0}|$cleanedForCache"]?.poster
         val cachedTmdbPoster  = tmdbMetaCache["${isSeries}|${year ?: 0}|$cleanedForCache"]?.poster
@@ -1028,23 +1063,16 @@ class CircleFtpProvider : MainAPI() {
     }
 
     /**
-     * Converts a [Post] into a list of [SearchResponse] objects.
-     *
-     * KEY CHANGE – Anime multi-season behaviour:
-     *   • For anime series we always surface only a single base entry (Season 1 / index 0)
-     *     on the grid. Subsequent seasons are surfaced through recommendations inside load().
-     *     This eliminates duplicated season tiles on the home / search layout.
-     *   • For regular TV series the original per-season splitting is preserved.
-     *   • Movies are unchanged.
+     * Anime = one base tile (season index 0).  All other types stay stacked as a single tile.
      */
     private suspend fun toSearchResults(post: Post, groupedPostIds: List<Int> = emptyList()): List<SearchResponse> {
         val isAnime   = isAnimeContent(post.categories, post.title) || post.title.contains("anime", true)
         val baseTitle = post.name?.ifBlank { post.title } ?: post.title
 
-        if (post.type == "series" && isAnime) {
-            // ── Anime series: expose ONE entry (Season 1) pointing to seasonIndex=0.
+        return if (post.type == "series" && isAnime) {
+            // Anime series: expose ONE entry pointing to seasonIndex=0.
             // Further seasons are navigable via recommendations from load().
-            return listOfNotNull(
+            listOfNotNull(
                 createSearchResult(
                     post          = post,
                     overrideTitle = stripSeasonSuffixForAnime(baseTitle),
@@ -1052,31 +1080,35 @@ class CircleFtpProvider : MainAPI() {
                     groupedPostIds = groupedPostIds
                 )
             )
+        } else {
+            // TV non-anime, Movies, Cartoon, etc.: single stacked entry (never split per season)
+            listOfNotNull(
+                createSearchResult(
+                    post           = post,
+                    overrideTitle  = baseTitle,
+                    seasonIndex    = null,
+                    groupedPostIds = groupedPostIds
+                )
+            )
         }
+    }
 
-        if (post.type == "series") {
-            // ── Regular TV series: keep original per-season split
-            val tvData  = fetchPostTvDataCached(post.id)
-            val seasons = tvData?.content.orEmpty()
-            if (seasons.size > 1) {
-                return seasons.mapIndexedNotNull { index, season ->
-                    createSearchResult(
-                        post          = post,
-                        overrideTitle = titleForSeason(baseTitle, season.seasonName, index + 1),
-                        seasonIndex   = index,
-                        groupedPostIds = groupedPostIds
-                    )
-                }
-            }
-        }
-
-        return listOfNotNull(createSearchResult(post, groupedPostIds = groupedPostIds))
+    private fun extractSeasonNumberFromTitle(title: String): Int {
+        return Regex("""(?i)\bseason\s*(\d+)\b""").find(title)?.groupValues?.getOrNull(1)?.toIntOrNull()
+            ?: Regex("""(?i)\bs(\d+)\b""").find(title)?.groupValues?.getOrNull(1)?.toIntOrNull()
+            ?: 1
     }
 
     private suspend fun createMergedSearchResult(posts: List<Post>): List<SearchResponse> {
         if (posts.isEmpty()) return emptyList()
-        val primary    = posts.first()
-        val groupedIds = posts.map { p -> p.id }.distinct()
+        val isAnimeGroup = posts.all { isAnimeContent(it.categories, it.title) || it.title.contains("anime", true) }
+        val sortedPosts = if (isAnimeGroup) {
+            posts.sortedBy { post -> extractSeasonNumberFromTitle(post.name ?: post.title) }
+        } else {
+            posts
+        }
+        val primary    = sortedPosts.first()
+        val groupedIds = sortedPosts.map { p -> p.id }.distinct()
         return toSearchResults(primary, groupedIds)
     }
 
@@ -1119,6 +1151,13 @@ class CircleFtpProvider : MainAPI() {
         }
     }
 
+    private data class AnimeSeasonSlot(
+        val uiIndex: Int,
+        val seasonNum: Int,
+        val seasonName: String?,
+        val sourceIndices: List<Int>
+    )
+
     override suspend fun load(url: String): LoadResponse {
         val postIds = groupedVariantPostIds(url)
 
@@ -1159,12 +1198,10 @@ class CircleFtpProvider : MainAPI() {
 
             return if (isAnime) {
                 val meta    = resolveAnimeMetaCached(cleanedTitle, year, false)
-                // meta.trailer already resolved via TMDB / AniList inside resolveAnimeMeta
                 val trailer = meta.trailer
 
                 newAnimeLoadResponse(meta.title.ifBlank { title }, url, TvType.AnimeMovie) {
                     this.posterUrl            = meta.poster ?: fallbackPoster
-                    // Fix: always populate backgroundPosterUrl with backdrop/bannerImage
                     this.backgroundPosterUrl = meta.background ?: meta.poster ?: fallbackPoster
                     this.year                = year
                     this.plot                = meta.plot ?: loadData.metaData
@@ -1192,7 +1229,6 @@ class CircleFtpProvider : MainAPI() {
 
                 newMovieLoadResponse(title, url, TvType.Movie, link) {
                     this.posterUrl            = meta?.poster ?: fallbackPoster
-                    // Fix: explicit backdrop assignment (original TMDB res or AniList banner)
                     this.backgroundPosterUrl = meta?.backdrop ?: meta?.poster ?: fallbackPoster
                     this.year                = year
                     this.plot                = meta?.overview ?: loadData.metaData
@@ -1214,17 +1250,58 @@ class CircleFtpProvider : MainAPI() {
 
         return if (isAnime) {
 
-            val allSeasons        = tvData.content
-            val targetIndex       = selectedSeason ?: 0
-            val currentSeasonData = allSeasons.getOrNull(targetIndex) ?: allSeasons.first()
-            val realSeasonNumber  = targetIndex + 1
+            // Parse all grouped responses to detect layout (stacked vs separate folders)
+            val allParsedTv: List<TvSeries?> = responses.map { r ->
+                try { r.parsed<TvSeries>() } catch (_: Exception) { null }
+            }
 
-            val metaTitle    = titleForSeason(title, currentSeasonData.seasonName, realSeasonNumber)
+            val primaryTv = allParsedTv.firstOrNull()
+            val isStackedLayout = (primaryTv?.content?.size ?: 0) > 1
+
+            val seasonSlots: List<AnimeSeasonSlot> = if (isStackedLayout) {
+                // Layout A: every post contains the same season list; posts are quality/audio variants
+                val count = primaryTv!!.content.size
+                List(count) { seasonIdx ->
+                    val sName = primaryTv.content.getOrNull(seasonIdx)?.seasonName
+                    val indices = allParsedTv.indices.filter { rIdx ->
+                        allParsedTv[rIdx]?.content?.getOrNull(seasonIdx) != null
+                    }
+                    AnimeSeasonSlot(
+                        uiIndex = seasonIdx,
+                        seasonNum = seasonIdx + 1,
+                        seasonName = sName,
+                        sourceIndices = indices
+                    )
+                }
+            } else {
+                // Layout B: each post may be a distinct season (or variant of same season)
+                val postMeta = allParsedTv.mapIndexed { idx, tv ->
+                    val data = loadDataList.getOrNull(idx)
+                    val postTitle = data?.name ?: data?.title ?: ""
+                    val content = tv?.content?.firstOrNull()
+                    val sName = content?.seasonName ?: ""
+                    val sNum = extractSeasonNumberFromTitle("$postTitle $sName") ?: 1
+                    Triple(idx, sNum, sName)
+                }
+                postMeta.groupBy { it.second }.toSortedMap().mapIndexed { _, (sNum, triples) ->
+                    AnimeSeasonSlot(
+                        uiIndex = triples.first().first, // provisional, re-mapped below
+                        seasonNum = sNum,
+                        seasonName = triples.firstOrNull { it.third.isNotBlank() }?.third,
+                        sourceIndices = triples.map { it.first }
+                    )
+                }.mapIndexed { finalIdx, slot -> slot.copy(uiIndex = finalIdx) }
+            }
+
+            val targetSlot = seasonSlots.getOrNull(selectedSeason ?: 0) ?: seasonSlots.first()
+            val realSeasonNumber = targetSlot.seasonNum
+
+            val metaTitle    = titleForSeason(title, targetSlot.seasonName, realSeasonNumber)
             val baseMeta     = resolveAnimeMetaCached(cleanedTitle, year, true)
 
             val seasonResolution = resolveAnimeSeasonDynamically(
                 baseTitle    = title,
-                seasonName   = currentSeasonData.seasonName,
+                seasonName   = targetSlot.seasonName,
                 seasonNumber = realSeasonNumber,
                 year         = year,
                 baseMeta     = baseMeta
@@ -1237,7 +1314,6 @@ class CircleFtpProvider : MainAPI() {
 
             val seasonTmdbId    = seasonAniZip?.tmdbId?.toIntOrNull()
 
-            // Build lightweight TMDB wrapper from season's cross-reference if available
             val seasonTmdbMeta: TmdbMeta? = seasonTmdbId?.let { tId ->
                 TmdbMeta(
                     poster   = null,
@@ -1254,14 +1330,25 @@ class CircleFtpProvider : MainAPI() {
                 ?.let { alId -> getAniZipEpisodeTitles(alId) }
                 ?: emptyMap()
 
-            // Collect matching season content from every variant post
-            val seriesVariants: List<Content> = responses.mapNotNull { response ->
-                val parsedSeries = response.parsed<TvSeries>()
-                parsedSeries.content.getOrNull(targetIndex) ?: parsedSeries.content.firstOrNull()
+            // Gather contents, source titles, and url-checks for the target season only
+            val slotContents = if (isStackedLayout) {
+                targetSlot.sourceIndices.mapNotNull { rIdx ->
+                    allParsedTv[rIdx]?.content?.getOrNull(targetSlot.uiIndex)
+                }
+            } else {
+                targetSlot.sourceIndices.mapNotNull { rIdx ->
+                    allParsedTv[rIdx]?.content?.firstOrNull()
+                }
             }
 
-            val sourceTitles    = loadDataList.map { d -> d.name ?: d.title }
-            val mergedEpisodes  = mergeEpisodeStreamsForSeason(seriesVariants, urlChecks, sourceTitles)
+            val slotSourceTitles = targetSlot.sourceIndices.map { sIdx ->
+                loadDataList[sIdx].name ?: loadDataList[sIdx].title
+            }
+            val slotUrlChecks = targetSlot.sourceIndices.map { sIdx ->
+                urlChecks.getOrNull(sIdx) ?: false
+            }
+
+            val mergedEpisodes = mergeEpisodeStreamsForSeason(slotContents, slotUrlChecks, slotSourceTitles)
 
             val episodesData: List<Episode> = mergedEpisodes.mapIndexed { idx, mergedEpisode ->
                 val epNum        = mergedEpisode.episodeNumber
@@ -1282,17 +1369,13 @@ class CircleFtpProvider : MainAPI() {
                 }
             }
 
-            // ── Build recommendation links for OTHER seasons of THIS anime ──
-            // Each is a separate AnimeSearchResponse pointing to the correct seasonIndex.
-            // When the user taps one, load() will re-run resolveAnimeSeasonDynamically()
-            // with that season's index and pull its own accurate tracking IDs.
-            val recommendationItems: List<SearchResponse> = allSeasons.mapIndexedNotNull { index, season ->
-                if (index == targetIndex) return@mapIndexedNotNull null
-                val seasonNum   = index + 1
-                val seasonTitle = titleForSeason(title, season.seasonName, seasonNum)
+            // Recommendation links for every OTHER season slot
+            val recommendationItems: List<SearchResponse> = seasonSlots.mapNotNull { slot ->
+                if (slot.uiIndex == targetSlot.uiIndex) return@mapNotNull null
+                val seasonTitle = titleForSeason(title, slot.seasonName, slot.seasonNum)
                 newAnimeSearchResponse(
                     seasonTitle,
-                    makeContentUrl(loadData.id, index, postIds),
+                    makeContentUrl(loadData.id, slot.uiIndex, postIds),
                     TvType.Anime
                 ) {
                     this.posterUrl = targetMeta.poster ?: fallbackPoster
@@ -1300,13 +1383,10 @@ class CircleFtpProvider : MainAPI() {
                 }
             }
 
-            // Resolve the correct trailer for this specific season
             val seasonTrailer: String? = fetchTmdbTrailer(seasonTmdbMeta?.tmdbId, true)
                 ?: getAniListTrailerUrl(seasonAniListNode?.trailer)
                 ?: targetMeta.trailer
 
-            // Consolidate IDs: for Season 1 fall back to base series IDs when the
-            // season-specific lookup returned nothing
             val idsForCurrentSeason = if (realSeasonNumber == 1) {
                 SeasonIds(
                     anilistId = seasonIds.anilistId ?: baseMeta.anilistId,
@@ -1320,8 +1400,6 @@ class CircleFtpProvider : MainAPI() {
 
             newAnimeLoadResponse(targetMeta.title.ifBlank { metaTitle }, url, TvType.Anime) {
                 this.posterUrl = targetMeta.poster ?: fallbackPoster
-                // Fix: explicit backdrop – prefer season-specific TMDB backdrop (original),
-                // then AniList bannerImage, then resolved meta background
                 this.backgroundPosterUrl = resolveBackdrop(
                     tmdbMeta     = seasonTmdbMeta,
                     aniListMeta  = seasonAniListNode,
@@ -1342,7 +1420,6 @@ class CircleFtpProvider : MainAPI() {
                 idsForCurrentSeason.simklId?.let { s -> addSimklId(s) }
                 baseMeta.imdbId?.let { i -> addImdbId(i) }
 
-                // Attach other-season tiles as recommendations for chained navigation
                 this.recommendations = recommendationItems
 
                 addEpisodes(
@@ -1367,8 +1444,8 @@ class CircleFtpProvider : MainAPI() {
             val episodesData = mutableListOf<Episode>()
 
             tvData.content.forEachIndexed { seasonIndex, _ ->
-                val seasonNum      = seasonIndex + 1
-                val tmdbEpisodes   = tmdbId?.let { tId -> fetchTmdbSeasonEpisodes(tId, seasonNum) } ?: emptyList()
+                val seasonNum     = seasonIndex + 1
+                val tmdbEpisodes  = tmdbId?.let { tId -> fetchTmdbSeasonEpisodes(tId, seasonNum) } ?: emptyList()
                 val seasonContents = allSeriesVariants.mapNotNull { series -> series.content.getOrNull(seasonIndex) }
                 val mergedEpisodes = mergeEpisodeStreamsForSeason(seasonContents, urlChecks, sourceTitles)
 
@@ -1391,7 +1468,6 @@ class CircleFtpProvider : MainAPI() {
 
             newTvSeriesLoadResponse(title, url, TvType.TvSeries, episodesData) {
                 this.posterUrl            = meta?.poster ?: fallbackPoster
-                // Fix: explicit backdrop assignment (original TMDB res)
                 this.backgroundPosterUrl = meta?.backdrop ?: meta?.poster ?: fallbackPoster
                 this.year                = year
                 this.plot                = meta?.overview ?: loadData.metaData
