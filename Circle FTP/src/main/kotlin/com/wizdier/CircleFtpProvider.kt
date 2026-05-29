@@ -938,6 +938,7 @@ class CircleFtpProvider : MainAPI() {
         year: Int?,
         baseMeta: ResolvedAnimeMeta
     ): SeasonAnimeResolution {
+        // Season 1: return baseMeta IDs directly — no dynamic resolution needed.
         if (seasonNumber <= 1) {
             return SeasonAnimeResolution(
                 meta = baseMeta,
@@ -954,78 +955,126 @@ class CircleFtpProvider : MainAPI() {
 
         val candidateTitles = animeSeasonSearchTitles(baseTitle, seasonName, seasonNumber)
 
-        // ─── Search Kitsu for season sequence ──────────────────────────────
+        // ─── Search Kitsu for this specific season ─────────────────────────
         var seasonKitsu: KitsuMeta? = null
         var seasonKitsuZip: AniZipFull? = null
-        for (candidate in candidateTitles) {
-            seasonKitsu = getKitsuMetaCached(candidate) ?: getKitsuMeta(candidate)
-            if (seasonKitsu?.id != null) {
-                seasonKitsuZip = getAniZipByKitsuId(seasonKitsu.id)
-                if (seasonKitsuZip?.anilistId != null || seasonKitsuZip?.malId != null) break
-            }
-        }
-
-        // ─── Search MAL for season sequence ──────────────────────────────────
-        var seasonMalId: Int? = seasonKitsuZip?.malId
-        var seasonMalZip: AniZipFull? = null
-        if (seasonMalId == null) {
-            for (candidate in candidateTitles) {
-                seasonMalId = searchMalId(candidate)
-                if (seasonMalId != null) {
-                    seasonMalZip = getAniZipByMalId(seasonMalId)
-                    if (seasonMalZip?.anilistId != null) break
+        for (kitsuCandidate in candidateTitles) {
+            val kitsuResult = getKitsuMetaCached(kitsuCandidate) ?: getKitsuMeta(kitsuCandidate)
+            if (kitsuResult?.id != null) {
+                val kitsuZip = getAniZipByKitsuId(kitsuResult.id)
+                // Accept only if AniZip confirms a distinct entry (has its own AniList or MAL ID)
+                if (kitsuZip?.anilistId != null || kitsuZip?.malId != null) {
+                    seasonKitsu = kitsuResult
+                    seasonKitsuZip = kitsuZip
+                    break
+                }
+                // Keep as candidate even without AniZip confirmation
+                if (seasonKitsu == null) {
+                    seasonKitsu = kitsuResult
+                    seasonKitsuZip = kitsuZip
                 }
             }
         }
 
-        // ─── Search TMDB for season sequence ───────────────────────────────
+        // ─── Search MAL for this specific season ──────────────────────────
+        var seasonMalId: Int? = seasonKitsuZip?.malId
+        var seasonMalZip: AniZipFull? = null
+        if (seasonMalId == null) {
+            for (malCandidate in candidateTitles) {
+                val foundMalId = searchMalId(malCandidate)
+                if (foundMalId != null) {
+                    val malZip = getAniZipByMalId(foundMalId)
+                    if (malZip?.anilistId != null) {
+                        seasonMalId = foundMalId
+                        seasonMalZip = malZip
+                        break
+                    }
+                    if (seasonMalId == null) {
+                        seasonMalId = foundMalId
+                        seasonMalZip = malZip
+                    }
+                }
+            }
+        }
+
+        // ─── Search TMDB for this specific season ─────────────────────────
         val seasonTmdbMeta = getTmdbMeta(cleanTitle(baseTitle), year, true)
-        val seasonTmdbZip = seasonTmdbMeta?.tmdbId?.let { getAniZipByTmdbId(it) }
+        val seasonTmdbZip = seasonTmdbMeta?.tmdbId?.let { tmdbIdVal -> getAniZipByTmdbId(tmdbIdVal) }
 
-        // ─── Combine best AniZip from all DBs ────────────────────────────────
-        val bestSeasonZip = seasonKitsuZip ?: seasonMalZip ?: seasonTmdbZip
+        // ─── Combine: prefer Kitsu > MAL > TMDB ───────────────────────────
+        val bestSeasonZip: AniZipFull? = seasonKitsuZip ?: seasonMalZip ?: seasonTmdbZip
 
-        // ─── Search AniList for season sequence (LAST RESORT) ──────────────
+        // ─── Step 1: Resolve AniList ID via cross-DB zip ───────────────────
         var seasonAniList: AniListMeta? = null
         var seasonAniListId: Int? = bestSeasonZip?.anilistId
         if (seasonAniListId != null) {
             seasonAniList = getAniListMetaById(seasonAniListId)
         }
 
-        // Try AniList SEQUEL chain from baseMeta
+        // ─── Step 2: Walk the AniList SEQUEL chain from baseMeta ──────────
+        // Walk exactly (seasonNumber - 1) SEQUEL hops. Each hop is named
+        // explicitly to avoid implicit `it` shadowing inside the loop body.
         if (seasonAniList == null && baseMeta.anilistId != null) {
-            var node: AniListMeta? = getAniListMetaById(baseMeta.anilistId)
-            repeat((seasonNumber - 1).coerceAtLeast(0)) {
-                val nextId = node?.relations?.edges
-                    ?.firstOrNull { edge -> edge.relationType.equals("SEQUEL", ignoreCase = true) }
-                    ?.node?.id
-                node = nextId?.let { getAniListMetaById(it) }
+            var currentNode: AniListMeta? = getAniListMetaById(baseMeta.anilistId)
+            val stepsNeeded = (seasonNumber - 1).coerceAtLeast(0)
+            repeat(stepsNeeded) { _ ->
+                val sequelId = currentNode
+                    ?.relations
+                    ?.edges
+                    ?.firstOrNull { sequelEdge ->
+                        sequelEdge.relationType.equals("SEQUEL", ignoreCase = true)
+                    }
+                    ?.node
+                    ?.id
+                currentNode = sequelId?.let { nextId -> getAniListMetaById(nextId) }
             }
-            if (node != null && node.id != baseMeta.anilistId) {
-                val hasEpisodes = (node.episodes ?: 0) > 0 || (node.streamingEpisodes?.size ?: 0) > 0
-                if (hasEpisodes) {
-                    seasonAniList = node
-                    seasonAniListId = node.id
+            val walkedNode = currentNode
+            if (walkedNode != null && walkedNode.id != baseMeta.anilistId) {
+                val hasContent = (walkedNode.episodes ?: 0) > 0 ||
+                    (walkedNode.streamingEpisodes?.size ?: 0) > 0
+                if (hasContent) {
+                    seasonAniList = walkedNode
+                    seasonAniListId = walkedNode.id
                 }
             }
         }
 
-        // Try direct AniList search with candidate titles
+        // ─── Step 3: Fall back to direct AniList title search ─────────────
         if (seasonAniList == null) {
-            for (candidate in candidateTitles) {
-                val al = getAniListMeta(candidate)
-                if (al != null) {
-                    seasonAniList = al
-                    seasonAniListId = al.id
+            for (titleCandidate in candidateTitles) {
+                val searchResult = getAniListMeta(titleCandidate)
+                if (searchResult != null) {
+                    seasonAniList = searchResult
+                    seasonAniListId = searchResult.id
                     break
                 }
             }
         }
 
-        val seasonAniZip = seasonAniListId?.let { getAniZipFullCached(it) } ?: bestSeasonZip
+        // ─── Step 4: Re-fetch AniZip keyed to THIS season's AniList ID ────
+        // This is the critical step: always derive the final AniZip from the
+        // resolved seasonAniListId so we never carry Season 1's Simkl/MAL IDs.
+        val seasonAniZip: AniZipFull? = when {
+            seasonAniListId != null -> getAniZipFullCached(seasonAniListId)
+            else -> bestSeasonZip
+        }
 
-        val seasonMeta = if (seasonAniList != null) {
-            resolvedAnimeMetaFromAniListNode(seasonAniList, seasonAniZip, baseMeta, true)
+        // ─── Build the per-season IDs — never fall back to baseMeta IDs ───
+        // Each tracker ID must come from this season's resolved data only.
+        // If resolution failed for a given DB, the ID is null for that DB.
+        val resolvedSeasonIds = SeasonIds(
+            anilistId = seasonAniListId,
+            malId = seasonAniList?.idMal ?: seasonAniZip?.malId ?: seasonMalId,
+            kitsuId = seasonKitsu?.id ?: seasonAniZip?.kitsuId,
+            simklId = seasonAniZip?.simklId
+        )
+
+        val seasonMeta: ResolvedAnimeMeta = if (seasonAniList != null) {
+            resolvedAnimeMetaFromAniListNode(seasonAniList, seasonAniZip, baseMeta, true).copy(
+                malId = resolvedSeasonIds.malId,
+                kitsuId = resolvedSeasonIds.kitsuId,
+                simklId = resolvedSeasonIds.simklId
+            )
         } else {
             ResolvedAnimeMeta(
                 title = seasonKitsu?.title ?: titleForSeason(baseTitle, seasonName, seasonNumber),
@@ -1038,22 +1087,17 @@ class CircleFtpProvider : MainAPI() {
                 anilistEpisodes = null,
                 logoUrl = baseMeta.logoUrl,
                 actors = baseMeta.actors,
-                anilistId = seasonAniListId,
-                malId = seasonAniList?.idMal ?: seasonAniZip?.malId ?: seasonMalId ?: baseMeta.malId,
-                kitsuId = seasonKitsu?.id ?: seasonAniZip?.kitsuId ?: baseMeta.kitsuId,
-                simklId = seasonAniZip?.simklId ?: baseMeta.simklId,
+                anilistId = resolvedSeasonIds.anilistId,
+                malId = resolvedSeasonIds.malId,
+                kitsuId = resolvedSeasonIds.kitsuId,
+                simklId = resolvedSeasonIds.simklId,
                 imdbId = baseMeta.imdbId
             )
         }
 
         return SeasonAnimeResolution(
             meta = seasonMeta,
-            ids = SeasonIds(
-                anilistId = seasonAniListId,
-                malId = seasonAniList?.idMal ?: seasonAniZip?.malId ?: seasonMalId,
-                kitsuId = seasonKitsu?.id ?: seasonAniZip?.kitsuId,
-                simklId = seasonAniZip?.simklId
-            ),
+            ids = resolvedSeasonIds,
             aniListNode = seasonAniList,
             aniZip = seasonAniZip
         )
@@ -1425,7 +1469,11 @@ class CircleFtpProvider : MainAPI() {
                 ?: getAniListTrailerUrl(seasonAniListNode?.trailer)
                 ?: targetMeta.trailer
 
-            val idsForCurrentSeason = if (realSeasonNumber == 1) {
+            // For season 1, resolveAnimeSeasonDynamically returns baseMeta IDs directly
+            // (early-return path). The baseMeta fallback here guards against null fields.
+            // For season 2+, the dynamic resolver fetched season-specific IDs via AniZip;
+            // we MUST NOT fall back to baseMeta IDs or Season 1 tracking will bleed in.
+            val idsForCurrentSeason: SeasonIds = if (realSeasonNumber <= 1) {
                 SeasonIds(
                     anilistId = seasonIds.anilistId ?: baseMeta.anilistId,
                     malId = seasonIds.malId ?: baseMeta.malId,
@@ -1433,6 +1481,8 @@ class CircleFtpProvider : MainAPI() {
                     simklId = seasonIds.simklId ?: baseMeta.simklId
                 )
             } else {
+                // Season 2+ — use only the season-specific IDs. Null means not resolved
+                // for this season; do NOT substitute Season 1 baseMeta values here.
                 seasonIds
             }
 
