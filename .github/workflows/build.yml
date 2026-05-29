@@ -1,63 +1,32 @@
+# Sample GitHub Actions workflow showing how to pass secrets
+# for BuildConfig fields.  Add the following secrets in your
+# repository Settings -> Secrets and variables -> Actions:
+#
+#   TMDB_API          - your TMDB API key
+#   FTP_IP_OVERRIDES  - comma-separated domain=ip pairs, e.g.:
+#     "index2.circleftp.net=15.1.4.5,index1.circleftp.net=15.1.4.9,..."
+
+name: Build CloudStream Plugin
+
 on:
   push:
-    branches:
-      - main
-  workflow_dispatch:
+    branches: [main]
+  pull_request:
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          path: "src"
+      - uses: actions/checkout@v4
 
-      # FIX: Added 'cache' and switched from deprecated 'adopt' to 'temurin'
-      - name: Set up JDK 17
+      - name: Set up JDK
         uses: actions/setup-java@v4
         with:
           java-version: '17'
           distribution: 'temurin'
-          cache: 'gradle'
 
-      - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
-
-      # FIX: Added timeout parameters to prevent the JitPack 'Read timed out' error
       - name: Build with Gradle
         env:
           TMDB_API: ${{ secrets.TMDB_API }}
-        run: |
-          cd src
-          chmod +x gradlew
-          ./gradlew clean make makePluginsJson \
-            -Dorg.gradle.internal.http.connectionTimeout=180000 \
-            -Dorg.gradle.internal.http.socketTimeout=180000
-          mkdir -p ../dist
-          cp **/build/*.cs3 ../dist/ || true
-          cp build/plugins.json ../dist/ || true
-
-      # FIX: Made directory copying and git pushing less prone to failure
-      - name: Push to builds branch
-        run: |
-          mkdir -p final_builds
-          cp -r dist/. final_builds/
-          cd final_builds
-          git init
-          git config user.name "GitHub Actions"
-          git config user.email "actions@github.com"
-          git checkout -b builds
-          git add .
-          
-          # Only attempt to commit and push if there are actually files present
-          if [ -n "$(git status --porcelain)" ]; then
-            git commit -m "Build $GITHUB_SHA"
-            git remote add origin https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}
-            git push -f origin builds
-          else
-            echo "No build artifacts found to deploy."
-       
-          fi
+          FTP_IP_OVERRIDES: ${{ secrets.FTP_IP_OVERRIDES }}
+        run: ./gradlew build

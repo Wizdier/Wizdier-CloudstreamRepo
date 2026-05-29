@@ -67,7 +67,10 @@ subprojects {
         val cloudstream by configurations
         val implementation by configurations
 
-        // KEY: use pre-release to match the latest CloudStream beta app
+        // NOTE: "pre-release" is required — CloudStream plugins must target the
+        // same build as the installed app.  Pinning to a specific version would
+        // break compatibility with newer CloudStream app releases.  See:
+        // https://github.com/recloudstream/cloudstream#plugin-development
         cloudstream("com.lagradost:cloudstream3:pre-release")
 
         implementation(kotlin("stdlib"))
