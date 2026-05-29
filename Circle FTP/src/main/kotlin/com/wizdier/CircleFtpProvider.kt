@@ -7,6 +7,7 @@ import com.lagradost.cloudstream3.LoadResponse.Companion.addKitsuId
 import com.lagradost.cloudstream3.LoadResponse.Companion.addMalId
 import com.lagradost.cloudstream3.LoadResponse.Companion.addSimklId
 import com.lagradost.cloudstream3.LoadResponse.Companion.addTrailer
+import com.lagradost.cloudstream3.LoadResponse.Companion.addTraktId
 import com.lagradost.cloudstream3.syncproviders.SyncIdName
 import com.lagradost.cloudstream3.utils.AppUtils
 import com.lagradost.cloudstream3.utils.AppUtils.toJson
@@ -22,6 +23,7 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.net.URLEncoder
 import java.util.Collections
+import java.util.LinkedHashMap
 
 class CircleFtpProvider : MainAPI() {
     override var mainUrl = "http://new.circleftp.net"
@@ -95,19 +97,30 @@ class CircleFtpProvider : MainAPI() {
         "cartoon", "animation", "animated", "pixar", "disney", "dreamworks"
     )
 
+    // ─── LRU-bounded caches to prevent unbounded memory growth ───────────
+    // Each cache evicts the eldest entry when it exceeds `maxEntries`, so a
+    // long browsing session never runs into OOM.  Access-order ensures that
+    // recently-used entries survive while stale ones are evicted first.
+
+    private fun <K, V> lruMap(maxEntries: Int): MutableMap<K, V> =
+        object : LinkedHashMap<K, V>(maxEntries, 0.75f, true) {
+            override fun removeEldestEntry(eldest: MutableMap.MutableEntry<K, V>?): Boolean =
+                size > maxEntries
+        }
+
     private val tmdbMetaCache: MutableMap<String, TmdbMeta?> =
-        Collections.synchronizedMap(mutableMapOf())
+        Collections.synchronizedMap(lruMap(200))
     private val animeMetaCache: MutableMap<String, ResolvedAnimeMeta> =
-        Collections.synchronizedMap(mutableMapOf())
+        Collections.synchronizedMap(lruMap(200))
     private val kitsuMetaCache: MutableMap<String, KitsuMeta?> =
-        Collections.synchronizedMap(mutableMapOf())
+        Collections.synchronizedMap(lruMap(200))
     private val postTvDataCache: MutableMap<Int, TvSeries?> =
-        Collections.synchronizedMap(mutableMapOf())
+        Collections.synchronizedMap(lruMap(100))
     private val seasonResolutionCache: MutableMap<String, SeasonAnimeResolution> =
-        Collections.synchronizedMap(mutableMapOf())
+        Collections.synchronizedMap(lruMap(200))
 
     private val aniZipFullCache: MutableMap<Int, AniZipFull?> =
-        Collections.synchronizedMap(mutableMapOf())
+        Collections.synchronizedMap(lruMap(300))
 
     // ─── String / Title Helpers ──────────────────────────────────────────────
 
@@ -258,27 +271,36 @@ class CircleFtpProvider : MainAPI() {
         return listOfNotNull(baseId).plus(variantIds).distinct()
     }
 
+    // ─── FTP Domain → IP Mapping ──────────────────────────────────────────
+    // Map-based lookup replaces the old when-chain for O(1) resolution and
+    // easier maintenance (just add an entry to the map).  Order matters for
+    // the index* hosts: "index2" must be checked before "index" so the longer
+    // domain is matched first.
+    private val ftpDomainToIp: Map<String, String> = linkedMapOf(
+        "index2.circleftp.net" to "15.1.4.5",
+        "index1.circleftp.net" to "15.1.4.9",
+        "index.circleftp.net" to "15.1.4.2",
+        "ftp3.circleftp.net" to "15.1.4.7",
+        "ftp4.circleftp.net" to "15.1.1.5",
+        "ftp5.circleftp.net" to "15.1.1.15",
+        "ftp6.circleftp.net" to "15.1.2.3",
+        "ftp7.circleftp.net" to "15.1.4.8",
+        "ftp8.circleftp.net" to "15.1.2.2",
+        "ftp9.circleftp.net" to "15.1.2.12",
+        "ftp10.circleftp.net" to "15.1.4.3",
+        "ftp11.circleftp.net" to "15.1.2.6",
+        "ftp12.circleftp.net" to "15.1.2.1",
+        "ftp13.circleftp.net" to "15.1.1.18",
+        "ftp15.circleftp.net" to "15.1.4.12",
+        "ftp17.circleftp.net" to "15.1.3.8"
+    )
+
     private fun linkToIp(data: String?): String {
         if (data == null) return ""
-        return when {
-            data.contains("index.circleftp.net") -> data.replace("index.circleftp.net", "15.1.4.2")
-            data.contains("index2.circleftp.net") -> data.replace("index2.circleftp.net", "15.1.4.5")
-            data.contains("index1.circleftp.net") -> data.replace("index1.circleftp.net", "15.1.4.9")
-            data.contains("ftp3.circleftp.net") -> data.replace("ftp3.circleftp.net", "15.1.4.7")
-            data.contains("ftp4.circleftp.net") -> data.replace("ftp4.circleftp.net", "15.1.1.5")
-            data.contains("ftp5.circleftp.net") -> data.replace("ftp5.circleftp.net", "15.1.1.15")
-            data.contains("ftp6.circleftp.net") -> data.replace("ftp6.circleftp.net", "15.1.2.3")
-            data.contains("ftp7.circleftp.net") -> data.replace("ftp7.circleftp.net", "15.1.4.8")
-            data.contains("ftp8.circleftp.net") -> data.replace("ftp8.circleftp.net", "15.1.2.2")
-            data.contains("ftp9.circleftp.net") -> data.replace("ftp9.circleftp.net", "15.1.2.12")
-            data.contains("ftp10.circleftp.net") -> data.replace("ftp10.circleftp.net", "15.1.4.3")
-            data.contains("ftp11.circleftp.net") -> data.replace("ftp11.circleftp.net", "15.1.2.6")
-            data.contains("ftp12.circleftp.net") -> data.replace("ftp12.circleftp.net", "15.1.2.1")
-            data.contains("ftp13.circleftp.net") -> data.replace("ftp13.circleftp.net", "15.1.1.18")
-            data.contains("ftp15.circleftp.net") -> data.replace("ftp15.circleftp.net", "15.1.4.12")
-            data.contains("ftp17.circleftp.net") -> data.replace("ftp17.circleftp.net", "15.1.3.8")
-            else -> data
+        for ((domain, ip) in ftpDomainToIp) {
+            if (data.contains(domain)) return data.replace(domain, ip)
         }
+        return data
     }
 
     // ─── Stream Variant Helpers ──────────────────────────────────────────────
@@ -442,6 +464,8 @@ class CircleFtpProvider : MainAPI() {
                 trailer { id site thumbnail }
                 streamingEpisodes { title thumbnail url site }
                 episodes
+                status
+                nextAiringEpisode { airingAt timeUntilAiring episode }
                 characters(sort:[ROLE,RELEVANCE], perPage:12) {
                   edges { role node { name{full} image{large} } }
                 }
@@ -472,6 +496,38 @@ class CircleFtpProvider : MainAPI() {
             "youtube" -> "https://www.youtube.com/watch?v=$trailerId"
             "dailymotion" -> "https://www.dailymotion.com/video/$trailerId"
             else -> "https://www.youtube.com/watch?v=$trailerId"
+        }
+    }
+
+    /**
+     * Formats the next airing episode information into a human-readable string.
+     * Example output: "Episode 13 airs in 2d 5h (RELEASING)"
+     * Returns null if the anime is not currently airing or the data is unavailable.
+     */
+    private fun formatNextAiringInfo(
+        nextAiring: AniListNextAiringEpisode?,
+        status: String?
+    ): String? {
+        val next = nextAiring ?: return null
+        val epNum = next.episode ?: return null
+        val timeUntil = next.timeUntilAiring ?: return null
+        val days = timeUntil / 86400
+        val hours = (timeUntil % 86400) / 3600
+        val minutes = (timeUntil % 3600) / 60
+        val timeStr = buildString {
+            if (days > 0) append("${days}d ")
+            if (hours > 0) append("${hours}h ")
+            if (days == 0 && minutes > 0) append("${minutes}m")
+        }.trim().ifBlank { "<1m" }
+        val statusTag = when (status?.lowercase()) {
+            "releasing" -> "RELEASING"
+            "not_yet_released" -> "UPCOMING"
+            else -> null
+        }
+        return if (statusTag != null) {
+            "Episode $epNum airs in $timeStr ($statusTag)"
+        } else {
+            "Episode $epNum airs in $timeStr"
         }
     }
 
@@ -508,7 +564,12 @@ class CircleFtpProvider : MainAPI() {
                 if (fromMap != 0) return@run fromMap
                 null
             },
-            tmdbId = fallbackTmdbId ?: m?.optString("themoviedb_id")?.takeIf { it.isNotBlank() }
+            tmdbId = fallbackTmdbId ?: m?.optString("themoviedb_id")?.takeIf { it.isNotBlank() },
+            traktId = run {
+                val fromMap = m?.optInt("trakt_id", 0) ?: 0
+                if (fromMap != 0) return@run fromMap
+                null
+            }
         )
     }
 
@@ -521,7 +582,7 @@ class CircleFtpProvider : MainAPI() {
                 aniZipFullCache[anilistId] = value
                 return value
             } catch (_: Exception) {
-                if (attempt == retryCount - 1) return 
+                if (attempt == retryCount - 1) return null
                 kotlinx.coroutines.delay(300L * (attempt + 1))
             }
         }
@@ -711,15 +772,30 @@ class CircleFtpProvider : MainAPI() {
                 app.get("$tmdbApi/$type/$tmdbId/images?api_key=$tmdbKey", cacheTime = 86400).text
             )
             val logos = json.optJSONArray("logos") ?: return null
+            // Collect all valid logos then pick the best one by language preference.
+            // Prefer: English > Bengali (provider lang) > any language > no language.
+            // SVG logos (vector) are preferred over PNG (raster) for sharpness.
+            val preferredLangs = listOf("en", "bn")
+            var bestMatch: String? = null
+            var bestScore = -1  // Higher = better
             for (i in 0 until logos.length()) {
                 val logo = logos.getJSONObject(i)
-                val path = logo.optString("file_path")
-                val lang = logo.optString("iso_639_1")
-                if (path.isNotBlank()) {
-                    return "$tmdbImageBase$path"
+                val path = logo.optString("file_path").takeIf { p -> p.isNotBlank() } ?: continue
+                val lang = logo.optString("iso_639_1").orEmpty()
+                val isSvg = path.endsWith(".svg", ignoreCase = true)
+                val score = when {
+                    lang in preferredLangs && isSvg -> 4
+                    lang == "en" -> 3
+                    lang == "bn" -> 2
+                    lang.isNotBlank() -> 1
+                    else -> 0
+                }
+                if (score > bestScore) {
+                    bestScore = score
+                    bestMatch = "$tmdbImageBase$path"
                 }
             }
-            null
+            bestMatch
         } catch (_: Exception) {
             null
         }
@@ -891,7 +967,9 @@ class CircleFtpProvider : MainAPI() {
             malId = aniList?.idMal ?: finalAniZip?.malId ?: zipFromKitsu?.malId ?: zipFromMal?.malId ?: malId,
             kitsuId = finalAniZip?.kitsuId ?: zipFromKitsu?.kitsuId ?: zipFromMal?.kitsuId ?: zipFromTmdb?.kitsuId ?: kitsu?.id,
             simklId = finalAniZip?.simklId ?: zipFromKitsu?.simklId ?: zipFromMal?.simklId ?: zipFromTmdb?.simklId,
-            imdbId = finalTmdb?.imdbId
+            traktId = finalAniZip?.traktId ?: zipFromKitsu?.traktId ?: zipFromMal?.traktId ?: zipFromTmdb?.traktId,
+            imdbId = finalTmdb?.imdbId,
+            nextAiringInfo = formatNextAiringInfo(aniList?.nextAiringEpisode, aniList?.status)
         )
     }
 
@@ -971,7 +1049,9 @@ class CircleFtpProvider : MainAPI() {
             malId = aniZip?.malId ?: aniList.idMal,
             kitsuId = aniZip?.kitsuId,
             simklId = aniZip?.simklId,
-            imdbId = fallback.imdbId
+            traktId = aniZip?.traktId,
+            imdbId = fallback.imdbId,
+            nextAiringInfo = formatNextAiringInfo(aniList.nextAiringEpisode, aniList.status)
         )
     }
 
@@ -990,7 +1070,8 @@ class CircleFtpProvider : MainAPI() {
                     anilistId = baseMeta.anilistId,
                     malId = baseMeta.malId,
                     kitsuId = baseMeta.kitsuId,
-                    simklId = baseMeta.simklId
+                    simklId = baseMeta.simklId,
+                    traktId = baseMeta.traktId
                 ),
                 aniListNode = null,
                 aniZip = null
@@ -1059,50 +1140,126 @@ class CircleFtpProvider : MainAPI() {
             }
         }
 
-        // ─── Strategy B: Cross-DB title search (Kitsu → MAL → AniList) ─────
-        // Only runs if the SEQUEL chain walk above did not find a valid node.
+        // ─── Strategy A2: PREQUEL walk to anchor at Season 1, then re-walk ─
+        // If the SEQUEL chain failed, the baseMeta AniList node might NOT be
+        // Season 1 — it could be Season 2, 3, etc. (e.g. "Naruto Shippuden"
+        // is Season 2 but might be the only post the provider has).  In that
+        // case walking PREQUEL edges finds Season 1, and then we can walk
+        // forward (seasonNumber-1) hops to find the correct target season.
+        if (seasonAniListId == null && baseMeta.anilistId != null) {
+            val visitedIds = mutableSetOf<Int>()
+            var anchorNode: AniListMeta? = getAniListMetaById(baseMeta.anilistId)
+            // Walk PREQUEL edges until we can't go further back.
+            while (anchorNode != null) {
+                val prequelEdge = anchorNode.relations?.edges
+                    ?.filter { edge ->
+                        edge.relationType.equals("PREQUEL", ignoreCase = true)
+                    }
+                    ?.sortedByDescending { edge -> edge.node?.episodes ?: 0 }
+                    ?.firstOrNull()
+                val prequelId = prequelEdge?.node?.id
+                if (prequelId == null || prequelId in visitedIds) break
+                visitedIds.add(prequelId)
+                // Detect if we'd loop back to the starting node.
+                if (prequelId == baseMeta.anilistId) break
+                anchorNode = getAniListMetaById(prequelId)
+            }
+            // anchorNode is now the earliest season (Season 1).
+            // Re-walk forward exactly (seasonNumber-1) SEQUEL hops from it.
+            if (anchorNode != null && anchorNode.id != baseMeta.anilistId) {
+                var rewalkCurrent: AniListMeta? = anchorNode
+                val rewalkVisited = mutableSetOf<Int>(anchorNode.id)
+                for (hop in 1 until seasonNumber) {
+                    if (rewalkCurrent == null) break
+                    val sequelEdge = rewalkCurrent.relations?.edges
+                        ?.filter { edge ->
+                            edge.relationType.equals("SEQUEL", ignoreCase = true)
+                        }
+                        ?.sortedByDescending { edge -> edge.node?.episodes ?: 0 }
+                        ?.firstOrNull()
+                    val nextId = sequelEdge?.node?.id
+                    if (nextId == null || nextId in rewalkVisited) {
+                        rewalkCurrent = null
+                        break
+                    }
+                    rewalkVisited.add(nextId)
+                    rewalkCurrent = getAniListMetaById(nextId)
+                }
+                val rewalkedNode = rewalkCurrent
+                if (rewalkedNode != null && rewalkedNode.id != baseMeta.anilistId) {
+                    seasonAniList = rewalkedNode
+                    seasonAniListId = rewalkedNode.id
+                }
+            }
+        }
+
+        // ─── Strategy B: Cross-DB title search (Kitsu + MAL + AniList) ────
+        // Only runs if the SEQUEL/PREQUEL chain walk above did not find a
+        // valid node.  We launch Kitsu, MAL, and AniList searches in parallel
+        // using async/awaitAll to minimise latency for the cross-DB fallback.
         var seasonKitsu: KitsuMeta? = null
         var seasonKitsuZip: AniZipFull? = null
         var seasonMalId: Int? = null
         var seasonMalZip: AniZipFull? = null
 
         if (seasonAniListId == null) {
-            // Search Kitsu for each candidate title; keep the first confirmed hit.
-            for (kitsuCandidate in candidateTitles) {
-                val kitsuResult = getKitsuMetaCached(kitsuCandidate)
-                    ?: getKitsuMeta(kitsuCandidate)
-                if (kitsuResult?.id != null) {
-                    val kitsuZip = getAniZipByKitsuId(kitsuResult.id)
-                    if (seasonKitsu == null) {
-                        seasonKitsu = kitsuResult
-                        seasonKitsuZip = kitsuZip
+            // ── Parallel Kitsu + MAL searches ───────────────────────────
+            // Each search iterates over candidate titles and returns the
+            // first result that has a confirmed cross-DB link (AniZip with
+            // anilistId or malId).  Failing that, the first hit is kept.
+            val (kitsuResult, malResult) = coroutineScope {
+                val kitsuDeferred = async {
+                    var bestKitsu: KitsuMeta? = null
+                    var bestKitsuZip: AniZipFull? = null
+                    var confirmedKitsu: KitsuMeta? = null
+                    var confirmedKitsuZip: AniZipFull? = null
+                    for (kitsuCandidate in candidateTitles) {
+                        val kitsuHit = getKitsuMetaCached(kitsuCandidate)
+                            ?: getKitsuMeta(kitsuCandidate)
+                        if (kitsuHit?.id != null) {
+                            val kitsuZip = getAniZipByKitsuId(kitsuHit.id)
+                            if (bestKitsu == null) {
+                                bestKitsu = kitsuHit
+                                bestKitsuZip = kitsuZip
+                            }
+                            if (kitsuZip?.anilistId != null || kitsuZip?.malId != null) {
+                                confirmedKitsu = kitsuHit
+                                confirmedKitsuZip = kitsuZip
+                                break
+                            }
+                        }
                     }
-                    if (kitsuZip?.anilistId != null || kitsuZip?.malId != null) {
-                        seasonKitsu = kitsuResult
-                        seasonKitsuZip = kitsuZip
-                        break
-                    }
+                    Pair(confirmedKitsu ?: bestKitsu, confirmedKitsuZip ?: bestKitsuZip)
                 }
+                val malDeferred = async {
+                    var bestMalId: Int? = null
+                    var bestMalZip: AniZipFull? = null
+                    var confirmedMalId: Int? = null
+                    var confirmedMalZip: AniZipFull? = null
+                    for (malCandidate in candidateTitles) {
+                        val foundMalId = searchMalId(malCandidate)
+                        if (foundMalId != null) {
+                            val malZip = getAniZipByMalId(foundMalId)
+                            if (bestMalId == null) {
+                                bestMalId = foundMalId
+                                bestMalZip = malZip
+                            }
+                            if (malZip?.anilistId != null) {
+                                confirmedMalId = foundMalId
+                                confirmedMalZip = malZip
+                                break
+                            }
+                        }
+                    }
+                    Pair(confirmedMalId ?: bestMalId, confirmedMalZip ?: bestMalZip)
+                }
+                Pair(kitsuDeferred.await(), malDeferred.await())
             }
 
-            // Search MAL for each candidate title if Kitsu didn't give an AniList ID.
-            if (seasonKitsuZip?.anilistId == null) {
-                for (malCandidate in candidateTitles) {
-                    val foundMalId = searchMalId(malCandidate)
-                    if (foundMalId != null) {
-                        val malZip = getAniZipByMalId(foundMalId)
-                        if (seasonMalId == null) {
-                            seasonMalId = foundMalId
-                            seasonMalZip = malZip
-                        }
-                        if (malZip?.anilistId != null) {
-                            seasonMalId = foundMalId
-                            seasonMalZip = malZip
-                            break
-                        }
-                    }
-                }
-            }
+            seasonKitsu = kitsuResult.first
+            seasonKitsuZip = kitsuResult.second
+            seasonMalId = malResult.first
+            seasonMalZip = malResult.second
 
             // Resolve AniList ID from the best cross-DB zip found so far.
             val crossDbAniListId = seasonKitsuZip?.anilistId ?: seasonMalZip?.anilistId
@@ -1137,7 +1294,8 @@ class CircleFtpProvider : MainAPI() {
             anilistId = seasonAniListId,
             malId = seasonAniList?.idMal ?: seasonAniZip?.malId ?: seasonMalId,
             kitsuId = seasonKitsu?.id ?: seasonAniZip?.kitsuId,
-            simklId = seasonAniZip?.simklId
+            simklId = seasonAniZip?.simklId,
+            traktId = seasonAniZip?.traktId
         )
 
         // ─── Build display metadata from the resolved season data ─────────
@@ -1166,6 +1324,7 @@ class CircleFtpProvider : MainAPI() {
                 malId = resolvedSeasonIds.malId,
                 kitsuId = resolvedSeasonIds.kitsuId,
                 simklId = resolvedSeasonIds.simklId,
+                traktId = resolvedSeasonIds.traktId,
                 imdbId = baseMeta.imdbId
             )
         }
@@ -1376,7 +1535,7 @@ class CircleFtpProvider : MainAPI() {
                     this.posterUrl = meta.poster ?: fallbackPoster
                     this.backgroundPosterUrl = meta.background ?: meta.poster ?: fallbackPoster
                     this.year = year
-                    this.plot = meta.plot ?: loadData.metaData
+                    this.plot = (meta.nextAiringInfo?.let { info -> "$info\n\n" } ?: "") + (meta.plot ?: loadData.metaData)
                     this.tags = meta.tags
                     this.score = Score.from100(meta.score100)
                     this.duration = duration
@@ -1387,6 +1546,7 @@ class CircleFtpProvider : MainAPI() {
                     addMalId(meta.malId)
                     meta.kitsuId?.let { k -> addKitsuId(k) }
                     meta.simklId?.let { s -> addSimklId(s) }
+                    meta.traktId?.let { t -> addTraktId(t) }
                     meta.imdbId?.let { i -> addImdbId(i) }
                     addEpisodes(if (isDubTitle(title)) DubStatus.Dubbed else DubStatus.Subbed, listOf(newEpisode(link)))
                 }
@@ -1563,12 +1723,23 @@ class CircleFtpProvider : MainAPI() {
                 emptyList()
             } else {
                 val recommendationBaseId = postIds.firstOrNull() ?: loadData.id
-                // Use baseMeta.poster as the recommendation card artwork.
-                // targetMeta.poster belongs to the CURRENTLY LOADED season; it would
-                // be wrong to stamp every other season card with this season's artwork.
-                // baseMeta.poster is the series-level art (Season 1 entry) and is a
-                // safe shared visual until each season is individually loaded.
+                // Use baseMeta.poster as the default recommendation card artwork.
+                // For the CURRENTLY loaded season (targetIndex), we already have
+                // targetMeta.poster; for other seasons we use baseMeta.poster as
+                // a safe fallback.  We could pre-fetch per-season AniList poster
+                // images here, but that would require N API calls for N seasons.
+                // Instead, we use the season-specific poster for the currently
+                // loaded season and the base poster for all others — this gives
+                // the user an immediate visual cue while keeping latency low.
                 val seriesPoster = baseMeta.poster ?: fallbackPoster
+                // If the current season has a different poster than the base,
+                // use it for the current season's recommendation card in case
+                // the user navigated here from another season's page.
+                val currentSeasonPoster = if (targetMeta.poster != baseMeta.poster) {
+                    targetMeta.poster ?: seriesPoster
+                } else {
+                    seriesPoster
+                }
                 allSeasons.mapIndexedNotNull { recIdx, _ ->
                     if (recIdx == targetIndex) return@mapIndexedNotNull null
 
@@ -1600,7 +1771,8 @@ class CircleFtpProvider : MainAPI() {
                     anilistId = seasonIds.anilistId ?: baseMeta.anilistId,
                     malId = seasonIds.malId ?: baseMeta.malId,
                     kitsuId = seasonIds.kitsuId ?: baseMeta.kitsuId,
-                    simklId = seasonIds.simklId ?: baseMeta.simklId
+                    simklId = seasonIds.simklId ?: baseMeta.simklId,
+                    traktId = seasonIds.traktId ?: baseMeta.traktId
                 )
             } else {
                 // Season 2+ IDs are season-specific — no baseMeta fallback permitted.
@@ -1615,7 +1787,7 @@ class CircleFtpProvider : MainAPI() {
                     fallback = targetMeta.background ?: targetMeta.poster ?: fallbackPoster
                 )
                 this.year = year
-                this.plot = targetMeta.plot ?: loadData.metaData
+                this.plot = (targetMeta.nextAiringInfo?.let { info -> "$info\n\n" } ?: "") + (targetMeta.plot ?: loadData.metaData)
                 this.tags = targetMeta.tags
                 this.score = Score.from100(targetMeta.score100)
                 this.actors = targetMeta.actors
@@ -1625,6 +1797,7 @@ class CircleFtpProvider : MainAPI() {
                 addMalId(idsForCurrentSeason.malId)
                 idsForCurrentSeason.kitsuId?.let { k -> addKitsuId(k) }
                 idsForCurrentSeason.simklId?.let { s -> addSimklId(s) }
+                idsForCurrentSeason.traktId?.let { t -> addTraktId(t) }
                 baseMeta.imdbId?.let { i -> addImdbId(i) }
                 this.recommendations = recommendationItems
                 addEpisodes(
@@ -1726,14 +1899,17 @@ class CircleFtpProvider : MainAPI() {
         val malId: Int?,
         val kitsuId: String?,
         val simklId: Int?,
-        val imdbId: String?
+        val traktId: Int?,
+        val imdbId: String?,
+        val nextAiringInfo: String? = null
     )
 
     data class SeasonIds(
         val anilistId: Int? = null,
         val malId: Int? = null,
         val kitsuId: String? = null,
-        val simklId: Int? = null
+        val simklId: Int? = null,
+        val traktId: Int? = null
     )
 
     data class Post(
@@ -1785,8 +1961,16 @@ class CircleFtpProvider : MainAPI() {
         val trailer: AniListTrailer?,
         val streamingEpisodes: List<AniListStreamingEpisode>?,
         val episodes: Int?,
+        val status: String?,
+        val nextAiringEpisode: AniListNextAiringEpisode?,
         val characters: AniListCharacterConnection?,
         val relations: AniListRelationConnection?
+    )
+
+    data class AniListNextAiringEpisode(
+        val airingAt: Int?,
+        val timeUntilAiring: Int?,
+        val episode: Int?
     )
 
     data class AniListCoverImage(val extraLarge: String?, val large: String?)
@@ -1806,7 +1990,8 @@ class CircleFtpProvider : MainAPI() {
         val malId: Int?,
         val kitsuId: String?,
         val simklId: Int?,
-        val tmdbId: String?
+        val tmdbId: String?,
+        val traktId: Int?
     )
 
     data class TmdbSearchResponse(val results: List<TmdbResult>?)
