@@ -441,6 +441,8 @@ class CircleFtpProvider : MainAPI() {
 
     // ─── AniZip API ──────────────────────────────────────────────────────────
 
+    // ─── AniZip API ──────────────────────────────────────────────────────────
+
     private fun parseAniZip(
         json: JSONObject,
         fallbackAnilistId: Int? = null,
@@ -449,41 +451,30 @@ class CircleFtpProvider : MainAPI() {
         fallbackTmdbId: String? = null
     ): AniZipFull {
         val m = json.optJSONObject("mappings")
-
-        var anilistId: Int? = fallbackAnilistId
-        if (anilistId == null) {
-            val v = json.optInt("anilist_id", 0)
-            if (v != 0) anilistId = v
-        }
-        if (anilistId == null && m != null) {
-            val v = m.optInt("anilist_id", 0)
-            if (v != 0) anilistId = v
-        }
-
-        var malId: Int? = fallbackMalId
-        if (malId == null && m != null) {
-            val v = m.optInt("mal_id", 0)
-            if (v != 0) malId = v
-        }
-
-        val kitsuId: String? = fallbackKitsuId
-            ?: m?.optString("kitsu_id")?.takeIf { it.isNotBlank() }
-
-        var simklId: Int? = null
-        if (m != null) {
-            val v = m.optInt("simkl_id", 0)
-            if (v != 0) simklId = v
-        }
-
-        val tmdbId: String? = fallbackTmdbId
-            ?: m?.optString("themoviedb_id")?.takeIf { it.isNotBlank() }
-
         return AniZipFull(
-            anilistId = anilistId,
-            malId = malId,
-            kitsuId = kitsuId,
-            simklId = simklId,
-            tmdbId = tmdbId
+            anilistId = run {
+                val fallback = fallbackAnilistId
+                if (fallback != null) return@run fallback
+                val fromJson = json.optInt("anilist_id", 0)
+                if (fromJson != 0) return@run fromJson
+                val fromMap = m?.optInt("anilist_id", 0) ?: 0
+                if (fromMap != 0) return@run fromMap
+                null
+            },
+            malId = run {
+                val fallback = fallbackMalId
+                if (fallback != null) return@run fallback
+                val fromMap = m?.optInt("mal_id", 0) ?: 0
+                if (fromMap != 0) return@run fromMap
+                null
+            },
+            kitsuId = fallbackKitsuId ?: m?.optString("kitsu_id")?.takeIf { it.isNotBlank() },
+            simklId = run {
+                val fromMap = m?.optInt("simkl_id", 0) ?: 0
+                if (fromMap != 0) return@run fromMap
+                null
+            },
+            tmdbId = fallbackTmdbId ?: m?.optString("themoviedb_id")?.takeIf { it.isNotBlank() }
         )
     }
 
@@ -860,7 +851,6 @@ class CircleFtpProvider : MainAPI() {
             imdbId = finalTmdb?.imdbId
         )
     }
-
     private suspend fun resolveAnimeMetaCached(title: String, year: Int? = null, isSeries: Boolean = true): ResolvedAnimeMeta {
         val key = "${isSeries}|${year ?: 0}|${title.lowercase()}"
         animeMetaCache[key]?.let { cached -> return cached }
@@ -1068,7 +1058,6 @@ class CircleFtpProvider : MainAPI() {
             aniZip = seasonAniZip
         )
     }
-
     // ─── Episode Stream Merging ──────────────────────────────────────────────
 
     private fun mergeEpisodeStreamsForSeason(
