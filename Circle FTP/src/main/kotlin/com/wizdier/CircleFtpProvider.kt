@@ -103,6 +103,9 @@ class CircleFtpProvider : MainAPI() {
         Collections.synchronizedMap(mutableMapOf())
     private val postTvDataCache: MutableMap<Int, TvSeries?> =
         Collections.synchronizedMap(mutableMapOf())
+    private val seasonResolutionCache: MutableMap<String, SeasonAnimeResolution> =
+        Collections.synchronizedMap(mutableMapOf())
+
     private val aniZipFullCache: MutableMap<Int, AniZipFull?> =
         Collections.synchronizedMap(mutableMapOf())
 
@@ -404,19 +407,25 @@ class CircleFtpProvider : MainAPI() {
         return null
     }
 
-    private suspend fun getAniListMetaById(id: Int): AniListMeta? = try {
-        val query = buildAniListQuery(byId = true)
-        val body = mapOf("query" to query, "variables" to mapOf("id" to id))
-            .toJson().toRequestBody(RequestBodyTypes.JSON.toMediaTypeOrNull())
-        val res = app.post(
-            anilistApi,
-            requestBody = body,
-            headers = mapOf("Content-Type" to "application/json"),
-            cacheTime = 86400
-        )
-        AppUtils.parseJson<AniListResponse>(res.text).data?.Media
-    } catch (_: Exception) {
-        null
+    private suspend fun getAniListMetaById(id: Int, retryCount: Int = 2): AniListMeta? {
+        repeat(retryCount) { attempt ->
+            try {
+                val query = buildAniListQuery(byId = true)
+                val body = mapOf("query" to query, "variables" to mapOf("id" to id))
+                    .toJson().toRequestBody(RequestBodyTypes.JSON.toMediaTypeOrNull())
+                val res = app.post(
+                    anilistApi,
+                    requestBody = body,
+                    headers = mapOf("Content-Type" to "application/json"),
+                    cacheTime = 86400
+                )
+                return AppUtils.parseJson<AniListResponse>(res.text).data?.Media
+            } catch (_: Exception) {
+                if (attempt == retryCount - 1) return null
+                kotlinx.coroutines.delay(300L * (attempt + 1))
+            }
+        }
+        return null
     }
 
     private fun buildAniListQuery(byId: Boolean): String {
@@ -504,17 +513,20 @@ class CircleFtpProvider : MainAPI() {
             tmdbId = fallbackTmdbId ?: m?.optString("themoviedb_id")?.takeIf { it.isNotBlank() }
         )
     }
-
-    private suspend fun getAniZipFullCached(anilistId: Int): AniZipFull? {
+    private suspend fun getAniZipFullCached(anilistId: Int, retryCount: Int = 2): AniZipFull? {
         if (aniZipFullCache.containsKey(anilistId)) return aniZipFullCache[anilistId]
-        val value = try {
-            val json = JSONObject(app.get("https://api.ani.zip/mappings?anilist_id=$anilistId", cacheTime = 86400).text)
-            parseAniZip(json, fallbackAnilistId = anilistId)
-        } catch (_: Exception) {
-            null
+        repeat(retryCount) { attempt ->
+            try {
+                val json = JSONObject(app.get("https://api.ani.zip/mappings?anilist_id=$anilistId", cacheTime = 86400).text)
+                val value = parseAniZip(json, fallbackAnilistId = anilistId)
+                aniZipFullCache[anilistId] = value
+                return value
+            } catch (_: Exception) {
+                if (attempt == retryCount - 1) break
+                kotlinx.coroutines.delay(300L * (attempt + 1))
+            }
         }
-        aniZipFullCache[anilistId] = value
-        return value
+        return null
     }
 
     private suspend fun getAniZipByMalId(malId: Int): AniZipFull? = try {
@@ -596,16 +608,18 @@ class CircleFtpProvider : MainAPI() {
             cover = cover,
             synopsis = attr.optString("synopsis").takeIf { s -> s.isNotBlank() },
             averageRating = attr.optString("averageRating").toDoubleOrNull()
-        )
-    } catch (_: Exception) {
-        null
+    private suspend fun getAniZipByMalId(malId: Int, retryCount: Int = 2): AniZipFull? {
+        repeat(retryCount) { attempt ->
+            try {
+                val json = JSONObject(app.get("https://api.ani.zip/mappings?mal_id=$malId", cacheTime = 86400).text)
+                return parseAniZip(json, fallbackMalId = malId)
+            } catch (_: Exception) {
+                if (attempt == retryCount - 1) return null
+                kotlinx.coroutines.delay(300L * (attempt + 1))
+            }
+        }
+        return null
     }
-
-    private suspend fun getKitsuMetaCached(title: String): KitsuMeta? {
-        val key = title.lowercase()
-        if (kitsuMetaCache.containsKey(key)) return kitsuMetaCache[key]
-        val value = getKitsuMeta(title)
-        kitsuMetaCache[key] = value
         return value
     }
 
@@ -686,16 +700,18 @@ class CircleFtpProvider : MainAPI() {
                 val logo = logos.getJSONObject(i)
                 val path = logo.optString("file_path")
                 val lang = logo.optString("iso_639_1")
-                if (path.isNotBlank() && (lang == "en" || lang.isEmpty()) && !path.endsWith(".svg")) {
-                    return "$tmdbImageBase$path"
-                }
+    private suspend fun getAniZipByTmdbId(tmdbId: Int, retryCount: Int = 2): AniZipFull? {
+        repeat(retryCount) { attempt ->
+            try {
+                val json = JSONObject(app.get("https://api.ani.zip/mappings?themoviedb_id=$tmdbId", cacheTime = 86400).text)
+                return parseAniZip(json, fallbackTmdbId = tmdbId.toString())
+            } catch (_: Exception) {
+                if (attempt == retryCount - 1) return null
+                kotlinx.coroutines.delay(300L * (attempt + 1))
             }
-            null
-        } catch (_: Exception) {
-            null
         }
+        return null
     }
-
     private suspend fun fetchTmdbTrailer(tmdbId: Int?, isSeries: Boolean): String? {
         if (tmdbId == null) return null
         return try {
@@ -776,16 +792,18 @@ class CircleFtpProvider : MainAPI() {
         app.get("$apiUrl/api/posts/$postId", verify = false, cacheTime = 60)
     }
 
-    private suspend fun fetchPostTvData(postId: Int): TvSeries? = try {
-        fetchPostResponse(postId).parsed<TvSeries>()
-    } catch (_: Exception) {
-        null
+    private suspend fun getAniZipByKitsuId(kitsuId: String, retryCount: Int = 2): AniZipFull? {
+        repeat(retryCount) { attempt ->
+            try {
+                val json = JSONObject(app.get("https://api.ani.zip/mappings?kitsu_id=$kitsuId", cacheTime = 86400).text)
+                return parseAniZip(json, fallbackKitsuId = kitsuId)
+            } catch (_: Exception) {
+                if (attempt == retryCount - 1) return null
+                kotlinx.coroutines.delay(300L * (attempt + 1))
+            }
+        }
+        return null
     }
-
-    private suspend fun fetchPostTvDataCached(postId: Int): TvSeries? {
-        if (postTvDataCache.containsKey(postId)) return postTvDataCache[postId]
-        val value = fetchPostTvData(postId)
-        postTvDataCache[postId] = value
         return value
     }
 
@@ -957,7 +975,6 @@ class CircleFtpProvider : MainAPI() {
             imdbId = fallback.imdbId
         )
     }
-
     private suspend fun resolveAnimeSeasonDynamically(
         baseTitle: String,
         seasonName: String?,
@@ -979,6 +996,10 @@ class CircleFtpProvider : MainAPI() {
                 aniZip = null
             )
         }
+
+        // Check cache first
+        val cacheKey = "${baseMeta.anilistId ?: 0}|${baseMeta.malId ?: 0}|$seasonNumber"
+        seasonResolutionCache[cacheKey]?.let { return it }
 
         // ── Season 2+: all IDs must be resolved fresh for THIS season only ──
         // We NEVER fall back to baseMeta's tracker IDs for season 2+.
@@ -1002,22 +1023,33 @@ class CircleFtpProvider : MainAPI() {
             // currentNode is clearly visible to the compiler across iterations
             // and there is no ambiguity about captured mutable references.
             for (hop in 1..hopsNeeded) {
-                // Find the first SEQUEL edge in the current node's relations.
-                val sequelNodeId = currentNode
-                    ?.relations
-                    ?.edges
-                    ?.firstOrNull { sequelEdge ->
-                        sequelEdge.relationType.equals("SEQUEL", ignoreCase = true)
+                if (currentNode == null) break
+                // Find SEQUEL edges; prefer TV series (more episodes) over movies/OVAs.
+                val sequelEdges = currentNode.relations?.edges
+                    ?.filter { edge ->
+                        edge.relationType.equals("SEQUEL", ignoreCase = true)
                     }
-                    ?.node
-                    ?.id
-                // If this hop has no sequel, the chain ends — no valid target found.
-                if (sequelNodeId == null) {
+                    ?.sortedByDescending { edge -> edge.node?.episodes ?: 0 }
+                val bestSequelId = sequelEdges?.firstOrNull()?.node?.id
+                // If no SEQUEL found, try ALTERNATIVE as a fallback.
+                val nextId = bestSequelId ?: run {
+                    currentNode.relations?.edges
+                        ?.filter { edge ->
+                            edge.relationType.equals("ALTERNATIVE", ignoreCase = true)
+                        }
+                        ?.sortedByDescending { edge -> edge.node?.episodes ?: 0 }
+                        ?.firstOrNull()?.node?.id
+                }
+                if (nextId == null) {
                     currentNode = null
                     break
                 }
-                // Fetch the full node so the NEXT hop can also inspect its relations.
-                currentNode = getAniListMetaById(sequelNodeId)
+                // Detect circular references and break early.
+                if (nextId == baseMeta.anilistId) {
+                    currentNode = null
+                    break
+                }
+                currentNode = getAniListMetaById(nextId)
             }
             val walkedNode = currentNode
             // Accept only if we actually moved forward (distinct from Season 1).
@@ -1093,9 +1125,6 @@ class CircleFtpProvider : MainAPI() {
         }
 
         // ─── Fetch AniZip keyed ONLY to this season's AniList ID ─────────
-        // This is the critical step: AniZip is the authoritative source for
-        // MAL, Kitsu, and Simkl IDs. It MUST be fetched using this season's
-        // AniList ID, never Season 1's.
         val seasonAniZip: AniZipFull? = when {
             seasonAniListId != null -> getAniZipFullCached(seasonAniListId)
             seasonMalZip != null -> seasonMalZip
@@ -1104,9 +1133,6 @@ class CircleFtpProvider : MainAPI() {
         }
 
         // ─── Build the per-season tracking IDs ───────────────────────────
-        // All four IDs come exclusively from this season's resolved data.
-        // If a DB lookup failed for this season, the ID is null — we do NOT
-        // substitute baseMeta (Season 1) values here.
         val resolvedSeasonIds = SeasonIds(
             anilistId = seasonAniListId,
             malId = seasonAniList?.idMal ?: seasonAniZip?.malId ?: seasonMalId,
@@ -1116,8 +1142,6 @@ class CircleFtpProvider : MainAPI() {
 
         // ─── Build display metadata from the resolved season data ─────────
         val seasonMeta: ResolvedAnimeMeta = if (seasonAniList != null) {
-            // resolvedAnimeMetaFromAniListNode sets anilistId/malId/kitsuId/simklId
-            // from its aniZip parameter — so pass seasonAniZip (this season's zip).
             resolvedAnimeMetaFromAniListNode(
                 aniList = seasonAniList,
                 aniZip = seasonAniZip,
@@ -1125,8 +1149,8 @@ class CircleFtpProvider : MainAPI() {
                 isSeries = true
             )
         } else {
-            // No AniList node found for this season — use visual fallbacks from
-            // baseMeta but leave the tracker IDs as whatever was resolved above.
+            // No AniList node found — use visual fallbacks from baseMeta but
+            // leave tracker IDs as whatever was resolved above.
             ResolvedAnimeMeta(
                 title = seasonKitsu?.title ?: titleForSeason(baseTitle, seasonName, seasonNumber),
                 poster = seasonKitsu?.poster ?: baseMeta.poster,
@@ -1139,6 +1163,24 @@ class CircleFtpProvider : MainAPI() {
                 logoUrl = baseMeta.logoUrl,
                 actors = baseMeta.actors,
                 anilistId = resolvedSeasonIds.anilistId,
+                malId = resolvedSeasonIds.malId,
+                kitsuId = resolvedSeasonIds.kitsuId,
+                simklId = resolvedSeasonIds.simklId,
+                imdbId = baseMeta.imdbId
+            )
+        }
+
+        val result = SeasonAnimeResolution(
+            meta = seasonMeta,
+            ids = resolvedSeasonIds,
+            aniListNode = seasonAniList,
+            aniZip = seasonAniZip
+        )
+
+        // Cache the result
+        seasonResolutionCache[cacheKey] = result
+        return result
+    }
                 malId = resolvedSeasonIds.malId,
                 kitsuId = resolvedSeasonIds.kitsuId,
                 simklId = resolvedSeasonIds.simklId,
