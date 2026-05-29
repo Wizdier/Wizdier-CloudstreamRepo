@@ -451,10 +451,10 @@ class CircleFtpProvider : MainAPI() {
         val m = json.optJSONObject("mappings")
         return AniZipFull(
             anilistId = fallbackAnilistId ?: json.optInt("anilist_id").takeIf { n -> n != 0 }
-                ?: m?.optInt("anilist_id")?.let { if (it != 0) it else null },
-            malId = fallbackMalId ?: m?.optInt("mal_id")?.let { if (it != 0) it else null },
+                ?: m?.optInt("anilist_id")?.takeIf { n -> n != 0 },
+            malId = fallbackMalId ?: m?.optInt("mal_id")?.takeIf { n -> n != 0 },
             kitsuId = fallbackKitsuId ?: m?.optString("kitsu_id")?.takeIf { s -> s.isNotBlank() },
-            simklId = m?.optInt("simkl_id")?.let { if (it != 0) it else null },
+            simklId = m?.optInt("simkl_id")?.takeIf { n -> n != 0 },
             tmdbId = fallbackTmdbId ?: m?.optString("themoviedb_id")?.takeIf { s -> s.isNotBlank() }
         )
     }
@@ -838,6 +838,21 @@ class CircleFtpProvider : MainAPI() {
         val aniZip: AniZipFull?
     )
 
+    private fun toRomanNumeral(num: Int): String {
+        if (num <= 0) return num.toString()
+        val values = listOf(1000, 900, 500, 400, 100, 90, 50, 40, 10, 9, 5, 4, 1)
+        val symbols = listOf("M", "CM", "D", "CD", "C", "XC", "L", "XL", "X", "IX", "V", "IV", "I")
+        val sb = StringBuilder()
+        var n = num
+        for (i in values.indices) {
+            while (n >= values[i]) {
+                sb.append(symbols[i])
+                n -= values[i]
+            }
+        }
+        return sb.toString()
+    }
+
     private fun animeSeasonSearchTitles(baseTitle: String, seasonName: String?, seasonNumber: Int): List<String> {
         val base = stripSeasonSuffixForAnime(baseTitle)
         val cleanedSeasonName = seasonName?.trim()?.takeIf { s -> s.isNotBlank() }
@@ -853,6 +868,11 @@ class CircleFtpProvider : MainAPI() {
         titles += "$base Season $seasonNumber"
         titles += "$base Part $seasonNumber"
         titles += "$base ${seasonNumber}th Season"
+        if (seasonNumber in 2..10) {
+            val roman = toRomanNumeral(seasonNumber)
+            titles += "$base $roman"
+            titles += "${base}Season $roman"
+        }
         return titles.map { t -> cleanTitle(t) }.filter { t -> t.isNotBlank() }.distinct()
     }
 
@@ -997,6 +1017,28 @@ class CircleFtpProvider : MainAPI() {
                     ),
                     aniListNode = selectedNode,
                     aniZip = selectedZip
+                )
+            }
+        }
+
+        // Final attempt: direct search with the formatted season title
+        val seasonSpecificTitle = titleForSeason(baseTitle, seasonName, seasonNumber)
+        val directAniList = getAniListMeta(seasonSpecificTitle)
+        val directAniZip = directAniList?.id?.let { alId -> getAniZipFullCached(alId) }
+        if (directAniList?.id != null && directAniList.id != baseMeta.anilistId) {
+            val hasEpisodes = (directAniList.episodes ?: 0) > 0 || (directAniList.streamingEpisodes?.size ?: 0) > 0
+            if (hasEpisodes) {
+                val seasonMeta = resolvedAnimeMetaFromAniListNode(directAniList, directAniZip, baseMeta, true)
+                return SeasonAnimeResolution(
+                    meta = seasonMeta,
+                    ids = SeasonIds(
+                        anilistId = directAniList.id,
+                        malId = directAniZip?.malId ?: directAniList.idMal,
+                        kitsuId = directAniZip?.kitsuId,
+                        simklId = directAniZip?.simklId
+                    ),
+                    aniListNode = directAniList,
+                    aniZip = directAniZip
                 )
             }
         }
