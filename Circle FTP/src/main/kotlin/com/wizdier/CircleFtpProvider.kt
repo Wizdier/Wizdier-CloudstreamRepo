@@ -521,7 +521,7 @@ class CircleFtpProvider : MainAPI() {
                 aniZipFullCache[anilistId] = value
                 return value
             } catch (_: Exception) {
-                if (attempt == retryCount - 1) break
+                if (attempt == retryCount - 1) return 
                 kotlinx.coroutines.delay(300L * (attempt + 1))
             }
         }
@@ -1543,7 +1543,7 @@ class CircleFtpProvider : MainAPI() {
                 val aniZipTitle = aniZipEpTitles[epNum]
                 val aniListTitle = targetMeta.anilistEpisodes?.getOrNull(idx)?.title
                 val serverTitle = mergedEpisode.title
-                    ?.replace(Regex("(?i)Episode\s*\d+"), "")
+                    ?.replace(Regex("(?i)Episode\\s*\\d+"), "")
                     ?.trim()
                     ?.ifBlank { null }
                 val epTitle = aniZipTitle ?: aniListTitle ?: serverTitle ?: "Episode $epNum"
