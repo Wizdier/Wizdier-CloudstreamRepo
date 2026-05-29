@@ -449,13 +449,41 @@ class CircleFtpProvider : MainAPI() {
         fallbackTmdbId: String? = null
     ): AniZipFull {
         val m = json.optJSONObject("mappings")
+
+        var anilistId: Int? = fallbackAnilistId
+        if (anilistId == null) {
+            val v = json.optInt("anilist_id", 0)
+            if (v != 0) anilistId = v
+        }
+        if (anilistId == null && m != null) {
+            val v = m.optInt("anilist_id", 0)
+            if (v != 0) anilistId = v
+        }
+
+        var malId: Int? = fallbackMalId
+        if (malId == null && m != null) {
+            val v = m.optInt("mal_id", 0)
+            if (v != 0) malId = v
+        }
+
+        val kitsuId: String? = fallbackKitsuId
+            ?: m?.optString("kitsu_id")?.takeIf { it.isNotBlank() }
+
+        var simklId: Int? = null
+        if (m != null) {
+            val v = m.optInt("simkl_id", 0)
+            if (v != 0) simklId = v
+        }
+
+        val tmdbId: String? = fallbackTmdbId
+            ?: m?.optString("themoviedb_id")?.takeIf { it.isNotBlank() }
+
         return AniZipFull(
-            anilistId = fallbackAnilistId ?: json.optInt("anilist_id").let { if (it != 0) it else null },
-                ?: m?.optInt("anilist_id")?.let { if (it != 0) it else null },
-            malId = fallbackMalId ?: m?.optInt("mal_id")?.let { if (it != 0) it else null },
-            kitsuId = fallbackKitsuId ?: m?.optString("kitsu_id")?.takeIf { s -> s.isNotBlank() },
-            simklId = m?.optInt("simkl_id")?.let { if (it != 0) it else null },
-            tmdbId = fallbackTmdbId ?: m?.optString("themoviedb_id")?.takeIf { s -> s.isNotBlank() }
+            anilistId = anilistId,
+            malId = malId,
+            kitsuId = kitsuId,
+            simklId = simklId,
+            tmdbId = tmdbId
         )
     }
 
@@ -751,24 +779,24 @@ class CircleFtpProvider : MainAPI() {
             .replace(Regex("""\s{2,}"""), " ")
             .trim()
 
-        // ─── Search Kitsu ──────────────────────────────────────────────────
+        // ─── Priority 1: Kitsu ─────────────────────────────────────────────
         val kitsu = getKitsuMetaCached(cleaned) ?: getKitsuMetaCached(title)
         val zipFromKitsu = kitsu?.id?.let { getAniZipByKitsuId(it) }
 
-        // ─── Search MAL (Jikan) ────────────────────────────────────────────
+        // ─── Priority 2: MAL (Jikan) ───────────────────────────────────────
         val malId: Int? = zipFromKitsu?.malId
             ?: searchMalId(cleaned)
             ?: searchMalId(title)
         val zipFromMal = malId?.let { getAniZipByMalId(it) }
 
-        // ─── Search TMDB ───────────────────────────────────────────────────
+        // ─── Priority 3: TMDB ──────────────────────────────────────────────
         val tmdbMeta = getTmdbMeta(cleaned, year, isSeries)
         val zipFromTmdb = tmdbMeta?.tmdbId?.let { getAniZipByTmdbId(it) }
 
         // ─── Build best AniZip from Kitsu/MAL/TMDB ─────────────────────────
         val bestAniZip: AniZipFull? = zipFromKitsu ?: zipFromMal ?: zipFromTmdb
 
-        // ─── Search AniList (LAST RESORT) ──────────────────────────────────
+        // ─── Priority 4: AniList (LAST RESORT) ─────────────────────────────
         var aniList: AniListMeta? = null
         var aniListId: Int? = bestAniZip?.anilistId
         if (aniListId != null) {
@@ -832,6 +860,7 @@ class CircleFtpProvider : MainAPI() {
             imdbId = finalTmdb?.imdbId
         )
     }
+
     private suspend fun resolveAnimeMetaCached(title: String, year: Int? = null, isSeries: Boolean = true): ResolvedAnimeMeta {
         val key = "${isSeries}|${year ?: 0}|${title.lowercase()}"
         animeMetaCache[key]?.let { cached -> return cached }
