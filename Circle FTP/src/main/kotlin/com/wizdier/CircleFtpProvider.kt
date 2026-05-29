@@ -449,41 +449,13 @@ class CircleFtpProvider : MainAPI() {
         fallbackTmdbId: String? = null
     ): AniZipFull {
         val m = json.optJSONObject("mappings")
-
-        var anilistId: Int? = fallbackAnilistId
-        if (anilistId == null) {
-            val v = json.optInt("anilist_id", 0)
-            if (v != 0) anilistId = v
-        }
-        if (anilistId == null && m != null) {
-            val v = m.optInt("anilist_id", 0)
-            if (v != 0) anilistId = v
-        }
-
-        var malId: Int? = fallbackMalId
-        if (malId == null && m != null) {
-            val v = m.optInt("mal_id", 0)
-            if (v != 0) malId = v
-        }
-
-        val kitsuId: String? = fallbackKitsuId
-            ?: m?.optString("kitsu_id")?.takeIf { it.isNotBlank() }
-
-        var simklId: Int? = null
-        if (m != null) {
-            val v = m.optInt("simkl_id", 0)
-            if (v != 0) simklId = v
-        }
-
-        val tmdbId: String? = fallbackTmdbId
-            ?: m?.optString("themoviedb_id")?.takeIf { it.isNotBlank() }
-
         return AniZipFull(
-            anilistId = anilistId,
-            malId = malId,
-            kitsuId = kitsuId,
-            simklId = simklId,
-            tmdbId = tmdbId
+            anilistId = fallbackAnilistId ?: json.optInt("anilist_id").let { if (it != 0) it else null },
+                ?: m?.optInt("anilist_id")?.let { if (it != 0) it else null },
+            malId = fallbackMalId ?: m?.optInt("mal_id")?.let { if (it != 0) it else null },
+            kitsuId = fallbackKitsuId ?: m?.optString("kitsu_id")?.takeIf { s -> s.isNotBlank() },
+            simklId = m?.optInt("simkl_id")?.let { if (it != 0) it else null },
+            tmdbId = fallbackTmdbId ?: m?.optString("themoviedb_id")?.takeIf { s -> s.isNotBlank() }
         )
     }
 
@@ -779,24 +751,24 @@ class CircleFtpProvider : MainAPI() {
             .replace(Regex("""\s{2,}"""), " ")
             .trim()
 
-        // ─── Priority 1: Kitsu ─────────────────────────────────────────────
+        // ─── Search Kitsu ──────────────────────────────────────────────────
         val kitsu = getKitsuMetaCached(cleaned) ?: getKitsuMetaCached(title)
         val zipFromKitsu = kitsu?.id?.let { getAniZipByKitsuId(it) }
 
-        // ─── Priority 2: MAL (Jikan) ───────────────────────────────────────
+        // ─── Search MAL (Jikan) ────────────────────────────────────────────
         val malId: Int? = zipFromKitsu?.malId
             ?: searchMalId(cleaned)
             ?: searchMalId(title)
         val zipFromMal = malId?.let { getAniZipByMalId(it) }
 
-        // ─── Priority 3: TMDB ──────────────────────────────────────────────
+        // ─── Search TMDB ───────────────────────────────────────────────────
         val tmdbMeta = getTmdbMeta(cleaned, year, isSeries)
         val zipFromTmdb = tmdbMeta?.tmdbId?.let { getAniZipByTmdbId(it) }
 
         // ─── Build best AniZip from Kitsu/MAL/TMDB ─────────────────────────
         val bestAniZip: AniZipFull? = zipFromKitsu ?: zipFromMal ?: zipFromTmdb
 
-        // ─── Priority 4: AniList (LAST RESORT) ─────────────────────────────
+        // ─── Search AniList (LAST RESORT) ──────────────────────────────────
         var aniList: AniListMeta? = null
         var aniListId: Int? = bestAniZip?.anilistId
         if (aniListId != null) {
@@ -860,7 +832,6 @@ class CircleFtpProvider : MainAPI() {
             imdbId = finalTmdb?.imdbId
         )
     }
-
     private suspend fun resolveAnimeMetaCached(title: String, year: Int? = null, isSeries: Boolean = true): ResolvedAnimeMeta {
         val key = "${isSeries}|${year ?: 0}|${title.lowercase()}"
         animeMetaCache[key]?.let { cached -> return cached }
@@ -964,7 +935,7 @@ class CircleFtpProvider : MainAPI() {
 
         val candidateTitles = animeSeasonSearchTitles(baseTitle, seasonName, seasonNumber)
 
-        // ─── Strategy 1: Kitsu ───────────────────────────────────────────
+        // ─── Search Kitsu for season sequence ──────────────────────────────
         var seasonKitsu: KitsuMeta? = null
         var seasonKitsuZip: AniZipFull? = null
         for (candidate in candidateTitles) {
@@ -975,7 +946,7 @@ class CircleFtpProvider : MainAPI() {
             }
         }
 
-        // ─── Strategy 2: MAL ───────────────────────────────────────────────
+        // ─── Search MAL for season sequence ──────────────────────────────────
         var seasonMalId: Int? = seasonKitsuZip?.malId
         var seasonMalZip: AniZipFull? = null
         if (seasonMalId == null) {
@@ -988,60 +959,47 @@ class CircleFtpProvider : MainAPI() {
             }
         }
 
-        // ─── Strategy 3: TMDB ──────────────────────────────────────────────
+        // ─── Search TMDB for season sequence ───────────────────────────────
         val seasonTmdbMeta = getTmdbMeta(cleanTitle(baseTitle), year, true)
         val seasonTmdbZip = seasonTmdbMeta?.tmdbId?.let { getAniZipByTmdbId(it) }
 
+        // ─── Combine best AniZip from all DBs ────────────────────────────────
         val bestSeasonZip = seasonKitsuZip ?: seasonMalZip ?: seasonTmdbZip
 
-        // ─── Strategy 4: AniList SEQUEL chain (LAST RESORT) ──────────────
+        // ─── Search AniList for season sequence (LAST RESORT) ──────────────
+        var seasonAniList: AniListMeta? = null
         var seasonAniListId: Int? = bestSeasonZip?.anilistId
-        var seasonAniList: AniListMeta? = seasonAniListId?.let { getAniListMetaById(it) }
+        if (seasonAniListId != null) {
+            seasonAniList = getAniListMetaById(seasonAniListId)
+        }
 
+        // Try AniList SEQUEL chain from baseMeta
         if (seasonAniList == null && baseMeta.anilistId != null) {
-            var relationNode: AniListMeta? = getAniListMetaById(baseMeta.anilistId)
+            var node: AniListMeta? = getAniListMetaById(baseMeta.anilistId)
             repeat((seasonNumber - 1).coerceAtLeast(0)) {
-                val nextId = relationNode?.relations?.edges
+                val nextId = node?.relations?.edges
                     ?.firstOrNull { edge -> edge.relationType.equals("SEQUEL", ignoreCase = true) }
                     ?.node?.id
-                relationNode = nextId?.let { sequelId -> getAniListMetaById(sequelId) }
+                node = nextId?.let { getAniListMetaById(it) }
             }
-            if (relationNode != null && relationNode.id != baseMeta.anilistId) {
-                val hasEpisodes = (relationNode.episodes ?: 0) > 0 || (relationNode.streamingEpisodes?.size ?: 0) > 0
+            if (node != null && node.id != baseMeta.anilistId) {
+                val hasEpisodes = (node.episodes ?: 0) > 0 || (node.streamingEpisodes?.size ?: 0) > 0
                 if (hasEpisodes) {
-                    seasonAniList = relationNode
-                    seasonAniListId = relationNode.id
+                    seasonAniList = node
+                    seasonAniListId = node.id
                 }
             }
         }
 
-        // ─── Strategy 5: Parallel AniList candidate search (absolute last)
+        // Try direct AniList search with candidate titles
         if (seasonAniList == null) {
-            val candidates: List<Pair<AniListMeta?, AniZipFull?>> = coroutineScope {
-                candidateTitles.map { candidateTitle ->
-                    async {
-                        val node: AniListMeta? = getAniListMeta(candidateTitle)
-                        val zip: AniZipFull? = node?.id?.let { getAniZipFullCached(it) }
-                        Pair(node, zip)
-                    }
-                }.awaitAll()
-            }
-
-            val selected = candidates.firstOrNull { (node, zip) ->
-                node?.id != null &&
-                    node.id != baseMeta.anilistId &&
-                    (
-                        zip?.malId != null ||
-                            zip?.kitsuId != null ||
-                            zip?.simklId != null ||
-                            zip?.tmdbId != null ||
-                            node.idMal != null
-                        )
-            }
-
-            if (selected != null) {
-                seasonAniList = selected.first
-                seasonAniListId = selected.first?.id
+            for (candidate in candidateTitles) {
+                val al = getAniListMeta(candidate)
+                if (al != null) {
+                    seasonAniList = al
+                    seasonAniListId = al.id
+                    break
+                }
             }
         }
 
