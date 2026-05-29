@@ -1,4 +1,4 @@
-version = 25
+version = 20
 
 android {
     namespace = "com.wizdier"
