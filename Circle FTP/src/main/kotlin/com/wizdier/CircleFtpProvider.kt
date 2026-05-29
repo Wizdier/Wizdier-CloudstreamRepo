@@ -477,8 +477,6 @@ class CircleFtpProvider : MainAPI() {
 
     // ─── AniZip API ──────────────────────────────────────────────────────────
 
-    // ─── AniZip API ──────────────────────────────────────────────────────────
-
     private fun parseAniZip(
         json: JSONObject,
         fallbackAnilistId: Int? = null,
@@ -513,6 +511,7 @@ class CircleFtpProvider : MainAPI() {
             tmdbId = fallbackTmdbId ?: m?.optString("themoviedb_id")?.takeIf { it.isNotBlank() }
         )
     }
+
     private suspend fun getAniZipFullCached(anilistId: Int, retryCount: Int = 2): AniZipFull? {
         if (aniZipFullCache.containsKey(anilistId)) return aniZipFullCache[anilistId]
         repeat(retryCount) { attempt ->
@@ -529,25 +528,43 @@ class CircleFtpProvider : MainAPI() {
         return null
     }
 
-    private suspend fun getAniZipByMalId(malId: Int): AniZipFull? = try {
-        val json = JSONObject(app.get("https://api.ani.zip/mappings?mal_id=$malId", cacheTime = 86400).text)
-        parseAniZip(json, fallbackMalId = malId)
-    } catch (_: Exception) {
-        null
+    private suspend fun getAniZipByMalId(malId: Int, retryCount: Int = 2): AniZipFull? {
+        repeat(retryCount) { attempt ->
+            try {
+                val json = JSONObject(app.get("https://api.ani.zip/mappings?mal_id=$malId", cacheTime = 86400).text)
+                return parseAniZip(json, fallbackMalId = malId)
+            } catch (_: Exception) {
+                if (attempt == retryCount - 1) return null
+                kotlinx.coroutines.delay(300L * (attempt + 1))
+            }
+        }
+        return null
     }
 
-    private suspend fun getAniZipByTmdbId(tmdbId: Int): AniZipFull? = try {
-        val json = JSONObject(app.get("https://api.ani.zip/mappings?themoviedb_id=$tmdbId", cacheTime = 86400).text)
-        parseAniZip(json, fallbackTmdbId = tmdbId.toString())
-    } catch (_: Exception) {
-        null
+    private suspend fun getAniZipByTmdbId(tmdbId: Int, retryCount: Int = 2): AniZipFull? {
+        repeat(retryCount) { attempt ->
+            try {
+                val json = JSONObject(app.get("https://api.ani.zip/mappings?themoviedb_id=$tmdbId", cacheTime = 86400).text)
+                return parseAniZip(json, fallbackTmdbId = tmdbId.toString())
+            } catch (_: Exception) {
+                if (attempt == retryCount - 1) return null
+                kotlinx.coroutines.delay(300L * (attempt + 1))
+            }
+        }
+        return null
     }
 
-    private suspend fun getAniZipByKitsuId(kitsuId: String): AniZipFull? = try {
-        val json = JSONObject(app.get("https://api.ani.zip/mappings?kitsu_id=$kitsuId", cacheTime = 86400).text)
-        parseAniZip(json, fallbackKitsuId = kitsuId)
-    } catch (_: Exception) {
-        null
+    private suspend fun getAniZipByKitsuId(kitsuId: String, retryCount: Int = 2): AniZipFull? {
+        repeat(retryCount) { attempt ->
+            try {
+                val json = JSONObject(app.get("https://api.ani.zip/mappings?kitsu_id=$kitsuId", cacheTime = 86400).text)
+                return parseAniZip(json, fallbackKitsuId = kitsuId)
+            } catch (_: Exception) {
+                if (attempt == retryCount - 1) return null
+                kotlinx.coroutines.delay(300L * (attempt + 1))
+            }
+        }
+        return null
     }
 
     private suspend fun getAniZipEpisodeTitles(anilistId: Int): Map<Int, String> = try {
@@ -608,18 +625,16 @@ class CircleFtpProvider : MainAPI() {
             cover = cover,
             synopsis = attr.optString("synopsis").takeIf { s -> s.isNotBlank() },
             averageRating = attr.optString("averageRating").toDoubleOrNull()
-    private suspend fun getAniZipByMalId(malId: Int, retryCount: Int = 2): AniZipFull? {
-        repeat(retryCount) { attempt ->
-            try {
-                val json = JSONObject(app.get("https://api.ani.zip/mappings?mal_id=$malId", cacheTime = 86400).text)
-                return parseAniZip(json, fallbackMalId = malId)
-            } catch (_: Exception) {
-                if (attempt == retryCount - 1) return null
-                kotlinx.coroutines.delay(300L * (attempt + 1))
-            }
-        }
-        return null
+        )
+    } catch (_: Exception) {
+        null
     }
+
+    private suspend fun getKitsuMetaCached(title: String): KitsuMeta? {
+        val key = title.lowercase()
+        if (kitsuMetaCache.containsKey(key)) return kitsuMetaCache[key]
+        val value = getKitsuMeta(title)
+        kitsuMetaCache[key] = value
         return value
     }
 
@@ -700,18 +715,16 @@ class CircleFtpProvider : MainAPI() {
                 val logo = logos.getJSONObject(i)
                 val path = logo.optString("file_path")
                 val lang = logo.optString("iso_639_1")
-    private suspend fun getAniZipByTmdbId(tmdbId: Int, retryCount: Int = 2): AniZipFull? {
-        repeat(retryCount) { attempt ->
-            try {
-                val json = JSONObject(app.get("https://api.ani.zip/mappings?themoviedb_id=$tmdbId", cacheTime = 86400).text)
-                return parseAniZip(json, fallbackTmdbId = tmdbId.toString())
-            } catch (_: Exception) {
-                if (attempt == retryCount - 1) return null
-                kotlinx.coroutines.delay(300L * (attempt + 1))
+                if (path.isNotBlank()) {
+                    return "$tmdbImageBase$path"
+                }
             }
+            null
+        } catch (_: Exception) {
+            null
         }
-        return null
     }
+
     private suspend fun fetchTmdbTrailer(tmdbId: Int?, isSeries: Boolean): String? {
         if (tmdbId == null) return null
         return try {
@@ -790,21 +803,6 @@ class CircleFtpProvider : MainAPI() {
         app.get("$mainApiUrl/api/posts/$postId", verify = false, cacheTime = 60)
     } catch (_: Exception) {
         app.get("$apiUrl/api/posts/$postId", verify = false, cacheTime = 60)
-    }
-
-    private suspend fun getAniZipByKitsuId(kitsuId: String, retryCount: Int = 2): AniZipFull? {
-        repeat(retryCount) { attempt ->
-            try {
-                val json = JSONObject(app.get("https://api.ani.zip/mappings?kitsu_id=$kitsuId", cacheTime = 86400).text)
-                return parseAniZip(json, fallbackKitsuId = kitsuId)
-            } catch (_: Exception) {
-                if (attempt == retryCount - 1) return null
-                kotlinx.coroutines.delay(300L * (attempt + 1))
-            }
-        }
-        return null
-    }
-        return value
     }
 
     // ─── Anime Meta Resolution ───────────────────────────────────────────────
@@ -896,6 +894,7 @@ class CircleFtpProvider : MainAPI() {
             imdbId = finalTmdb?.imdbId
         )
     }
+
     private suspend fun resolveAnimeMetaCached(title: String, year: Int? = null, isSeries: Boolean = true): ResolvedAnimeMeta {
         val key = "${isSeries}|${year ?: 0}|${title.lowercase()}"
         animeMetaCache[key]?.let { cached -> return cached }
@@ -975,6 +974,7 @@ class CircleFtpProvider : MainAPI() {
             imdbId = fallback.imdbId
         )
     }
+
     private suspend fun resolveAnimeSeasonDynamically(
         baseTitle: String,
         seasonName: String?,
@@ -1181,20 +1181,7 @@ class CircleFtpProvider : MainAPI() {
         seasonResolutionCache[cacheKey] = result
         return result
     }
-                malId = resolvedSeasonIds.malId,
-                kitsuId = resolvedSeasonIds.kitsuId,
-                simklId = resolvedSeasonIds.simklId,
-                imdbId = baseMeta.imdbId
-            )
-        }
 
-        return SeasonAnimeResolution(
-            meta = seasonMeta,
-            ids = resolvedSeasonIds,
-            aniListNode = seasonAniList,
-            aniZip = seasonAniZip
-        )
-    }
     // ─── Episode Stream Merging ──────────────────────────────────────────────
 
     private fun mergeEpisodeStreamsForSeason(
@@ -1556,7 +1543,7 @@ class CircleFtpProvider : MainAPI() {
                 val aniZipTitle = aniZipEpTitles[epNum]
                 val aniListTitle = targetMeta.anilistEpisodes?.getOrNull(idx)?.title
                 val serverTitle = mergedEpisode.title
-                    ?.replace(Regex("(?i)Episode\\s*\\d+"), "")
+                    ?.replace(Regex("(?i)Episode\s*\d+"), "")
                     ?.trim()
                     ?.ifBlank { null }
                 val epTitle = aniZipTitle ?: aniListTitle ?: serverTitle ?: "Episode $epNum"
