@@ -1406,28 +1406,36 @@ class CircleFtpProvider : MainAPI() {
                 seasonVariants = allSeasons.map { content -> listOf(content) }
             }
 
-            val detectedSeasonNumbers = mutableSetOf<Int>()
-            allSeasons.forEach { season ->
-                extractSeasonNumberOrNull(season.seasonName)?.let { n -> if (n > 0) detectedSeasonNumbers += n }
-            }
-            loadDataList.forEach { data ->
-                extractSeasonNumberOrNull(data.name ?: data.title)?.let { n -> if (n > 0) detectedSeasonNumbers += n }
-            }
-            val isMultiSeasonAnime = isStacked || detectedSeasonNumbers.size > 1
-
             val targetIndex = selectedSeason ?: 0
             val currentSeasonData = allSeasons.getOrNull(targetIndex) ?: allSeasons.firstOrNull()
                 ?: return newAnimeLoadResponse(title, url, TvType.Anime) {}
 
-            val inferredSeasonNumber =
-                extractSeasonNumberOrNull(currentSeasonData.seasonName)
-                    ?: extractSeasonNumberOrNull(loadDataList.getOrNull(targetIndex)?.let { d -> d.name ?: d.title })
-                    ?: extractSeasonNumberOrNull(title)
+            // A multi-season anime is simply one where we have more than one season
+            // worth of content loaded — regardless of whether the season names happen
+            // to contain "Season N" text.  The old check (detectedSeasonNumbers.size > 1)
+            // was too conservative: shows whose seasons are named "Part 1 / Part 2",
+            // or whose variant posts carry no season suffix at all, would evaluate
+            // isMultiSeasonAnime = false even though allSeasons.size > 1.
+            // That caused two cascading failures:
+            //   1. Recommendations were suppressed (the guard was !isMultiSeasonAnime).
+            //   2. realSeasonNumber fell back to inferredSeasonNumber / 1, so
+            //      resolveAnimeSeasonDynamically received seasonNumber = 1 and
+            //      immediately returned Season 1's IDs for every season clicked.
+            val isMultiSeasonAnime = allSeasons.size > 1
 
+            // When there are multiple seasons, the season number IS targetIndex + 1.
+            // We never fall back to inferring it from title/content name in the
+            // multi-season case: the base post title never changes across season
+            // clicks, so it always reads "Season 1" or nothing, making that
+            // inference always wrong.
             val realSeasonNumber = when {
                 isMultiSeasonAnime -> targetIndex + 1
-                inferredSeasonNumber != null -> inferredSeasonNumber
-                else -> 1
+                else -> {
+                    extractSeasonNumberOrNull(currentSeasonData.seasonName)
+                        ?: extractSeasonNumberOrNull(loadDataList.getOrNull(targetIndex)?.let { d -> d.name ?: d.title })
+                        ?: extractSeasonNumberOrNull(title)
+                        ?: 1
+                }
             }
 
             val metaTitle = titleForSeason(title, currentSeasonData.seasonName, realSeasonNumber)
@@ -1522,7 +1530,7 @@ class CircleFtpProvider : MainAPI() {
                 }
             }
 
-            val recommendationItems: List<SearchResponse> = if (!isMultiSeasonAnime || allSeasons.size <= 1) {
+            val recommendationItems: List<SearchResponse> = if (allSeasons.size <= 1) {
                 emptyList()
             } else {
                 val recommendationBaseId = postIds.firstOrNull() ?: loadData.id
