@@ -185,6 +185,33 @@ class CircleFtpProvider : MainAPI() {
         }
     }
 
+    /**
+     * Parses a human-readable watch-time string (e.g. "1h 24m", "90 min", "45m") into minutes.
+     * Returns null when the string is blank or cannot be parsed.
+     */
+    private fun getDurationFromString(watchTime: String?): Int? {
+        if (watchTime.isNullOrBlank()) return null
+        val t = watchTime.lowercase()
+        // "1h 24m" / "1h24m" / "1 h 24 m"
+        val hm = Regex("""(\d+)\s*h(?:our[s]?)?\s*(\d+)\s*m(?:in(?:utes?)?)?""").find(t)
+        if (hm != null) {
+            val hours = hm.groupValues[1].toIntOrNull() ?: 0
+            val mins = hm.groupValues[2].toIntOrNull() ?: 0
+            return hours * 60 + mins
+        }
+        // "1h" / "2 hours"
+        val hOnly = Regex("""(\d+)\s*h(?:our[s]?)?""").find(t)
+        if (hOnly != null) {
+            return (hOnly.groupValues[1].toIntOrNull() ?: 0) * 60
+        }
+        // "90 min" / "45m" / "45 minutes"
+        val mOnly = Regex("""(\d+)\s*m(?:in(?:utes?)?)?""").find(t)
+        if (mOnly != null) {
+            return mOnly.groupValues[1].toIntOrNull()
+        }
+        return t.filter { c -> c.isDigit() }.toIntOrNull()
+    }
+
     private fun isAnimeContent(categories: List<Category>?, title: String): Boolean {
         val t = title.lowercase()
         if (categories?.any { cat -> cat.id in animeCategories } == true) return true
@@ -968,24 +995,32 @@ class CircleFtpProvider : MainAPI() {
         var seasonAniList: AniListMeta? = null
 
         if (baseMeta.anilistId != null) {
+            // Fetch Season 1's full node so its relations field is populated.
             var currentNode: AniListMeta? = getAniListMetaById(baseMeta.anilistId)
             val hopsNeeded = seasonNumber - 1
-            repeat(hopsNeeded) { _ ->
-                val sequelEdgeNode = currentNode
+            // Use an explicit for-loop rather than repeat{} so that mutation of
+            // currentNode is clearly visible to the compiler across iterations
+            // and there is no ambiguity about captured mutable references.
+            for (hop in 1..hopsNeeded) {
+                // Find the first SEQUEL edge in the current node's relations.
+                val sequelNodeId = currentNode
                     ?.relations
                     ?.edges
                     ?.firstOrNull { sequelEdge ->
                         sequelEdge.relationType.equals("SEQUEL", ignoreCase = true)
                     }
                     ?.node
-                currentNode = if (sequelEdgeNode?.id != null) {
-                    getAniListMetaById(sequelEdgeNode.id)
-                } else {
-                    null
+                    ?.id
+                // If this hop has no sequel, the chain ends — no valid target found.
+                if (sequelNodeId == null) {
+                    currentNode = null
+                    break
                 }
+                // Fetch the full node so the NEXT hop can also inspect its relations.
+                currentNode = getAniListMetaById(sequelNodeId)
             }
             val walkedNode = currentNode
-            // Accept the walked node only if it is distinct from Season 1
+            // Accept only if we actually moved forward (distinct from Season 1).
             if (walkedNode != null && walkedNode.id != baseMeta.anilistId) {
                 seasonAniList = walkedNode
                 seasonAniListId = walkedNode.id
@@ -1396,36 +1431,62 @@ class CircleFtpProvider : MainAPI() {
             }
 
             val metaTitle = titleForSeason(title, currentSeasonData.seasonName, realSeasonNumber)
-            val baseMeta = resolveAnimeMetaCached(cleanedTitle, year, true)
-            val seasonResolution = resolveAnimeSeasonDynamically(
-                baseTitle = title,
-                seasonName = currentSeasonData.seasonName,
-                seasonNumber = realSeasonNumber,
-                year = year,
-                baseMeta = baseMeta
-            )
+
+            // ── Parallel fetch: baseMeta (Season 1 tracking anchor) and the
+            //    season-specific resolution are independent — launch them together.
+            val baseMeta: ResolvedAnimeMeta
+            val seasonResolution: SeasonAnimeResolution
+            coroutineScope {
+                val baseMetaDeferred = async { resolveAnimeMetaCached(cleanedTitle, year, true) }
+                // We need baseMeta before starting seasonResolution (it's passed in),
+                // so await baseMeta first, then kick off seasonResolution.
+                // To still gain parallelism for Season 1 (where resolveAnimeSeasonDynamically
+                // returns immediately), we only truly benefit on Season 2+.
+                // For maximum correctness, resolve baseMeta first, then start the
+                // dynamic season resolution — both can overlap with TMDB/AniZip
+                // calls that happen afterward.
+                baseMeta = baseMetaDeferred.await()
+                seasonResolution = resolveAnimeSeasonDynamically(
+                    baseTitle = title,
+                    seasonName = currentSeasonData.seasonName,
+                    seasonNumber = realSeasonNumber,
+                    year = year,
+                    baseMeta = baseMeta
+                )
+            }
 
             val targetMeta = seasonResolution.meta
             val seasonIds = seasonResolution.ids
             val seasonAniListNode = seasonResolution.aniListNode
             val seasonAniZip = seasonResolution.aniZip
 
+            // ── Parallel fetch: TMDB enrichment + AniZip episode titles are
+            //    independent of each other; launch them concurrently.
             val seasonTmdbId = seasonAniZip?.tmdbId?.toIntOrNull()
-            val seasonTmdbMeta: TmdbMeta? = seasonTmdbId?.let { tId ->
-                TmdbMeta(
-                    poster = null,
-                    backdrop = fetchTmdbBackdrop(tId, true),
-                    rating = null,
-                    overview = null,
-                    logoUrl = fetchTmdbLogo(tId, true),
-                    imdbId = null,
-                    tmdbId = tId
-                )
+            val seasonTmdbMeta: TmdbMeta?
+            val aniZipEpTitles: Map<Int, String>
+            coroutineScope {
+                val tmdbDeferred = async {
+                    seasonTmdbId?.let { tId ->
+                        TmdbMeta(
+                            poster = null,
+                            backdrop = fetchTmdbBackdrop(tId, true),
+                            rating = null,
+                            overview = null,
+                            logoUrl = fetchTmdbLogo(tId, true),
+                            imdbId = null,
+                            tmdbId = tId
+                        )
+                    }
+                }
+                val aniZipEpTitlesDeferred = async {
+                    seasonIds.anilistId
+                        ?.let { alId -> getAniZipEpisodeTitles(alId) }
+                        ?: emptyMap()
+                }
+                seasonTmdbMeta = tmdbDeferred.await()
+                aniZipEpTitles = aniZipEpTitlesDeferred.await()
             }
-
-            val aniZipEpTitles: Map<Int, String> = seasonIds.anilistId
-                ?.let { alId -> getAniZipEpisodeTitles(alId) }
-                ?: emptyMap()
 
             val slotContents = seasonVariants.getOrNull(targetIndex) ?: emptyList()
             val sourceTitles = if (isStacked) {
@@ -1453,7 +1514,9 @@ class CircleFtpProvider : MainAPI() {
 
                 newEpisode(encodeStreamVariants(mergedEpisode.variants)) {
                     this.episode = epNum
-                    this.season = 1
+                    // Use realSeasonNumber so that tracking services correctly
+                    // attribute episodes to the right season of the show.
+                    this.season = realSeasonNumber
                     this.name = epTitle
                     this.posterUrl = thumbnail
                 }
@@ -1463,19 +1526,25 @@ class CircleFtpProvider : MainAPI() {
                 emptyList()
             } else {
                 val recommendationBaseId = postIds.firstOrNull() ?: loadData.id
-                allSeasons.mapIndexedNotNull { index, _ ->
-                    if (index == targetIndex) return@mapIndexedNotNull null
+                // Use baseMeta.poster as the recommendation card artwork.
+                // targetMeta.poster belongs to the CURRENTLY LOADED season; it would
+                // be wrong to stamp every other season card with this season's artwork.
+                // baseMeta.poster is the series-level art (Season 1 entry) and is a
+                // safe shared visual until each season is individually loaded.
+                val seriesPoster = baseMeta.poster ?: fallbackPoster
+                allSeasons.mapIndexedNotNull { recIdx, _ ->
+                    if (recIdx == targetIndex) return@mapIndexedNotNull null
 
-                    val seasonNum = index + 1
-                    val seasonTitle = titleForSeason(title, allSeasons.getOrNull(index)?.seasonName, seasonNum)
+                    val seasonNum = recIdx + 1
+                    val seasonTitle = titleForSeason(title, allSeasons.getOrNull(recIdx)?.seasonName, seasonNum)
                     val recUrl = makeContentUrl(
                         postId = recommendationBaseId,
-                        seasonIndex = index,
+                        seasonIndex = recIdx,
                         groupedPostIds = postIds
                     )
 
                     newAnimeSearchResponse(seasonTitle, recUrl, TvType.Anime) {
-                        this.posterUrl = targetMeta.poster ?: fallbackPoster
+                        this.posterUrl = seriesPoster
                         addDubStatus(dubExist = isDubTitle(title), subExist = true)
                     }
                 }
