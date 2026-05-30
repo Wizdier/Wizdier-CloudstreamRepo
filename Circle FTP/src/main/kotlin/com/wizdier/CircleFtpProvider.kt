@@ -1099,7 +1099,7 @@ class CircleFtpProvider : MainAPI() {
         queryTitles: List<String>,
         year: Int?,
     ): AniListMedia? {
-        return candidates.maxByOrNull { candidate ->
+        return candidates.maxByOrNull { candidate: AniListMedia ->
             scoreAniListCandidate(candidate, queryTitles, year)
         }
     }
@@ -1138,10 +1138,33 @@ class CircleFtpProvider : MainAPI() {
     }
 
     private fun scoreTmdbCandidate(candidate: TmdbSearchResult, queryTitles: List<String>, year: Int?): Int {
-        val candidateTitle = normalizeTitle(candidate.displayTitle).franchiseTitle
-        val candidateYear = candidate.year
+    val candidateTitle = normalizeTitle(candidate.displayTitle).franchiseTitle
+    val candidateYear = candidate.year
+    val titleScore = queryTitles.maxOfOrNull { queryTitle ->
+        tokenScore(candidateTitle, normalizeTitle(queryTitle).franchiseTitle)
+    } ?: 0
+
+    val yearScore = when {
+        year == null || candidateYear == null -> 0
+        year == candidateYear -> 25
+        abs(year - candidateYear) <= 1 -> 10
+        else -> -10
+    }
+
+    return titleScore + yearScore
+}
+
+    private fun scoreAniListCandidate(candidate: AniListMedia, queryTitles: List<String>, year: Int?): Int {
+        val titles = candidate.allTitles()
+        val candidateYear = candidate.resolvedYear()
+    
         val titleScore = queryTitles.maxOfOrNull { queryTitle ->
-            tokenScore(candidateTitle, normalizeTitle(queryTitle).franchiseTitle)
+            titles.maxOfOrNull { candidateTitle ->
+                tokenScore(
+                    normalizeTitle(queryTitle).canonicalTitle,
+                    normalizeTitle(candidateTitle).canonicalTitle,
+                )
+            } ?: 0
         } ?: 0
     
         val yearScore = when {
@@ -1153,6 +1176,8 @@ class CircleFtpProvider : MainAPI() {
     
         return titleScore + yearScore
     }
+
+    private fun tokenScore(left: String, right: String): Int {
 
     private fun tokenScore(left: String, right: String): Int {
         val leftTokens = left.lowercase().split(" ").filter { token -> token.isNotBlank() }.toSet()
