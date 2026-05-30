@@ -421,6 +421,8 @@ class CircleFtpProvider : MainAPI() {
                 val meta = apiClient.getTmdbMetaCached(cleanedTitle, year, false)
                 val trailer = apiClient.fetchTmdbTrailer(meta?.tmdbId, false)
                 val actors = apiClient.fetchTmdbActors(meta?.tmdbId, false)
+                // Cross-reference via AniZip to get Simkl/Trakt/MAL/Kitsu IDs
+                val crossRef = meta?.tmdbId?.let { apiClient.getCrossRefIdsByTmdb(it) }
                 newMovieLoadResponse(title, url, TvType.Movie, link) {
                     this.posterUrl = meta?.poster ?: fallbackPoster
                     this.backgroundPosterUrl = meta?.backdrop ?: meta?.poster ?: fallbackPoster
@@ -432,6 +434,11 @@ class CircleFtpProvider : MainAPI() {
                     this.logoUrl = meta?.logoUrl
                     trailer?.let { t -> addTrailer(t) }
                     meta?.imdbId?.let { i -> addImdbId(i) }
+                    crossRef?.simklId?.let { s -> addSimklId(s) }
+                    crossRef?.traktId?.let { t -> addTraktId(t.toString()) }
+                    crossRef?.malId?.let { m -> addMalId(m) }
+                    crossRef?.kitsuId?.let { k -> addKitsuId(k) }
+                    crossRef?.anilistId?.let { a -> addAniListId(a) }
                 }
             }
         }
@@ -489,7 +496,15 @@ class CircleFtpProvider : MainAPI() {
                 isFinalSeasonMarker(title)
 
             val realSeasonNumber = when {
-                explicitSeasonNumber != null -> explicitSeasonNumber
+                // If we have an explicit marker AND it's consistent with the
+                // positional index (or there's only 1 season), trust it.
+                explicitSeasonNumber != null && (
+                    !isMultiSeasonAnime ||
+                    explicitSeasonNumber == targetIndex + 1 ||
+                    explicitSeasonNumber > 1
+                ) -> explicitSeasonNumber
+                // Multi-season post: positional index is the most reliable
+                // signal when the explicit marker is missing or dubious.
                 isMultiSeasonAnime -> targetIndex + 1
                 isFinalSeason -> 2 // a "Final Season" with no number is at least S2
                 else -> 1
@@ -523,21 +538,27 @@ class CircleFtpProvider : MainAPI() {
             val seasonAniZip = seasonResolution.aniZip
 
             // ── Parallel fetch: TMDB enrichment + AniZip episode titles
+            // Try AniZip TMDB ID first; if missing, search TMDB by the season
+            // display title so logos and backdrops still resolve.
             val seasonTmdbId = seasonAniZip?.tmdbId?.toIntOrNull()
             val seasonTmdbMeta: TmdbMeta?
             val aniZipEpTitles: Map<Int, String>
             coroutineScope {
                 val tmdbDeferred = async {
-                    seasonTmdbId?.let { tId ->
+                    if (seasonTmdbId != null) {
                         TmdbMeta(
                             poster = null,
-                            backdrop = apiClient.fetchTmdbBackdrop(tId, true),
+                            backdrop = apiClient.fetchTmdbBackdrop(seasonTmdbId, true),
                             rating = null,
                             overview = null,
-                            logoUrl = apiClient.fetchTmdbLogo(tId, true),
+                            logoUrl = apiClient.fetchTmdbLogo(seasonTmdbId, true),
                             imdbId = null,
-                            tmdbId = tId
+                            tmdbId = seasonTmdbId
                         )
+                    } else {
+                        // AniZip had no TMDB ID — try a direct TMDB search with
+                        // the resolved season title.
+                        apiClient.getTmdbMeta(targetMeta.title, null, true)
                     }
                 }
                 val aniZipEpTitlesDeferred = async {
@@ -669,6 +690,8 @@ class CircleFtpProvider : MainAPI() {
             val tmdbId = meta?.tmdbId
             val trailer = apiClient.fetchTmdbTrailer(tmdbId, true)
             val actors = apiClient.fetchTmdbActors(tmdbId, true)
+            // Cross-reference via AniZip to get Simkl/Trakt/MAL/Kitsu IDs
+            val crossRef = tmdbId?.let { apiClient.getCrossRefIdsByTmdb(it) }
             val allSeriesVariants: List<TvSeries> = responses.mapNotNull { response ->
                 try {
                     response.parsed<TvSeries>()
@@ -682,19 +705,31 @@ class CircleFtpProvider : MainAPI() {
 
             tvData.content.forEachIndexed { seasonIndex, _ ->
                 val seasonNum = seasonIndex + 1
-                val tmdbEpisodes = tmdbId?.let { tId -> apiClient.fetchTmdbSeasonEpisodes(tId, seasonNum) } ?: emptyList()
+                // Fetch TMDB episode data for proper names, stills, and air-dates.
+                val tmdbEpisodes = tmdbId?.let { tId ->
+                    apiClient.fetchTmdbSeasonEpisodes(tId, seasonNum)
+                } ?: emptyList()
                 val seasonContents = allSeriesVariants.mapNotNull { series -> series.content.getOrNull(seasonIndex) }
                 val mergedEpisodes = mergeEpisodeStreamsForSeason(seasonContents, urlChecks, sourceTitles)
                 mergedEpisodes.forEachIndexed { idx, mergedEpisode ->
                     val tmdbEp = tmdbEpisodes.getOrNull(idx)
+                    // Clean the server-supplied title: strip "Episode N" prefix,
+                    // then keep the remainder if it looks like a real title.
+                    val serverTitle = mergedEpisode.title
+                        ?.replace(CircleFtpPatterns.RE_EPISODE_WORD, "")
+                        ?.trim()
+                        ?.ifBlank { null }
+                    val epName = tmdbEp?.name?.takeIf { n -> n.isNotBlank() }
+                        ?: serverTitle
+                        ?: "Episode ${mergedEpisode.episodeNumber}"
                     episodesData.add(
                         newEpisode(encodeStreamVariants(mergedEpisode.variants)) {
                             this.episode = mergedEpisode.episodeNumber
                             this.season = seasonNum
-                            this.name = tmdbEp?.name?.takeIf { n -> n.isNotBlank() }
-                                ?: mergedEpisode.title?.ifBlank { null }
-                                ?: "Episode ${mergedEpisode.episodeNumber}"
-                            this.posterUrl = tmdbEp?.stillPath?.let { p -> "https://image.tmdb.org/t/p/w500$p" } ?: meta?.poster
+                            this.name = epName
+                            this.posterUrl = tmdbEp?.stillPath?.let { p ->
+                                "https://image.tmdb.org/t/p/w500$p"
+                            } ?: meta?.poster
                             this.description = tmdbEp?.overview
                             parseAirDateMillis(tmdbEp?.airDate)?.let { d -> this.date = d }
                         }
@@ -712,6 +747,11 @@ class CircleFtpProvider : MainAPI() {
                 this.logoUrl = meta?.logoUrl
                 trailer?.let { t -> addTrailer(t) }
                 meta?.imdbId?.let { i -> addImdbId(i) }
+                crossRef?.simklId?.let { s -> addSimklId(s) }
+                crossRef?.traktId?.let { t -> addTraktId(t.toString()) }
+                crossRef?.malId?.let { m -> addMalId(m) }
+                crossRef?.kitsuId?.let { k -> addKitsuId(k) }
+                crossRef?.anilistId?.let { a -> addAniListId(a) }
             }
         }
     }

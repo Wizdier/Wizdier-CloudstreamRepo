@@ -214,7 +214,7 @@ object CircleFtpPatterns {
     //   "Part 2", "Cour 2"        -> captures the trailing number
     val RE_PART_NUM by lazy { Regex("""(?i)\b(?:part|cour)\s*(\d+)\b""") }
     //   "Kaguya-sama 2"           -> trailing standalone 1-2 digit number
-    val RE_TRAILING_NUM by lazy { Regex("""(?i)[a-z].*?\s(\d{1,2})\s*$""") }
+    val RE_TRAILING_NUM by lazy { Regex("""(?i)[a-z]{2,}.*?\s(\d{1,2})\s*$""") }
     //   Trailing roman numeral    -> "Overlord III"
     val RE_ROMAN_SEASON by lazy { Regex("""(?i)(?:^|\s)(VIII|VII|VI|IV|IX|III|II|XI|X|V)\s*$""") }
     //   "Final Season"

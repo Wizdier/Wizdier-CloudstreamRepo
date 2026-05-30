@@ -581,6 +581,17 @@ class CircleFtpApiClient(
         }
     }
 
+
+    // ─── Cross-reference helper (non-anime Simkl / Trakt IDs) ──────────────
+
+    suspend fun getCrossRefIdsByTmdb(tmdbId: Int): AniZipFull? {
+        return try {
+            getAniZipByTmdbId(tmdbId)
+        } catch (e: Exception) {
+            logError("getCrossRefIdsByTmdb", e)
+            null
+        }
+    }
     // ─── Server / Post Fetching ──────────────────────────────────────────────
 
     suspend fun fetchWithFallback(
@@ -743,20 +754,29 @@ class CircleFtpApiClient(
         fallback: ResolvedAnimeMeta,
         isSeries: Boolean
     ): ResolvedAnimeMeta {
-        val tmdbId = aniZip?.tmdbId?.toIntOrNull()
-        val tmdbMeta: TmdbMeta? = tmdbId?.let { tId ->
+        // Try AniZip TMDB ID first, then fall back to a TMDB title search so
+        // logos and backdrops still resolve for seasons that AniZip hasn't
+        // indexed yet.
+        val searchTitle = aniList.title?.english ?: aniList.title?.romaji ?: fallback.title
+        val tmdbFromZip = aniZip?.tmdbId?.toIntOrNull()
+        val tmdbMeta: TmdbMeta? = if (tmdbFromZip != null) {
             TmdbMeta(
                 poster = null,
-                backdrop = fetchTmdbBackdrop(tId, isSeries),
+                backdrop = fetchTmdbBackdrop(tmdbFromZip, isSeries),
                 rating = null,
                 overview = null,
-                logoUrl = fetchTmdbLogo(tId, isSeries),
+                logoUrl = fetchTmdbLogo(tmdbFromZip, isSeries),
                 imdbId = null,
-                tmdbId = tId
+                tmdbId = tmdbFromZip
             )
+        } else {
+            // AniZip didn't carry a TMDB ID — search TMDB by the season's
+            // display title.  This is the key fix for missing logos/backdrops
+            // on season 2+ entries that AniZip hasn't fully mapped yet.
+            getTmdbMeta(searchTitle, null, isSeries)
         }
 
-        val displayTitle = aniList.title?.english ?: aniList.title?.romaji ?: fallback.title
+        val displayTitle = searchTitle
         return ResolvedAnimeMeta(
             title = displayTitle,
             poster = aniList.coverImage?.extraLarge ?: aniList.coverImage?.large ?: fallback.poster,
@@ -764,7 +784,7 @@ class CircleFtpApiClient(
             plot = aniList.description?.replace(CircleFtpPatterns.RE_HTML_TAGS, "") ?: fallback.plot,
             score100 = aniList.averageScore ?: fallback.score100,
             tags = aniList.genres ?: fallback.tags,
-            trailer = fetchTmdbTrailer(tmdbId, isSeries)
+            trailer = fetchTmdbTrailer(tmdbMeta?.tmdbId, isSeries)
                 ?: getAniListTrailerUrl(aniList.trailer)
                 ?: fallback.trailer,
             anilistEpisodes = aniList.streamingEpisodes ?: fallback.anilistEpisodes,
@@ -779,7 +799,7 @@ class CircleFtpApiClient(
             kitsuId = aniZip?.kitsuId,
             simklId = aniZip?.simklId,
             traktId = aniZip?.traktId,
-            imdbId = fallback.imdbId,
+            imdbId = tmdbMeta?.imdbId ?: fallback.imdbId,
             nextAiringInfo = formatNextAiringInfo(aniList.nextAiringEpisode, aniList.status)
         )
     }
@@ -831,10 +851,15 @@ class CircleFtpApiClient(
                     ?.sortedByDescending { edge -> edge.node?.episodes ?: 0 }
                 val bestSequelId = sequelEdges?.firstOrNull()?.node?.id
                 val nextId = bestSequelId ?: run {
-                    node.relations?.edges
-                        ?.filter { edge ->
-                            edge.relationType.equals("ALTERNATIVE", ignoreCase = true)
-                        }
+                    // SEQUEL edge is missing — try weaker continuation signals
+                    // before giving up.  SPIN_OFF and SIDE_STORY often serve
+                    // as de-facto continuations on AniList for multi-cour
+                    // series that weren't tagged as SEQUEL.
+                    val weakEdges = node.relations?.edges?.filter { edge ->
+                        val t = edge.relationType?.uppercase() ?: ""
+                        t == "SPIN_OFF" || t == "SIDE_STORY" || t == "PARENT"
+                    }
+                    weakEdges
                         ?.sortedByDescending { edge -> edge.node?.episodes ?: 0 }
                         ?.firstOrNull()?.node?.id
                 }
@@ -885,7 +910,15 @@ class CircleFtpApiClient(
                         }
                         ?.sortedByDescending { edge -> edge.node?.episodes ?: 0 }
                         ?.firstOrNull()
-                    val nextId = sequelEdge?.node?.id
+                    val nextId = sequelEdge?.node?.id ?: run {
+                        val weakEdges = node.relations?.edges?.filter { edge ->
+                            val t = edge.relationType?.uppercase() ?: ""
+                            t == "SPIN_OFF" || t == "SIDE_STORY" || t == "PARENT"
+                        }
+                        weakEdges
+                            ?.sortedByDescending { edge -> edge.node?.episodes ?: 0 }
+                            ?.firstOrNull()?.node?.id
+                    }
                     if (nextId == null || nextId in rewalkVisited) {
                         rewalkCurrent = null
                         break
