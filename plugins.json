@@ -1,0 +1,29 @@
+[
+    {
+        "url": "https://raw.githubusercontent.com/Wizdier/Wizdier-CloudstreamRepo/builds/Circle FTP.cs3",
+        "status": 1,
+        "version": 4,
+        "name": "Circle FTP",
+        "internalName": "Circle FTP",
+        "authors": [
+            "wizdier"
+        ],
+        "description": "Circle FTP \u2013 movies, TV series and anime with rich metadata.",
+        "fileSize": 118017,
+        "repositoryUrl": "https://github.com/Wizdier/Wizdier-CloudstreamRepo",
+        "tvTypes": [
+            "Movie",
+            "TvSeries",
+            "Anime",
+            "AnimeMovie",
+            "Cartoon",
+            "AsianDrama",
+            "Documentary",
+            "OVA",
+            "Others"
+        ],
+        "iconUrl": "https://www.google.com/s2/favicons?domain=new.circleftp.net&sz=%size%",
+        "apiVersion": 1,
+        "fileHash": "sha256-37f50e4808dd9b511b51fb96316287644cbec542936640c35f6b4bcefbda8681"
+    }
+]
