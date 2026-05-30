@@ -116,6 +116,10 @@ class CircleFtpProvider : MainAPI() {
         Collections.synchronizedMap(mutableMapOf())
     private val imdbToTmdbCache: MutableMap<String, Int?> =
         Collections.synchronizedMap(mutableMapOf())
+    // Cache the full base AniList node (with relations) so we don't re-fetch
+    // it every time we build recommendations or resolve seasons.
+    private val baseAniListNodeCache: MutableMap<Int, AniListMeta?> =
+        Collections.synchronizedMap(mutableMapOf())
 
     // ─── String / Title Helpers ──────────────────────────────────────────────
 
@@ -413,19 +417,29 @@ class CircleFtpProvider : MainAPI() {
 
     /**
      * Unified trailer resolution. Tries the known TMDB id first, then falls back to
-     * resolving a TMDB id from the IMDB id, and finally any provided fallback URL.
-     * Always returns a fully-formatted browser URL.
+     * resolving a TMDB id from the IMDB id, then the base TMDB id (for anime seasons),
+     * and finally any provided fallback URL.  Always returns a fully-formatted browser URL.
      */
     private suspend fun resolveTrailer(
         tmdbId: Int?,
         imdbId: String?,
         isSeries: Boolean,
+        baseTmdbId: Int? = null,
         fallbackTrailer: String? = null
     ): String? {
+        // Primary: direct TMDB trailer
         fetchTmdbTrailer(tmdbId, isSeries)?.let { primary -> return formatTrailerUrl(primary) }
+        // Bridge: IMDB → TMDB
         val bridgedTmdbId = resolveTmdbIdFromImdb(imdbId, isSeries)
-        if (bridgedTmdbId != null) {
+        if (bridgedTmdbId != null && bridgedTmdbId != tmdbId) {
             fetchTmdbTrailer(bridgedTmdbId, isSeries)?.let { bridged -> return formatTrailerUrl(bridged) }
+        }
+        // Base TMDB fallback (useful for anime seasons where the season-specific TMDB
+        // mapping is missing but the parent anime has one)
+        if (baseTmdbId != null && baseTmdbId != tmdbId && baseTmdbId != bridgedTmdbId) {
+            fetchTmdbTrailer(baseTmdbId, isSeries)?.let { baseTmdbTrailer ->
+                return formatTrailerUrl(baseTmdbTrailer)
+            }
         }
         return formatTrailerUrl(fallbackTrailer)
     }
@@ -527,6 +541,18 @@ class CircleFtpProvider : MainAPI() {
         AppUtils.parseJson<AniListResponse>(res.text).data?.Media
     } catch (_: Exception) {
         null
+    }
+
+    /**
+     * Cached version of [getAniListMetaById].  This is the preferred call-site for
+     * the base AniList node so that relation edges are available for recommendation
+     * poster resolution without re-fetching.
+     */
+    private suspend fun getAniListMetaByIdCached(id: Int): AniListMeta? {
+        if (baseAniListNodeCache.containsKey(id)) return baseAniListNodeCache[id]
+        val value = getAniListMetaById(id)
+        baseAniListNodeCache[id] = value
+        return value
     }
 
     private fun buildAniListQuery(byId: Boolean): String {
@@ -742,6 +768,11 @@ class CircleFtpProvider : MainAPI() {
         return value
     }
 
+    /**
+     * Resolves the best backdrop (landscape poster) from multiple metadata sources.
+     * Priority: TMDB backdrop_path → AniList bannerImage → explicit fallback →
+     * TMDB poster → AniList cover image.
+     */
     private fun resolveBackdrop(tmdbMeta: TmdbMeta?, aniListMeta: AniListMeta?, fallback: String?): String? =
         tmdbMeta?.backdrop
             ?: aniListMeta?.bannerImage
@@ -1050,6 +1081,22 @@ class CircleFtpProvider : MainAPI() {
         )
     }
 
+    /**
+     * Resolves per-season tracking metadata (AniList, MAL, Kitsu, Simkl, IMDB)
+     * using a multi-strategy approach:
+     *
+     * 1. **AniList SEQUEL relation chain** — starts from the base AniList node and
+     *    follows SEQUEL edges to reach the target season.  This is the most reliable
+     *    method when AniList has accurate relation data.
+     *
+     * 2. **Parallel candidate-title search** — builds multiple plausible title
+     *    variants (e.g. "Attack on Titan Season 2", "Shingeki no Kyojin Part 2") and
+     *    searches AniList for each concurrently.  The first candidate that returns a
+     *    unique AniList ID different from the base is selected.
+     *
+     * 3. **Graceful fallback** — if neither strategy succeeds, the base meta IDs are
+     *    kept so tracking still works without crashing.
+     */
     private suspend fun resolveAnimeSeasonDynamically(
         baseTitle: String,
         seasonName: String?,
@@ -1058,7 +1105,7 @@ class CircleFtpProvider : MainAPI() {
         baseMeta: ResolvedAnimeMeta
     ): SeasonAnimeResolution {
         if (seasonNumber <= 1) {
-            val node = baseMeta.anilistId?.let { alId -> getAniListMetaById(alId) }
+            val node = baseMeta.anilistId?.let { alId -> getAniListMetaByIdCached(alId) }
             val zip = baseMeta.anilistId?.let { alId -> getAniZipFullCached(alId) }
             return SeasonAnimeResolution(
                 meta = baseMeta,
@@ -1066,22 +1113,22 @@ class CircleFtpProvider : MainAPI() {
                     anilistId = baseMeta.anilistId,
                     malId = zip?.malId ?: baseMeta.malId,
                     kitsuId = zip?.kitsuId ?: baseMeta.kitsuId,
-                    simklId = zip?.simklId ?: baseMeta.simklId
+                    simklId = zip?.simklId ?: baseMeta.simklId,
+                    imdbId = baseMeta.imdbId
                 ),
                 aniListNode = node,
                 aniZip = zip
             )
         }
 
-        // Strategy 1: follow AniList SEQUEL relation chain.
+        // ── Strategy 1: follow AniList SEQUEL relation chain ────────────────
         // Start from the base node and follow SEQUEL edges (seasonNumber-1) times.
-        var relationNode: AniListMeta? = baseMeta.anilistId?.let { alId -> getAniListMetaById(alId) }
+        var relationNode: AniListMeta? = baseMeta.anilistId?.let { alId -> getAniListMetaByIdCached(alId) }
         for (step in 1 until seasonNumber) {
             val nextId = relationNode?.relations?.edges
                 ?.firstOrNull { edge -> edge.relationType.equals("SEQUEL", ignoreCase = true) }
                 ?.node?.id
             if (nextId == null) {
-                // No more sequels in the chain.
                 relationNode = null
                 break
             }
@@ -1102,14 +1149,15 @@ class CircleFtpProvider : MainAPI() {
                     anilistId = relationNode.id,
                     malId = relationZip?.malId ?: relationNode.idMal,
                     kitsuId = relationZip?.kitsuId,
-                    simklId = relationZip?.simklId
+                    simklId = relationZip?.simklId,
+                    imdbId = seasonMeta.imdbId
                 ),
                 aniListNode = relationNode,
                 aniZip = relationZip
             )
         }
 
-        // Strategy 2: parallel candidate title search (fallback).
+        // ── Strategy 2: parallel candidate title search (fallback) ─────────────
         val candidateTitles = animeSeasonSearchTitles(baseTitle, seasonName, seasonNumber)
         val candidates: List<Pair<AniListMeta?, AniZipFull?>> = coroutineScope {
             candidateTitles.map { candidateTitle ->
@@ -1146,7 +1194,8 @@ class CircleFtpProvider : MainAPI() {
                         anilistId = selectedNode.id,
                         malId = selectedZip?.malId ?: selectedNode.idMal,
                         kitsuId = selectedZip?.kitsuId,
-                        simklId = selectedZip?.simklId
+                        simklId = selectedZip?.simklId,
+                        imdbId = seasonMeta.imdbId
                     ),
                     aniListNode = selectedNode,
                     aniZip = selectedZip
@@ -1154,14 +1203,15 @@ class CircleFtpProvider : MainAPI() {
             }
         }
 
-        // Graceful fallback: no specific season found — keep baseMeta IDs so tracking still works.
+        // ── Graceful fallback: keep base IDs so tracking still works ──────────
         return SeasonAnimeResolution(
             meta = baseMeta,
             ids = SeasonIds(
                 anilistId = baseMeta.anilistId,
                 malId = baseMeta.malId,
                 kitsuId = baseMeta.kitsuId,
-                simklId = baseMeta.simklId
+                simklId = baseMeta.simklId,
+                imdbId = baseMeta.imdbId
             ),
             aniListNode = null,
             aniZip = null
@@ -1237,7 +1287,8 @@ class CircleFtpProvider : MainAPI() {
     }
 
     /**
-     * Anime series = ONE base tile (season index 0). Everything else stays stacked as a single tile.
+     * Anime series → ONE base tile (season index 0, stripped title).
+     * Standard TV / movies → single tile (no filtering).
      */
     private suspend fun toSearchResults(post: Post, groupedPostIds: List<Int> = emptyList()): List<SearchResponse> {
         val isAnime = isAnimeContent(post.categories, post.title) || post.title.contains("anime", true)
@@ -1354,7 +1405,11 @@ class CircleFtpProvider : MainAPI() {
                 )
                 newAnimeLoadResponse(meta.title.ifBlank { title }, url, TvType.AnimeMovie) {
                     this.posterUrl = meta.poster ?: fallbackPoster
-                    this.backgroundPosterUrl = meta.background ?: meta.poster ?: fallbackPoster
+                    this.backgroundPosterUrl = resolveBackdrop(
+                        tmdbMeta = null,
+                        aniListMeta = meta.anilistId?.let { alId -> getAniListMetaByIdCached(alId) },
+                        fallback = meta.background ?: meta.poster ?: fallbackPoster
+                    )
                     this.year = year
                     this.plot = meta.plot ?: loadData.metaData
                     this.tags = meta.tags
@@ -1449,6 +1504,11 @@ class CircleFtpProvider : MainAPI() {
 
             val baseMeta = resolveAnimeMetaCached(cleanedTitle, year, true)
 
+            // ── Resolve base TMDB id (for trailer/backdrop fallback across seasons) ──
+            val baseTmdbId: Int? = baseMeta.anilistId?.let { alId ->
+                getAniZipFullCached(alId)?.tmdbId?.toIntOrNull()
+            }
+
             // ── Multi-season tracking resolution (locked to the Anime branch) ──
             val seasonResolution = resolveAnimeSeasonDynamically(
                 baseTitle = title,
@@ -1505,9 +1565,24 @@ class CircleFtpProvider : MainAPI() {
                 }
             }
 
+            // ── Season recommendation items with per-season poster resolution ──
             val recommendationItems: List<SearchResponse> = if (!isMultiSeasonAnime || allSeasons.size <= 1) {
                 emptyList()
             } else {
+                // Fetch the base AniList node (cached) to extract per-season posters
+                // from the SEQUEL relation edges.
+                val baseAniNode = baseMeta.anilistId?.let { alId -> getAniListMetaByIdCached(alId) }
+                // Build a map: AniList ID → cover image from relation edges
+                val relationPosterMap: Map<Int, String> = baseAniNode?.relations?.edges
+                    ?.mapNotNull { edge ->
+                        val node = edge.node
+                        val cover = node?.coverImage?.extraLarge ?: node?.coverImage?.large
+                        val nodeId = node?.id
+                        if (nodeId != null && !cover.isNullOrBlank()) nodeId to cover else null
+                    }
+                    ?.toMap()
+                    ?: emptyMap()
+
                 val recommendationBaseId = postIds.firstOrNull() ?: loadData.id
                 allSeasons.mapIndexedNotNull { index, _ ->
                     if (index == targetIndex) return@mapIndexedNotNull null
@@ -1518,47 +1593,85 @@ class CircleFtpProvider : MainAPI() {
                         seasonIndex = index,
                         groupedPostIds = postIds
                     )
+                    // Try to get the per-season poster from the AniList relation map.
+                    // We walk the SEQUEL chain to find the correct AniList id for this index.
+                    val recAniListId: Int? = if (baseAniNode != null) {
+                        var walkNode = baseAniNode
+                        for (step in 0 until index) {
+                            val nextId = walkNode?.relations?.edges
+                                ?.firstOrNull { edge -> edge.relationType.equals("SEQUEL", ignoreCase = true) }
+                                ?.node?.id
+                            if (nextId != null) {
+                                walkNode = walkNode?.relations?.edges
+                                    ?.firstOrNull { edge -> edge.relationType.equals("SEQUEL", ignoreCase = true) }
+                                    ?.node
+                            } else {
+                                walkNode = null
+                                break
+                            }
+                        }
+                        walkNode?.id
+                    } else null
+
+                    val recPoster = recAniListId?.let { alId -> relationPosterMap[alId] }
+                        ?: targetMeta.poster
+                        ?: fallbackPoster
+
                     newAnimeSearchResponse(seasonTitle, recUrl, TvType.Anime) {
-                        this.posterUrl = targetMeta.poster ?: fallbackPoster
+                        this.posterUrl = recPoster
                         addDubStatus(dubExist = isDubTitle(title), subExist = true)
                     }
                 }
             }
 
-            // IMDB-aware trailer pipeline for the active season.
+            // ── Trailer resolution: season-specific → base TMDB → AniList fallback ──
             val seasonTrailer: String? = resolveTrailer(
                 tmdbId = seasonTmdbMeta?.tmdbId,
-                imdbId = seasonTmdbMeta?.imdbId ?: targetMeta.imdbId ?: baseMeta.imdbId,
+                imdbId = seasonTmdbMeta?.imdbId ?: seasonResolution.ids.imdbId ?: baseMeta.imdbId,
                 isSeries = true,
+                baseTmdbId = baseTmdbId,
                 fallbackTrailer = getAniListTrailerUrl(seasonAniListNode?.trailer) ?: targetMeta.trailer
             )
 
-            // Per-season unique tracking ids. For season 1 we may safely fall back to the
-            // base meta ids; for season 2+ we keep the dynamically-resolved season ids and
-            // never let them default back to season 1.
+            // ── Per-season unique tracking ids ──
+            // For season 1 we fall back to base meta ids as a safety net.
+            // For season 2+ we use the dynamically-resolved season ids and never
+            // default back to season 1.
             val idsForCurrentSeason = if (realSeasonNumber <= 1) {
                 SeasonIds(
                     anilistId = seasonAniZip?.anilistId ?: resolvedSeasonAniListId ?: baseMeta.anilistId,
                     malId = seasonAniZip?.malId ?: seasonResolution.ids.malId ?: baseMeta.malId,
                     kitsuId = seasonAniZip?.kitsuId ?: seasonResolution.ids.kitsuId ?: baseMeta.kitsuId,
-                    simklId = seasonAniZip?.simklId ?: seasonResolution.ids.simklId ?: baseMeta.simklId
+                    simklId = seasonAniZip?.simklId ?: seasonResolution.ids.simklId ?: baseMeta.simklId,
+                    imdbId = seasonTmdbMeta?.imdbId ?: seasonResolution.ids.imdbId ?: baseMeta.imdbId
                 )
             } else {
                 SeasonIds(
                     anilistId = seasonAniZip?.anilistId ?: resolvedSeasonAniListId ?: seasonResolution.ids.anilistId,
                     malId = seasonAniZip?.malId ?: seasonResolution.ids.malId,
                     kitsuId = seasonAniZip?.kitsuId ?: seasonResolution.ids.kitsuId,
-                    simklId = seasonAniZip?.simklId ?: seasonResolution.ids.simklId
+                    simklId = seasonAniZip?.simklId ?: seasonResolution.ids.simklId,
+                    imdbId = seasonTmdbMeta?.imdbId ?: seasonResolution.ids.imdbId ?: targetMeta.imdbId
                 )
             }
 
+            // ── Backdrop resolution with base-meta fallback ──
+            // When the season-specific TMDB meta has no backdrop, we also try
+            // the base AniList node's bannerImage and the base meta's resolved background.
+            val baseAniListNodeForBackdrop = baseMeta.anilistId?.let { alId -> getAniListMetaByIdCached(alId) }
+            val seasonBackdrop = resolveBackdrop(
+                tmdbMeta = seasonTmdbMeta,
+                aniListMeta = seasonAniListNode,
+                fallback = baseAniListNodeForBackdrop?.bannerImage
+                    ?: baseMeta.background
+                    ?: targetMeta.background
+                    ?: targetMeta.poster
+                    ?: fallbackPoster
+            )
+
             newAnimeLoadResponse(targetMeta.title.ifBlank { metaTitle }, url, TvType.Anime) {
                 this.posterUrl = targetMeta.poster ?: fallbackPoster
-                this.backgroundPosterUrl = resolveBackdrop(
-                    tmdbMeta = seasonTmdbMeta,
-                    aniListMeta = seasonAniListNode,
-                    fallback = targetMeta.background ?: targetMeta.poster ?: fallbackPoster
-                )
+                this.backgroundPosterUrl = seasonBackdrop
                 this.year = year
                 this.plot = targetMeta.plot ?: loadData.metaData
                 this.tags = targetMeta.tags
@@ -1570,7 +1683,7 @@ class CircleFtpProvider : MainAPI() {
                 addMalId(idsForCurrentSeason.malId)
                 idsForCurrentSeason.kitsuId?.let { k -> addKitsuId(k) }
                 idsForCurrentSeason.simklId?.let { s -> addSimklId(s) }
-                baseMeta.imdbId?.let { i -> addImdbId(i) }
+                idsForCurrentSeason.imdbId?.let { i -> addImdbId(i) }
                 this.recommendations = recommendationItems
                 addEpisodes(
                     if (isDubTitle(title)) DubStatus.Dubbed else DubStatus.Subbed,
@@ -1688,11 +1801,13 @@ class CircleFtpProvider : MainAPI() {
         val imdbId: String?
     )
 
+    /** Per-season tracking identifiers for MAL, AniList, Kitsu, Simkl, and IMDB. */
     data class SeasonIds(
         val anilistId: Int? = null,
         val malId: Int? = null,
         val kitsuId: String? = null,
-        val simklId: Int? = null
+        val simklId: Int? = null,
+        val imdbId: String? = null
     )
 
     data class Post(
