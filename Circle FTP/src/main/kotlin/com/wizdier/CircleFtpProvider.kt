@@ -1713,7 +1713,7 @@ class CircleFtpProvider : MainAPI() {
     private fun String.toTvType(): TvType {
         return TvType.entries.firstOrNull { tvType -> tvType.name.equals(this, ignoreCase = true) } ?: TvType.Others
     }
-}
+
 
     data class PageData(
         @JsonProperty("posts") val posts: List<Post> = emptyList(),
