@@ -1142,7 +1142,8 @@ class CircleFtpProvider : MainAPI() {
     val candidateYear = candidate.year
     val titleScore = queryTitles.maxOfOrNull { queryTitle ->
         tokenScore(candidateTitle, normalizeTitle(queryTitle).franchiseTitle)
-    } ?: 0
+        } ?: 0
+    }
 
     val yearScore = when {
         year == null || candidateYear == null -> 0
