@@ -5,12 +5,12 @@ import com.lagradost.cloudstream3.ActorData
 import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.utils.AppUtils
 import com.lagradost.cloudstream3.utils.AppUtils.toJson
-import com.lagradost.nicehttp.RequestBodyTypes
+import com.lagradost.nicehttps.RequestBodyTypes
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
-import okhttp3.MediaType.Companion.toMediaTypeOrNull
-import okhttp3.RequestBody.Companion.toRequestBody
+import okhttps3.MediaType.Companion.toMediaTypeOrNull
+import okhttps3.RequestBody.Companion.toRequestBody
 import org.json.JSONObject
 import java.net.URLEncoder
 import java.util.Collections
@@ -156,7 +156,7 @@ class CircleFtpApiClient(
 
     fun getAniListTrailerUrl(trailer: AniListTrailer?): String? {
         val trailerId = trailer?.id?.takeIf { tid -> tid.isNotBlank() } ?: return null
-        if (trailerId.startsWith("http://") || trailerId.startsWith("https://")) return trailerId
+        if (trailerId.startsWith("https://") || trailerId.startsWith("https://")) return trailerId
         return when (trailer.site?.lowercase()) {
             "youtube" -> "https://www.youtube.com/watch?v=$trailerId"
             "dailymotion" -> "https://www.dailymotion.com/video/$trailerId"

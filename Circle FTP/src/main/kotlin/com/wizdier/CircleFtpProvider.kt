@@ -21,9 +21,9 @@ import org.json.JSONArray
 import java.net.URLEncoder
 
 class CircleFtpProvider : MainAPI() {
-    override var mainUrl = "https://new.circleftp.net"
-    private var mainApiUrl = "https://new.circleftp.net:5000"
-    private val fallbackApiUrl = "https://15.1.1.50:5000"
+    override var mainUrl = "http://new.circleftp.net"
+    private var mainApiUrl = "http://new.circleftp.net:5000"
+    private val fallbackApiUrl = "http://15.1.1.50:5000"
 
     override var name = "Circle FTP"
     override var lang = "bn"
