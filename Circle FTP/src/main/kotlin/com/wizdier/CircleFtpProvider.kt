@@ -1138,27 +1138,26 @@ class CircleFtpProvider : MainAPI() {
     }
 
     private fun scoreTmdbCandidate(candidate: TmdbSearchResult, queryTitles: List<String>, year: Int?): Int {
-    val candidateTitle = normalizeTitle(candidate.displayTitle).franchiseTitle
-    val candidateYear = candidate.year
-    val titleScore = queryTitles.maxOfOrNull { queryTitle ->
-        tokenScore(candidateTitle, normalizeTitle(queryTitle).franchiseTitle)
+        val candidateTitle = normalizeTitle(candidate.displayTitle).franchiseTitle
+        val candidateYear = candidate.year
+        val titleScore = queryTitles.maxOfOrNull { queryTitle ->
+            tokenScore(candidateTitle, normalizeTitle(queryTitle).franchiseTitle)
         } ?: 0
-    }
 
-    val yearScore = when {
-        year == null || candidateYear == null -> 0
-        year == candidateYear -> 25
-        abs(year - candidateYear) <= 1 -> 10
-        else -> -10
-    }
+        val yearScore = when {
+            year == null || candidateYear == null -> 0
+            year == candidateYear -> 25
+            abs(year - candidateYear) <= 1 -> 10
+            else -> -10
+        }
 
-    return titleScore + yearScore
-}
+        return titleScore + yearScore
+    }
 
     private fun scoreAniListCandidate(candidate: AniListMedia, queryTitles: List<String>, year: Int?): Int {
         val titles = candidate.allTitles()
         val candidateYear = candidate.resolvedYear()
-    
+
         val titleScore = queryTitles.maxOfOrNull { queryTitle ->
             titles.maxOfOrNull { candidateTitle ->
                 tokenScore(
@@ -1167,18 +1166,16 @@ class CircleFtpProvider : MainAPI() {
                 )
             } ?: 0
         } ?: 0
-    
+
         val yearScore = when {
             year == null || candidateYear == null -> 0
             year == candidateYear -> 25
             abs(year - candidateYear) <= 1 -> 10
             else -> -10
         }
-    
+
         return titleScore + yearScore
     }
-
-    private fun tokenScore(left: String, right: String): Int {
 
     private fun tokenScore(left: String, right: String): Int {
         val leftTokens = left.lowercase().split(" ").filter { token -> token.isNotBlank() }.toSet()
@@ -1547,14 +1544,21 @@ class CircleFtpProvider : MainAPI() {
             ?.trim()
     }
 
-    private fun AniListMedia.allTitles(): List<String> {
-        return buildList {
-            title?.english?.let { englishTitle -> add(englishTitle) }
-            title?.romaji?.let { romajiTitle -> add(romajiTitle) }
-            title?.native?.let { nativeTitle -> add(nativeTitle) }
-            title?.userPreferred?.let { preferred -> add(preferred) }
-            synonyms.orEmpty().forEach { synonym -> if (!synonym.isNullOrBlank()) add(synonym) }
-        }.distinct()
+        private fun AniListMedia.allTitles(): List<String> {
+        val result = mutableListOf<String>()
+
+        this.title?.english?.takeIf { it.isNotBlank() }?.let { result.add(it) }
+        this.title?.romaji?.takeIf { it.isNotBlank() }?.let { result.add(it) }
+        this.title?.native?.takeIf { it.isNotBlank() }?.let { result.add(it) }
+        this.title?.userPreferred?.takeIf { it.isNotBlank() }?.let { result.add(it) }
+
+        this.synonyms.orEmpty().forEach { synonym ->
+            if (!synonym.isNullOrBlank()) {
+                result.add(synonym)
+            }
+        }
+
+        return result.distinct()
     }
 
     private fun AniListMedia.resolvedYear(): Int? {
