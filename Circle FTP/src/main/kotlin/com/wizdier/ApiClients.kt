@@ -1,6 +1,5 @@
 package com.wizdier
 
-import android.util.Log
 import com.lagradost.cloudstream3.Actor
 import com.lagradost.cloudstream3.ActorData
 import com.lagradost.cloudstream3.app
@@ -35,7 +34,8 @@ class CircleFtpApiClient(
     // ─── Logging Helper ────────────────────────────────────────────────────
 
     private fun logError(method: String, e: Exception) {
-        Log.w(CircleFtpPatterns.LOG_TAG, "$method: ${e.message}", e)
+        // Plain println keeps this plugin cross-platform compatible (no platform Log).
+        println("${CircleFtpPatterns.LOG_TAG}: $method: ${e.message}")
     }
 
     // ─── LRU-bounded caches ────────────────────────────────────────────────
