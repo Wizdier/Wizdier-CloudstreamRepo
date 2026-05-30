@@ -4,6 +4,7 @@ import android.util.Log
 import com.lagradost.cloudstream3.Actor
 import com.lagradost.cloudstream3.ActorData
 import com.lagradost.cloudstream3.MainAPI
+import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.utils.AppUtils
 import com.lagradost.cloudstream3.utils.AppUtils.toJson
 import com.lagradost.nicehttp.RequestBodyTypes
@@ -78,7 +79,7 @@ class CircleFtpApiClient(
                 val query = buildAniListQuery(byId = false)
                 val body = mapOf("query" to query, "variables" to mapOf("search" to title))
                     .toJson().toRequestBody(RequestBodyTypes.JSON.toMediaTypeOrNull())
-                val res = provider.app.post(
+                val res = app.post(
                     anilistApi,
                     requestBody = body,
                     headers = mapOf("Content-Type" to "application/json"),
@@ -100,7 +101,7 @@ class CircleFtpApiClient(
                 val query = buildAniListQuery(byId = true)
                 val body = mapOf("query" to query, "variables" to mapOf("id" to id))
                     .toJson().toRequestBody(RequestBodyTypes.JSON.toMediaTypeOrNull())
-                val res = provider.app.post(
+                val res = app.post(
                     anilistApi,
                     requestBody = body,
                     headers = mapOf("Content-Type" to "application/json"),
@@ -243,7 +244,7 @@ class CircleFtpApiClient(
         aniZipFullCache[anilistId]?.let { return it }
         repeat(retryCount) { attempt ->
             try {
-                val json = JSONObject(provider.app.get("https://api.ani.zip/mappings?anilist_id=$anilistId", cacheTime = 86400).text)
+                val json = JSONObject(app.get("https://api.ani.zip/mappings?anilist_id=$anilistId", cacheTime = 86400).text)
                 val value = parseAniZip(json, fallbackAnilistId = anilistId)
                 aniZipFullCache[anilistId] = value
                 aniZipRawCache[anilistId] = json
@@ -260,7 +261,7 @@ class CircleFtpApiClient(
     suspend fun getAniZipByMalId(malId: Int, retryCount: Int = 2): AniZipFull? {
         repeat(retryCount) { attempt ->
             try {
-                val json = JSONObject(provider.app.get("https://api.ani.zip/mappings?mal_id=$malId", cacheTime = 86400).text)
+                val json = JSONObject(app.get("https://api.ani.zip/mappings?mal_id=$malId", cacheTime = 86400).text)
                 return parseAniZip(json, fallbackMalId = malId)
             } catch (e: Exception) {
                 logError("getAniZipByMalId", e)
@@ -274,7 +275,7 @@ class CircleFtpApiClient(
     suspend fun getAniZipByTmdbId(tmdbId: Int, retryCount: Int = 2): AniZipFull? {
         repeat(retryCount) { attempt ->
             try {
-                val json = JSONObject(provider.app.get("https://api.ani.zip/mappings?themoviedb_id=$tmdbId", cacheTime = 86400).text)
+                val json = JSONObject(app.get("https://api.ani.zip/mappings?themoviedb_id=$tmdbId", cacheTime = 86400).text)
                 return parseAniZip(json, fallbackTmdbId = tmdbId.toString())
             } catch (e: Exception) {
                 logError("getAniZipByTmdbId", e)
@@ -288,7 +289,7 @@ class CircleFtpApiClient(
     suspend fun getAniZipByKitsuId(kitsuId: String, retryCount: Int = 2): AniZipFull? {
         repeat(retryCount) { attempt ->
             try {
-                val json = JSONObject(provider.app.get("https://api.ani.zip/mappings?kitsu_id=$kitsuId", cacheTime = 86400).text)
+                val json = JSONObject(app.get("https://api.ani.zip/mappings?kitsu_id=$kitsuId", cacheTime = 86400).text)
                 return parseAniZip(json, fallbackKitsuId = kitsuId)
             } catch (e: Exception) {
                 logError("getAniZipByKitsuId", e)
@@ -303,7 +304,7 @@ class CircleFtpApiClient(
         // Check the raw JSON cache first — avoids a redundant network call if
         // getAniZipFullCached already fetched this ID.
         val json = aniZipRawCache[anilistId]
-            ?: JSONObject(provider.app.get("https://api.ani.zip/mappings?anilist_id=$anilistId", cacheTime = 86400).text)
+            ?: JSONObject(app.get("https://api.ani.zip/mappings?anilist_id=$anilistId", cacheTime = 86400).text)
         val episodes = json.optJSONObject("episodes") ?: return emptyMap()
         val map = mutableMapOf<Int, String>()
         episodes.keys().forEach { key ->
@@ -324,7 +325,7 @@ class CircleFtpApiClient(
     // ─── Kitsu / MAL API ─────────────────────────────────────────────────────
 
     suspend fun searchMalId(title: String): Int? = try {
-        val res = provider.app.get(
+        val res = app.get(
             "https://api.jikan.moe/v4/anime?q=${URLEncoder.encode(title, "UTF-8")}&limit=1",
             cacheTime = 3600
         )
@@ -335,7 +336,7 @@ class CircleFtpApiClient(
     }
 
     private suspend fun getKitsuMeta(title: String): KitsuMeta? = try {
-        val res = provider.app.get(
+        val res = app.get(
             "https://kitsu.io/api/edge/anime?filter[text]=${URLEncoder.encode(title, "UTF-8")}",
             headers = mapOf("Accept" to "application/vnd.api+json"),
             cacheTime = 3600
@@ -383,7 +384,7 @@ class CircleFtpApiClient(
         val yearParam = year?.let { y -> if (isSeries) "&first_air_date_year=$y" else "&year=$y" } ?: ""
         val searchUrl = "$tmdbApi/search/$type?api_key=$tmdbKey&query=${URLEncoder.encode(title, "UTF-8")}$yearParam&language=en-US"
         val first = AppUtils.parseJson<TmdbSearchResponse>(
-            provider.app.get(searchUrl, cacheTime = 86400).text
+            app.get(searchUrl, cacheTime = 86400).text
         ).results?.firstOrNull() ?: return null
 
         val tmdbId = first.id ?: return null
@@ -393,7 +394,7 @@ class CircleFtpApiClient(
 
         try {
             val detail = JSONObject(
-                provider.app.get("$tmdbApi/$type/$tmdbId?api_key=$tmdbKey&append_to_response=external_ids", cacheTime = 86400).text
+                app.get("$tmdbApi/$type/$tmdbId?api_key=$tmdbKey&append_to_response=external_ids", cacheTime = 86400).text
             )
             imdbId = detail.optJSONObject("external_ids")?.optString("imdb_id")?.takeIf { s -> s.isNotBlank() }
             val detailBackdrop = detail.optString("backdrop_path").takeIf { s -> s.isNotBlank() }
@@ -438,7 +439,7 @@ class CircleFtpApiClient(
         val result = try {
             val type = if (isSeries) "tv" else "movie"
             val json = JSONObject(
-                provider.app.get("$tmdbApi/$type/$tmdbId?api_key=$tmdbKey&language=en-US", cacheTime = 86400).text
+                app.get("$tmdbApi/$type/$tmdbId?api_key=$tmdbKey&language=en-US", cacheTime = 86400).text
             )
             json.optString("backdrop_path").takeIf { p -> p.isNotBlank() }?.let { p -> "$tmdbBackdropBase$p" }
         } catch (e: Exception) {
@@ -456,7 +457,7 @@ class CircleFtpApiClient(
         val result = try {
             val type = if (isSeries) "tv" else "movie"
             val json = JSONObject(
-                provider.app.get("$tmdbApi/$type/$tmdbId/images?api_key=$tmdbKey", cacheTime = 86400).text
+                app.get("$tmdbApi/$type/$tmdbId/images?api_key=$tmdbKey", cacheTime = 86400).text
             )
             val logos = json.optJSONArray("logos") ?: return@try null
             // Collect all valid logos then pick the best one by language preference.
@@ -498,7 +499,7 @@ class CircleFtpApiClient(
         val result = try {
             val type = if (isSeries) "tv" else "movie"
             val json = JSONObject(
-                provider.app.get("$tmdbApi/$type/$tmdbId/videos?api_key=$tmdbKey&language=en-US", cacheTime = 86400).text
+                app.get("$tmdbApi/$type/$tmdbId/videos?api_key=$tmdbKey&language=en-US", cacheTime = 86400).text
             )
             val results = json.optJSONArray("results") ?: return@try null
             val videos = List(results.length()) { idx -> results.getJSONObject(idx) }
@@ -531,7 +532,7 @@ class CircleFtpApiClient(
 
     suspend fun fetchTmdbSeasonEpisodes(tmdbId: Int, seasonNum: Int): List<TmdbEpisode> = try {
         val json = JSONObject(
-            provider.app.get("$tmdbApi/tv/$tmdbId/season/$seasonNum?api_key=$tmdbKey&language=en-US", cacheTime = 86400).text
+            app.get("$tmdbApi/tv/$tmdbId/season/$seasonNum?api_key=$tmdbKey&language=en-US", cacheTime = 86400).text
         )
         val arr = json.optJSONArray("episodes") ?: return emptyList()
         List(arr.length()) { idx ->
@@ -554,7 +555,7 @@ class CircleFtpApiClient(
         return try {
             val type = if (isSeries) "tv" else "movie"
             val json = JSONObject(
-                provider.app.get("$tmdbApi/$type/$tmdbId/credits?api_key=$tmdbKey", cacheTime = 86400).text
+                app.get("$tmdbApi/$type/$tmdbId/credits?api_key=$tmdbKey", cacheTime = 86400).text
             )
             val cast = json.optJSONArray("cast") ?: return null
             (0 until minOf(cast.length(), 20)).mapNotNull { idx ->
@@ -585,10 +586,10 @@ class CircleFtpApiClient(
     }
 
     suspend fun fetchPostResponse(postId: Int) = try {
-        provider.app.get("$mainApiUrl/api/posts/$postId", cacheTime = 60)
+        app.get("$mainApiUrl/api/posts/$postId", cacheTime = 60)
     } catch (e: Exception) {
         logError("fetchPostResponse", e)
-        provider.app.get("$fallbackApiUrl/api/posts/$postId", cacheTime = 60)
+        app.get("$fallbackApiUrl/api/posts/$postId", cacheTime = 60)
     }
 
     // ─── Anime Meta Resolution ───────────────────────────────────────────────
@@ -797,7 +798,7 @@ class CircleFtpApiClient(
         }
 
         // Check cache first
-        val cacheKey = "${baseMeta.anilistId ?: 0}|${baseMeta.malId ?: 0}|$seasonNumber"
+        val cacheKey = "${baseTitle.lowercase()}|${baseMeta.anilistId ?: 0}|${baseMeta.malId ?: 0}|$seasonNumber"
         seasonResolutionCache[cacheKey]?.let { return it }
 
         // ── Season 2+: all IDs must be resolved fresh for THIS season only ──

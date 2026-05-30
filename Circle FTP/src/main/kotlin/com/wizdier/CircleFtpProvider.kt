@@ -624,7 +624,7 @@ class CircleFtpProvider : MainAPI() {
                 idsForCurrentSeason.kitsuId?.let { k -> addKitsuId(k) }
                 idsForCurrentSeason.simklId?.let { s -> addSimklId(s) }
                 idsForCurrentSeason.traktId?.let { t -> addTraktId(t.toString()) }
-                baseMeta.imdbId?.let { i -> addImdbId(i) }
+                if (realSeasonNumber <= 1) baseMeta.imdbId?.let { i -> addImdbId(i) }
                 this.recommendations = recommendationItems
                 addEpisodes(
                     if (isDubTitle(title)) DubStatus.Dubbed else DubStatus.Subbed,
