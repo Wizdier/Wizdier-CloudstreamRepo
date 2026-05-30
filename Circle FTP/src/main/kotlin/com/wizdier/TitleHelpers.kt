@@ -37,7 +37,12 @@ fun cleanTitle(title: String): String {
 fun stripSeasonSuffixForAnime(title: String): String =
     cleanTitle(title)
         .replace(CircleFtpPatterns.RE_ANIME_WORD, "")
+        .replace(CircleFtpPatterns.RE_FINAL_SEASON, "")
+        .replace(CircleFtpPatterns.RE_ORDINAL_SEASON_STRIP, "")
         .replace(CircleFtpPatterns.RE_SEASON_WORD, "")
+        .replace(CircleFtpPatterns.RE_PART_STRIP, "")
+        .replace(CircleFtpPatterns.RE_TRAILING_ROMAN_STRIP, "")
+        .replace(CircleFtpPatterns.RE_TRAILING_NUM_STRIP, "")
         .replace(CircleFtpPatterns.RE_MULTISPACE, " ")
         .trim()
 
@@ -58,10 +63,47 @@ fun titleForSeason(baseTitle: String, seasonName: String?, seasonNumber: Int): S
     }
 }
 
+private val romanSeasonMap = mapOf(
+    "II" to 2, "III" to 3, "IV" to 4, "V" to 5, "VI" to 6,
+    "VII" to 7, "VIII" to 8, "IX" to 9, "X" to 10, "XI" to 11
+)
+
+/**
+ * Best-effort detection of the season number from a free-form anime title or
+ * season-name. Handles the many ways multi-seasonal anime express the season:
+ *
+ *   "Season 2", "S2", "2nd Season", "Part 2", "Cour 2",
+ *   "Final Season" (treated as the last/next season — caller may override),
+ *   trailing roman numerals ("Overlord III"), and a trailing bare number
+ *   ("Kaguya-sama 2").  Returns null when no season marker is found so the
+ *   caller can fall back to positional season indexing.
+ */
 fun extractSeasonNumberOrNull(value: String?): Int? {
     if (value.isNullOrBlank()) return null
-    return CircleFtpPatterns.RE_SEASON_NUM.find(value)?.groupValues?.getOrNull(1)?.toIntOrNull()
-        ?: CircleFtpPatterns.RE_S_NUM.find(value)?.groupValues?.getOrNull(1)?.toIntOrNull()
+    val v = value.trim()
+
+    // Explicit "Season N" / "Seasons N"
+    CircleFtpPatterns.RE_SEASON_NUM.find(v)?.groupValues?.getOrNull(1)?.toIntOrNull()?.let { return it }
+    // "2nd Season", "3rd Cour"
+    CircleFtpPatterns.RE_ORDINAL_SEASON.find(v)?.groupValues?.getOrNull(1)?.toIntOrNull()?.let { return it }
+    // "Part 2", "Cour 2"
+    CircleFtpPatterns.RE_PART_NUM.find(v)?.groupValues?.getOrNull(1)?.toIntOrNull()?.let { return it }
+    // "S2"
+    CircleFtpPatterns.RE_S_NUM.find(v)?.groupValues?.getOrNull(1)?.toIntOrNull()?.let { return it }
+    // Trailing roman numeral ("Overlord III")
+    CircleFtpPatterns.RE_ROMAN_SEASON.find(v)?.groupValues?.getOrNull(1)
+        ?.uppercase()?.let { roman -> romanSeasonMap[roman]?.let { return it } }
+    // Trailing bare number ("Kaguya-sama 2") — only if it isn't a 4-digit year
+    CircleFtpPatterns.RE_TRAILING_NUM.find(v)?.groupValues?.getOrNull(1)?.toIntOrNull()
+        ?.let { n -> if (n in 2..40) return n }
+
+    return null
+}
+
+/** True when the title/season-name marks the *final* season (e.g. AoT Final Season). */
+fun isFinalSeasonMarker(value: String?): Boolean {
+    if (value.isNullOrBlank()) return false
+    return CircleFtpPatterns.RE_FINAL_SEASON.containsMatchIn(value)
 }
 
 fun extractSeasonNumberFromTitle(title: String): Int =

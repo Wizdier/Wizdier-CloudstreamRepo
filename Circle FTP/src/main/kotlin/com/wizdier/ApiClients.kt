@@ -3,7 +3,6 @@ package com.wizdier
 import android.util.Log
 import com.lagradost.cloudstream3.Actor
 import com.lagradost.cloudstream3.ActorData
-import com.lagradost.cloudstream3.MainAPI
 import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.utils.AppUtils
 import com.lagradost.cloudstream3.utils.AppUtils.toJson
@@ -24,7 +23,6 @@ import java.util.LinkedHashMap
  * API calls through this class.
  */
 class CircleFtpApiClient(
-    private val provider: MainAPI,
     private val mainApiUrl: String,
     private val fallbackApiUrl: String
 ) {
@@ -798,7 +796,7 @@ class CircleFtpApiClient(
         }
 
         // Check cache first
-        val cacheKey = "${baseTitle.lowercase()}|${baseMeta.anilistId ?: 0}|${baseMeta.malId ?: 0}|$seasonNumber"
+        val cacheKey = "${baseMeta.anilistId ?: 0}|${baseMeta.malId ?: 0}|$seasonNumber"
         seasonResolutionCache[cacheKey]?.let { return it }
 
         // ── Season 2+: all IDs must be resolved fresh for THIS season only ──

@@ -205,8 +205,26 @@ object CircleFtpPatterns {
     val RE_VARIANTS_PARAM by lazy { Regex("""[?&]variants=([^&]+)""") }
 
     // extractSeasonNumber
-    val RE_SEASON_NUM by lazy { Regex("""(?i)\bseason\s*(\d+)\b""") }
-    val RE_S_NUM by lazy { Regex("""(?i)\bs(\d+)\b""") }
+    val RE_SEASON_NUM by lazy { Regex("""(?i)\bseasons?\s*(\d+)\b""") }
+    val RE_S_NUM by lazy { Regex("""(?i)\bs(\d{1,2})\b""") }
+
+    // Extended season-number detection (multi-seasonal anime)
+    //   "2nd Season", "3rd Cour"  -> captures the leading number
+    val RE_ORDINAL_SEASON by lazy { Regex("""(?i)\b(\d+)\s*(?:st|nd|rd|th)\s+(?:season|cour)\b""") }
+    //   "Part 2", "Cour 2"        -> captures the trailing number
+    val RE_PART_NUM by lazy { Regex("""(?i)\b(?:part|cour)\s*(\d+)\b""") }
+    //   "Kaguya-sama 2"           -> trailing standalone 1-2 digit number
+    val RE_TRAILING_NUM by lazy { Regex("""(?i)[a-z].*?\s(\d{1,2})\s*$""") }
+    //   Trailing roman numeral    -> "Overlord III"
+    val RE_ROMAN_SEASON by lazy { Regex("""(?i)(?:^|\s)(VIII|VII|VI|IV|IX|III|II|XI|X|V)\s*$""") }
+    //   "Final Season"
+    val RE_FINAL_SEASON by lazy { Regex("""(?i)\bfinal\s+season\b""") }
+
+    // Aggressive season-suffix stripping helpers (anime franchise base title)
+    val RE_ORDINAL_SEASON_STRIP by lazy { Regex("""(?i)\b\d+\s*(?:st|nd|rd|th)\s+(?:season|cour)\b""") }
+    val RE_PART_STRIP by lazy { Regex("""(?i)\b(?:part|cour)\s*\d+\b""") }
+    val RE_TRAILING_ROMAN_STRIP by lazy { Regex("""(?i)\s+(?:VIII|VII|VI|IV|IX|III|II|XI|X|V)\s*$""") }
+    val RE_TRAILING_NUM_STRIP by lazy { Regex("""(?i)\s+\d{1,2}\s*$""") }
 
     // extractEpisodeNumber
     val RE_EP_NUM by lazy { Regex("""(?i)\b(?:episode|ep|e)\s*\.?\s*(\d{1,4})\b""") }

@@ -74,7 +74,7 @@ class CircleFtpProvider : MainAPI() {
 
     // ─── API Client ────────────────────────────────────────────────────────
 
-    private val apiClient = CircleFtpApiClient(this, mainApiUrl, fallbackApiUrl)
+    private val apiClient = CircleFtpApiClient(mainApiUrl, fallbackApiUrl)
 
     // ─── Logging Helper ────────────────────────────────────────────────────
 
@@ -191,12 +191,14 @@ class CircleFtpProvider : MainAPI() {
     private fun mergeKeyForPost(post: Post): MergeKey {
         val rawTitle = post.name?.ifBlank { post.title } ?: post.title
         val isAnime = isAnimeContent(post.categories, post.title) || post.title.contains("anime", true)
-        val cleanedTitle = if (isAnime) {
-            cleanTitle(rawTitle).lowercase()
-        } else {
-            normalizeMergeTitle(rawTitle)
-        }
         val isSeries = post.type.lowercase() == "series"
+        val cleanedTitle = when {
+            // Anime series: strip EVERY season marker so all seasons of a
+            // franchise collapse to one merge key and group into a single tile.
+            isAnime && isSeries -> stripSeasonSuffixForAnime(rawTitle).lowercase()
+            isAnime -> cleanTitle(rawTitle).lowercase()
+            else -> normalizeMergeTitle(rawTitle)
+        }
         return MergeKey(
             title = cleanedTitle,
             type = post.type.lowercase(),
@@ -467,23 +469,44 @@ class CircleFtpProvider : MainAPI() {
 
             val isMultiSeasonAnime = allSeasons.size > 1
 
+            // ── Robust season-number resolution ───────────────────────────────
+            // Order of trust:
+            //   1. An explicit marker in THIS season's name ("2nd Season",
+            //      "Part 2", "S3", roman numerals, trailing number, …)
+            //   2. An explicit marker in the source/post title
+            //   3. An explicit marker in the main title
+            //   4. Positional index for stacked multi-season posts (index + 1)
+            //   5. Final fallback: season 1
+            // "Final Season" markers are mapped to the last positional slot so
+            // they don't collapse back to season 1.
+            val sourceTitleForSeason = loadDataList.getOrNull(targetIndex)?.let { d -> d.name ?: d.title }
+            val explicitSeasonNumber =
+                extractSeasonNumberOrNull(currentSeasonData.seasonName)
+                    ?: extractSeasonNumberOrNull(sourceTitleForSeason)
+                    ?: extractSeasonNumberOrNull(title)
+            val isFinalSeason = isFinalSeasonMarker(currentSeasonData.seasonName) ||
+                isFinalSeasonMarker(sourceTitleForSeason) ||
+                isFinalSeasonMarker(title)
+
             val realSeasonNumber = when {
+                explicitSeasonNumber != null -> explicitSeasonNumber
                 isMultiSeasonAnime -> targetIndex + 1
-                else -> {
-                    extractSeasonNumberOrNull(currentSeasonData.seasonName)
-                        ?: extractSeasonNumberOrNull(loadDataList.getOrNull(targetIndex)?.let { d -> d.name ?: d.title })
-                        ?: extractSeasonNumberOrNull(title)
-                        ?: 1
-                }
+                isFinalSeason -> 2 // a "Final Season" with no number is at least S2
+                else -> 1
             }
 
             val metaTitle = titleForSeason(title, currentSeasonData.seasonName, realSeasonNumber)
 
             // ── Parallel fetch: baseMeta and season-specific resolution
+            // baseMeta is the *franchise anchor* (Season 1). It MUST be resolved
+            // from the franchise base title with every season suffix stripped so
+            // that the AniList sequel-walk starts at Season 1 — otherwise titles
+            // like "Overlord III" would anchor on Season 3 and overshoot.
+            val franchiseBaseTitle = stripSeasonSuffixForAnime(title).ifBlank { cleanedTitle }
             val baseMeta: ResolvedAnimeMeta
             val seasonResolution: SeasonAnimeResolution
             coroutineScope {
-                val baseMetaDeferred = async { apiClient.resolveAnimeMetaCached(cleanedTitle, year, true) }
+                val baseMetaDeferred = async { apiClient.resolveAnimeMetaCached(franchiseBaseTitle, year, true) }
                 baseMeta = baseMetaDeferred.await()
                 seasonResolution = apiClient.resolveAnimeSeasonDynamically(
                     baseTitle = title,
@@ -624,7 +647,7 @@ class CircleFtpProvider : MainAPI() {
                 idsForCurrentSeason.kitsuId?.let { k -> addKitsuId(k) }
                 idsForCurrentSeason.simklId?.let { s -> addSimklId(s) }
                 idsForCurrentSeason.traktId?.let { t -> addTraktId(t.toString()) }
-                if (realSeasonNumber <= 1) baseMeta.imdbId?.let { i -> addImdbId(i) }
+                baseMeta.imdbId?.let { i -> addImdbId(i) }
                 this.recommendations = recommendationItems
                 addEpisodes(
                     if (isDubTitle(title)) DubStatus.Dubbed else DubStatus.Subbed,
