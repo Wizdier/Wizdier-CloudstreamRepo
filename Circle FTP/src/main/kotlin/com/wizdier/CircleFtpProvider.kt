@@ -1218,6 +1218,35 @@ class CircleFtpProvider : MainAPI() {
         )
     }
 
+    /**
+     * Walks the AniList SEQUEL relation chain starting from [baseAniListId], re-fetching
+     * each node via [getAniListMetaByIdCached] so that nested relation edges remain
+     * available at every depth.  This is the reliable way to map a season *index* to its
+     * exact AniList node, because the relation `node` objects returned inline by the
+     * GraphQL query do NOT carry their own `relations` edges (so a naive in-memory walk
+     * silently dies after depth 1).
+     *
+     * Returns a list aligned to season offsets:
+     *   index 0 → base node (Season 1), index 1 → first SEQUEL, index 2 → next, …
+     * The list may be shorter than [maxSeasons] if the chain ends early.
+     */
+    private suspend fun buildSeasonAniListChain(baseAniListId: Int?, maxSeasons: Int): List<AniListMeta?> {
+        if (baseAniListId == null || maxSeasons <= 0) return emptyList()
+        val chain = mutableListOf<AniListMeta?>()
+        var currentNode: AniListMeta? = getAniListMetaByIdCached(baseAniListId)
+        chain += currentNode
+        while (chain.size < maxSeasons) {
+            val nextId = currentNode?.relations?.edges
+                ?.firstOrNull { edge -> edge.relationType.equals("SEQUEL", ignoreCase = true) }
+                ?.node?.id
+                ?: break
+            currentNode = getAniListMetaByIdCached(nextId)
+            chain += currentNode
+            if (currentNode == null) break
+        }
+        return chain
+    }
+
     // ─── Episode Stream Merging ──────────────────────────────────────────────
 
     private fun mergeEpisodeStreamsForSeason(
@@ -1566,23 +1595,17 @@ class CircleFtpProvider : MainAPI() {
             }
 
             // ── Season recommendation items with per-season poster resolution ──
+            // Resolve the AniList node for EVERY season up front by re-fetching each
+            // SEQUEL node (so nested relation edges survive past depth 1).  This gives
+            // each recommendation tile its own correct cover art instead of collapsing
+            // to the base/season-1 poster.
+            val seasonAniListChain: List<AniListMeta?> =
+                if (!isMultiSeasonAnime || allSeasons.size <= 1) emptyList()
+                else buildSeasonAniListChain(baseMeta.anilistId, allSeasons.size)
+
             val recommendationItems: List<SearchResponse> = if (!isMultiSeasonAnime || allSeasons.size <= 1) {
                 emptyList()
             } else {
-                // Fetch the base AniList node (cached) to extract per-season posters
-                // from the SEQUEL relation edges.
-                val baseAniNode = baseMeta.anilistId?.let { alId -> getAniListMetaByIdCached(alId) }
-                // Build a map: AniList ID → cover image from relation edges
-                val relationPosterMap: Map<Int, String> = baseAniNode?.relations?.edges
-                    ?.mapNotNull { edge ->
-                        val node = edge.node
-                        val cover = node?.coverImage?.extraLarge ?: node?.coverImage?.large
-                        val nodeId = node?.id
-                        if (nodeId != null && !cover.isNullOrBlank()) nodeId to cover else null
-                    }
-                    ?.toMap()
-                    ?: emptyMap()
-
                 val recommendationBaseId = postIds.firstOrNull() ?: loadData.id
                 allSeasons.mapIndexedNotNull { index, _ ->
                     if (index == targetIndex) return@mapIndexedNotNull null
@@ -1593,27 +1616,10 @@ class CircleFtpProvider : MainAPI() {
                         seasonIndex = index,
                         groupedPostIds = postIds
                     )
-                    // Try to get the per-season poster from the AniList relation map.
-                    // We walk the SEQUEL chain to find the correct AniList id for this index.
-                    val recAniListId: Int? = if (baseAniNode != null) {
-                        var walkNode = baseAniNode
-                        for (step in 0 until index) {
-                            val nextId = walkNode?.relations?.edges
-                                ?.firstOrNull { edge -> edge.relationType.equals("SEQUEL", ignoreCase = true) }
-                                ?.node?.id
-                            if (nextId != null) {
-                                walkNode = walkNode?.relations?.edges
-                                    ?.firstOrNull { edge -> edge.relationType.equals("SEQUEL", ignoreCase = true) }
-                                    ?.node
-                            } else {
-                                walkNode = null
-                                break
-                            }
-                        }
-                        walkNode?.id
-                    } else null
-
-                    val recPoster = recAniListId?.let { alId -> relationPosterMap[alId] }
+                    // Pull this season's exact AniList node from the pre-walked chain.
+                    val recNode: AniListMeta? = seasonAniListChain.getOrNull(index)
+                    val recPoster = recNode?.coverImage?.extraLarge
+                        ?: recNode?.coverImage?.large
                         ?: targetMeta.poster
                         ?: fallbackPoster
 
