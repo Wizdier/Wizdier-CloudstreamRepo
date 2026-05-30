@@ -457,31 +457,35 @@ class CircleFtpApiClient(
             val json = JSONObject(
                 app.get("$tmdbApi/$type/$tmdbId/images?api_key=$tmdbKey", cacheTime = 86400).text
             )
-            val logos = json.optJSONArray("logos") ?: return@try null
-            // Collect all valid logos then pick the best one by language preference.
-            // Prefer: English > Bengali (provider lang) > any language > no language.
-            // SVG logos (vector) are preferred over PNG (raster) for sharpness.
-            val preferredLangs = listOf("en", "bn")
-            var bestMatch: String? = null
-            var bestScore = -1  // Higher = better
-            for (i in 0 until logos.length()) {
-                val logo = logos.getJSONObject(i)
-                val path = logo.optString("file_path").takeIf { p -> p.isNotBlank() } ?: continue
-                val lang = logo.optString("iso_639_1").orEmpty()
-                val isSvg = path.endsWith(".svg", ignoreCase = true)
-                val score = when {
-                    lang in preferredLangs && isSvg -> 4
-                    lang == "en" -> 3
-                    lang == "bn" -> 2
-                    lang.isNotBlank() -> 1
-                    else -> 0
+            val logos = json.optJSONArray("logos")
+            if (logos == null) {
+                null
+            } else {
+                // Collect all valid logos then pick the best one by language preference.
+                // Prefer: English > Bengali (provider lang) > any language > no language.
+                // SVG logos (vector) are preferred over PNG (raster) for sharpness.
+                val preferredLangs = listOf("en", "bn")
+                var bestMatch: String? = null
+                var bestScore = -1  // Higher = better
+                for (i in 0 until logos.length()) {
+                    val logo = logos.getJSONObject(i)
+                    val path = logo.optString("file_path").takeIf { p -> p.isNotBlank() } ?: continue
+                    val lang = logo.optString("iso_639_1").orEmpty()
+                    val isSvg = path.endsWith(".svg", ignoreCase = true)
+                    val score = when {
+                        lang in preferredLangs && isSvg -> 4
+                        lang == "en" -> 3
+                        lang == "bn" -> 2
+                        lang.isNotBlank() -> 1
+                        else -> 0
+                    }
+                    if (score > bestScore) {
+                        bestScore = score
+                        bestMatch = "$tmdbImageBase$path"
+                    }
                 }
-                if (score > bestScore) {
-                    bestScore = score
-                    bestMatch = "$tmdbImageBase$path"
-                }
+                bestMatch
             }
-            bestMatch
         } catch (e: Exception) {
             logError("fetchTmdbLogo", e)
             null
@@ -499,26 +503,34 @@ class CircleFtpApiClient(
             val json = JSONObject(
                 app.get("$tmdbApi/$type/$tmdbId/videos?api_key=$tmdbKey&language=en-US", cacheTime = 86400).text
             )
-            val results = json.optJSONArray("results") ?: return@try null
-            val videos = List(results.length()) { idx -> results.getJSONObject(idx) }
-            val preferred = videos.firstOrNull { v ->
-                v.optString("site").equals("YouTube", true) &&
-                    v.optString("type").equals("Trailer", true) &&
-                    v.optBoolean("official")
-            } ?: videos.firstOrNull { v ->
-                v.optString("site").equals("YouTube", true) &&
-                    v.optString("type").equals("Trailer", true)
-            } ?: videos.firstOrNull { v ->
-                v.optString("site").equals("YouTube", true) &&
-                    v.optString("type").equals("Teaser", true)
-            } ?: videos.firstOrNull { v ->
-                v.optString("site").equals("Dailymotion", true)
-            }
-            val key = preferred?.optString("key")?.takeIf { k -> k.isNotBlank() } ?: return@try null
-            when (preferred.optString("site").lowercase()) {
-                "youtube" -> "https://www.youtube.com/watch?v=$key"
-                "dailymotion" -> "https://www.dailymotion.com/video/$key"
-                else -> "https://www.youtube.com/watch?v=$key"
+            val results = json.optJSONArray("results")
+            if (results == null) {
+                null
+            } else {
+                val videos = List(results.length()) { idx -> results.getJSONObject(idx) }
+                val preferred = videos.firstOrNull { v ->
+                    v.optString("site").equals("YouTube", true) &&
+                        v.optString("type").equals("Trailer", true) &&
+                        v.optBoolean("official")
+                } ?: videos.firstOrNull { v ->
+                    v.optString("site").equals("YouTube", true) &&
+                        v.optString("type").equals("Trailer", true)
+                } ?: videos.firstOrNull { v ->
+                    v.optString("site").equals("YouTube", true) &&
+                        v.optString("type").equals("Teaser", true)
+                } ?: videos.firstOrNull { v ->
+                    v.optString("site").equals("Dailymotion", true)
+                }
+                val key = preferred?.optString("key")?.takeIf { k -> k.isNotBlank() }
+                if (preferred == null || key == null) {
+                    null
+                } else {
+                    when (preferred.optString("site").lowercase()) {
+                        "youtube" -> "https://www.youtube.com/watch?v=$key"
+                        "dailymotion" -> "https://www.dailymotion.com/video/$key"
+                        else -> "https://www.youtube.com/watch?v=$key"
+                    }
+                }
             }
         } catch (e: Exception) {
             logError("fetchTmdbTrailer", e)
@@ -806,19 +818,20 @@ class CircleFtpApiClient(
         var seasonAniListId: Int? = null
         var seasonAniList: AniListMeta? = null
 
-        if (baseMeta.anilistId != null) {
-            var currentNode: AniListMeta? = getAniListMetaById(baseMeta.anilistId)
+        val baseAniListId: Int? = baseMeta.anilistId
+        if (baseAniListId != null) {
+            var currentNode: AniListMeta? = getAniListMetaById(baseAniListId)
             val hopsNeeded = seasonNumber - 1
             for (hop in 1..hopsNeeded) {
-                if (currentNode == null) break
-                val sequelEdges = currentNode.relations?.edges
+                val node = currentNode ?: break
+                val sequelEdges = node.relations?.edges
                     ?.filter { edge ->
                         edge.relationType.equals("SEQUEL", ignoreCase = true)
                     }
                     ?.sortedByDescending { edge -> edge.node?.episodes ?: 0 }
                 val bestSequelId = sequelEdges?.firstOrNull()?.node?.id
                 val nextId = bestSequelId ?: run {
-                    currentNode.relations?.edges
+                    node.relations?.edges
                         ?.filter { edge ->
                             edge.relationType.equals("ALTERNATIVE", ignoreCase = true)
                         }
@@ -829,25 +842,26 @@ class CircleFtpApiClient(
                     currentNode = null
                     break
                 }
-                if (nextId == baseMeta.anilistId) {
+                if (nextId == baseAniListId) {
                     currentNode = null
                     break
                 }
                 currentNode = getAniListMetaById(nextId)
             }
             val walkedNode = currentNode
-            if (walkedNode != null && walkedNode.id != baseMeta.anilistId) {
+            if (walkedNode != null && walkedNode.id != baseAniListId) {
                 seasonAniList = walkedNode
                 seasonAniListId = walkedNode.id
             }
         }
 
         // ─── Strategy A2: PREQUEL walk to anchor at Season 1, then re-walk ─
-        if (seasonAniListId == null && baseMeta.anilistId != null) {
+        if (seasonAniListId == null && baseAniListId != null) {
             val visitedIds = mutableSetOf<Int>()
-            var anchorNode: AniListMeta? = getAniListMetaById(baseMeta.anilistId)
-            while (anchorNode != null) {
-                val prequelEdge = anchorNode.relations?.edges
+            var anchorNode: AniListMeta? = getAniListMetaById(baseAniListId)
+            while (true) {
+                val node = anchorNode ?: break
+                val prequelEdge = node.relations?.edges
                     ?.filter { edge ->
                         edge.relationType.equals("PREQUEL", ignoreCase = true)
                     }
@@ -856,15 +870,16 @@ class CircleFtpApiClient(
                 val prequelId = prequelEdge?.node?.id
                 if (prequelId == null || prequelId in visitedIds) break
                 visitedIds.add(prequelId)
-                if (prequelId == baseMeta.anilistId) break
+                if (prequelId == baseAniListId) break
                 anchorNode = getAniListMetaById(prequelId)
             }
-            if (anchorNode != null && anchorNode.id != baseMeta.anilistId) {
-                var rewalkCurrent: AniListMeta? = anchorNode
-                val rewalkVisited = mutableSetOf<Int?>(); rewalkVisited.add(anchorNode.id)
+            val anchored = anchorNode
+            if (anchored != null && anchored.id != baseAniListId) {
+                var rewalkCurrent: AniListMeta? = anchored
+                val rewalkVisited = mutableSetOf<Int?>(); rewalkVisited.add(anchored.id)
                 for (hop in 1 until seasonNumber) {
-                    if (rewalkCurrent == null) break
-                    val sequelEdge = rewalkCurrent.relations?.edges
+                    val node = rewalkCurrent ?: break
+                    val sequelEdge = node.relations?.edges
                         ?.filter { edge ->
                             edge.relationType.equals("SEQUEL", ignoreCase = true)
                         }
@@ -879,7 +894,7 @@ class CircleFtpApiClient(
                     rewalkCurrent = getAniListMetaById(nextId)
                 }
                 val rewalkedNode = rewalkCurrent
-                if (rewalkedNode != null && rewalkedNode.id != baseMeta.anilistId) {
+                if (rewalkedNode != null && rewalkedNode.id != baseAniListId) {
                     seasonAniList = rewalkedNode
                     seasonAniListId = rewalkedNode.id
                 }
