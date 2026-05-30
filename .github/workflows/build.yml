@@ -13,7 +13,9 @@ on:
       - main
     paths-ignore:
       - '*.md'
-
+permissions:
+  contents: write   # ← allows the bot to push the built .cs3 back
+  
 jobs:
   build:
     runs-on: ubuntu-latest
