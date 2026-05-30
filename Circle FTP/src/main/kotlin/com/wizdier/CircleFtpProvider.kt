@@ -45,6 +45,7 @@ import com.lagradost.cloudstream3.utils.AppUtils
 import com.lagradost.cloudstream3.utils.AppUtils.toJson
 import com.lagradost.cloudstream3.utils.AppUtils.tryParseJson
 import com.lagradost.cloudstream3.utils.ExtractorLink
+import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.newExtractorLink
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
@@ -66,7 +67,7 @@ class CircleFtpProvider : MainAPI() {
     private val fribbAnimeListUrl = "https://raw.githubusercontent.com/Fribb/anime-lists/master/anime-list-mini.json"
     private val payloadPrefix = "circleftp://"
 
-    override var name = "(BDIX) Circle FTP"
+    override var name = "Circle FTP"
     override var lang = "bn"
     override val hasMainPage = true
     override val hasDownloadSupport = true
@@ -146,22 +147,41 @@ class CircleFtpProvider : MainAPI() {
         callback: (ExtractorLink) -> Unit,
     ): Boolean {
         val streamPayload = tryParseJson<StreamPayload>(data)
+    
         if (streamPayload != null && streamPayload.variants.isNotEmpty()) {
             streamPayload.variants
                 .distinctBy { variant -> variant.url }
                 .forEach { variant ->
+                    val fixedUrl = linkToIp(variant.url)
+    
                     callback.invoke(
                         newExtractorLink(
                             source = name,
                             name = variant.label,
-                            url = variant.url,
-                        ) {
-                            this.quality = inferExtractorQuality(variant.label)
-                        }
-                    )
-                }
-            return true
-        }
+                            url = fixedUrl,
+                            type = ExtractorLinkType.VIDEO,
+                    ) {
+                    this.quality = inferExtractorQuality(variant.label)
+                    }
+                )
+            }
+    
+        return true
+    }
+
+    val fixedUrl = linkToIp(data)
+
+    callback.invoke(
+        newExtractorLink(
+            source = name,
+            name = name,
+            url = fixedUrl,
+            type = ExtractorLinkType.VIDEO,
+        )
+    )
+
+    return true
+}
 
         callback.invoke(
             newExtractorLink(
@@ -288,28 +308,55 @@ class CircleFtpProvider : MainAPI() {
         if (post.type != "singleVideo" && post.type != "series") {
             return null
         }
-
-        val normalized = normalizeTitle(post.title)
-        val resolvedType = inferPostTvType(post, categoryName, categoryId, normalized)
+    
+        // Use clean API name for display/search grouping.
+        // Example:
+        // title = "Fate Strange Fake (TV Series 2024-) Anime [Dual Audio] [Eng+Jap]"
+        // name  = "Fate Strange Fake"
+        val cleanName = post.name?.takeIf { it.isNotBlank() }
+        val displaySourceTitle = cleanName ?: post.title
+    
+        val normalizedDisplay = normalizeTitle(displaySourceTitle)
+        val normalizedRaw = normalizeTitle(post.title)
+    
+        val resolvedType = inferPostTvType(post, categoryName, categoryId, normalizedDisplay)
+        val resolvedYear = post.year.selectUntilNonInt()
+            ?: normalizedDisplay.year
+            ?: normalizedRaw.year
+    
+        val resolvedSeason = normalizedDisplay.season ?: normalizedRaw.season
+        val resolvedQuality = normalizedRaw.quality ?: normalizedDisplay.quality
+        val resolvedAudioTag = normalizedRaw.audioTag ?: normalizedDisplay.audioTag
+    
         return IndexedPost(
             id = post.id,
             imageSm = post.imageSm,
             rawTitle = post.title,
             mediaType = resolvedType,
             postType = post.type,
-            displayTitle = if (resolvedType == TvType.Anime || resolvedType == TvType.AnimeMovie || resolvedType == TvType.OVA) normalized.franchiseTitle else normalized.displayTitle,
-            franchiseTitle = normalized.franchiseTitle,
-            year = normalized.year,
-            declaredSeason = normalized.season,
-            quality = normalized.quality,
-            audioTag = normalized.audioTag,
-            franchiseKey = normalized.franchiseKey,
+            displayTitle = if (
+                resolvedType == TvType.Anime ||
+                resolvedType == TvType.AnimeMovie ||
+                resolvedType == TvType.OVA
+            ) {
+                normalizedDisplay.franchiseTitle
+            } else {
+                normalizedDisplay.displayTitle
+            },
+            franchiseTitle = normalizedDisplay.franchiseTitle,
+            year = resolvedYear,
+            declaredSeason = resolvedSeason,
+            quality = resolvedQuality,
+            audioTag = resolvedAudioTag,
+            franchiseKey = normalizedDisplay.franchiseKey,
             audioMergeKey = when {
-                resolvedType == TvType.TvSeries || resolvedType == TvType.Cartoon || resolvedType == TvType.AsianDrama -> {
-                    "${normalized.canonicalKey}:S${normalized.season ?: 0}"
+                resolvedType == TvType.TvSeries ||
+                    resolvedType == TvType.Cartoon ||
+                    resolvedType == TvType.AsianDrama -> {
+                    "${normalizedDisplay.canonicalKey}:S${resolvedSeason ?: 0}"
                 }
-
-                else -> normalized.canonicalKey
+    
+                else -> normalizedDisplay.canonicalKey
             },
         )
     }
@@ -418,7 +465,7 @@ class CircleFtpProvider : MainAPI() {
             throw ErrorLoadingException("No anime season data found")
         }
 
-        val animeMeta = resolveAnimeMetadata(payload, fetchedPosts, allSeasonSlices, resolvedSeason)
+        val animeMeta = runCatching {resolveAnimeMetadata(payload, fetchedPosts, allSeasonSlices, resolvedSeason)}.getOrNull()
         val seasonEpisodes = mergeEpisodes(
             slices = activeSlices,
             seasonNumber = resolvedSeason,
@@ -473,8 +520,8 @@ class CircleFtpProvider : MainAPI() {
             )
         }.distinctBy { variant -> variant.url }
 
-        val animeMeta = resolveAnimeMetadata(payload, fetchedPosts, emptyList(), payload.activeSeason ?: 1)
-        val fallbackTitle = payload.displayTitle.ifBlank { fallbackPost.data.title }
+        val animeMeta = runCatching {resolveAnimeMetadata(payload, fetchedPosts, emptyList(), payload.activeSeason ?: 1)}.getOrNull()
+        val fallbackTitle = payload.displayTitle.ifBlank { fallbackPost.data.bestTitle() }
         val displayName = animeMeta?.selectedMedia?.preferredTitle() ?: fallbackTitle
         val fallbackPoster = buildPosterUrl(fallbackPost.data.image)
         val fallbackPlot = fallbackPost.data.metaData
@@ -527,7 +574,7 @@ class CircleFtpProvider : MainAPI() {
             }.distinctBy { variant -> variant.url }
             val streamPayload = StreamPayload(variants = streamVariants)
             return@coroutineScope newMovieLoadResponse(
-                name = tmdbMetadata?.displayTitle ?: payload.displayTitle.ifBlank { fallbackPost.data.title },
+                name = tmdbMetadata?.displayTitle ?: payload.displayTitle.ifBlank { fallbackPost.data.bestTitle() },
                 url = encodePayload(payload),
                 type = effectiveType,
                 dataUrl = streamPayload.toJson(),
@@ -556,7 +603,7 @@ class CircleFtpProvider : MainAPI() {
             .map { seasonNumber -> SeasonData(season = seasonNumber, name = "Season $seasonNumber", displaySeason = seasonNumber) }
 
         return@coroutineScope newTvSeriesLoadResponse(
-            name = tmdbMetadata?.displayTitle ?: payload.displayTitle.ifBlank { fallbackPost.data.title },
+            name = tmdbMetadata?.displayTitle ?: payload.displayTitle.ifBlank { fallbackPost.data.bestTitle() },
             url = encodePayload(payload),
             type = effectiveType,
             episodes = mergedEpisodes,
@@ -1281,12 +1328,12 @@ class CircleFtpProvider : MainAPI() {
     }
 
     private fun normalizeCircleStream(rawUrl: String?, usedFallbackApi: Boolean): String {
-        val streamUrl = rawUrl.orEmpty()
-        return if (usedFallbackApi) {
-            linkToIp(streamUrl)
-        } else {
-            streamUrl
-        }
+    val streamUrl = rawUrl.orEmpty()
+
+    // Always convert Circle FTP hostnames to IPs.
+    // The main API can return links like ftp17.circleftp.net, which may not resolve
+    // correctly for some users/devices.
+    return linkToIp(streamUrl)
     }
 
     private fun FetchedPost.dataSourceRequiresIp(): Boolean {
@@ -1544,20 +1591,20 @@ class CircleFtpProvider : MainAPI() {
             ?.trim()
     }
 
-        private fun AniListMedia.allTitles(): List<String> {
+    private fun AniListMedia.allTitles(): List<String> {
         val result = mutableListOf<String>()
-
+    
         this.title?.english?.takeIf { it.isNotBlank() }?.let { result.add(it) }
         this.title?.romaji?.takeIf { it.isNotBlank() }?.let { result.add(it) }
         this.title?.native?.takeIf { it.isNotBlank() }?.let { result.add(it) }
         this.title?.userPreferred?.takeIf { it.isNotBlank() }?.let { result.add(it) }
-
+    
         this.synonyms.orEmpty().forEach { synonym ->
             if (!synonym.isNullOrBlank()) {
                 result.add(synonym)
             }
         }
-
+    
         return result.distinct()
     }
 
@@ -1755,6 +1802,8 @@ class CircleFtpProvider : MainAPI() {
         @JsonProperty("imageSm") val imageSm: String? = null,
         @JsonProperty("title") val title: String,
         @JsonProperty("name") val name: String? = null,
+        @JsonProperty("year") val year: String? = null,
+        @JsonProperty("quality") val quality: String? = null,
     )
 
     data class Data(
