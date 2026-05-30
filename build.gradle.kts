@@ -10,6 +10,7 @@ buildscript {
         mavenCentral()
         maven("https://jitpack.io")
     }
+
     dependencies {
         classpath("com.android.tools.build:gradle:9.1.1")
         classpath("com.github.recloudstream:gradle:master-SNAPSHOT")
@@ -66,12 +67,17 @@ subprojects {
     dependencies {
         val cloudstream by configurations
         val implementation by configurations
+        val compileOnly by configurations
 
         // NOTE: "pre-release" is required — CloudStream plugins must target the
-        // same build as the installed app.  Pinning to a specific version would
-        // break compatibility with newer CloudStream app releases.  See:
-        // https://github.com/recloudstream/cloudstream#plugin-development
+        // same build as the installed app. Pinning to a specific version would
+        // break compatibility with newer CloudStream app releases.
         cloudstream("com.lagradost:cloudstream3:pre-release")
+
+        // Fixes: Unresolved reference 'JsonProperty'
+        // Needed because CircleFtpProvider.kt imports:
+        // import com.fasterxml.jackson.annotation.JsonProperty
+        compileOnly("com.fasterxml.jackson.core:jackson-annotations:2.13.1")
 
         implementation(kotlin("stdlib"))
         implementation("com.github.Blatzar:NiceHttp:0.4.18")
