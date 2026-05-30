@@ -25,7 +25,6 @@ import com.lagradost.cloudstream3.SearchResponse
 import com.lagradost.cloudstream3.SeasonData
 import com.lagradost.cloudstream3.ShowStatus
 import com.lagradost.cloudstream3.SubtitleFile
-import com.lagradost.cloudstream3.TrackerType
 import com.lagradost.cloudstream3.TvType
 import com.lagradost.cloudstream3.addDate
 import com.lagradost.cloudstream3.addDubStatus
@@ -368,26 +367,30 @@ class CircleFtpProvider : MainAPI() {
     }
 
     private suspend fun detectAnime(title: String, year: Int?): Boolean {
-        val cacheKey = "$title|${year ?: 0}"
-        animeDetectionCache[cacheKey]?.let { detectedAnime ->
-            return detectedAnime
-        }
-
-        val tracker = getTracker(
-            titles = listOf(title),
-            types = setOf(
-                TrackerType.TV,
-                TrackerType.TV_SHORT,
-                TrackerType.ONA,
-                TrackerType.OVA,
-                TrackerType.MOVIE,
-            ),
-            year = year,
-            lessAccurate = true,
-        )
-        val detectedAnime = tracker?.aniId != null || tracker?.malId != null
-        animeDetectionCache[cacheKey] = detectedAnime
+    val cacheKey = "$title|${year ?: 0}"
+    animeDetectionCache[cacheKey]?.let { detectedAnime ->
         return detectedAnime
+    }
+
+    // getTracker is not available in the current Cloudstream extension compile classpath.
+    // Use AniList search directly instead.
+    val detectedAnime = runCatching {
+        val candidates = searchAniList(title)
+        val bestMatch = chooseBestAniListMatch(
+            candidates = candidates,
+            queryTitles = listOf(title),
+            year = year,
+        )
+
+        bestMatch != null && scoreAniListCandidate(
+            candidate = bestMatch,
+            queryTitles = listOf(title),
+            year = year,
+        ) >= 60
+    }.getOrDefault(false)
+
+    animeDetectionCache[cacheKey] = detectedAnime
+    return detectedAnime
     }
 
     private suspend fun loadAnimePayload(payload: CirclePayload): LoadResponse = coroutineScope {
@@ -1136,27 +1139,18 @@ class CircleFtpProvider : MainAPI() {
 
     private fun scoreTmdbCandidate(candidate: TmdbSearchResult, queryTitles: List<String>, year: Int?): Int {
         val candidateTitle = normalizeTitle(candidate.displayTitle).franchiseTitle
-        val titleScore = queryTitles.maxOfOrNull { queryTitle -> tokenScore(candidateTitle, normalizeTitle(queryTitle).franchiseTitle) } ?: 0
-        val yearScore = when {
-            year == null || candidate.year == null -> 0
-            year == candidate.year -> 25
-            abs(year - candidate.year) <= 1 -> 10
-            else -> -10
-        }
-        return titleScore + yearScore
-    }
-
-    private fun scoreAniListCandidate(candidate: AniListMedia, queryTitles: List<String>, year: Int?): Int {
-        val titles = candidate.allTitles()
+        val candidateYear = candidate.year
         val titleScore = queryTitles.maxOfOrNull { queryTitle ->
-            titles.maxOfOrNull { candidateTitle -> tokenScore(normalizeTitle(queryTitle).canonicalTitle, normalizeTitle(candidateTitle).canonicalTitle) } ?: 0
+            tokenScore(candidateTitle, normalizeTitle(queryTitle).franchiseTitle)
         } ?: 0
+    
         val yearScore = when {
-            year == null || candidate.resolvedYear() == null -> 0
-            year == candidate.resolvedYear() -> 25
-            abs(year - (candidate.resolvedYear() ?: year)) <= 1 -> 10
+            year == null || candidateYear == null -> 0
+            year == candidateYear -> 25
+            abs(year - candidateYear) <= 1 -> 10
             else -> -10
         }
+    
         return titleScore + yearScore
     }
 
@@ -1337,10 +1331,9 @@ class CircleFtpProvider : MainAPI() {
     private fun urlEncode(value: String): String {
         return URLEncoder.encode(value, "UTF-8")
     }
-
-    private fun selectUntilNonInt(string: String?): Int? {
-        return string?.let { rawString ->
-            Regex("^.*?(?=\\D|$)").find(rawString)?.value?.toIntOrNull()
+    private fun String?.selectUntilNonInt(): Int? {
+        return this?.let { rawString ->
+        Regex("^.*?(?=\\D|$)").find(rawString)?.value?.toIntOrNull()
         }
     }
 
@@ -1378,7 +1371,7 @@ class CircleFtpProvider : MainAPI() {
 
     private fun cleanupEpisodeTitle(title: String?, episodeNumber: Int): String {
         val cleaned = title.orEmpty()
-            .replace(Regex("(?:episode|ep)\\s*0*$episodeNumber\\s*[:\-]?", RegexOption.IGNORE_CASE), "")
+            .replace(Regex("""(?:episode|ep)\s*0*$episodeNumber\s*[:-]?""", RegexOption.IGNORE_CASE), "")
             .replace('_', ' ')
             .replace('.', ' ')
             .replace(Regex("\\s+"), " ")
@@ -1457,7 +1450,7 @@ class CircleFtpProvider : MainAPI() {
         )
         val cleanedDisplay = noiseRegex.replace(raw, " ")
             .replace(Regex("\\s+"), " ")
-            .replace(Regex("[\[\](){}]"), " ")
+            .replace(Regex("""[\[\](){}]"""), " ")
             .trim()
 
         val franchiseTitle = cleanedDisplay
