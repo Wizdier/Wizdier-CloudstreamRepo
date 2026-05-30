@@ -1,4 +1,4 @@
-package com.redowan
+package com.wizdier
 
 import com.fasterxml.jackson.annotation.JsonProperty
 import com.lagradost.cloudstream3.Actor
@@ -247,7 +247,7 @@ class CircleFtpProvider : MainAPI() {
                 val quality = groupPosts.mapNotNull { indexedPost -> indexedPost.quality }.maxByOrNull { qualityValue -> qualityValue.ordinal }
 
                 val response = when {
-                    primaryPost.mediaType == TvType.TvSeries || primaryPost.mediaType == TvType.Cartoon || primaryPost.mediaType == TvType.AsianDrama -> {
+                    primaryPost.postType == "series" || primaryPost.mediaType == TvType.TvSeries || primaryPost.mediaType == TvType.AsianDrama -> {
                         newTvSeriesSearchResponse(
                             name = displayTitle,
                             url = encodePayload(searchPayload),
@@ -595,6 +595,7 @@ class CircleFtpProvider : MainAPI() {
                 data = data,
                 movieLink = normalizeCircleStream(movieData?.content, apiResponse.usedFallback),
                 tvSeries = null,
+                usedFallbackApi = apiResponse.usedFallback,
             )
         } else {
             FetchedPost(
@@ -602,6 +603,7 @@ class CircleFtpProvider : MainAPI() {
                 data = data,
                 movieLink = null,
                 tvSeries = AppUtils.parseJson<TvSeries>(apiResponse.text),
+                usedFallbackApi = apiResponse.usedFallback,
             )
         }
     }
@@ -716,7 +718,15 @@ class CircleFtpProvider : MainAPI() {
         val relationSeed = baselineSearch ?: directMatch
         val relationChain = relationSeed?.id?.let { seedId -> buildAniListSeasonChain(seedId) }.orEmpty()
         val selectedMedia = when {
-            relationChain.size >= activeSeason -> fetchAniListById(relationChain[activeSeason - 1].id ?: return@when directMatch)
+            relationChain.size >= activeSeason -> {
+                val relationMediaId = relationChain[activeSeason - 1].id
+                when {
+                    relationMediaId != null -> fetchAniListById(relationMediaId)
+                    directMatch?.id != null -> fetchAniListById(directMatch.id)
+                    else -> directMatch
+                }
+            }
+
             directMatch?.id != null -> fetchAniListById(directMatch.id)
             relationSeed?.id != null -> fetchAniListById(relationSeed.id)
             else -> null
@@ -944,6 +954,7 @@ class CircleFtpProvider : MainAPI() {
                   }
                   episodes
                   duration
+                  averageScore
                   description(asHtml: false)
                   bannerImage
                   genres
@@ -1024,6 +1035,7 @@ class CircleFtpProvider : MainAPI() {
                 }
                 episodes
                 duration
+                averageScore
                 description(asHtml: false)
                 bannerImage
                 genres
@@ -1167,13 +1179,9 @@ class CircleFtpProvider : MainAPI() {
         loadResponse.addAniListId(selectedMedia.id)
         loadResponse.addMalId(aniZip?.mappings?.malId ?: selectedMedia.idMal)
         val kitsuId = aniZip?.mappings?.kitsuId ?: fribbEntry?.kitsuId
-        if (kitsuId != null) {
-            loadResponse.addKitsuId(kitsuId)
-        }
+        loadResponse.addKitsuId(kitsuId)
         val simklId = aniZip?.mappings?.simklId ?: fribbEntry?.simklId
-        if (simklId != null) {
-            loadResponse.addSimklId(simklId)
-        }
+        loadResponse.addSimklId(simklId)
         val tmdbId = aniZip?.mappings?.tmdbId?.tv ?: aniZip?.mappings?.tmdbId?.movie ?: fribbEntry?.tmdbId?.tv ?: fribbEntry?.tmdbId?.movie
         if (tmdbId != null) {
             loadResponse.addTMDbId(tmdbId.toString())
@@ -1213,7 +1221,7 @@ class CircleFtpProvider : MainAPI() {
     ): String? {
         val logo = logos
             .sortedWith(
-                compareByDescending<TmdbLogo> { logoEntry -> (logoEntry.iso6391 == "en") }
+                compareByDescending<TmdbLogo> { logoEntry -> if (logoEntry.iso6391 == "en") 1 else 0 }
                     .thenByDescending { logoEntry -> logoEntry.voteAverage ?: 0.0 }
                     .thenByDescending { logoEntry -> logoEntry.width ?: 0 }
             )
@@ -1225,9 +1233,9 @@ class CircleFtpProvider : MainAPI() {
     private fun pickTmdbTrailerUrl(videos: List<TmdbVideo>): String? {
         val video = videos
             .sortedWith(
-                compareByDescending<TmdbVideo> { tmdbVideo -> tmdbVideo.official == true }
-                    .thenByDescending { tmdbVideo -> tmdbVideo.type.equals("Trailer", ignoreCase = true) }
-                    .thenByDescending { tmdbVideo -> tmdbVideo.type.equals("Teaser", ignoreCase = true) }
+                compareByDescending<TmdbVideo> { tmdbVideo -> if (tmdbVideo.official == true) 1 else 0 }
+                    .thenByDescending { tmdbVideo -> if (tmdbVideo.type.equals("Trailer", ignoreCase = true)) 1 else 0 }
+                    .thenByDescending { tmdbVideo -> if (tmdbVideo.type.equals("Teaser", ignoreCase = true)) 1 else 0 }
             )
             .firstOrNull { tmdbVideo -> tmdbVideo.site.equals("YouTube", ignoreCase = true) && !tmdbVideo.key.isNullOrBlank() }
             ?: return null
@@ -1265,7 +1273,7 @@ class CircleFtpProvider : MainAPI() {
     }
 
     private fun FetchedPost.dataSourceRequiresIp(): Boolean {
-        return this.movieLink?.let { movieLink -> movieLink.contains("15.1.") } == true
+        return this.usedFallbackApi
     }
 
     private fun encodePayload(payload: CirclePayload): String {
@@ -1453,8 +1461,7 @@ class CircleFtpProvider : MainAPI() {
             .trim()
 
         val franchiseTitle = cleanedDisplay
-            .replace(Regex("(?:season|s)\\s*\
-                *0*(\\d{1,2})", RegexOption.IGNORE_CASE), " ")
+            .replace(Regex("(?:season|s)\\s*0*(\\d{1,2})", RegexOption.IGNORE_CASE), " ")
             .replace(Regex("(\\d{1,2})(?:st|nd|rd|th)?\\s*season", RegexOption.IGNORE_CASE), " ")
             .replace(Regex("part\\s*0*(\\d{1,2})", RegexOption.IGNORE_CASE), " ")
             .replace(Regex("cour\\s*0*(\\d{1,2})", RegexOption.IGNORE_CASE), " ")
@@ -1536,7 +1543,7 @@ class CircleFtpProvider : MainAPI() {
     }
 
     private fun AniListMedia.score(): Score? {
-        return null
+        return Score.from100(this.averageScore)
     }
 
     private fun AniListMedia.toShowStatus(): ShowStatus? {
@@ -1650,6 +1657,7 @@ class CircleFtpProvider : MainAPI() {
         val data: Data,
         val movieLink: String?,
         val tvSeries: TvSeries?,
+        val usedFallbackApi: Boolean,
     )
 
     private data class SeasonSlice(
@@ -1892,6 +1900,7 @@ class CircleFtpProvider : MainAPI() {
         @JsonProperty("startDate") val startDate: AniListDate? = null,
         @JsonProperty("episodes") val episodes: Int? = null,
         @JsonProperty("duration") val duration: Int? = null,
+        @JsonProperty("averageScore") val averageScore: Int? = null,
         @JsonProperty("description") val description: String? = null,
         @JsonProperty("bannerImage") val bannerImage: String? = null,
         @JsonProperty("genres") val genres: List<String?>? = null,
