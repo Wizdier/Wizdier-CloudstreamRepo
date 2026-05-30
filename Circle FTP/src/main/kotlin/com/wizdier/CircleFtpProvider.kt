@@ -421,7 +421,9 @@ class CircleFtpProvider : MainAPI() {
                 val meta = apiClient.getTmdbMetaCached(cleanedTitle, year, false)
                 val trailer = apiClient.fetchTmdbTrailer(meta?.tmdbId, false)
                 val actors = apiClient.fetchTmdbActors(meta?.tmdbId, false)
-                // Cross-reference via AniZip to get Simkl/Trakt/MAL/Kitsu IDs
+                // Attempt cross-reference via AniZip for Simkl/Trakt IDs.
+                // Most non-anime content won't have AniZip entries, but
+                // animation, Asian dramas, and cross-listed content may.
                 val crossRef = meta?.tmdbId?.let { apiClient.getCrossRefIdsByTmdb(it) }
                 newMovieLoadResponse(title, url, TvType.Movie, link) {
                     this.posterUrl = meta?.poster ?: fallbackPoster
@@ -496,15 +498,11 @@ class CircleFtpProvider : MainAPI() {
                 isFinalSeasonMarker(title)
 
             val realSeasonNumber = when {
-                // If we have an explicit marker AND it's consistent with the
-                // positional index (or there's only 1 season), trust it.
                 explicitSeasonNumber != null && (
                     !isMultiSeasonAnime ||
                     explicitSeasonNumber == targetIndex + 1 ||
                     explicitSeasonNumber > 1
                 ) -> explicitSeasonNumber
-                // Multi-season post: positional index is the most reliable
-                // signal when the explicit marker is missing or dubious.
                 isMultiSeasonAnime -> targetIndex + 1
                 isFinalSeason -> 2 // a "Final Season" with no number is at least S2
                 else -> 1
@@ -538,8 +536,6 @@ class CircleFtpProvider : MainAPI() {
             val seasonAniZip = seasonResolution.aniZip
 
             // ── Parallel fetch: TMDB enrichment + AniZip episode titles
-            // Try AniZip TMDB ID first; if missing, search TMDB by the season
-            // display title so logos and backdrops still resolve.
             val seasonTmdbId = seasonAniZip?.tmdbId?.toIntOrNull()
             val seasonTmdbMeta: TmdbMeta?
             val aniZipEpTitles: Map<Int, String>
@@ -556,8 +552,8 @@ class CircleFtpProvider : MainAPI() {
                             tmdbId = seasonTmdbId
                         )
                     } else {
-                        // AniZip had no TMDB ID — try a direct TMDB search with
-                        // the resolved season title.
+                        // AniZip had no TMDB ID — search TMDB by the resolved
+                        // season title so logos and backdrops still resolve.
                         apiClient.getTmdbMeta(targetMeta.title, null, true)
                     }
                 }
@@ -690,8 +686,6 @@ class CircleFtpProvider : MainAPI() {
             val tmdbId = meta?.tmdbId
             val trailer = apiClient.fetchTmdbTrailer(tmdbId, true)
             val actors = apiClient.fetchTmdbActors(tmdbId, true)
-            // Cross-reference via AniZip to get Simkl/Trakt/MAL/Kitsu IDs
-            val crossRef = tmdbId?.let { apiClient.getCrossRefIdsByTmdb(it) }
             val allSeriesVariants: List<TvSeries> = responses.mapNotNull { response ->
                 try {
                     response.parsed<TvSeries>()
@@ -705,16 +699,13 @@ class CircleFtpProvider : MainAPI() {
 
             tvData.content.forEachIndexed { seasonIndex, _ ->
                 val seasonNum = seasonIndex + 1
-                // Fetch TMDB episode data for proper names, stills, and air-dates.
-                val tmdbEpisodes = tmdbId?.let { tId ->
-                    apiClient.fetchTmdbSeasonEpisodes(tId, seasonNum)
-                } ?: emptyList()
+                val tmdbEpisodes = tmdbId?.let { tId -> apiClient.fetchTmdbSeasonEpisodes(tId, seasonNum) } ?: emptyList()
                 val seasonContents = allSeriesVariants.mapNotNull { series -> series.content.getOrNull(seasonIndex) }
                 val mergedEpisodes = mergeEpisodeStreamsForSeason(seasonContents, urlChecks, sourceTitles)
                 mergedEpisodes.forEachIndexed { idx, mergedEpisode ->
                     val tmdbEp = tmdbEpisodes.getOrNull(idx)
-                    // Clean the server-supplied title: strip "Episode N" prefix,
-                    // then keep the remainder if it looks like a real title.
+                    // Clean the server title: strip "Episode N" prefix, keep the
+                    // actual episode name as fallback when TMDB data is unavailable.
                     val serverTitle = mergedEpisode.title
                         ?.replace(CircleFtpPatterns.RE_EPISODE_WORD, "")
                         ?.trim()
@@ -727,9 +718,7 @@ class CircleFtpProvider : MainAPI() {
                             this.episode = mergedEpisode.episodeNumber
                             this.season = seasonNum
                             this.name = epName
-                            this.posterUrl = tmdbEp?.stillPath?.let { p ->
-                                "https://image.tmdb.org/t/p/w500$p"
-                            } ?: meta?.poster
+                            this.posterUrl = tmdbEp?.stillPath?.let { p -> "https://image.tmdb.org/t/p/w500$p" } ?: meta?.poster
                             this.description = tmdbEp?.overview
                             parseAirDateMillis(tmdbEp?.airDate)?.let { d -> this.date = d }
                         }
@@ -737,6 +726,8 @@ class CircleFtpProvider : MainAPI() {
                 }
             }
 
+            // Attempt cross-reference via AniZip for Simkl/Trakt IDs.
+            val crossRef = tmdbId?.let { apiClient.getCrossRefIdsByTmdb(it) }
             newTvSeriesLoadResponse(title, url, TvType.TvSeries, episodesData) {
                 this.posterUrl = meta?.poster ?: fallbackPoster
                 this.backgroundPosterUrl = meta?.backdrop ?: meta?.poster ?: fallbackPoster

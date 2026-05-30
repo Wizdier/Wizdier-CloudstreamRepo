@@ -581,8 +581,11 @@ class CircleFtpApiClient(
         }
     }
 
-
-    // ─── Cross-reference helper (non-anime Simkl / Trakt IDs) ──────────────
+    // ─── Cross-reference helper (TMDB → AniZip) ────────────────────────────
+    // Allows non-anime paths to attempt AniZip lookups by TMDB ID.  AniZip
+    // primarily indexes anime, but some animation, Asian dramas, and other
+    // cross-listed content also have entries.  Returns null gracefully when
+    // no mapping exists.
 
     suspend fun getCrossRefIdsByTmdb(tmdbId: Int): AniZipFull? {
         return try {
@@ -592,6 +595,7 @@ class CircleFtpApiClient(
             null
         }
     }
+
     // ─── Server / Post Fetching ──────────────────────────────────────────────
 
     suspend fun fetchWithFallback(
@@ -754,9 +758,10 @@ class CircleFtpApiClient(
         fallback: ResolvedAnimeMeta,
         isSeries: Boolean
     ): ResolvedAnimeMeta {
-        // Try AniZip TMDB ID first, then fall back to a TMDB title search so
-        // logos and backdrops still resolve for seasons that AniZip hasn't
-        // indexed yet.
+        // ── TMDB enrichment ──────────────────────────────────────────────
+        // Try AniZip TMDB ID first.  If AniZip hasn't mapped this season to
+        // TMDB yet, fall back to a direct TMDB title search so logos and
+        // backdrops still resolve for season 2+ entries.
         val searchTitle = aniList.title?.english ?: aniList.title?.romaji ?: fallback.title
         val tmdbFromZip = aniZip?.tmdbId?.toIntOrNull()
         val tmdbMeta: TmdbMeta? = if (tmdbFromZip != null) {
@@ -770,9 +775,6 @@ class CircleFtpApiClient(
                 tmdbId = tmdbFromZip
             )
         } else {
-            // AniZip didn't carry a TMDB ID — search TMDB by the season's
-            // display title.  This is the key fix for missing logos/backdrops
-            // on season 2+ entries that AniZip hasn't fully mapped yet.
             getTmdbMeta(searchTitle, null, isSeries)
         }
 
@@ -851,10 +853,11 @@ class CircleFtpApiClient(
                     ?.sortedByDescending { edge -> edge.node?.episodes ?: 0 }
                 val bestSequelId = sequelEdges?.firstOrNull()?.node?.id
                 val nextId = bestSequelId ?: run {
-                    // SEQUEL edge is missing — try weaker continuation signals
-                    // before giving up.  SPIN_OFF and SIDE_STORY often serve
-                    // as de-facto continuations on AniList for multi-cour
-                    // series that weren't tagged as SEQUEL.
+                    // SEQUEL edge missing — try weaker continuation signals
+                    // (SPIN_OFF / SIDE_STORY often serve as de-facto
+                    // continuations on AniList for multi-cour series).
+                    // ALTERNATIVE is deliberately avoided — it means a
+                    // completely different adaptation, not a sequel.
                     val weakEdges = node.relations?.edges?.filter { edge ->
                         val t = edge.relationType?.uppercase() ?: ""
                         t == "SPIN_OFF" || t == "SIDE_STORY" || t == "PARENT"
