@@ -562,8 +562,17 @@ class CircleFtpProvider : MainAPI() {
             }
 
             val mergedEpisodes = mergeEpisodeStreamsForSeason(slotContents, slotUrlChecks, sourceTitles)
+
+            // Rebase absolutely-numbered seasons (e.g. S2 starting at "Episode 26")
+            // back to per-season numbering so episode titles, thumbnails and watch
+            // tracking align with AniList / AniZip (which number each season from 1).
+            val absOffset = absoluteEpisodeOffset(
+                mergedEpisodes.map { it.episodeNumber },
+                realSeasonNumber
+            )
+
             val episodesData: List<Episode> = mergedEpisodes.mapIndexed { idx, mergedEpisode ->
-                val epNum = mergedEpisode.episodeNumber
+                val epNum = (mergedEpisode.episodeNumber - absOffset).let { if (it >= 1) it else mergedEpisode.episodeNumber }
                 val aniZipTitle = aniZipEpTitles[epNum]
                 val aniListTitle = targetMeta.anilistEpisodes?.getOrNull(idx)?.title
                 val serverTitle = mergedEpisode.title
@@ -687,7 +696,7 @@ class CircleFtpProvider : MainAPI() {
                                 ?: "Episode ${mergedEpisode.episodeNumber}"
                             this.posterUrl = tmdbEp?.stillPath?.let { p -> "https://image.tmdb.org/t/p/w500$p" } ?: meta?.poster
                             this.description = tmdbEp?.overview
-                            tmdbEp?.airDate?.let { d -> addDate(d) }
+                            parseAirDateMillis(tmdbEp?.airDate)?.let { d -> this.date = d }
                         }
                     )
                 }

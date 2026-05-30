@@ -219,3 +219,56 @@ fun extractEpisodeNumber(title: String?): Int? {
     return CircleFtpPatterns.RE_EP_NUM
         .find(title)?.groupValues?.getOrNull(1)?.toIntOrNull()
 }
+
+/**
+ * Computes an offset to rebase *absolutely-numbered* anime episodes back to
+ * per-season numbering.
+ *
+ * Many FTP anime posts label later seasons with continuous/absolute episode
+ * numbers (e.g. Season 2 episode 1 is titled "Episode 26"). AniList, MAL and
+ * AniZip all number each season's episodes starting from 1, so without
+ * rebasing the episode titles, thumbnails and — most importantly — watch
+ * tracking all line up against the wrong entries.
+ *
+ * Heuristic (conservative, only applied for season 2+):
+ *   - the smallest detected episode number is >= 2 (so it clearly didn't start
+ *     at 1), AND
+ *   - the numbers form a roughly contiguous run (max - min + 1 is close to the
+ *     episode count), which is the signature of an absolutely-numbered block.
+ * When both hold, the returned offset is `(min - 1)`; subtract it from each
+ * episode number to get 1-based per-season numbering. Otherwise returns 0.
+ *
+ * @param episodeNumbers the raw episode numbers detected for the season
+ * @param seasonNumber   the resolved season number (rebasing only for 2+)
+ */
+fun absoluteEpisodeOffset(episodeNumbers: List<Int>, seasonNumber: Int): Int {
+    if (seasonNumber <= 1) return 0
+    val nums = episodeNumbers.filter { it > 0 }
+    if (nums.size < 2) return 0
+    val min = nums.min()
+    val max = nums.max()
+    if (min < 2) return 0
+    // Contiguity check: a real absolute block of N episodes spans ~N numbers.
+    val span = max - min + 1
+    val isContiguousBlock = span in nums.size..(nums.size + 2)
+    return if (isContiguousBlock) min - 1 else 0
+}
+
+/**
+ * Parses a TMDB air-date ("yyyy-MM-dd") into epoch milliseconds so it can be
+ * assigned directly to [com.lagradost.cloudstream3.Episode.date].
+ *
+ * This deliberately avoids the library's `Episode.addDate(String)` extension,
+ * whose availability varies across Cloudstream versions, so the plugin builds
+ * against any reasonably recent library. Returns null on blank/invalid input.
+ */
+fun parseAirDateMillis(date: String?): Long? {
+    if (date.isNullOrBlank()) return null
+    return try {
+        val fmt = java.text.SimpleDateFormat("yyyy-MM-dd", java.util.Locale.US)
+        fmt.isLenient = false
+        fmt.parse(date.trim())?.time
+    } catch (e: Exception) {
+        null
+    }
+}
