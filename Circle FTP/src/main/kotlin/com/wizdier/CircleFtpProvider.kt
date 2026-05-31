@@ -244,7 +244,6 @@ class CircleFtpProvider : MainAPI() {
         val baseTitle = mainClean.baseTitle
         val tvType = if (first.type == "singleVideo") TvType.Movie else inferTypeFromPostIds(postIds, mainClean)
 
-        // Pre-fetch metadata (season-aware for anime)
         var finalPlot = first.metaData
         var finalYear = selectUntilNonInt(first.year)
         var finalPoster: String? = "$apiUrl/uploads/${first.image}"
@@ -304,7 +303,7 @@ class CircleFtpProvider : MainAPI() {
                 this.logoUrl = finalLogo
                 this.backgroundPosterUrl = finalBackground
             }
-            movieResponse.trailerUrl = finalTrailer
+            finalTrailer?.let { movieResponse.addTrailer(it) }
             return@coroutineScope movieResponse
         }
 
@@ -341,8 +340,7 @@ class CircleFtpProvider : MainAPI() {
             this.logoUrl = finalLogo
             this.backgroundPosterUrl = finalBackground
         }
-        seriesResponse.trailerUrl = finalTrailer
-        // Attach tracking IDs
+        finalTrailer?.let { seriesResponse.addTrailer(it) }
         aniListId?.let { seriesResponse.addAniListId(it) }
         malId?.let { seriesResponse.addMalId(it) }
         kitsuId?.let { seriesResponse.addKitsuId(it) }
@@ -354,7 +352,7 @@ class CircleFtpProvider : MainAPI() {
             val recommendations = seasons.filterKeys { it != currentSeason }.map { (s, _) ->
                 val recUrl = "circleftp://load?key=${URLEncoder.encode(cacheKey, "utf-8")}&season=$s"
                 newAnimeSearchResponse("$baseTitle Season $s", recUrl, TvType.Anime) {
-                    this.posterUrl = finalPoster // placeholder, updated when loaded
+                    this.posterUrl = finalPoster // placeholder
                 }
             }
             seriesResponse.recommendations = recommendations
@@ -473,7 +471,7 @@ class CircleFtpProvider : MainAPI() {
             val response = app.post(
                 url = anilistApiUrl,
                 headers = mapOf("Content-Type" to "application/json"),
-                requestBody = body.toString(),
+                data = body.toString(),
                 verify = false,
                 cacheTime = 600
             )
@@ -547,7 +545,7 @@ class CircleFtpProvider : MainAPI() {
             val response = app.post(
                 url = anilistApiUrl,
                 headers = mapOf("Content-Type" to "application/json"),
-                requestBody = body.toString(),
+                data = body.toString(),
                 verify = false,
                 cacheTime = 600
             )
@@ -588,7 +586,7 @@ class CircleFtpProvider : MainAPI() {
             val response = app.post(
                 url = anilistApiUrl,
                 headers = mapOf("Content-Type" to "application/json"),
-                requestBody = body.toString(),
+                data = body.toString(),
                 verify = false,
                 cacheTime = 600
             )
@@ -627,7 +625,7 @@ class CircleFtpProvider : MainAPI() {
             val response = app.post(
                 url = anilistApiUrl,
                 headers = mapOf("Content-Type" to "application/json"),
-                requestBody = body.toString(),
+                data = body.toString(),
                 verify = false,
                 cacheTime = 600
             )
@@ -699,7 +697,7 @@ class CircleFtpProvider : MainAPI() {
             val response = app.post(
                 url = anilistApiUrl,
                 headers = mapOf("Content-Type" to "application/json"),
-                requestBody = body.toString(),
+                data = body.toString(),
                 verify = false,
                 cacheTime = 600
             )
@@ -799,7 +797,7 @@ class CircleFtpProvider : MainAPI() {
             val response = app.post(
                 url = anilistApiUrl,
                 headers = mapOf("Content-Type" to "application/json"),
-                requestBody = body.toString(),
+                data = body.toString(),
                 verify = false,
                 cacheTime = 600
             )
