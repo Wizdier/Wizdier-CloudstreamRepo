@@ -194,7 +194,7 @@ class CircleFtpProvider : MainAPI() {
             val animeMeta = resolveAnimeMetadata(franchise ?: primaryPost.data.title, primaryPost.data.year?.selectUntilNonInt())
             return@coroutineScope newMovieLoadResponse(
                 animeMeta?.selectedMedia?.preferredTitle() ?: primaryPost.data.bestTitle(),
-                "$mainUrl/content/${primaryPost.ref.id}", mediaType, streamUrl
+                "$mainUrl/content/${primaryPost.id}", mediaType, streamUrl
             ) {
                 this.posterUrl = animeMeta?.posterUrl ?: buildPosterUrl(primaryPost.data.image)
                 this.backgroundPosterUrl = animeMeta?.backgroundPosterUrl ?: this.posterUrl
@@ -219,13 +219,13 @@ class CircleFtpProvider : MainAPI() {
             ?: primaryPost.data.bestTitle()
 
         val recommendations = allSeasons.map { it.globalSeason }.distinct().filter { it != activeSeason }.map { seasonNum ->
-            newAnimeSearchResponse("$displayName Season $seasonNum", "$mainUrl/content/${primaryPost.ref.id}?season=$seasonNum", mediaType) {
+            newAnimeSearchResponse("$displayName Season $seasonNum", "$mainUrl/content/${primaryPost.id}?season=$seasonNum", mediaType) {
                 this.posterUrl = animeMeta?.posterUrl
                 this.year = animeMeta?.selectedMedia?.resolvedYear()
             }
         }
 
-        return@coroutineScope newAnimeLoadResponse(displayName, "$mainUrl/content/${primaryPost.ref.id}", mediaType) {
+        return@coroutineScope newAnimeLoadResponse(displayName, "$mainUrl/content/${primaryPost.id}", mediaType) {
             addEpisodes(DubStatus.Dubbed, episodes)
             this.posterUrl = animeMeta?.posterUrl ?: buildPosterUrl(primaryPost.data.image)
             this.backgroundPosterUrl = animeMeta?.backgroundPosterUrl ?: this.posterUrl
@@ -252,7 +252,7 @@ class CircleFtpProvider : MainAPI() {
             val streamUrl = primaryPost.movieLink ?: throw ErrorLoadingException("No stream URL")
             return@coroutineScope newMovieLoadResponse(
                 tmdbMeta?.displayTitle ?: primaryPost.data.bestTitle(),
-                "$mainUrl/content/${primaryPost.ref.id}", mediaType, streamUrl
+                "$mainUrl/content/${primaryPost.id}", mediaType, streamUrl
             ) {
                 this.posterUrl = tmdbMeta?.posterUrl ?: buildPosterUrl(primaryPost.data.image)
                 this.backgroundPosterUrl = tmdbMeta?.backgroundPosterUrl ?: this.posterUrl
@@ -277,7 +277,7 @@ class CircleFtpProvider : MainAPI() {
 
         return@coroutineScope newTvSeriesLoadResponse(
             tmdbMeta?.displayTitle ?: primaryPost.data.bestTitle(),
-            "$mainUrl/content/${primaryPost.ref.id}", mediaType, episodes
+            "$mainUrl/content/${primaryPost.id}", mediaType, episodes
         ) {
             this.posterUrl = tmdbMeta?.posterUrl ?: buildPosterUrl(primaryPost.data.image)
             this.backgroundPosterUrl = tmdbMeta?.backgroundPosterUrl ?: this.posterUrl
@@ -532,7 +532,7 @@ class CircleFtpProvider : MainAPI() {
     // ==============================
     // Helpers
     // ==============================
-    private fun inferType(post: Post, normalized: NormalizedTitle): TvType {
+    private suspend fun inferType(post: Post, normalized: NormalizedTitle): TvType {
         val titleCheck = post.title.lowercase()
         val isAnime = detectAnime(normalized.franchiseTitle, normalized.year)
         return when {
@@ -544,7 +544,7 @@ class CircleFtpProvider : MainAPI() {
         }
     }
 
-    private fun inferTypeFromData(data: Data): TvType {
+    private suspend fun inferTypeFromData(data: Data): TvType {
         val titleCheck = data.title.lowercase()
         val isAnime = detectAnime(normalizeTitle(data.title).franchiseTitle, data.year?.selectUntilNonInt())
         return when {
@@ -579,7 +579,7 @@ class CircleFtpProvider : MainAPI() {
         animeMeta.aniZip?.mappings?.imdbId?.let { if (it.isNotBlank()) loadResponse.addImdbId(it) }
     }
 
-    private fun applyAnimeTrailer(loadResponse: LoadResponse, animeMeta: AnimeMetaBundle?) {
+    private suspend fun applyAnimeTrailer(loadResponse: LoadResponse, animeMeta: AnimeMetaBundle?) {
         animeMeta?.selectedMedia?.trailer?.fullUrl()?.let { loadResponse.addTrailer(it) }
     }
 
