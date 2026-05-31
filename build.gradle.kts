@@ -69,12 +69,10 @@ subprojects {
         val implementation by configurations
         val compileOnly by configurations
 
-        // NOTE: "pre-release" is required — CloudStream plugins must target the
-        // same build as the installed app. Pinning to a specific version would
-        // break compatibility with newer CloudStream app releases.
+        // Cloudstream plugin stubs
         cloudstream("com.lagradost:cloudstream3:pre-release")
 
-        // Keep Jackson pinned to 2.13.1 for Android compatibility.
+        // Keep Jackson pinned for compatibility
         compileOnly("com.fasterxml.jackson.core:jackson-annotations:2.13.1")
         implementation("com.fasterxml.jackson.module:jackson-module-kotlin:2.13.1")
 

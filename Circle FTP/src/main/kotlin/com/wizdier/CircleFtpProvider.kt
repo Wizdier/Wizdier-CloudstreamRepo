@@ -1,13 +1,13 @@
 package com.wizdier
 
+import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
+import com.fasterxml.jackson.module.kotlin.readValue
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.LoadResponse.Companion.addAniListId
 import com.lagradost.cloudstream3.LoadResponse.Companion.addKitsuId
 import com.lagradost.cloudstream3.LoadResponse.Companion.addMalId
 import com.lagradost.cloudstream3.LoadResponse.Companion.addSimklId
 import com.lagradost.cloudstream3.LoadResponse.Companion.addTrailer
-import com.lagradost.cloudstream3.mapper
-import com.lagradost.cloudstream3.utils.AppUtils.parseJson
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.newExtractorLink
 import kotlinx.coroutines.async
@@ -28,6 +28,12 @@ import kotlinx.coroutines.coroutineScope
 // ─────────────────────────────────────────────────────────────────────────────
 
 class CircleFtpProvider : MainAPI() {
+
+    private val jsonMapper = jacksonObjectMapper()
+
+    private inline fun <reified T> parseJsonCompat(data: String): T = jsonMapper.readValue(data)
+
+    private fun toJsonCompat(value: Any): String = jsonMapper.writeValueAsString(value)
 
     // ── URLs ──────────────────────────────────────────────────────────────────
     override var mainUrl      = "http://new.circleftp.net"
@@ -138,7 +144,7 @@ class CircleFtpProvider : MainAPI() {
         val json  = fetchWithFallback(
             "$mainApiUrl/api/posts?categoryExact=${request.data}&page=$page&order=desc&limit=10"
         )
-        val posts = parseJson<PageData>(json).posts
+        val posts = parseJsonCompat<PageData>(json).posts
         val home  = consolidateAndFilter(posts, isAnime = isAnimeCategory(request.data))
             .mapNotNull { group -> toSearchResult(group) }
         return newHomePageResponse(request.name, home, true)
@@ -150,7 +156,7 @@ class CircleFtpProvider : MainAPI() {
 
     override suspend fun search(query: String): List<SearchResponse> {
         val json  = fetchWithFallback("$mainApiUrl/api/posts?searchTerm=$query&order=desc")
-        val posts = parseJson<PageData>(json).posts
+        val posts = parseJsonCompat<PageData>(json).posts
         return consolidateAndFilter(posts, isAnime = false)
             .mapNotNull { group -> toSearchResult(group) }
     }
@@ -235,7 +241,7 @@ class CircleFtpProvider : MainAPI() {
     override suspend fun load(url: String): LoadResponse {
         val rawJson  = fetchWithFallback(url.replace("$mainUrl/content/", "$mainApiUrl/api/posts/"))
         val useMain  = rawJson.contains(mainApiUrl)
-        val loadData = parseJson<Data>(rawJson)
+        val loadData = parseJsonCompat<Data>(rawJson)
 
         val rawTitle   = loadData.title
         val cleanTitle = sanitiseTitle(rawTitle)
@@ -246,7 +252,7 @@ class CircleFtpProvider : MainAPI() {
 
         // ── MOVIE ─────────────────────────────────────────────────────────
         if (loadData.type == "singleVideo") {
-            val movieUrl = parseJson<Movies>(rawJson).content
+            val movieUrl = parseJsonCompat<Movies>(rawJson).content
             val link     = if (useMain) movieUrl ?: "" else linkToIp(movieUrl)
             val duration = getDurationFromString(loadData.watchTime)
 
@@ -304,7 +310,7 @@ class CircleFtpProvider : MainAPI() {
         }
 
         // ── TV SERIES / ANIME SERIES ──────────────────────────────────────
-        val tvData       = parseJson<TvSeries>(rawJson)
+        val tvData       = parseJsonCompat<TvSeries>(rawJson)
         val companionIds = extractCompanionIds(url)
 
         // Fetch companion audio-variant season data in parallel
@@ -313,8 +319,8 @@ class CircleFtpProvider : MainAPI() {
                 async {
                     try {
                         val cJson = fetchWithFallback("$mainApiUrl/api/posts/$cId")
-                        val cData = parseJson<TvSeries>(cJson)
-                        val tag   = extractAudioTag(parseJson<Data>(cJson).title) ?: "Alt-Audio"
+                        val cData = parseJsonCompat<TvSeries>(cJson)
+                        val tag   = extractAudioTag(parseJsonCompat<Data>(cJson).title) ?: "Alt-Audio"
                         val eps   = cData.content.flatMap { season -> season.episodes }
                         Pair(tag, eps)
                     } catch (_: Exception) { null }
@@ -347,15 +353,13 @@ class CircleFtpProvider : MainAPI() {
                     companions = companionLinks
                 )
 
-                val dataJson = mapper.writeValueAsString(episodeLinkData)
+                val dataJson = toJsonCompat(episodeLinkData)
 
-                episodesData.add(
-                    newEpisode(dataJson, fix = false) {
-                        this.name    = epData.title.takeIf { it.isNotBlank() }
-                        this.episode = episodeNum
-                        this.season  = seasonNum
-                    }
-                )
+                val episode = newEpisode(dataJson, fix = false)
+                episode.name = if (epData.title.isBlank()) "Episode $episodeNum" else epData.title
+                episode.episode = episodeNum
+                episode.season = seasonNum
+                episodesData.add(episode)
             }
         }
 
@@ -451,7 +455,7 @@ class CircleFtpProvider : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         return try {
-            val linkData     = parseJson<EpisodeLinkData>(data)
+            val linkData     = parseJsonCompat<EpisodeLinkData>(data)
             val primaryLabel = if (linkData.primaryTag != null) "FTP [${linkData.primaryTag}]" else name
 
             callback.invoke(newExtractorLink(source = name, name = primaryLabel, url = linkData.primary))
@@ -503,9 +507,9 @@ class CircleFtpProvider : MainAPI() {
                 "$tmdbBase/search/movie?api_key=$tmdbApiKey&query=${title.encodeUrl()}$yearStr",
                 verify = false
             )
-            val first   = parseJson<TmdbSearchResult<TmdbMovieSummary>>(search.text).results.firstOrNull()
+            val first   = parseJsonCompat<TmdbSearchResult<TmdbMovieSummary>>(search.text).results.firstOrNull()
                           ?: return null
-            parseJson<TmdbMovieDetail>(
+            parseJsonCompat<TmdbMovieDetail>(
                 app.get("$tmdbBase/movie/${first.id}?api_key=$tmdbApiKey", verify = false).text
             )
         } catch (_: Exception) { null }
@@ -518,9 +522,9 @@ class CircleFtpProvider : MainAPI() {
                 "$tmdbBase/search/tv?api_key=$tmdbApiKey&query=${title.encodeUrl()}$yearStr",
                 verify = false
             )
-            val first   = parseJson<TmdbSearchResult<TmdbTvSummary>>(search.text).results.firstOrNull()
+            val first   = parseJsonCompat<TmdbSearchResult<TmdbTvSummary>>(search.text).results.firstOrNull()
                           ?: return null
-            parseJson<TmdbTvDetail>(
+            parseJsonCompat<TmdbTvDetail>(
                 app.get("$tmdbBase/tv/${first.id}?api_key=$tmdbApiKey", verify = false).text
             )
         } catch (_: Exception) { null }
@@ -530,7 +534,7 @@ class CircleFtpProvider : MainAPI() {
         if (tmdbId == null) return null
         return try {
             val endpoint = if (isTv) "tv" else "movie"
-            val images   = parseJson<TmdbImages>(
+            val images   = parseJsonCompat<TmdbImages>(
                 app.get("$tmdbBase/$endpoint/$tmdbId/images?api_key=$tmdbApiKey", verify = false).text
             )
             val logo = images.logos?.firstOrNull { img -> img.iso_639_1 == "en" }
@@ -543,7 +547,7 @@ class CircleFtpProvider : MainAPI() {
         if (tmdbId == null) return null
         return try {
             val endpoint = if (isTv) "tv" else "movie"
-            val videos   = parseJson<TmdbVideos>(
+            val videos   = parseJsonCompat<TmdbVideos>(
                 app.get("$tmdbBase/$endpoint/$tmdbId/videos?api_key=$tmdbApiKey", verify = false).text
             ).results ?: emptyList()
             val trailer  = videos.firstOrNull { v ->
@@ -590,7 +594,7 @@ class CircleFtpProvider : MainAPI() {
                 verify  = false,
                 headers = mapOf("Content-Type" to "application/json", "Accept" to "application/json")
             )
-            parseJson<AniListResponse>(resp.text).data?.Media
+            parseJsonCompat<AniListResponse>(resp.text).data?.Media
         } catch (_: Exception) { null }
     }
 
@@ -600,7 +604,7 @@ class CircleFtpProvider : MainAPI() {
 
     private suspend fun fetchAniZip(aniListId: Int): AniZipResult? {
         return try {
-            parseJson<AniZipResult>(
+            parseJsonCompat<AniZipResult>(
                 app.get("$aniZipApi?anilist_id=$aniListId", verify = false).text
             )
         } catch (_: Exception) { null }
