@@ -1,7 +1,6 @@
 package com.wizdier
 
 import com.lagradost.cloudstream3.*
-import com.lagradost.cloudstream3.utils.AppUtils
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.newExtractorLink
 import com.lagradost.cloudstream3.DubStatus
@@ -150,7 +149,18 @@ class CircleFtpProvider : MainAPI() {
         } catch (_: Exception) {
             app.get("$apiUrl/api/posts?$params", verify = false, cacheTime = 60)
         }
-        return AppUtils.parseJson<PageData>(json.text).posts
+        val jsonObj = JSONObject(json.text)
+        val postsArray = jsonObj.getJSONArray("posts")
+        return (0 until postsArray.length()).map { i ->
+            val post = postsArray.getJSONObject(i)
+            Post(
+                id = post.getInt("id"),
+                type = post.optString("type"),
+                imageSm = post.optString("imageSm"),
+                title = post.optString("title"),
+                name = post.optString("name").takeIf { it.isNotEmpty() }
+            )
+        }
     }
 
     /**
@@ -331,7 +341,18 @@ class CircleFtpProvider : MainAPI() {
         }.awaitAll()
 
         val loadDataList = postJsons.mapIndexed { index, response ->
-            val loadData = AppUtils.parseJson<Data>(response.text)
+            val obj = JSONObject(response.text)
+            val loadData = Data(
+                type = obj.optString("type"),
+                imageSm = obj.optString("imageSm"),
+                title = obj.optString("title"),
+                image = obj.optString("image"),
+                metaData = obj.optString("metaData").takeIf { it.isNotEmpty() },
+                name = obj.optString("name"),
+                quality = obj.optString("quality").takeIf { it.isNotEmpty() },
+                year = obj.optString("year").takeIf { it.isNotEmpty() },
+                watchTime = obj.optString("watchTime").takeIf { it.isNotEmpty() }
+            )
             val cleaned = cleanTitle(loadData.title)
             val useMain = response.url.contains(mainApiUrl)
             Triple(loadData, useMain, cleaned)
@@ -359,7 +380,7 @@ class CircleFtpProvider : MainAPI() {
         // --- Build movie response ---
         if (firstData.type == "singleVideo") {
             val firstUseMain = loadDataList.first().second
-            val rawUrl = AppUtils.parseJson<Movies>(postJsons.first().text).content
+            val rawUrl = JSONObject(postJsons.first().text).optString("content")
             val movieUrl = if (firstUseMain) rawUrl else linkToIp(rawUrl)
             val duration = getDurationFromString(firstData.watchTime)
             return@coroutineScope newMovieLoadResponse(resolvedBaseTitle, url, tvType, movieUrl) {
@@ -384,7 +405,24 @@ class CircleFtpProvider : MainAPI() {
             val variantLabel = variantGroups.find { vg -> postId in vg.postIds }?.audioLabel ?: "default"
             val sourceTag = buildSourceTag(variantLabel, cleaned.audioTags)
 
-            val tvData = AppUtils.parseJson<TvSeries>(postJsons[dataIndex].text)
+            val tvObj = JSONObject(postJsons[dataIndex].text)
+            val contentArray = tvObj.getJSONArray("content")
+            val tvData = TvSeries(
+                content = (0 until contentArray.length()).map { i ->
+                    val seasonObj = contentArray.getJSONObject(i)
+                    val episodesArray = seasonObj.getJSONArray("episodes")
+                    Content(
+                        episodes = (0 until episodesArray.length()).map { j ->
+                            val epObj = episodesArray.getJSONObject(j)
+                            EpisodeData(
+                                link = epObj.optString("link"),
+                                title = epObj.optString("title")
+                            )
+                        },
+                        seasonName = seasonObj.optString("seasonName")
+                    )
+                }
+            )
             var seasonAccumulator = 0
             tvData.content.forEach { season ->
                 seasonAccumulator++
