@@ -471,7 +471,7 @@ class CircleFtpProvider : MainAPI() {
             val response = app.post(
                 url = anilistApiUrl,
                 headers = mapOf("Content-Type" to "application/json"),
-                data = body.toString(),
+                body = body.toString(),
                 verify = false,
                 cacheTime = 600
             )
@@ -545,7 +545,7 @@ class CircleFtpProvider : MainAPI() {
             val response = app.post(
                 url = anilistApiUrl,
                 headers = mapOf("Content-Type" to "application/json"),
-                data = body.toString(),
+                body = body.toString(),
                 verify = false,
                 cacheTime = 600
             )
@@ -586,7 +586,7 @@ class CircleFtpProvider : MainAPI() {
             val response = app.post(
                 url = anilistApiUrl,
                 headers = mapOf("Content-Type" to "application/json"),
-                data = body.toString(),
+                body = body.toString(),
                 verify = false,
                 cacheTime = 600
             )
@@ -625,7 +625,7 @@ class CircleFtpProvider : MainAPI() {
             val response = app.post(
                 url = anilistApiUrl,
                 headers = mapOf("Content-Type" to "application/json"),
-                data = body.toString(),
+                body = body.toString(),
                 verify = false,
                 cacheTime = 600
             )
@@ -697,7 +697,7 @@ class CircleFtpProvider : MainAPI() {
             val response = app.post(
                 url = anilistApiUrl,
                 headers = mapOf("Content-Type" to "application/json"),
-                data = body.toString(),
+                body = body.toString(),
                 verify = false,
                 cacheTime = 600
             )
@@ -797,7 +797,7 @@ class CircleFtpProvider : MainAPI() {
             val response = app.post(
                 url = anilistApiUrl,
                 headers = mapOf("Content-Type" to "application/json"),
-                data = body.toString(),
+                body = body.toString(),
                 verify = false,
                 cacheTime = 600
             )
