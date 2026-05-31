@@ -1,4 +1,4 @@
-package com.redowan
+package com.wizdier
 
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.AppUtils
@@ -39,7 +39,7 @@ class CircleFtpProvider : MainAPI() {
     private val aniZipApi     = "https://api.ani.zip/mappings"
 
     // ── Provider metadata ────────────────────────────────────────────────────
-    override var name                 = "(BDIX) Circle FTP"
+    override var name                 = "Circle FTP"
     override var lang                 = "bn"
     override val hasMainPage          = true
     override val hasDownloadSupport   = true
