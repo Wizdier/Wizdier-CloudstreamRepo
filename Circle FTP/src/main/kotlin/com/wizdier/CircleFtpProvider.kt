@@ -128,13 +128,17 @@ class CircleFtpProvider : MainAPI() {
     }
 
     override suspend fun load(url: String): LoadResponse {
-        val payload = decodePayload(url) ?: buildLegacyPayload(url)
+        val payload = when {
+            url.startsWith(payloadPrefix) -> {
+                decodePayload(url) ?: throw ErrorLoadingException("Failed to decode Circle FTP payload")
+            }
+            else -> buildLegacyPayload(url)
+        }
         val payloadType = payload.mediaType.toTvType()
         return when {
             payloadType == TvType.Anime || payloadType == TvType.AnimeMovie || payloadType == TvType.OVA -> {
                 loadAnimePayload(payload)
             }
-
             else -> loadStandardPayload(payload)
         }
     }
@@ -1334,17 +1338,18 @@ class CircleFtpProvider : MainAPI() {
         if (!url.startsWith(payloadPrefix)) {
             return null
         }
-        return runCatching {
-            val encoded = url.removePrefix(payloadPrefix)
-            val decodedBytes = Base64.getUrlDecoder().decode(encoded)
-            val decodedText = String(decodedBytes)
-            parseCirclePayload(JSONObject(decodedText))
-        }.getOrNull()
+        val encoded = url.removePrefix(payloadPrefix)
+        val decodedText = try {
+            String(Base64.getUrlDecoder().decode(encoded))
+        } catch (_: Exception) {
+            return null
+        }
+        return parseCirclePayload(JSONObject(decodedText))
     }
 
     private fun buildLegacyPayload(url: String): CirclePayload {
         val legacyId = url.substringAfterLast("/").substringBefore("?").toIntOrNull()
-            ?: throw ErrorLoadingException("Invalid Circle FTP URL")
+            ?: throw ErrorLoadingException("Invalid Circle FTP URL: $url")
         return CirclePayload(
             mediaType = TvType.Others.name,
             displayTitle = "Circle FTP",
@@ -2115,43 +2120,51 @@ class CircleFtpProvider : MainAPI() {
     }
 
     private fun parseCirclePayload(json: JSONObject): CirclePayload? {
-        return runCatching {
-            val postsArray = json.getJSONArray("posts")
-            val posts = (0 until postsArray.length()).map { i ->
-                val obj = postsArray.getJSONObject(i)
-                PayloadPostRef(
-                    id = obj.getInt("id"),
-                    rawTitle = obj.optString("rawTitle"),
-                    imageSm = obj.optString("imageSm").takeIf { it.isNotEmpty() },
-                    declaredSeason = obj.optInt("declaredSeason").takeIf { it > 0 },
-                    audioTag = obj.optString("audioTag").takeIf { it.isNotEmpty() },
-                    postType = obj.optString("postType").takeIf { it.isNotEmpty() }
-                )
+        val postsArray = json.optJSONArray("posts") ?: return null
+        val posts = mutableListOf<PayloadPostRef>()
+        for (i in 0 until postsArray.length()) {
+            val obj = postsArray.optJSONObject(i) ?: continue
+            val id = when {
+                !obj.isNull("id") && obj.opt("id") is Int -> obj.optInt("id", 0)
+                !obj.isNull("id") -> obj.optString("id", "").toIntOrNull() ?: 0
+                else -> 0
             }
-            CirclePayload(
-                mediaType = json.getString("mediaType"),
-                displayTitle = json.getString("displayTitle"),
-                franchiseTitle = json.getString("franchiseTitle"),
-                year = json.optInt("year").takeIf { it > 0 },
-                activeSeason = json.optInt("activeSeason").takeIf { it > 0 },
-                posts = posts
+            if (id <= 0) continue
+            posts += PayloadPostRef(
+                id = id,
+                rawTitle = obj.optString("rawTitle", ""),
+                imageSm = obj.optString("imageSm", "").takeIf { it.isNotEmpty() },
+                declaredSeason = obj.optString("declaredSeason", "").toIntOrNull()
+                    ?: obj.optInt("declaredSeason", 0).takeIf { it > 0 },
+                audioTag = obj.optString("audioTag", "").takeIf { it.isNotEmpty() },
+                postType = obj.optString("postType", "").takeIf { it.isNotEmpty() }
             )
-        }.getOrNull()
+        }
+        if (posts.isEmpty()) return null
+        return CirclePayload(
+            mediaType = json.optString("mediaType", "").ifEmpty { return null },
+            displayTitle = json.optString("displayTitle", "").ifEmpty { return null },
+            franchiseTitle = json.optString("franchiseTitle", "").ifEmpty { return null },
+            year = json.optString("year", "").toIntOrNull()
+                ?: json.optInt("year", 0).takeIf { it > 0 },
+            activeSeason = json.optString("activeSeason", "").toIntOrNull()
+                ?: json.optInt("activeSeason", 0).takeIf { it > 0 },
+            posts = posts
+        )
     }
 
     private fun parseStreamPayload(jsonStr: String): StreamPayload? {
-        return runCatching {
-            val json = JSONObject(jsonStr)
-            val variantsArray = json.getJSONArray("variants")
-            val variants = (0 until variantsArray.length()).map { i ->
-                val obj = variantsArray.getJSONObject(i)
-                StreamVariant(
-                    label = obj.getString("label"),
-                    url = obj.getString("url")
-                )
-            }
-            StreamPayload(variants = variants)
-        }.getOrNull()
+        val json = try { JSONObject(jsonStr) } catch (_: Exception) { return null }
+        val variantsArray = json.optJSONArray("variants") ?: return null
+        val variants = mutableListOf<StreamVariant>()
+        for (i in 0 until variantsArray.length()) {
+            val obj = variantsArray.optJSONObject(i) ?: continue
+            val label = obj.optString("label", "").ifEmpty { continue }
+            val url = obj.optString("url", "").ifEmpty { continue }
+            variants += StreamVariant(label = label, url = url)
+        }
+        if (variants.isEmpty()) return null
+        return StreamPayload(variants = variants)
     }
 
     private fun StreamPayload.toJsonString(): String {
