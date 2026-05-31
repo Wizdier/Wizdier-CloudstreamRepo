@@ -242,7 +242,7 @@ class CircleFtpProvider : MainAPI() {
         val first = loadDataList.first().first
         val mainClean = loadDataList.first().third
         val baseTitle = mainClean.baseTitle
-        val tvType = if (first.type == "singleVideo") TvType.Movie else inferTypeFromPosts(postIds.map { it }, mainClean)
+        val tvType = if (first.type == "singleVideo") TvType.Movie else inferTypeFromPostIds(postIds, mainClean)
 
         // Pre-fetch metadata (season-aware for anime)
         var finalPlot = first.metaData
@@ -288,7 +288,7 @@ class CircleFtpProvider : MainAPI() {
             finalTrailer = fetchTMDBTrailer(baseTitle, year, tvType)
         }
 
-        // Build response
+        // Build movie response
         if (first.type == "singleVideo") {
             val movieUrls = loadDataList.map { (data, useMain, _) ->
                 val movieJson = postJsons[loadDataList.indexOf(Triple(data, useMain, cleanTitle(data.title)))]
@@ -296,17 +296,19 @@ class CircleFtpProvider : MainAPI() {
                 if (useMain) movieUrl else linkToIp(movieUrl)
             }
             val duration = getDurationFromString(first.watchTime)
-            return@coroutineScope newMovieLoadResponse(baseTitle, url, tvType, movieUrls.first()) {
+            val movieResponse = newMovieLoadResponse(baseTitle, url, tvType, movieUrls.first()) {
                 this.posterUrl = finalPoster
                 this.year = finalYear
                 this.plot = finalPlot
                 this.duration = duration
                 this.logoUrl = finalLogo
                 this.backgroundPosterUrl = finalBackground
-                this.trailerUrl = finalTrailer
             }
+            movieResponse.trailerUrl = finalTrailer
+            return@coroutineScope movieResponse
         }
 
+        // Build TV series response
         val allEpisodes = mutableListOf<Episode>()
         loadDataList.forEachIndexed { index, (data, useMain, cleaned) ->
             val tvData = AppUtils.parseJson<TvSeries>(postJsons[index].text)
@@ -332,18 +334,19 @@ class CircleFtpProvider : MainAPI() {
             }
         }
 
-        val response = newTvSeriesLoadResponse(baseTitle, url, tvType, allEpisodes) {
+        val seriesResponse = newTvSeriesLoadResponse(baseTitle, url, tvType, allEpisodes) {
             this.posterUrl = finalPoster
             this.year = finalYear
             this.plot = finalPlot
             this.logoUrl = finalLogo
             this.backgroundPosterUrl = finalBackground
-            this.trailerUrl = finalTrailer
-            this.anilistId = aniListId
-            this.malId = malId
-            this.kitsuId = kitsuId
-            this.simklId = simklId
         }
+        seriesResponse.trailerUrl = finalTrailer
+        // Attach tracking IDs
+        aniListId?.let { seriesResponse.addAniListId(it) }
+        malId?.let { seriesResponse.addMalId(it) }
+        kitsuId?.let { seriesResponse.addKitsuId(it) }
+        simklId?.let { seriesResponse.addSimklId(it) }
 
         if (tvType == TvType.Anime && cacheKey != null) {
             val seasons = animeSeasonCache[cacheKey] ?: emptyMap()
@@ -354,10 +357,10 @@ class CircleFtpProvider : MainAPI() {
                     this.posterUrl = finalPoster // placeholder, updated when loaded
                 }
             }
-            response.recommendations = recommendations
+            seriesResponse.recommendations = recommendations
         }
 
-        response
+        seriesResponse
     }
 
     // ==============================
@@ -470,7 +473,7 @@ class CircleFtpProvider : MainAPI() {
             val response = app.post(
                 url = anilistApiUrl,
                 headers = mapOf("Content-Type" to "application/json"),
-                data = body.toString(),
+                requestBody = body.toString(),
                 verify = false,
                 cacheTime = 600
             )
@@ -544,7 +547,7 @@ class CircleFtpProvider : MainAPI() {
             val response = app.post(
                 url = anilistApiUrl,
                 headers = mapOf("Content-Type" to "application/json"),
-                data = body.toString(),
+                requestBody = body.toString(),
                 verify = false,
                 cacheTime = 600
             )
@@ -585,7 +588,7 @@ class CircleFtpProvider : MainAPI() {
             val response = app.post(
                 url = anilistApiUrl,
                 headers = mapOf("Content-Type" to "application/json"),
-                data = body.toString(),
+                requestBody = body.toString(),
                 verify = false,
                 cacheTime = 600
             )
@@ -624,7 +627,7 @@ class CircleFtpProvider : MainAPI() {
             val response = app.post(
                 url = anilistApiUrl,
                 headers = mapOf("Content-Type" to "application/json"),
-                data = body.toString(),
+                requestBody = body.toString(),
                 verify = false,
                 cacheTime = 600
             )
@@ -696,7 +699,7 @@ class CircleFtpProvider : MainAPI() {
             val response = app.post(
                 url = anilistApiUrl,
                 headers = mapOf("Content-Type" to "application/json"),
-                data = body.toString(),
+                requestBody = body.toString(),
                 verify = false,
                 cacheTime = 600
             )
@@ -796,7 +799,7 @@ class CircleFtpProvider : MainAPI() {
             val response = app.post(
                 url = anilistApiUrl,
                 headers = mapOf("Content-Type" to "application/json"),
-                data = body.toString(),
+                requestBody = body.toString(),
                 verify = false,
                 cacheTime = 600
             )
