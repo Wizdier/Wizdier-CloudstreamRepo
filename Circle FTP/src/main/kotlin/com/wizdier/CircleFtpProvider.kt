@@ -684,8 +684,7 @@ class CircleFtpProvider : MainAPI() {
     private fun Data.bestTitle(): String = this.name?.takeIf { it.isNotBlank() } ?: this.title
 
     private fun AniListMedia.preferredTitle(): String = this.title?.english ?: this.title?.romaji ?: this.title?.native ?: this.title?.userPreferred ?: "Unknown Anime"
-    private fun AniListMedia.cleanDescription(): String? = this.description?.replace("<br>", "
-", ignoreCase = true)?.replace(Regex("<[^>]+>"), "")?.trim()
+    private fun AniListMedia.cleanDescription(): String? = this.description?.replace("<br>", "\n", ignoreCase = true)?.replace(Regex("<[^>]+>"), "")?.trim()
     private fun AniListMedia.allTitles(): List<String> = buildList {
         title?.english?.takeIf { it.isNotBlank() }?.let { add(it) }
         title?.romaji?.takeIf { it.isNotBlank() }?.let { add(it) }
