@@ -74,10 +74,9 @@ subprojects {
         // break compatibility with newer CloudStream app releases.
         cloudstream("com.lagradost:cloudstream3:pre-release")
 
-        // Fixes: Unresolved reference 'JsonProperty'
-        // Needed because CircleFtpProvider.kt imports:
-        // import com.fasterxml.jackson.annotation.JsonProperty
+        // Keep Jackson pinned to 2.13.1 for Android compatibility.
         compileOnly("com.fasterxml.jackson.core:jackson-annotations:2.13.1")
+        implementation("com.fasterxml.jackson.module:jackson-module-kotlin:2.13.1")
 
         implementation(kotlin("stdlib"))
         implementation("com.github.Blatzar:NiceHttp:0.4.18")

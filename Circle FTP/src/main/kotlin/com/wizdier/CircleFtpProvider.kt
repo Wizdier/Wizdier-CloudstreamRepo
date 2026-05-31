@@ -6,8 +6,8 @@ import com.lagradost.cloudstream3.LoadResponse.Companion.addKitsuId
 import com.lagradost.cloudstream3.LoadResponse.Companion.addMalId
 import com.lagradost.cloudstream3.LoadResponse.Companion.addSimklId
 import com.lagradost.cloudstream3.LoadResponse.Companion.addTrailer
+import com.lagradost.cloudstream3.mapper
 import com.lagradost.cloudstream3.utils.AppUtils.parseJson
-import com.lagradost.cloudstream3.utils.AppUtils.toJson
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.newExtractorLink
 import kotlinx.coroutines.async
@@ -347,14 +347,14 @@ class CircleFtpProvider : MainAPI() {
                     companions = companionLinks
                 )
 
-                val dataJson = episodeLinkData.toJson()
+                val dataJson = mapper.writeValueAsString(episodeLinkData)
 
                 episodesData.add(
-                    newEpisode(dataJson, {
-                        this.name    = epData.title.ifBlank { "Episode $episodeNum" }
+                    newEpisode(dataJson, fix = false) {
+                        this.name    = epData.title.takeIf { it.isNotBlank() }
                         this.episode = episodeNum
                         this.season  = seasonNum
-                    }, fix = false)
+                    }
                 )
             }
         }
