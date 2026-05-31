@@ -308,14 +308,14 @@ class CircleFtpProvider : MainAPI() {
         val streamPayload = parseStreamPayload(data)
         if (streamPayload != null && streamPayload.variants.isNotEmpty()) {
             streamPayload.variants.distinctBy { it.url }.forEach { variant ->
-                callback.invoke(newExtractorLink(source = name, name = variant.label, url = linkToIp(variant.url), type = ExtractorLinkType.VIDEO) {
+                callback.invoke(newExtractorLink(source = name, name = variant.label, url = variant.url, type = ExtractorLinkType.VIDEO) {
                     this.quality = inferExtractorQuality(variant.label)
                 })
             }
             return true
         }
         // Direct URL fallback
-        callback.invoke(newExtractorLink(source = name, name = name, url = linkToIp(data), type = ExtractorLinkType.VIDEO))
+        callback.invoke(newExtractorLink(source = name, name = name, url = data, type = ExtractorLinkType.VIDEO))
         return true
     }
 
@@ -595,7 +595,7 @@ class CircleFtpProvider : MainAPI() {
     }
 
     private fun normalizeStream(rawUrl: String?, dataType: String): String {
-        return rawUrl?.let { linkToIp(it) } ?: ""
+        return rawUrl ?: ""
     }
 
     private fun buildTmdbImageUrl(config: TmdbConfiguration, path: String?, kind: TmdbImageKind): String? {
@@ -703,15 +703,15 @@ class CircleFtpProvider : MainAPI() {
 
     private fun urlEncode(value: String): String = URLEncoder.encode(value, "UTF-8")
 
-    private fun String?.selectUntilNonInt(): Int? = this?.let { Regex("^.*?(?=\D|$)").find(it)?.value?.toIntOrNull() }
+    private fun String?.selectUntilNonInt(): Int? = this?.let { Regex("""^.*?(?=\D|$)""").find(it)?.value?.toIntOrNull() }
 
     private fun parseSeasonNumber(value: String?): Int? {
         val cleaned = value.orEmpty()
         listOf(
-            Regex("(?:season|s)\s*0*(\d{1,2})", RegexOption.IGNORE_CASE),
-            Regex("(\d{1,2})(?:st|nd|rd|th)?\s*season", RegexOption.IGNORE_CASE),
-            Regex("part\s*0*(\d{1,2})", RegexOption.IGNORE_CASE),
-            Regex("cour\s*0*(\d{1,2})", RegexOption.IGNORE_CASE)
+            Regex("""(?:season|s)\s*0*(\d{1,2})""", RegexOption.IGNORE_CASE),
+            Regex("""(\d{1,2})(?:st|nd|rd|th)?\s*season""", RegexOption.IGNORE_CASE),
+            Regex("""part\s*0*(\d{1,2})""", RegexOption.IGNORE_CASE),
+            Regex("""cour\s*0*(\d{1,2})""", RegexOption.IGNORE_CASE)
         ).forEach { regex ->
             regex.find(cleaned)?.groupValues?.getOrNull(1)?.toIntOrNull()?.let { return it }
         }
@@ -721,8 +721,8 @@ class CircleFtpProvider : MainAPI() {
     private fun extractEpisodeNumber(title: String?): Int? {
         val cleaned = title.orEmpty()
         listOf(
-            Regex("(?:episode|ep|e)\s*0*(\d{1,4})", RegexOption.IGNORE_CASE),
-            Regex("(?:^|\D)(\d{1,4})(?:\D|$)")
+            Regex("""(?:episode|ep|e)\s*0*(\d{1,4})""", RegexOption.IGNORE_CASE),
+            Regex("""(?:^|\D)(\d{1,4})(?:\D|$)""")
         ).forEach { regex ->
             regex.find(cleaned)?.groupValues?.getOrNull(1)?.toIntOrNull()?.let { return it }
         }
@@ -733,7 +733,7 @@ class CircleFtpProvider : MainAPI() {
         val cleaned = title.orEmpty()
             .replace(Regex("""(?:episode|ep)\s*0*$episodeNumber\s*[:-]?""", RegexOption.IGNORE_CASE), "")
             .replace('_', ' ').replace('.', ' ')
-            .replace(Regex("\s+"), " ").trim()
+            .replace(Regex("""\s+"""), " ").trim()
         return if (cleaned.isBlank()) "Episode $episodeNumber" else cleaned
     }
 
@@ -771,19 +771,19 @@ class CircleFtpProvider : MainAPI() {
     }
 
     private fun normalizeTitle(rawTitle: String): NormalizedTitle {
-        val raw = rawTitle.replace('_', ' ').replace('.', ' ').replace(Regex("\s+"), " ").trim()
+        val raw = rawTitle.replace('_', ' ').replace('.', ' ').replace(Regex("""\s+"""), " ").trim()
         val audioTag = when {
-            Regex("dual\s*audio", RegexOption.IGNORE_CASE).containsMatchIn(raw) -> "Dual-Audio"
-            Regex("multi\s*audio", RegexOption.IGNORE_CASE).containsMatchIn(raw) -> "Multi-Audio"
-            Regex("subbed", RegexOption.IGNORE_CASE).containsMatchIn(raw) -> "Subbed"
-            Regex("dubbed", RegexOption.IGNORE_CASE).containsMatchIn(raw) -> "Dubbed"
-            Regex("hindi", RegexOption.IGNORE_CASE).containsMatchIn(raw) -> "Hindi"
-            Regex("english", RegexOption.IGNORE_CASE).containsMatchIn(raw) -> "English"
+            Regex("""dual\s*audio""", RegexOption.IGNORE_CASE).containsMatchIn(raw) -> "Dual-Audio"
+            Regex("""multi\s*audio""", RegexOption.IGNORE_CASE).containsMatchIn(raw) -> "Multi-Audio"
+            Regex("""subbed""", RegexOption.IGNORE_CASE).containsMatchIn(raw) -> "Subbed"
+            Regex("""dubbed""", RegexOption.IGNORE_CASE).containsMatchIn(raw) -> "Dubbed"
+            Regex("""hindi""", RegexOption.IGNORE_CASE).containsMatchIn(raw) -> "Hindi"
+            Regex("""english""", RegexOption.IGNORE_CASE).containsMatchIn(raw) -> "English"
             else -> null
         }
         val quality = getSearchQuality(raw)
-        val qualityTag = Regex("(2160p|1080p|720p|480p|4k|bluray|blu-ray|web-dl|webrip|hdrip|hdr|uhd|sdr)", RegexOption.IGNORE_CASE).find(raw)?.value?.uppercase()
-        val year = Regex("(?<!\d)(19\d{2}|20\d{2}|21\d{2})(?!\d)").find(raw)?.value?.toIntOrNull()
+        val qualityTag = Regex("""(2160p|1080p|720p|480p|4k|bluray|blu-ray|web-dl|webrip|hdrip|hdr|uhd|sdr)""", RegexOption.IGNORE_CASE).find(raw)?.value?.uppercase()
+        val year = Regex("""(?<!\d)(19\d{2}|20\d{2}|21\d{2})(?!\d)""").find(raw)?.value?.toIntOrNull()
         val season = parseSeasonNumber(raw)
         val noiseRegex = Regex("""
             (?ix)
@@ -791,35 +791,23 @@ class CircleFtpProvider : MainAPI() {
             (\(.*?(dual\s*audio|multi\s*audio|dubbed|subbed|bluray|blu-ray|web[- ]?dl|webrip|hdrip|2160p|1080p|720p|480p|x264|x265|hevc|hdr|sdr|hindi|english).*?\))|
             \b(?:bluray|blu-ray|web[- ]?dl|webrip|hdrip|brrip|dvdrip|2160p|1080p|720p|480p|4k|x264|x265|h264|h265|hevc|aac|dts|ddp5\.1|dual\s*audio|multi\s*audio|dubbed|subbed|hindi|english|multi|audio|hdr|sdr)\b
         """.trimIndent())
-        val cleanedDisplay = noiseRegex.replace(raw, " ").replace(Regex("\s+"), " ").replace(Regex("""[\[\](){}]"""), " ").trim()
+        val cleanedDisplay = noiseRegex.replace(raw, " ").replace(Regex("""\s+"""), " ").replace(Regex("""[\[\](){}]"""), " ").trim()
         val franchiseTitle = cleanedDisplay
-            .replace(Regex("(?:season|s)\s*0*(\d{1,2})", RegexOption.IGNORE_CASE), " ")
-            .replace(Regex("(\d{1,2})(?:st|nd|rd|th)?\s*season", RegexOption.IGNORE_CASE), " ")
-            .replace(Regex("part\s*0*(\d{1,2})", RegexOption.IGNORE_CASE), " ")
-            .replace(Regex("cour\s*0*(\d{1,2})", RegexOption.IGNORE_CASE), " ")
-            .replace(Regex("\b(19\d{2}|20\d{2}|21\d{2})\b"), " ")
-            .replace(Regex("\s+"), " ").trim()
+            .replace(Regex("""(?:season|s)\s*0*(\d{1,2})""", RegexOption.IGNORE_CASE), " ")
+            .replace(Regex("""(\d{1,2})(?:st|nd|rd|th)?\s*season""", RegexOption.IGNORE_CASE), " ")
+            .replace(Regex("""part\s*0*(\d{1,2})""", RegexOption.IGNORE_CASE), " ")
+            .replace(Regex("""cour\s*0*(\d{1,2})""", RegexOption.IGNORE_CASE), " ")
+            .replace(Regex("""\b(19\d{2}|20\d{2}|21\d{2})\b"""), " ")
+            .replace(Regex("""\s+"""), " ").trim()
             .ifBlank { cleanedDisplay.ifBlank { raw } }
         return NormalizedTitle(
-            displayTitle = cleanedDisplay.ifBlank { raw }, canonicalTitle = cleanedDisplay.replace(Regex("\s+"), " ").trim(),
-            franchiseTitle = franchiseTitle, franchiseKey = franchiseTitle.lowercase(), canonicalKey = cleanedDisplay.replace(Regex("\s+"), " ").trim().lowercase(),
+            displayTitle = cleanedDisplay.ifBlank { raw }, canonicalTitle = cleanedDisplay.replace(Regex("""\s+"""), " ").trim(),
+            franchiseTitle = franchiseTitle, franchiseKey = franchiseTitle.lowercase(), canonicalKey = cleanedDisplay.replace(Regex("""\s+"""), " ").trim().lowercase(),
             year = year, season = season, quality = quality, qualityTag = qualityTag, audioTag = audioTag
         )
     }
 
-    private fun linkToIp(data: String): String {
-        val hostMap = mapOf(
-            "index.circleftp.net" to "15.1.4.2", "index2.circleftp.net" to "15.1.4.5", "index1.circleftp.net" to "15.1.4.9",
-            "ftp3.circleftp.net" to "15.1.4.7", "ftp4.circleftp.net" to "15.1.1.5", "ftp5.circleftp.net" to "15.1.1.15",
-            "ftp6.circleftp.net" to "15.1.2.3", "ftp7.circleftp.net" to "15.1.4.8", "ftp8.circleftp.net" to "15.1.2.2",
-            "ftp9.circleftp.net" to "15.1.2.12", "ftp10.circleftp.net" to "15.1.4.3", "ftp11.circleftp.net" to "15.1.2.6",
-            "ftp12.circleftp.net" to "15.1.2.1", "ftp13.circleftp.net" to "15.1.1.18", "ftp15.circleftp.net" to "15.1.4.12",
-            "ftp17.circleftp.net" to "15.1.3.8"
-        )
-        var result = data
-        hostMap.forEach { (host, ip) -> result = result.replace(host, ip) }
-        return result
-    }
+
 
     private suspend fun apiGet(path: String, cacheTime: Int) = try {
         app.get("$mainApiUrl$path", verify = false, cacheTime = cacheTime)
