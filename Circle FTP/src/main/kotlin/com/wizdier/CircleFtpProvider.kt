@@ -4,6 +4,7 @@ import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.AppUtils
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.newExtractorLink
+import com.lagradost.cloudstream3.utils.DubStatus
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
@@ -200,21 +201,15 @@ class CircleFtpProvider : MainAPI() {
             // For anime multi-season: cache and pick Season 1 as baseline
             val entrySeasons = seasons.toMap()
             val isMultiSeasonAnime = finalType == TvType.Anime && entrySeasons.size > 1
-            val baselinePostIds: List<Int> = if (isMultiSeasonAnime) {
-                val s1Ids = entrySeasons[1] ?: nonSeasonedIds.ifEmpty {
-                    entrySeasons.minByOrNull { seasonEntry -> seasonEntry.key }?.value ?: pairs.map { pair -> pair.first.id }
-                }
+            if (isMultiSeasonAnime) {
                 val cacheKey = "group:$normalizedKey"
                 animeSeasonCache[cacheKey] = entrySeasons
-                s1Ids
-            } else {
-                pairs.map { pair -> pair.first.id }
             }
 
             // Build audio-variant groups from the baseline posts only
             val variantMap = linkedMapOf<String, MutableList<Int>>()
             for ((post, cleaned) in pairs) {
-                val idsForVariants = if (isMultiSeasonAnime) {
+                if (isMultiSeasonAnime) {
                     // Only include posts belonging to baseline season
                     val belongsToBaseline = entrySeasons[1]?.contains(post.id) == true ||
                         (entrySeasons.isEmpty() && nonSeasonedIds.contains(post.id))
@@ -232,7 +227,7 @@ class CircleFtpProvider : MainAPI() {
                 VariantGroup(audioLabel = label, postIds = ids)
             }
 
-            val poster = "$mainApiUrl/uploads/${firstPost.imageSm}"
+            val poster = firstPost.imageSm?.let { "$mainApiUrl/uploads/$it" }"
             ConsolidatedEntry(
                 id = "group:$normalizedKey",
                 baseTitle = baseTitle,
@@ -271,9 +266,8 @@ class CircleFtpProvider : MainAPI() {
         return newAnimeSearchResponse(entry.displayTitle, url, tvType) {
             this.posterUrl = entry.poster
             this.quality = getSearchQuality(entry.displayTitle)
-            val titleLower = entry.displayTitle.lowercase()
             addDubStatus(
-                dubExist = "dubbed" in titleLower || "dual audio" in titleLower || "multi audio" in titleLower,
+                dubExist = "dubbed" in entry.displayTitle.lowercase() || "dual audio" in entry.displayTitle.lowercase() || "multi audio" in entry.displayTitle.lowercase(),
                 subExist = false
             )
         }
@@ -348,21 +342,13 @@ class CircleFtpProvider : MainAPI() {
         val resolvedBaseTitle = if (baseTitle.isNotEmpty()) baseTitle else mainCleaned.baseTitle
         val tvType = if (firstData.type == "singleVideo") TvType.Movie else inferTypeFromPostData(loadDataList)
 
-        // --- Concurrent metadata fetching ---
-        val metaDeferred = async {
-            resolveMetadata(resolvedBaseTitle, tvType, mainCleaned, seasonOverride)
-        }
-        val trailerDeferred = async {
-            resolveTrailer(resolvedBaseTitle, tvType, mainCleaned, seasonOverride)
-        }
-
-        val metaResult = metaDeferred.await()
-        val trailerResult = trailerDeferred.await()
+        // --- Fetch metadata ---
+        val metaResult = resolveMetadata(resolvedBaseTitle, tvType, mainCleaned, seasonOverride)
 
         // Unpack metadata
         var finalPlot = metaResult.plot ?: firstData.metaData
         var finalYear = metaResult.year ?: selectUntilNonInt(firstData.year)
-        var finalPoster: String? = metaResult.posterUrl ?: "$apiUrl/uploads/${firstData.image}"
+        var finalPoster: String? = metaResult.posterUrl ?: firstData.image?.let { "$apiUrl/uploads/$it" }"
         var finalLogo: String? = metaResult.logoUrl
         var finalBackground: String? = metaResult.backgroundPosterUrl
         val aniListId: Int? = metaResult.aniListId
@@ -372,14 +358,11 @@ class CircleFtpProvider : MainAPI() {
 
         // --- Build movie response ---
         if (firstData.type == "singleVideo") {
-            val movieUrls = loadDataList.mapIndexed { index, triple ->
-                val useMain = triple.second
-                val data = triple.first
-                val rawUrl = AppUtils.parseJson<Movies>(postJsons[index].text).content
-                if (useMain) rawUrl else linkToIp(rawUrl)
-            }
+            val firstUseMain = loadDataList.first().second
+            val rawUrl = AppUtils.parseJson<Movies>(postJsons.first().text).content
+            val movieUrl = if (firstUseMain) rawUrl else linkToIp(rawUrl)
             val duration = getDurationFromString(firstData.watchTime)
-            val movieResponse = newMovieLoadResponse(resolvedBaseTitle, url, tvType, movieUrls.first()) {
+            return@coroutineScope newMovieLoadResponse(resolvedBaseTitle, url, tvType, movieUrl) {
                 this.posterUrl = finalPoster
                 this.year = finalYear
                 this.plot = finalPlot
@@ -387,7 +370,6 @@ class CircleFtpProvider : MainAPI() {
                 this.logoUrl = finalLogo
                 this.backgroundPosterUrl = finalBackground
             }
-            return@coroutineScope movieResponse
         }
 
         // --- Build episode list: merge all variant groups into unified episodes ---
@@ -409,12 +391,16 @@ class CircleFtpProvider : MainAPI() {
                 var episodeAccumulator = 0
                 season.episodes.forEach { ep ->
                     episodeAccumulator++
-                    val link = if (useMain) ep.link else linkToIp(ep.link)
+                    val link = ep.link?.let { if (useMain) it else linkToIp(it) } ?: continue
                     allEpisodes.add(
                         newEpisode(link) {
                             this.episode = episodeAccumulator
                             this.season = seasonAccumulator
-                            this.name = "${ep.title.ifBlank { "Episode $episodeAccumulator" }} ($sourceTag)"
+                            this.name = if (sourceTag.isNotBlank()) {
+                                "${ep.title.ifBlank { "Episode $episodeAccumulator" }} ($sourceTag)"
+                            } else {
+                                ep.title.ifBlank { "Episode $episodeAccumulator" }
+                            }
                         }
                     )
                 }
@@ -425,7 +411,7 @@ class CircleFtpProvider : MainAPI() {
         val isAnimeType = tvType == TvType.Anime || tvType == TvType.AnimeMovie || tvType == TvType.OVA
         val seriesResponse = if (isAnimeType) {
             newAnimeLoadResponse(resolvedBaseTitle, url, tvType) {
-                addEpisodes(allEpisodes)
+                addEpisodes(DubStatus.Dubbed, allEpisodes)
                 this.posterUrl = finalPoster
                 this.year = finalYear
                 this.plot = finalPlot
@@ -433,8 +419,7 @@ class CircleFtpProvider : MainAPI() {
                 this.backgroundPosterUrl = finalBackground
             }
         } else {
-            newTvSeriesLoadResponse(resolvedBaseTitle, url, tvType) {
-                addEpisodes(allEpisodes)
+            newTvSeriesLoadResponse(resolvedBaseTitle, url, tvType, allEpisodes) {
                 this.posterUrl = finalPoster
                 this.year = finalYear
                 this.plot = finalPlot
@@ -553,23 +538,6 @@ class CircleFtpProvider : MainAPI() {
         }
     }
 
-    /**
-     * Routes trailer fetching to the correct backend.
-     */
-    private suspend fun resolveTrailer(
-        baseTitle: String,
-        tvType: TvType,
-        cleaned: CleanedTitle,
-        seasonOverride: Int?
-    ): String? {
-        val isAnimeType = tvType == TvType.Anime || tvType == TvType.AnimeMovie || tvType == TvType.OVA
-        return if (isAnimeType) {
-            val trailerQuery = if (seasonOverride != null) "$baseTitle Season $seasonOverride" else baseTitle
-            fetchAniListTrailer(trailerQuery, null)
-        } else {
-            fetchTMDBTrailer(baseTitle, null, tvType)
-        }
-    }
 
     data class UnifiedMetadata(
         val plot: String? = null,
@@ -627,35 +595,6 @@ class CircleFtpProvider : MainAPI() {
                 backgroundPosterUrl = backdrop?.let { tmdbImageBase + "w1280" + it }
             )
         } catch (_: Exception) { return null }
-    }
-
-    private suspend fun fetchTMDBTrailer(
-        query: String,
-        year: Int?,
-        tvType: TvType
-    ): String? {
-        val type = if (tvType == TvType.Movie || tvType == TvType.Cartoon || tvType == TvType.AnimeMovie) "movie" else "tv"
-        var searchUrl = "https://api.themoviedb.org/3/search/$type?api_key=$tmdbApiKey&query=${URLEncoder.encode(query, "utf-8")}"
-        if (year != null) searchUrl += "&year=$year"
-        try {
-            val searchResponse = app.get(searchUrl, verify = false, cacheTime = 600)
-            val results = JSONObject(searchResponse.text).getJSONArray("results")
-            if (results.length() == 0) return null
-            val best = results.getJSONObject(0)
-            val tmdbId = best.getInt("id")
-            val videosUrl = "https://api.themoviedb.org/3/$type/$tmdbId/videos?api_key=$tmdbApiKey"
-            val videoResponse = app.get(videosUrl, verify = false, cacheTime = 600)
-            val videos = JSONObject(videoResponse.text).getJSONArray("results")
-            for (i in 0 until videos.length()) {
-                val video = videos.getJSONObject(i)
-                if (video.optString("site").equals("YouTube", true) &&
-                    video.optString("type").equals("Trailer", true)) {
-                    val key = video.optString("key")
-                    if (key.isNotEmpty()) return "https://www.youtube.com/watch?v=$key"
-                }
-            }
-        } catch (_: Exception) { }
-        return null
     }
 
     /**
@@ -730,8 +669,7 @@ class CircleFtpProvider : MainAPI() {
                         seasonYear
                         coverImage { large }
                         bannerImage
-                        trailer { id site }
-                    }
+                                            }
                 }
             }
         """.trimIndent()
@@ -902,8 +840,7 @@ class CircleFtpProvider : MainAPI() {
                     startDate { year }
                     coverImage { large }
                     bannerImage
-                    trailer { id site }
-                }
+                                    }
             }
         """.trimIndent()
         val body = JSONObject().apply {
@@ -944,40 +881,6 @@ class CircleFtpProvider : MainAPI() {
                 simklId = anizipMeta?.simklId
             )
         } catch (_: Exception) { return null }
-    }
-
-    private suspend fun fetchAniListTrailer(query: String, year: Int?): String? {
-        val graphql = """
-            query (${'$'}query: String) {
-                Page(perPage: 1) {
-                    media(search: ${'$'}query, type: ANIME) {
-                        id
-                        trailer { id site }
-                    }
-                }
-            }
-        """.trimIndent()
-        val body = JSONObject().apply {
-            put("query", graphql)
-            put("variables", JSONObject().apply { put("query", query) })
-        }
-        try {
-            val response = app.post(
-                url = anilistApiUrl,
-                headers = mapOf("Content-Type" to "application/json"),
-                json = body.toString(),
-                verify = false,
-                cacheTime = 600
-            )
-            val json = JSONObject(response.text)
-            val media = json.getJSONObject("data")?.getJSONObject("Page")?.getJSONArray("media")?.optJSONObject(0)
-            val trailer = media?.optJSONObject("trailer")
-            if (trailer != null && trailer.optString("site").equals("youtube", true)) {
-                val trailerId = trailer.optString("id")
-                if (trailerId.isNotEmpty()) return "https://www.youtube.com/watch?v=$trailerId"
-            }
-        } catch (_: Exception) { }
-        return null
     }
 
     private suspend fun fetchAniZip(anilistId: Int): AniZipMeta? {
@@ -1156,7 +1059,7 @@ class CircleFtpProvider : MainAPI() {
             lower.contains("hdts") || lower.contains("hdcam") || lower.contains("hdtc") -> SearchQuality.HdCam
             lower.contains("dvd") -> SearchQuality.DVD
             lower.contains("cam") -> SearchQuality.Cam
-            lower.contains("camrip") || lower.contains("rip") -> SearchQuality.CamRip
+            lower.contains("camrip") || lower.contains("brrip") || lower.contains("hdrip") -> SearchQuality.CamRip
             lower.contains("hdrip") || lower.contains("hd") || lower.contains("hdtv") -> SearchQuality.HD
             lower.contains("telesync") -> SearchQuality.Telesync
             lower.contains("telecine") -> SearchQuality.Telecine
