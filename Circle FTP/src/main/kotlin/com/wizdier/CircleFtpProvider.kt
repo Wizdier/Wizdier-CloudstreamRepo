@@ -2189,6 +2189,10 @@ class CircleFtpProvider : MainAPI() {
         return json.toString()
     }
 
+    private fun Data.bestTitle(): String {
+        return this.name?.takeIf { it.isNotBlank() } ?: this.title
+    }
+
     data class PageData(
         @JsonProperty("posts") val posts: List<Post> = emptyList(),
     )
