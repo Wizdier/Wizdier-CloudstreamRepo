@@ -1,7 +1,12 @@
 package com.wizdier
 
 import com.lagradost.cloudstream3.*
-import com.lagradost.cloudstream3.utils.AppUtils
+import com.lagradost.cloudstream3.LoadResponse.Companion.addAniListId
+import com.lagradost.cloudstream3.LoadResponse.Companion.addKitsuId
+import com.lagradost.cloudstream3.LoadResponse.Companion.addMalId
+import com.lagradost.cloudstream3.LoadResponse.Companion.addSimklId
+import com.lagradost.cloudstream3.LoadResponse.Companion.addTrailer
+import com.lagradost.cloudstream3.mapper
 import com.lagradost.cloudstream3.utils.AppUtils.parseJson
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.newExtractorLink
@@ -267,12 +272,12 @@ class CircleFtpProvider : MainAPI() {
                     this.plot                = aniMeta?.description?.stripHtml() ?: loadData.metaData
                     this.duration            = duration
                     this.tags                = aniMeta?.genres
-                }.also { response ->
-                    aniMeta?.idAniList?.let { id -> response.addAniListId(id) }
-                    aniMeta?.idMal?.let     { id -> response.addMalId(id) }
-                    aniZip?.mappings?.kitsu_id?.toIntOrNull()?.let { id -> response.addKitsuId(id) }
-                    aniZip?.mappings?.simkl_id?.let               { id -> response.addSimklId(id) }
-                    trailerUrl?.let { t -> response.addTrailer(t) }
+
+                    aniMeta?.idAniList?.let { addAniListId(it) }
+                    aniMeta?.idMal?.let { addMalId(it) }
+                    aniZip?.mappings?.kitsu_id?.toIntOrNull()?.let { addKitsuId(it) }
+                    aniZip?.mappings?.simkl_id?.let { addSimklId(it) }
+                    trailerUrl?.let { addTrailer(it) }
                 }
 
             } else {
@@ -292,10 +297,8 @@ class CircleFtpProvider : MainAPI() {
                     this.year                = tmdb?.release_date?.take(4)?.toIntOrNull() ?: year
                     this.plot                = tmdb?.overview ?: loadData.metaData
                     this.duration            = tmdb?.runtime ?: duration
-                    // score replaces the deprecated rating field (0–100 scale)
-                    this.score               = tmdb?.vote_average?.times(10)?.toInt()
-                }.also { response ->
-                    trailerUrl?.let { t -> response.addTrailer(t) }
+                    this.score               = Score.from10(tmdb?.vote_average)
+                    trailerUrl?.let { addTrailer(it) }
                 }
             }
         }
@@ -344,12 +347,11 @@ class CircleFtpProvider : MainAPI() {
                     companions = companionLinks
                 )
 
-                // FIX: use AppUtils.mapper.writeValueAsString() instead of AppUtils.toJson()
-                val dataJson = AppUtils.mapper.writeValueAsString(episodeLinkData)
+                val dataJson = mapper.writeValueAsString(episodeLinkData)
 
                 episodesData.add(
-                    newEpisode(dataJson) {
-                        this.name    = epData.title.ifBlank { null }
+                    newEpisode(dataJson, fix = false) {
+                        this.name    = epData.title.takeIf { it.isNotBlank() }
                         this.episode = episodeNum
                         this.season  = seasonNum
                     }
@@ -386,15 +388,10 @@ class CircleFtpProvider : MainAPI() {
                     "https://www.youtube.com/watch?v=${t.id}" else null
             }
 
-            // FIX: newAnimeLoadResponse called directly on MainAPI receiver — not inside coroutineScope
             newAnimeLoadResponse(
-                name     = aniMeta?.title?.english ?: aniMeta?.title?.romaji ?: cleanTitle,
-                url      = url,
-                type     = TvType.Anime,
-                episodes = mapOf(
-                    DubStatus.Dubbed to episodesData,
-                    DubStatus.Subbed to emptyList()
-                )
+                name = aniMeta?.title?.english ?: aniMeta?.title?.romaji ?: cleanTitle,
+                url  = url,
+                type = TvType.Anime
             ) {
                 this.posterUrl           = aniMeta?.coverImage?.extraLarge ?: poster
                 this.backgroundPosterUrl = aniMeta?.bannerImage
@@ -402,17 +399,18 @@ class CircleFtpProvider : MainAPI() {
                 this.plot                = aniMeta?.description?.stripHtml() ?: loadData.metaData
                 this.tags                = aniMeta?.genres
                 this.recommendations     = recommendations
-            }.also { response ->
+                this.episodes            = mutableMapOf(DubStatus.Dubbed to episodesData.toList())
+
                 val aniListId = aniMeta?.idAniList
                 val malId     = aniZip?.mappings?.mal_id ?: aniMeta?.idMal
                 val kitsuId   = aniZip?.mappings?.kitsu_id?.toIntOrNull()
                 val simklId   = aniZip?.mappings?.simkl_id
 
-                aniListId?.let { id -> response.addAniListId(id) }
-                malId?.let     { id -> response.addMalId(id) }
-                kitsuId?.let   { id -> response.addKitsuId(id) }
-                simklId?.let   { id -> response.addSimklId(id) }
-                trailerUrl?.let { t -> response.addTrailer(t) }
+                aniListId?.let { addAniListId(it) }
+                malId?.let { addMalId(it) }
+                kitsuId?.let { addKitsuId(it) }
+                simklId?.let { addSimklId(it) }
+                trailerUrl?.let { addTrailer(it) }
             }
 
         } else {
@@ -437,8 +435,7 @@ class CircleFtpProvider : MainAPI() {
                 this.logoUrl             = fetchTmdbLogo(tmdb?.id, isTv = true)
                 this.year                = tmdb?.first_air_date?.take(4)?.toIntOrNull() ?: year
                 this.plot                = tmdb?.overview ?: loadData.metaData
-            }.also { response ->
-                trailerUrl?.let { t -> response.addTrailer(t) }
+                trailerUrl?.let { addTrailer(it) }
             }
         }
     }
