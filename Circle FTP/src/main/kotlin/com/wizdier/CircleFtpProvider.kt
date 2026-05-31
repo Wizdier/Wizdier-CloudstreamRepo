@@ -4,7 +4,7 @@ import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.AppUtils
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.newExtractorLink
-import com.lagradost.cloudstream3.utils.DubStatus
+import com.lagradost.cloudstream3.DubStatus
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
@@ -227,7 +227,7 @@ class CircleFtpProvider : MainAPI() {
                 VariantGroup(audioLabel = label, postIds = ids)
             }
 
-            val poster = firstPost.imageSm?.let { "$mainApiUrl/uploads/$it" }"
+            val poster = firstPost.imageSm?.let { "$mainApiUrl/uploads/$it" }
             ConsolidatedEntry(
                 id = "group:$normalizedKey",
                 baseTitle = baseTitle,
@@ -348,7 +348,7 @@ class CircleFtpProvider : MainAPI() {
         // Unpack metadata
         var finalPlot = metaResult.plot ?: firstData.metaData
         var finalYear = metaResult.year ?: selectUntilNonInt(firstData.year)
-        var finalPoster: String? = metaResult.posterUrl ?: firstData.image?.let { "$apiUrl/uploads/$it" }"
+        var finalPoster: String? = metaResult.posterUrl ?: firstData.image?.let { "$apiUrl/uploads/$it" }
         var finalLogo: String? = metaResult.logoUrl
         var finalBackground: String? = metaResult.backgroundPosterUrl
         val aniListId: Int? = metaResult.aniListId
@@ -391,7 +391,7 @@ class CircleFtpProvider : MainAPI() {
                 var episodeAccumulator = 0
                 season.episodes.forEach { ep ->
                     episodeAccumulator++
-                    val link = ep.link?.let { if (useMain) it else linkToIp(it) } ?: continue
+                    val link = ep.link?.let { if (useMain) it else linkToIp(it) } ?: return@forEach
                     allEpisodes.add(
                         newEpisode(link) {
                             this.episode = episodeAccumulator
