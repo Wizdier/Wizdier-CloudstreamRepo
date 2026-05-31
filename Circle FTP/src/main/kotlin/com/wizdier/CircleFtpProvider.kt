@@ -135,7 +135,7 @@ class CircleFtpProvider : MainAPI() {
         groups.values.forEach { group ->
             val primary = group.minByOrNull { it.id } ?: return@forEach
             val posterUrl = buildPosterUrl(primary.imageSm)
-            val quality = group.mapNotNull { it.quality }.maxByOrNull { it.ordinal }
+            val quality = group.mapNotNull { it.quality }.maxByOrNull { it }
 
             val hasDub = group.any {
                 val tag = it.audioTag?.lowercase() ?: ""
@@ -162,7 +162,7 @@ class CircleFtpProvider : MainAPI() {
                         this.posterUrl = posterUrl
                         this.year = primary.year
                         this.id = primary.id
-                        this.quality = quality
+                        this.quality = intToSearchQuality(quality)
                         addDubStatus(dubExist = hasDub, subExist = hasSub)
                     }
                 }
@@ -171,7 +171,7 @@ class CircleFtpProvider : MainAPI() {
                         this.posterUrl = posterUrl
                         this.year = primary.year
                         this.id = primary.id
-                        this.quality = quality
+                        this.quality = intToSearchQuality(quality)
                     }
                 }
                 else -> {
@@ -179,7 +179,7 @@ class CircleFtpProvider : MainAPI() {
                         this.posterUrl = posterUrl
                         this.year = primary.year
                         this.id = primary.id
-                        this.quality = quality
+                        this.quality = intToSearchQuality(quality)
                     }
                 }
             }
@@ -891,7 +891,7 @@ class CircleFtpProvider : MainAPI() {
             else -> null
         }
 
-        val quality = getSearchQuality(raw)
+        val quality = getSearchQualityInt(raw)
         val qualityTag = Regex("(2160p|1080p|720p|480p|4k|bluray|blu-ray|web-dl|webrip|hdrip|hdr|uhd|sdr)", RegexOption.IGNORE_CASE).find(raw)?.value?.uppercase()
 
         val year = Regex("(?<!\\d)(19\\d{2}|20\\d{2}|21\\d{2})(?!\\d)").find(raw)?.value?.toIntOrNull()
@@ -932,23 +932,26 @@ class CircleFtpProvider : MainAPI() {
         )
     }
 
-    private fun getSearchQuality(check: String?): SearchQuality? {
+    // FIXED: Returns Int? instead of local SearchQuality enum
+    private fun getSearchQualityInt(check: String?): Int? {
         val lower = check?.lowercase() ?: return null
         return when {
-            lower.contains("2160p") || lower.contains("4k") -> SearchQuality.FourK
-            lower.contains("webrip") || lower.contains("web-dl") || lower.contains("webdl") -> SearchQuality.WebRip
-            lower.contains("bluray") || lower.contains("blu-ray") -> SearchQuality.BlueRay
-            lower.contains("hdts") || lower.contains("hdcam") || lower.contains("hdtc") -> SearchQuality.HdCam
-            lower.contains("dvd") -> SearchQuality.DVD
-            lower.contains("camrip") -> SearchQuality.CamRip
-            lower.contains("cam") -> SearchQuality.Cam
-            lower.contains("hdrip") || lower.contains("hdtv") -> SearchQuality.HD
-            lower.contains("hdr") -> SearchQuality.HDR
-            lower.contains("uhd") -> SearchQuality.UHD
-            lower.contains("sdr") -> SearchQuality.SDR
-            lower.contains("1080p") || lower.contains("720p") || lower.contains("hd") -> SearchQuality.HD
-            lower.contains("telesync") -> SearchQuality.Telesync
-            lower.contains("telecine") -> SearchQuality.Telecine
+            lower.contains("2160p") || lower.contains("4k") -> 2160
+            lower.contains("1440p") -> 1440
+            lower.contains("1080p") -> 1080
+            lower.contains("720p") -> 720
+            lower.contains("480p") -> 480
+            else -> null
+        }
+    }
+
+    // HELPER: Convert Int quality to CloudStream's SearchQuality enum
+    private fun intToSearchQuality(quality: Int?): com.lagradost.cloudstream3.SearchQuality? {
+        return when (quality) {
+            2160 -> com.lagradost.cloudstream3.SearchQuality.VeryHigh
+            1440, 1080 -> com.lagradost.cloudstream3.SearchQuality.High
+            720 -> com.lagradost.cloudstream3.SearchQuality.Medium
+            480 -> com.lagradost.cloudstream3.SearchQuality.Low
             else -> null
         }
     }
@@ -1254,7 +1257,7 @@ class CircleFtpProvider : MainAPI() {
         val franchiseTitle: String,
         val year: Int?,
         val declaredSeason: Int?,
-        val quality: SearchQuality?,
+        val quality: Int?,  // FIXED: Changed from SearchQuality? to Int?
         val audioTag: String?,
         val groupKey: String
     )
@@ -1264,7 +1267,7 @@ class CircleFtpProvider : MainAPI() {
         val franchiseTitle: String,
         val year: Int?,
         val season: Int?,
-        val quality: SearchQuality?,
+        val quality: Int?,  // FIXED: Changed from SearchQuality? to Int?
         val qualityTag: String?,
         val audioTag: String?
     )
@@ -1354,8 +1357,4 @@ class CircleFtpProvider : MainAPI() {
     data class AniZipTmdbId(val movie: Int? = null, val tv: Int? = null)
     data class AniZipEpisode(val title: AniZipEpisodeTitle? = null, val overview: String? = null, val summary: String? = null, val image: String? = null, val runtime: Int? = null, val length: Int? = null, val airDate: String? = null, val airDateUtc: String? = null, val rating: String? = null)
     data class AniZipEpisodeTitle(val en: String? = null, val ja: String? = null, val xJat: String? = null)
-}
-
-private enum class SearchQuality {
-    FourK, BlueRay, WebRip, HdCam, DVD, CamRip, Cam, HD, HDR, UHD, SDR, Telesync, Telecine
 }
