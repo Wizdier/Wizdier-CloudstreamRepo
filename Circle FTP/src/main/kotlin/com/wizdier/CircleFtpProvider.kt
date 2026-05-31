@@ -206,7 +206,6 @@ class CircleFtpProvider : MainAPI() {
     // LOAD - core logic (with pre-fetched metadata)
     // ==============================
     override suspend fun load(url: String): LoadResponse = coroutineScope {
-        // Parse URL
         val postIds: List<Int>
         val seasonOverride: Int?
         val cacheKey: String?
@@ -225,7 +224,6 @@ class CircleFtpProvider : MainAPI() {
             postIds = listOf(idString.toInt())
         }
 
-        // Fetch all post details concurrently
         val postJsons = postIds.map { id ->
             async {
                 try {
@@ -246,19 +244,18 @@ class CircleFtpProvider : MainAPI() {
         val baseTitle = mainClean.baseTitle
         val tvType = if (first.type == "singleVideo") TvType.Movie else inferTypeFromPosts(postIds.map { it }, mainClean)
 
-        // ---------- Pre-fetch metadata & tracking (season-aware) ----------
+        // Pre-fetch metadata (season-aware for anime)
         var finalPlot = first.metaData
         var finalYear = selectUntilNonInt(first.year)
         var finalPoster: String? = "$apiUrl/uploads/${first.image}"
         var finalLogo: String? = null
         var finalBackground: String? = null
         var finalTrailer: String? = null
-        var anilistId: Int? = null
+        var aniListId: Int? = null
         var malId: Int? = null
         var kitsuId: Int? = null
         var simklId: Int? = null
 
-        // Enrich metadata based on type
         if (tvType == TvType.Anime || tvType == TvType.AnimeMovie) {
             val seasonMeta = if (seasonOverride != null) {
                 fetchAnimeSeasonSpecificMetadata(baseTitle, seasonOverride)
@@ -271,16 +268,14 @@ class CircleFtpProvider : MainAPI() {
                 finalPoster = seasonMeta.posterUrl ?: finalPoster
                 finalLogo = seasonMeta.logoUrl
                 finalBackground = seasonMeta.backgroundPosterUrl
-                anilistId = seasonMeta.aniListId
+                aniListId = seasonMeta.aniListId
                 malId = seasonMeta.malId
                 kitsuId = seasonMeta.kitsuId
                 simklId = seasonMeta.simklId
             }
-            // Trailer
             val trailerQuery = if (seasonOverride != null) "$baseTitle Season $seasonOverride" else baseTitle
             finalTrailer = fetchAniListTrailer(trailerQuery, finalYear)
         } else {
-            // Non-anime: TMDB enrichment
             val year = finalYear
             val tmdbMeta = fetchTMDBMetadata(baseTitle, year, tvType)
             if (tmdbMeta != null) {
@@ -293,7 +288,7 @@ class CircleFtpProvider : MainAPI() {
             finalTrailer = fetchTMDBTrailer(baseTitle, year, tvType)
         }
 
-        // ========== Single video ==========
+        // Build response
         if (first.type == "singleVideo") {
             val movieUrls = loadDataList.map { (data, useMain, _) ->
                 val movieJson = postJsons[loadDataList.indexOf(Triple(data, useMain, cleanTitle(data.title)))]
@@ -308,11 +303,10 @@ class CircleFtpProvider : MainAPI() {
                 this.duration = duration
                 this.logoUrl = finalLogo
                 this.backgroundPosterUrl = finalBackground
-                finalTrailer?.let { addTrailer(it) }
+                this.trailerUrl = finalTrailer
             }
         }
 
-        // ========== Series / Anime with episodes ==========
         val allEpisodes = mutableListOf<Episode>()
         loadDataList.forEachIndexed { index, (data, useMain, cleaned) ->
             val tvData = AppUtils.parseJson<TvSeries>(postJsons[index].text)
@@ -338,29 +332,26 @@ class CircleFtpProvider : MainAPI() {
             }
         }
 
-        // ========== Build response with all metadata injected ==========
         val response = newTvSeriesLoadResponse(baseTitle, url, tvType, allEpisodes) {
             this.posterUrl = finalPoster
             this.year = finalYear
             this.plot = finalPlot
             this.logoUrl = finalLogo
             this.backgroundPosterUrl = finalBackground
-            finalTrailer?.let { addTrailer(it) }
-            // Tracking IDs for anime
-            anilistId?.let { addAniListId(it) }
-            malId?.let { addMalId(it) }
-            kitsuId?.let { addKitsuId(it) }
-            simklId?.let { addSimklId(it) }
+            this.trailerUrl = finalTrailer
+            this.anilistId = aniListId
+            this.malId = malId
+            this.kitsuId = kitsuId
+            this.simklId = simklId
         }
 
-        // ========== Anime chained recommendations ==========
         if (tvType == TvType.Anime && cacheKey != null) {
             val seasons = animeSeasonCache[cacheKey] ?: emptyMap()
             val currentSeason = seasonOverride ?: 1
             val recommendations = seasons.filterKeys { it != currentSeason }.map { (s, _) ->
                 val recUrl = "circleftp://load?key=${URLEncoder.encode(cacheKey, "utf-8")}&season=$s"
                 newAnimeSearchResponse("$baseTitle Season $s", recUrl, TvType.Anime) {
-                    this.posterUrl = finalPoster // placeholder, will be updated on load
+                    this.posterUrl = finalPoster // placeholder, updated when loaded
                 }
             }
             response.recommendations = recommendations
@@ -476,10 +467,13 @@ class CircleFtpProvider : MainAPI() {
             put("variables", JSONObject().apply { put("query", query) })
         }
         try {
-            val response = app.post(anilistApiUrl,
+            val response = app.post(
+                url = anilistApiUrl,
                 headers = mapOf("Content-Type" to "application/json"),
                 data = body.toString(),
-                verify = false, cacheTime = 600)
+                verify = false,
+                cacheTime = 600
+            )
             val json = JSONObject(response.text)
             val mediaArray = json.getJSONObject("data")?.getJSONObject("Page")?.getJSONArray("media") ?: return null
             if (mediaArray.length() == 0) return null
@@ -506,7 +500,7 @@ class CircleFtpProvider : MainAPI() {
                 plot = plot?.ifBlank { null },
                 year = yearAni?.takeIf { it > 0 },
                 posterUrl = poster,
-                logoUrl = fetchTMDBLogo(title, yearAni),   // fallback logo
+                logoUrl = fetchTMDBLogo(title, yearAni),
                 backgroundPosterUrl = banner,
                 aniListId = id,
                 malId = malId ?: anizipMeta?.malId,
@@ -521,11 +515,9 @@ class CircleFtpProvider : MainAPI() {
         seasonNumber: Int
     ): AniListMetadata? {
         val searchQuery = "$baseTitle Season $seasonNumber"
-        // Try direct search first
         var meta = fetchAniListMetadata(searchQuery, null)
         if (meta != null) return meta
 
-        // Fallback: find main series, traverse sequels
         val mainId = getMainSeriesId(baseTitle) ?: return null
         val targetId = getSeasonIdFromRelations(mainId, seasonNumber)
         if (targetId != null) {
@@ -549,10 +541,13 @@ class CircleFtpProvider : MainAPI() {
             put("variables", JSONObject().apply { put("query", baseTitle) })
         }
         try {
-            val response = app.post(anilistApiUrl,
+            val response = app.post(
+                url = anilistApiUrl,
                 headers = mapOf("Content-Type" to "application/json"),
                 data = body.toString(),
-                verify = false, cacheTime = 600)
+                verify = false,
+                cacheTime = 600
+            )
             val json = JSONObject(response.text)
             val media = json.getJSONObject("data")?.getJSONObject("Page")?.getJSONArray("media")
             return media?.optJSONObject(0)?.optInt("id")?.takeIf { it > 0 }
@@ -587,10 +582,13 @@ class CircleFtpProvider : MainAPI() {
             put("variables", JSONObject().apply { put("id", anilistId) })
         }
         try {
-            val response = app.post(anilistApiUrl,
+            val response = app.post(
+                url = anilistApiUrl,
                 headers = mapOf("Content-Type" to "application/json"),
                 data = body.toString(),
-                verify = false, cacheTime = 600)
+                verify = false,
+                cacheTime = 600
+            )
             val json = JSONObject(response.text)
             val edges = json.getJSONObject("data")?.getJSONObject("Media")
                 ?.getJSONObject("relations")?.getJSONArray("edges") ?: return null
@@ -623,10 +621,13 @@ class CircleFtpProvider : MainAPI() {
             put("variables", JSONObject().apply { put("id", id) })
         }
         try {
-            val response = app.post(anilistApiUrl,
+            val response = app.post(
+                url = anilistApiUrl,
                 headers = mapOf("Content-Type" to "application/json"),
                 data = body.toString(),
-                verify = false, cacheTime = 600)
+                verify = false,
+                cacheTime = 600
+            )
             val json = JSONObject(response.text)
             val media = json.getJSONObject("data")?.getJSONObject("Media") ?: return null
             val malId = media.optInt("idMal", -1).takeIf { it > 0 }
@@ -692,10 +693,13 @@ class CircleFtpProvider : MainAPI() {
             put("variables", JSONObject().apply { put("query", query) })
         }
         try {
-            val response = app.post(anilistApiUrl,
+            val response = app.post(
+                url = anilistApiUrl,
                 headers = mapOf("Content-Type" to "application/json"),
                 data = body.toString(),
-                verify = false, cacheTime = 600)
+                verify = false,
+                cacheTime = 600
+            )
             val json = JSONObject(response.text)
             val media = json.getJSONObject("data")?.getJSONObject("Page")?.getJSONArray("media")?.optJSONObject(0)
             val trailer = media?.optJSONObject("trailer")
@@ -789,10 +793,13 @@ class CircleFtpProvider : MainAPI() {
             put("variables", JSONObject().apply { put("query", query) })
         }
         try {
-            val response = app.post(anilistApiUrl,
+            val response = app.post(
+                url = anilistApiUrl,
                 headers = mapOf("Content-Type" to "application/json"),
                 data = body.toString(),
-                verify = false, cacheTime = 600)
+                verify = false,
+                cacheTime = 600
+            )
             val json = JSONObject(response.text)
             return json.getJSONObject("data")?.getJSONObject("Page")?.getJSONArray("media")?.length() ?: 0 > 0
         } catch (_: Exception) { return null }
