@@ -7,7 +7,6 @@ import com.lagradost.cloudstream3.utils.newExtractorLink
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
-import org.json.JSONArray
 import org.json.JSONObject
 import java.net.URLEncoder
 import java.text.Normalizer
@@ -106,7 +105,7 @@ class CircleFtpProvider : MainAPI() {
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
-        val posts = fetchPosts("searchTerm=$URLEncoder.encode(query, "utf-8")&order=desc")
+        val posts = fetchPosts("searchTerm=${URLEncoder.encode(query, "utf-8")}&order=desc")
         return consolidateAndPrepare(posts, null)
     }
 
@@ -204,9 +203,10 @@ class CircleFtpProvider : MainAPI() {
     }
 
     // ==============================
-    // LOAD - core logic
+    // LOAD - core logic (with pre-fetched metadata)
     // ==============================
     override suspend fun load(url: String): LoadResponse = coroutineScope {
+        // Parse URL
         val postIds: List<Int>
         val seasonOverride: Int?
         val cacheKey: String?
@@ -214,24 +214,18 @@ class CircleFtpProvider : MainAPI() {
         if (url.startsWith("circleftp://load")) {
             val uri = java.net.URI(url)
             val query = uri.query.split("&").associate { it.split("=")[0] to it.split("=")[1] }
-            cacheKey = URLEncoder.encode(query["key"] ?: "", "utf-8")
+            cacheKey = query["key"]
             seasonOverride = query["season"]?.toIntOrNull()
             postIds = animeSeasonCache[cacheKey]?.get(seasonOverride ?: 1)
                 ?: throw Exception("No posts found for key $cacheKey season $seasonOverride")
         } else {
             val idString = url.substringAfterLast("/")
-            postIds = if (idString.startsWith("group:")) {
-                val ids = idString.removePrefix("group:").split(",").map { it.toInt() }
-                cacheKey = idString
-                seasonOverride = null
-                ids
-            } else {
-                cacheKey = null
-                seasonOverride = null
-                listOf(idString.toInt())
-            }
+            cacheKey = null
+            seasonOverride = null
+            postIds = listOf(idString.toInt())
         }
 
+        // Fetch all post details concurrently
         val postJsons = postIds.map { id ->
             async {
                 try {
@@ -250,7 +244,54 @@ class CircleFtpProvider : MainAPI() {
         val first = loadDataList.first().first
         val mainClean = loadDataList.first().third
         val baseTitle = mainClean.baseTitle
-        val tvType = inferTypeFromPostIds(postIds, mainClean)
+        val tvType = if (first.type == "singleVideo") TvType.Movie else inferTypeFromPosts(postIds.map { it }, mainClean)
+
+        // ---------- Pre-fetch metadata & tracking (season-aware) ----------
+        var finalPlot = first.metaData
+        var finalYear = selectUntilNonInt(first.year)
+        var finalPoster: String? = "$apiUrl/uploads/${first.image}"
+        var finalLogo: String? = null
+        var finalBackground: String? = null
+        var finalTrailer: String? = null
+        var anilistId: Int? = null
+        var malId: Int? = null
+        var kitsuId: Int? = null
+        var simklId: Int? = null
+
+        // Enrich metadata based on type
+        if (tvType == TvType.Anime || tvType == TvType.AnimeMovie) {
+            val seasonMeta = if (seasonOverride != null) {
+                fetchAnimeSeasonSpecificMetadata(baseTitle, seasonOverride)
+            } else {
+                fetchAniListMetadata(baseTitle, finalYear)
+            }
+            if (seasonMeta != null) {
+                finalPlot = seasonMeta.plot ?: finalPlot
+                finalYear = seasonMeta.year ?: finalYear
+                finalPoster = seasonMeta.posterUrl ?: finalPoster
+                finalLogo = seasonMeta.logoUrl
+                finalBackground = seasonMeta.backgroundPosterUrl
+                anilistId = seasonMeta.aniListId
+                malId = seasonMeta.malId
+                kitsuId = seasonMeta.kitsuId
+                simklId = seasonMeta.simklId
+            }
+            // Trailer
+            val trailerQuery = if (seasonOverride != null) "$baseTitle Season $seasonOverride" else baseTitle
+            finalTrailer = fetchAniListTrailer(trailerQuery, finalYear)
+        } else {
+            // Non-anime: TMDB enrichment
+            val year = finalYear
+            val tmdbMeta = fetchTMDBMetadata(baseTitle, year, tvType)
+            if (tmdbMeta != null) {
+                finalPlot = tmdbMeta.plot ?: finalPlot
+                finalYear = tmdbMeta.year ?: finalYear
+                finalPoster = tmdbMeta.posterUrl ?: finalPoster
+                finalLogo = tmdbMeta.logoUrl
+                finalBackground = tmdbMeta.backgroundPosterUrl
+            }
+            finalTrailer = fetchTMDBTrailer(baseTitle, year, tvType)
+        }
 
         // ========== Single video ==========
         if (first.type == "singleVideo") {
@@ -261,11 +302,13 @@ class CircleFtpProvider : MainAPI() {
             }
             val duration = getDurationFromString(first.watchTime)
             return@coroutineScope newMovieLoadResponse(baseTitle, url, tvType, movieUrls.first()) {
-                this.posterUrl = "$apiUrl/uploads/${first.image}"
-                this.year = selectUntilNonInt(first.year)
-                this.plot = first.metaData
+                this.posterUrl = finalPoster
+                this.year = finalYear
+                this.plot = finalPlot
                 this.duration = duration
-                enrichMetadata(tvType, baseTitle, first.year)
+                this.logoUrl = finalLogo
+                this.backgroundPosterUrl = finalBackground
+                finalTrailer?.let { addTrailer(it) }
             }
         }
 
@@ -295,42 +338,19 @@ class CircleFtpProvider : MainAPI() {
             }
         }
 
-        // ========== Build response ==========
+        // ========== Build response with all metadata injected ==========
         val response = newTvSeriesLoadResponse(baseTitle, url, tvType, allEpisodes) {
-            this.posterUrl = "$apiUrl/uploads/${first.image}"
-            this.year = selectUntilNonInt(first.year)
-            this.plot = first.metaData
-        }
-
-        // ========== Metadata enrichment (season‑aware) ==========
-        if (tvType == TvType.Anime || tvType == TvType.AnimeMovie) {
-            // For anime, check if we have a season override
-            val seasonMeta: AniListMetadata? = if (seasonOverride != null) {
-                // Fetch season‑specific metadata and tracking
-                fetchAnimeSeasonSpecificMetadata(baseTitle, seasonOverride)
-            } else {
-                // Standard anime metadata (Season 1)
-                fetchAniListMetadata(baseTitle, selectUntilNonInt(first.year))
-            }
-            if (seasonMeta != null) {
-                with(response) {
-                    plot = seasonMeta.plot ?: plot
-                    year = seasonMeta.year ?: year
-                    posterUrl = seasonMeta.posterUrl ?: posterUrl
-                    logoUrl = seasonMeta.logoUrl ?: logoUrl
-                    backgroundPosterUrl = seasonMeta.backgroundPosterUrl ?: backgroundPosterUrl
-                }
-                seasonMeta.aniListId?.let { response.addAniListId(it) }
-                seasonMeta.malId?.let { response.addMalId(it) }
-                seasonMeta.kitsuId?.let { response.addKitsuId(it) }
-                seasonMeta.simklId?.let { response.addSimklId(it) }
-            }
-            // Trailer (separate, can use season‑specific title)
-            val trailerUrl = fetchAniListTrailer("$baseTitle${if (seasonOverride != null) " Season $seasonOverride" else ""}", null)
-            if (trailerUrl != null) response.addTrailer(trailerUrl)
-        } else {
-            // Non‑anime: standard TMDB enrichment
-            response.enrichMetadata(tvType, baseTitle, first.year)
+            this.posterUrl = finalPoster
+            this.year = finalYear
+            this.plot = finalPlot
+            this.logoUrl = finalLogo
+            this.backgroundPosterUrl = finalBackground
+            finalTrailer?.let { addTrailer(it) }
+            // Tracking IDs for anime
+            anilistId?.let { addAniListId(it) }
+            malId?.let { addMalId(it) }
+            kitsuId?.let { addKitsuId(it) }
+            simklId?.let { addSimklId(it) }
         }
 
         // ========== Anime chained recommendations ==========
@@ -340,38 +360,13 @@ class CircleFtpProvider : MainAPI() {
             val recommendations = seasons.filterKeys { it != currentSeason }.map { (s, _) ->
                 val recUrl = "circleftp://load?key=${URLEncoder.encode(cacheKey, "utf-8")}&season=$s"
                 newAnimeSearchResponse("$baseTitle Season $s", recUrl, TvType.Anime) {
-                    this.posterUrl = "$apiUrl/uploads/${first.image}" // placeholder, will be updated on load
+                    this.posterUrl = finalPoster // placeholder, will be updated on load
                 }
             }
             response.recommendations = recommendations
         }
 
         response
-    }
-
-    // ==============================
-    // Metadata enrichment (non‑anime base)
-    // ==============================
-    private suspend fun LoadResponse.enrichMetadata(
-        tvType: TvType,
-        cleanTitle: String,
-        rawYear: String?
-    ) = coroutineScope {
-        val year = selectUntilNonInt(rawYear)
-        if (tvType == TvType.Movie || tvType == TvType.TvSeries ||
-            tvType == TvType.Cartoon || tvType == TvType.Documentary || tvType == TvType.Others) {
-            val deferred = async { fetchTMDBMetadata(cleanTitle, year, tvType) }
-            val deferredTrailer = async { fetchTMDBTrailer(cleanTitle, year, tvType) }
-            val (meta, trailer) = deferred.await() to deferredTrailer.await()
-            if (meta != null) {
-                this@enrichMetadata.plot = meta.plot ?: this@enrichMetadata.plot
-                this@enrichMetadata.year = meta.year ?: this@enrichMetadata.year
-                this@enrichMetadata.posterUrl = meta.posterUrl ?: this@enrichMetadata.posterUrl
-                this@enrichMetadata.logoUrl = meta.logoUrl
-                this@enrichMetadata.backgroundPosterUrl = meta.backgroundPosterUrl
-            }
-            if (trailer != null) addTrailer(trailer)
-        }
     }
 
     // ==============================
@@ -425,7 +420,7 @@ class CircleFtpProvider : MainAPI() {
         tvType: TvType
     ): String? {
         val type = if (tvType == TvType.Movie || tvType == TvType.Cartoon || tvType == TvType.AnimeMovie) "movie" else "tv"
-        val searchUrl = "https://api.themoviedb.org/3/search/$type?api_key=$tmdbApiKey&query=${URLEncoder.encode(query, "utf-8")}"
+        var searchUrl = "https://api.themoviedb.org/3/search/$type?api_key=$tmdbApiKey&query=${URLEncoder.encode(query, "utf-8")}"
         if (year != null) searchUrl += "&year=$year"
         try {
             val searchResponse = app.get(searchUrl, verify = false, cacheTime = 600)
@@ -521,10 +516,6 @@ class CircleFtpProvider : MainAPI() {
         } catch (_: Exception) { return null }
     }
 
-    /**
-     * Fetch metadata for a specific anime season (e.g., "Attack on Titan Season 2").
-     * Uses direct search, backed by relation traversal if needed.
-     */
     private suspend fun fetchAnimeSeasonSpecificMetadata(
         baseTitle: String,
         seasonNumber: Int
@@ -662,14 +653,12 @@ class CircleFtpProvider : MainAPI() {
     }
 
     private suspend fun fetchTMDBLogo(title: String, year: Int?): String? {
-        // Try TMDB TV search for a logo
-        val searchUrl = "https://api.themoviedb.org/3/search/tv?api_key=$tmdbApiKey&query=${URLEncoder.encode(title, "utf-8")}"
-        if (year != null) searchUrl + "&first_air_date_year=$year"
+        var searchUrl = "https://api.themoviedb.org/3/search/tv?api_key=$tmdbApiKey&query=${URLEncoder.encode(title, "utf-8")}"
+        if (year != null) searchUrl += "&first_air_date_year=$year"
         try {
             val searchResponse = app.get(searchUrl, verify = false, cacheTime = 600)
             val results = JSONObject(searchResponse.text).getJSONArray("results")
             if (results.length() == 0) return null
-            // pick best by popularity? just first
             val best = results.getJSONObject(0)
             val tvId = best.getInt("id")
             val detailsUrl = "https://api.themoviedb.org/3/tv/$tvId?api_key=$tmdbApiKey&append_to_response=images"
