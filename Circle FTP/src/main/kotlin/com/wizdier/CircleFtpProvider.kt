@@ -131,6 +131,7 @@ class CircleFtpProvider : MainAPI() {
             val kitsuId: String? = null,
             val simklId: Int? = null,
             val imdbId: String? = null,
+            val originalLanguage: String? = null,
             val genres: List<String>? = null,
             val episodes: List<EpisodeMetadata>? = null
         )
@@ -298,6 +299,14 @@ class CircleFtpProvider : MainAPI() {
             }
         }
 
+        // Strict Alphanumeric Title Similarity Matcher (Issue 1)
+        fun isTitleSimilar(title1: String, title2: String): Boolean {
+            val clean1 = title1.lowercase().replace(Regex("[^a-z0-9]"), "")
+            val clean2 = title2.lowercase().replace(Regex("[^a-z0-9]"), "")
+            if (clean1.isEmpty() || clean2.isEmpty()) return false
+            return clean1 == clean2 || clean1.contains(clean2) || clean2.contains(clean1)
+        }
+
         // Core Metadata Fetcher from TMDB (for movies/TV) and AniList (for Anime)
         suspend fun fetchMetadata(title: String, isAnime: Boolean, season: Int? = null): MetadataInfo? {
             val targetSeason = season ?: 1
@@ -354,6 +363,11 @@ class CircleFtpProvider : MainAPI() {
                                 val eng = media.optJSONObject("title")?.optString("english", "")?.lowercase() ?: ""
                                 val rom = media.optJSONObject("title")?.optString("romaji", "")?.lowercase() ?: ""
                                 
+                                // Strict verification that AniList match actually corresponds to searched title (Issue 1)
+                                if (!isTitleSimilar(title, eng) && !isTitleSimilar(title, rom)) {
+                                    continue
+                                }
+
                                 if (eng.contains("season 2") || eng.contains("season 3") || eng.contains("season 4") ||
                                     rom.contains("season 2") || rom.contains("season 3") || rom.contains("season 4") ||
                                     eng.contains(" ii") || eng.contains(" iii") || rom.contains(" ii") || rom.contains(" iii")) {
@@ -362,7 +376,14 @@ class CircleFtpProvider : MainAPI() {
                                 bestMedia = media
                                 break
                             }
-                            if (bestMedia == null) bestMedia = mediaList.getJSONObject(0)
+                            if (bestMedia == null) {
+                                val fallback = mediaList.getJSONObject(0)
+                                val eng = fallback.optJSONObject("title")?.optString("english", "") ?: ""
+                                val rom = fallback.optJSONObject("title")?.optString("romaji", "") ?: ""
+                                if (isTitleSimilar(title, eng) || isTitleSimilar(title, rom)) {
+                                    bestMedia = fallback
+                                }
+                            }
                         } else {
                             val keywords = getSeasonKeywords(targetSeason)
                             for (i in 0 until mediaList.length()) {
@@ -370,13 +391,24 @@ class CircleFtpProvider : MainAPI() {
                                 val eng = media.optJSONObject("title")?.optString("english", "")?.lowercase() ?: ""
                                 val rom = media.optJSONObject("title")?.optString("romaji", "")?.lowercase() ?: ""
                                 
+                                if (!isTitleSimilar(title, eng) && !isTitleSimilar(title, rom)) {
+                                    continue
+                                }
+
                                 val matches = keywords.any { kw -> eng.contains(kw.lowercase()) || rom.contains(kw.lowercase()) }
                                 if (matches) {
                                     bestMedia = media
                                     break
                                 }
                             }
-                            if (bestMedia == null) bestMedia = mediaList.getJSONObject(0)
+                            if (bestMedia == null) {
+                                val fallback = mediaList.getJSONObject(0)
+                                val eng = fallback.optJSONObject("title")?.optString("english", "") ?: ""
+                                val rom = fallback.optJSONObject("title")?.optString("romaji", "") ?: ""
+                                if (isTitleSimilar(title, eng) || isTitleSimilar(title, rom)) {
+                                    bestMedia = fallback
+                                }
+                            }
                         }
                     }
 
@@ -608,6 +640,7 @@ class CircleFtpProvider : MainAPI() {
                             logoUrl = logoUrl,
                             simklId = simklId,
                             imdbId = imdbId,
+                            originalLanguage = details.optString("original_language", null),
                             kitsuId = null,
                             anilistId = null,
                             malId = null,
@@ -635,7 +668,8 @@ class CircleFtpProvider : MainAPI() {
             val movieMeta = fetchMetadata(title, isAnime = false, season = season)
             if (movieMeta != null) {
                 val isAnime = movieMeta.genres?.contains("16") == true && 
-                              (movieMeta.origTitle?.contains(Regex("[\\u3000-\\u303f\\u3040-\\u309f\\u30a0-\\u30ff\\uff00-\\uff9f\\u4e00-\\u9faf\\u3400-\\u4dbf]")) == true || 
+                              (movieMeta.originalLanguage in setOf("ja", "zh", "ko") || 
+                               movieMeta.origTitle?.contains(Regex("[\\u3000-\\u303f\\u3040-\\u309f\\u30a0-\\u30ff\\uff00-\\uff9f\\u4e00-\\u9faf\\u3400-\\u4dbf]")) == true || 
                                movieMeta.title.contains("anime", true))
                 if (isAnime) {
                     val retryAnime = fetchMetadata(movieMeta.title, isAnime = true, season = season)
@@ -706,7 +740,7 @@ class CircleFtpProvider : MainAPI() {
                             type = pObj.getString("type"),
                             imageSm = pObj.getString("imageSm"),
                             title = pObj.getString("title"),
-                            name = jsonObj.optStringSafe("name") ?: pObj.optStringSafe("name")
+                            name = pObj.optStringSafe("name")
                         )
                     )
                 }
