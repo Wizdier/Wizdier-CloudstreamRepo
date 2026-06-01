@@ -12,11 +12,10 @@ import com.lagradost.cloudstream3.LoadResponse.Companion.addImdbId
 import com.lagradost.cloudstream3.LoadResponse.Companion.addKitsuId
 import com.lagradost.cloudstream3.LoadResponse.Companion.addMalId
 import com.lagradost.cloudstream3.LoadResponse.Companion.addScore
+import com.lagradost.cloudstream3.LoadResponse.Companion.addSeasonNames
 import com.lagradost.cloudstream3.LoadResponse.Companion.addSimklId
 import com.lagradost.cloudstream3.LoadResponse.Companion.addTMDbId
 import com.lagradost.cloudstream3.LoadResponse.Companion.addTrailer
-import com.lagradost.cloudstream3.addSeasonNames
-import com.lagradost.cloudstream3.SeasonData
 import com.lagradost.cloudstream3.utils.AppUtils.toJson
 import com.lagradost.cloudstream3.utils.AppUtils.parseJson
 import com.lagradost.cloudstream3.utils.AppUtils.tryParseJson
@@ -86,20 +85,20 @@ class CircleFtpProvider : MainAPI() {
         return newHomePageResponse(request.name, results, true)
     }
 
-    override suspend fun search(query: String): List<<SearchResponse> {
+    override suspend fun search(query: String): List<SearchResponse> {
         val posts = fetchPosts("searchTerm=${urlEncode(query)}&order=desc")
         return buildSearchResults(posts, null)
     }
 
-    private suspend fun fetchPosts(params: String): List<<Post> {
+    private suspend fun fetchPosts(params: String): List<Post> {
         val response = apiGet("/api/posts?$params", cacheTime = 60)
-        return response.parsedSafe<<PageData>()?.posts ?: emptyList()
+        return response.parsedSafe<PageData>()?.posts ?: emptyList()
     }
 
     // ==============================
     // SEARCH BUILDER — SEASONAL SPLITTING
     // ==============================
-    private fun buildSearchResults(posts: List<<Post>, tvTypeHint: TvType?): List<<SearchResponse> {
+    private fun buildSearchResults(posts: List<Post>, tvTypeHint: TvType?): List<SearchResponse> {
         val indexed = posts.mapNotNull { post ->
             if (post.type != "singleVideo" && post.type != "series") return@mapNotNull null
             val normalized = normalizeTitle(post.title)
@@ -131,7 +130,7 @@ class CircleFtpProvider : MainAPI() {
 
         // Group by the unique key. Since season is part of the key, seasons are separated.
         val groups = indexed.groupBy { it.groupKey }
-        val results = mutableListOf<<SearchResponse>()
+        val results = mutableListOf<SearchResponse>()
 
         groups.values.forEach { group ->
             val primary = group.minByOrNull { it.id } ?: return@forEach
@@ -556,7 +555,7 @@ class CircleFtpProvider : MainAPI() {
     // ==============================
     // ANILIST HELPERS
     // ==============================
-    private suspend fun searchAniList(title: String): List<<AniListMedia> {
+    private suspend fun searchAniList(title: String): List<AniListMedia> {
         val query = """
             query (${'$'}search: String) {
               Page(page: 1, perPage: 10) {
@@ -602,7 +601,7 @@ class CircleFtpProvider : MainAPI() {
         return media
     }
 
-    private suspend fun buildAniListSeasonChain(seedId: Int): List<<AniListMedia> {
+    private suspend fun buildAniListSeasonChain(seedId: Int): List<AniListMedia> {
         val visited = linkedSetOf<Int>()
         var earliest = fetchAniListById(seedId) ?: return emptyList()
 
@@ -617,7 +616,7 @@ class CircleFtpProvider : MainAPI() {
             earliest = prequelMedia
         }
 
-        val chain = mutableListOf<<AniListMedia>()
+        val chain = mutableListOf<AniListMedia>()
         var cursor: AniListMedia? = earliest
         while (cursor != null) {
             val cursorId = cursor.id ?: break
@@ -650,7 +649,7 @@ class CircleFtpProvider : MainAPI() {
         }
     }
 
-    private fun discoverSeasons(fetchedPost: FetchedPost): List<<SeasonSlice> {
+    private fun discoverSeasons(fetchedPost: FetchedPost): List<SeasonSlice> {
         val tvSeries = fetchedPost.tvSeries ?: return emptyList()
         val declaredSeason = normalizeTitle(fetchedPost.data.title).season ?: 1
         return tvSeries.content.mapIndexedNotNull { index, seasonContent ->
@@ -670,11 +669,11 @@ class CircleFtpProvider : MainAPI() {
     }
 
     private fun mergeEpisodes(
-        slices: List<<SeasonSlice>,
+        slices: List<SeasonSlice>,
         seasonNumber: Int?,
         aniZip: AniZipResponse?,
         tmdbEpisodes: List<TmdbEpisode>?
-    ): List<<Episode> {
+    ): List<Episode> {
         val episodeMap = linkedMapOf<String, EpisodeAccumulator>()
         slices.forEach { slice ->
             slice.episodes.forEachIndexed { index, epData ->
@@ -831,7 +830,7 @@ class CircleFtpProvider : MainAPI() {
         return exactBonus + (overlap * 20) - abs(leftTokens.size - rightTokens.size) * 4
     }
 
-    private fun chooseBestAniListMatch(candidates: List<<AniListMedia>, queryTitles: List<String>, year: Int?): AniListMedia? {
+    private fun chooseBestAniListMatch(candidates: List<AniListMedia>, queryTitles: List<String>, year: Int?): AniListMedia? {
         return candidates.maxByOrNull { scoreAniListCandidate(it, queryTitles, year) }
     }
 
@@ -947,12 +946,12 @@ class CircleFtpProvider : MainAPI() {
     }
 
     // HELPER: Convert Int quality to CloudStream's SearchQuality enum
-    private fun intToSearchQuality(quality: Int?): SearchQuality? {
+    private fun intToSearchQuality(quality: Int?): com.lagradost.cloudstream3.SearchQuality? {
         return when (quality) {
-            2160 -> SearchQuality.UHD
-            1440, 1080 -> SearchQuality.HD
-            720 -> SearchQuality.HQ
-            480 -> SearchQuality.SD
+            2160 -> com.lagradost.cloudstream3.SearchQuality.VeryHigh
+            1440, 1080 -> com.lagradost.cloudstream3.SearchQuality.High
+            720 -> com.lagradost.cloudstream3.SearchQuality.Medium
+            480 -> com.lagradost.cloudstream3.SearchQuality.Low
             else -> null
         }
     }
@@ -998,7 +997,7 @@ class CircleFtpProvider : MainAPI() {
         return runCatching {
             val json = JSONObject(jsonStr)
             val variantsArray = json.getJSONArray("variants")
-            val variants = mutableListOf<<StreamVariant>()
+            val variants = mutableListOf<StreamVariant>()
             for (i in 0 until variantsArray.length()) {
                 val obj = variantsArray.getJSONObject(i)
                 variants += StreamVariant(label = obj.getString("label"), url = obj.getString("url"))
@@ -1258,7 +1257,7 @@ class CircleFtpProvider : MainAPI() {
         val franchiseTitle: String,
         val year: Int?,
         val declaredSeason: Int?,
-        val quality: Int?,
+        val quality: Int?,  // FIXED: Changed from SearchQuality? to Int?
         val audioTag: String?,
         val groupKey: String
     )
@@ -1268,15 +1267,15 @@ class CircleFtpProvider : MainAPI() {
         val franchiseTitle: String,
         val year: Int?,
         val season: Int?,
-        val quality: Int?,
+        val quality: Int?,  // FIXED: Changed from SearchQuality? to Int?
         val qualityTag: String?,
         val audioTag: String?
     )
 
     private data class FetchedPost(val id: Int, val data: Data, val movieLink: String?, val tvSeries: TvSeries?)
-    private data class SeasonSlice(val fetchedPost: FetchedPost, val globalSeason: Int, val seasonName: String?, val episodes: List<<EpisodeData>)
-    private data class EpisodeAccumulator(val season: Int, val episode: Int, var fallbackName: String, val sources: MutableList<<StreamVariant> = mutableListOf())
-    private data class StreamPayload(val variants: List<<StreamVariant>) {
+    private data class SeasonSlice(val fetchedPost: FetchedPost, val globalSeason: Int, val seasonName: String?, val episodes: List<EpisodeData>)
+    private data class EpisodeAccumulator(val season: Int, val episode: Int, var fallbackName: String, val sources: MutableList<StreamVariant> = mutableListOf())
+    private data class StreamPayload(val variants: List<StreamVariant>) {
         fun toJsonString(): String {
             val json = JSONObject()
             val arr = org.json.JSONArray()
@@ -1288,7 +1287,7 @@ class CircleFtpProvider : MainAPI() {
     private data class StreamVariant(val label: String, val url: String)
     private data class AnimeMetaBundle(
         val selectedMedia: AniListMedia,
-        val seasonChain: List<<AniListMedia>,
+        val seasonChain: List<AniListMedia>,
         val aniZip: AniZipResponse?,
         val posterUrl: String?,
         val backgroundPosterUrl: String?,
@@ -1306,17 +1305,17 @@ class CircleFtpProvider : MainAPI() {
         val duration: Int?,
         val genres: List<String>?,
         val score: Score?,
-        val actors: List<Pair<<Actor, String?>>?,
+        val actors: List<Pair<Actor, String?>>?,
         val trailerUrl: String?,
         val showStatus: ShowStatus?
     )
     private enum class TmdbImageKind { POSTER, BACKDROP, LOGO, PROFILE }
 
-    data class PageData(val posts: List<<Post> = emptyList())
+    data class PageData(val posts: List<Post> = emptyList())
     data class Post(val id: Int, val type: String, val imageSm: String? = null, val title: String, val name: String? = null, val year: String? = null, val quality: String? = null)
     data class Data(val type: String, val imageSm: String? = null, val title: String, val image: String? = null, val metaData: String? = null, val name: String? = null, val quality: String? = null, val year: String? = null, val watchTime: String? = null)
-    data class TvSeries(val content: List<<SeasonContent> = emptyList())
-    data class SeasonContent(val episodes: List<<EpisodeData> = emptyList(), val seasonName: String? = null)
+    data class TvSeries(val content: List<SeasonContent> = emptyList())
+    data class SeasonContent(val episodes: List<EpisodeData> = emptyList(), val seasonName: String? = null)
     data class EpisodeData(val link: String, val title: String? = null)
     data class Movies(val content: String? = null)
 
@@ -1342,7 +1341,7 @@ class CircleFtpProvider : MainAPI() {
 
     data class AniListSearchResponse(val data: AniListSearchData? = null)
     data class AniListSearchData(val page: AniListPage? = null)
-    data class AniListPage(val media: List<<AniListMedia> = emptyList())
+    data class AniListPage(val media: List<AniListMedia> = emptyList())
     data class AniListByIdResponse(val data: AniListByIdData? = null)
     data class AniListByIdData(val media: AniListMedia? = null)
     data class AniListMedia(val id: Int? = null, val idMal: Int? = null, val title: AniListTitle? = null, val synonyms: List<String?>? = null, val format: String? = null, val status: String? = null, val seasonYear: Int? = null, val startDate: AniListDate? = null, val episodes: Int? = null, val duration: Int? = null, val averageScore: Int? = null, val description: String? = null, val bannerImage: String? = null, val genres: List<String?>? = null, val trailer: AniListTrailer? = null, val coverImage: AniListCoverImage? = null, val relations: AniListRelations? = null)
@@ -1350,9 +1349,9 @@ class CircleFtpProvider : MainAPI() {
     data class AniListDate(val year: Int? = null, val month: Int? = null, val day: Int? = null)
     data class AniListTrailer(val id: String? = null, val site: String? = null, val thumbnail: String? = null)
     data class AniListCoverImage(val extraLarge: String? = null, val large: String? = null)
-    data class AniListRelations(val edges: List<<AniListRelationEdge> = emptyList())
+    data class AniListRelations(val edges: List<AniListRelationEdge> = emptyList())
     data class AniListRelationEdge(val relationType: String = " ", val node: AniListMedia = AniListMedia())
-    data class AniZipResponse(val images: List<<AniZipImage>? = null, val episodes: Map<String, AniZipEpisode>? = null, val mappings: AniZipMappings? = null)
+    data class AniZipResponse(val images: List<AniZipImage>? = null, val episodes: Map<String, AniZipEpisode>? = null, val mappings: AniZipMappings? = null)
     data class AniZipImage(val coverType: String? = null, val url: String? = null)
     data class AniZipMappings(val anilistId: Int? = null, val malId: Int? = null, val kitsuId: Int? = null, val simklId: Int? = null, val imdbId: String? = null, val tmdbId: AniZipTmdbId? = null)
     data class AniZipTmdbId(val movie: Int? = null, val tv: Int? = null)
