@@ -109,6 +109,13 @@ class CircleFtpProvider : MainAPI() {
             val selectedSeason: Int? = null
         )
 
+        data class EpisodeMetadata(
+            val name: String?,
+            val overview: String?,
+            val stillPath: String?,
+            val rating: Double?
+        )
+
         data class MetadataInfo(
             val title: String,
             val origTitle: String?,
@@ -124,7 +131,8 @@ class CircleFtpProvider : MainAPI() {
             val kitsuId: String? = null,
             val simklId: Int? = null,
             val imdbId: String? = null,
-            val genres: List<String>? = null
+            val genres: List<String>? = null,
+            val episodes: List<EpisodeMetadata>? = null
         )
 
         // Utility to encode GroupedUrlData into a relative URL string (prevents absolute schema pre-pending errors in Cloudstream!)
@@ -189,7 +197,7 @@ class CircleFtpProvider : MainAPI() {
 
             // Use the beautifully sorted "name" field directly. If null or blank, fallback to cleaned title.
             var cleaned = postName?.trim().orEmpty()
-            if (cleaned.isEmpty() || cleaned.equals("null", ignoreCase = true)) {
+            if (cleaned.isEmpty() || cleaned.equals("null", ignoreCase = true) || cleaned.lowercase() == "null") {
                 cleaned = postTitle.replace(Regex("\\.[a-zA-Z0-9]{2,4}$"), "") // strip extension first
                     .replace(".", " ")
                     .replace("_", " ")
@@ -386,14 +394,66 @@ class CircleFtpProvider : MainAPI() {
                         
                         var kitsuId: String? = null
                         var simklId: Int? = null
+                        var tmdbId: Int? = null
+                        var imdbId: String? = null
+                        
                         try {
                             val aniZipText = app.get("https://api.ani.zip/mappings?anilist_id=$aniId").text
                             val aniZip = JSONObject(aniZipText)
                             val mappings = aniZip.optJSONObject("mappings")
                             kitsuId = mappings?.optString("kitsu_id", null)
+                            val rawTmdb = mappings?.optString("themoviedb_id", null)
+                            tmdbId = rawTmdb?.toIntOrNull()
                         } catch (_: Exception) {}
 
-                        if (malId != null) {
+                        if (tmdbId == null) {
+                            try {
+                                val searchUrl = "https://api.themoviedb.org/3/search/tv?api_key=98ae14df2b8d8f8f8136499daf79f0e0&query=${URLEncoder.encode(title, "UTF-8")}"
+                                val searchJson = JSONObject(app.get(searchUrl).text)
+                                val results = searchJson.optJSONArray("results")
+                                if (results != null && results.length() > 0) {
+                                    tmdbId = results.getJSONObject(0).optInt("id")
+                                }
+                            } catch (_: Exception) {}
+                        }
+
+                        var logoUrl: String? = null
+                        val epList = mutableListOf<EpisodeMetadata>()
+                        if (tmdbId != null) {
+                            try {
+                                logoUrl = fetchTmdbLogoUrl("https://api.themoviedb.org/3", "98ae14df2b8d8f8f8136499daf79f0e0", TvType.TvSeries, tmdbId, "en")
+                            } catch (_: Exception) {}
+
+                            try {
+                                val seasonUrl = "https://api.themoviedb.org/3/tv/$tmdbId/season/$targetSeason?api_key=98ae14df2b8d8f8f8136499daf79f0e0"
+                                val seasonRes = JSONObject(app.get(seasonUrl).text)
+                                val epArr = seasonRes.optJSONArray("episodes")
+                                if (epArr != null) {
+                                    for (i in 0 until epArr.length()) {
+                                        val epObj = epArr.getJSONObject(i)
+                                        val stillPath = epObj.optString("still_path", "")
+                                        val stillUrl = if (stillPath.isNotEmpty() && stillPath != "null") "https://image.tmdb.org/t/p/original$stillPath" else null
+                                        epList.add(
+                                            EpisodeMetadata(
+                                                name = epObj.optString("name", null),
+                                                overview = epObj.optString("overview", null),
+                                                stillPath = stillUrl,
+                                                rating = epObj.optDouble("vote_average", 0.0).takeIf { it > 0.0 }
+                                            )
+                                        )
+                                    }
+                                }
+                            } catch (_: Exception) {}
+                            
+                            try {
+                                val tvDetailsUrl = "https://api.themoviedb.org/3/tv/$tmdbId?api_key=98ae14df2b8d8f8f8136499daf79f0e0"
+                                val tvDetails = JSONObject(app.get(tvDetailsUrl).text)
+                                val extIds = tvDetails.optJSONObject("external_ids")
+                                imdbId = extIds?.optString("imdb_id", null) ?: tvDetails.optString("imdb_id", null)
+                            } catch (_: Exception) {}
+                        }
+
+                        if (malId != null && simklId == null) {
                             try {
                                 val simklRes = app.get("https://api.simkl.com/search/id?mal=$malId&client_id=1285090f70f69a53235b91b984d7a8e7e10b106093849ea267e1a681c62fbc04").text
                                 val simklArr = JSONArray(simklRes)
@@ -421,12 +481,14 @@ class CircleFtpProvider : MainAPI() {
                             rating = score,
                             year = null,
                             trailerUrl = null,
-                            logoUrl = null,
+                            logoUrl = logoUrl,
                             malId = malId,
                             anilistId = aniId,
                             kitsuId = kitsuId,
                             simklId = simklId,
-                            genres = genres
+                            imdbId = imdbId,
+                            genres = genres,
+                            episodes = epList
                         )
                         metadataCache[cacheKey] = metadata
                         return metadata
@@ -494,9 +556,10 @@ class CircleFtpProvider : MainAPI() {
                             } catch (_: Exception) {}
                         }
 
+                        val epList = mutableListOf<EpisodeMetadata>()
                         var seasonPoster: String? = null
                         var seasonPlot: String? = null
-                        if (mediaType == "tv" && targetSeason > 1) {
+                        if (mediaType == "tv") {
                             try {
                                 val seasonUrl = "https://api.themoviedb.org/3/tv/$tmdbId/season/$targetSeason?api_key=98ae14df2b8d8f8f8136499daf79f0e0"
                                 val seasonRes = JSONObject(app.get(seasonUrl).text)
@@ -505,7 +568,32 @@ class CircleFtpProvider : MainAPI() {
                                     seasonPoster = "https://image.tmdb.org/t/p/original$sPosterPath"
                                 }
                                 seasonPlot = seasonRes.optString("overview", null)
+
+                                val epArr = seasonRes.optJSONArray("episodes")
+                                if (epArr != null) {
+                                    for (i in 0 until epArr.length()) {
+                                        val epObj = epArr.getJSONObject(i)
+                                        val stillPath = epObj.optString("still_path", "")
+                                        val stillUrl = if (stillPath.isNotEmpty() && stillPath != "null") "https://image.tmdb.org/t/p/original$stillPath" else null
+                                        epList.add(
+                                            EpisodeMetadata(
+                                                name = epObj.optString("name", null),
+                                                overview = epObj.optString("overview", null),
+                                                stillPath = stillUrl,
+                                                rating = epObj.optDouble("vote_average", 0.0).takeIf { it > 0.0 }
+                                            )
+                                        )
+                                    }
+                                }
                             } catch (_: Exception) {}
+                        }
+
+                        val genres = mutableListOf<String>()
+                        val genresArr = details.optJSONArray("genres")
+                        if (genresArr != null) {
+                            for (i in 0 until genresArr.length()) {
+                                genres.add(genresArr.getJSONObject(i).optInt("id").toString())
+                            }
                         }
 
                         val metadata = MetadataInfo(
@@ -522,7 +610,9 @@ class CircleFtpProvider : MainAPI() {
                             imdbId = imdbId,
                             kitsuId = null,
                             anilistId = null,
-                            malId = null
+                            malId = null,
+                            genres = genres,
+                            episodes = epList
                         )
                         metadataCache[cacheKey] = metadata
                         return metadata
@@ -535,11 +625,6 @@ class CircleFtpProvider : MainAPI() {
             return null
         }
 
-        private suspend fun getSeasonPoster(title: String, isAnime: Boolean, season: Int): String? {
-            val meta = fetchMetadata(title, isAnime, season)
-            return meta?.posterUrl
-        }
-
         // Unified High-Intelligence Metadata Routing Engine (Problem 2 & 5)
         suspend fun fetchUnifiedMetadata(title: String, season: Int): Pair<MetadataInfo, Boolean> {
             val animeMeta = fetchMetadata(title, isAnime = true, season = season)
@@ -549,7 +634,7 @@ class CircleFtpProvider : MainAPI() {
             
             val movieMeta = fetchMetadata(title, isAnime = false, season = season)
             if (movieMeta != null) {
-                val isAnime = movieMeta.genres?.contains("Animation") == true && 
+                val isAnime = movieMeta.genres?.contains("16") == true && 
                               (movieMeta.origTitle?.contains(Regex("[\\u3000-\\u303f\\u3040-\\u309f\\u30a0-\\u30ff\\uff00-\\uff9f\\u4e00-\\u9faf\\u3400-\\u4dbf]")) == true || 
                                movieMeta.title.contains("anime", true))
                 if (isAnime) {
@@ -575,6 +660,13 @@ class CircleFtpProvider : MainAPI() {
                 ),
                 false
             )
+        }
+
+        fun JSONObject.optStringSafe(key: String): String? {
+            if (this.isNull(key)) return null
+            val value = this.optString(key)
+            if (value == "null" || value.trim().lowercase() == "null") return null
+            return value
         }
     }
 
@@ -609,7 +701,7 @@ class CircleFtpProvider : MainAPI() {
                             type = pObj.getString("type"),
                             imageSm = pObj.getString("imageSm"),
                             title = pObj.getString("title"),
-                            name = pObj.optString("name", null)
+                            name = jsonObj.optStringSafe("name") ?: pObj.optStringSafe("name")
                         )
                     )
                 }
@@ -650,7 +742,7 @@ class CircleFtpProvider : MainAPI() {
                             type = pObj.getString("type"),
                             imageSm = pObj.getString("imageSm"),
                             title = pObj.getString("title"),
-                            name = pObj.optString("name", null)
+                            name = pObj.optStringSafe("name")
                         )
                     )
                 }
@@ -737,7 +829,7 @@ class CircleFtpProvider : MainAPI() {
             if (id != null) {
                 val detailsObj = getPostDetails(id)
                 val title = detailsObj.optString("title")
-                val name = detailsObj.optString("name", null)
+                val name = detailsObj.optStringSafe("name")
                 val isAnime = title.contains("anime", true) || 
                               title.contains("animation", true) ||
                               title.contains("cartoon", true)
@@ -885,11 +977,20 @@ class CircleFtpProvider : MainAPI() {
                     }
 
                     val epDataString = "circleftp://episode?data=" + Base64.getEncoder().encodeToString(epLinks.toString().toByteArray())
+                    
+                    // Fetch episode specific metadata from TMDB if available! (Issue 4)
+                    val epMeta = metadata.episodes?.getOrNull(epIndex)
+                    val epName = epMeta?.name ?: "Episode $epNum"
+                    val epOverview = epMeta?.overview
+                    val epStill = epMeta?.stillPath
+
                     episodesData.add(
                         newEpisode(epDataString) {
                             this.episode = epNum
                             this.season = selectedSeason
-                            this.name = "Episode $epNum"
+                            this.name = epName
+                            this.description = epOverview
+                            this.posterUrl = epStill
                         }
                     )
                 }
@@ -917,7 +1018,9 @@ class CircleFtpProvider : MainAPI() {
                 for (sIndex in 0 until maxSeasons) {
                     val sNum = sIndex + 1
                     
-                    // Find max episodes in this season
+                    val sMetadata = fetchMetadata(cleanedTitle, isAnime = isAnime, season = sNum)
+                    val sEpisodes = sMetadata?.episodes
+
                     val sEpisodeCounts = postsDetails.map { (postObj, _) ->
                         val contentArray = postObj.optJSONArray("content")
                         val seasonObj = contentArray?.optJSONObject(sIndex)
@@ -946,11 +1049,19 @@ class CircleFtpProvider : MainAPI() {
                         }
                         
                         val epDataString = "circleftp://episode?data=" + Base64.getEncoder().encodeToString(epLinks.toString().toByteArray())
+                        
+                        val epMeta = sEpisodes?.getOrNull(epIndex)
+                        val epName = epMeta?.name ?: "Episode $epNum"
+                        val epOverview = epMeta?.overview
+                        val epStill = epMeta?.stillPath
+
                         episodesData.add(
                             newEpisode(epDataString) {
                                 this.episode = epNum
                                 this.season = sNum
-                                this.name = "Episode $epNum"
+                                this.name = epName
+                                this.description = epOverview
+                                this.posterUrl = epStill
                             }
                         )
                     }
