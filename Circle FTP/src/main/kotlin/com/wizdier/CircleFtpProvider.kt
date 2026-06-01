@@ -178,7 +178,7 @@ class CircleFtpProvider : MainAPI() {
             }
         }
 
-        // Clean titles: Removes years and audio initials from the title (Problem 1)
+        // Clean titles: Standardizes dividers (. and _ to spaces) and removes years & audio initials (Problem 1)
         fun cleanFtpTitle(title: String): Pair<String, String?> {
             // Extract audio tags if any
             val audioRegex = Regex("(?i)\\b(dual[- ]?audio|multi[- ]?audio|dubbed|hindi[- ]?dubbed|eng[- ]?sub|bengali|hindi|dual|multi)\\b")
@@ -187,22 +187,30 @@ class CircleFtpProvider : MainAPI() {
                 audioMatches.joinToString(" ").uppercase()
             } else null
 
+            // Clean title by replacing dots and underscores with spaces to separate tags correctly (Problem 1)
+            var cleaned = title.replace(Regex("\\.[a-zA-Z0-9]{2,4}$"), "") // strip extension first
+                .replace(".", " ")
+                .replace("_", " ")
+                .replace("-", " ")
+
             // Clean title by removing brackets/parentheses containing years, quality, or audio tags
-            var cleaned = title
             val bracketRegex = Regex("[\\[\\(][^\\]\\(]*(?:web[- ]?dl|web[- ]?rip|bluray|bdrip|brrip|remux|hdrip|dvdrip|hdtv|uhd|cam|ts|tc|1080p|720p|480p|2160p|4k|hevc|h264|h265|x264|x265|10bit|hdr|dual|multi|dub|sub|bengali|hindi|english|telugu|tamil|19\\d{2}|20\\d{2})[^\\]\\(]*[\\]\\)]", RegexOption.IGNORE_CASE)
             cleaned = bracketRegex.replace(cleaned, "")
 
-            // Remove any remaining years completely (Problem 1)
+            // Remove any remaining standalone years completely (Problem 1)
             cleaned = cleaned.replace(Regex("\\b(19|20)\\d{2}\\b"), "")
 
-            // Remove isolated quality and audio tags, and any season numbers
-            val cleanRegex = Regex("(?i)\\b(web[- ]?dl|web[- ]?rip|bluray|bdrip|brrip|remux|hdrip|dvdrip|hdtv|uhd|cam|ts|tc|1080p|720p|480p|2160p|4k|hevc|h264|h265|x264|x265|10bit|hdr|dual[- ]?audio|multi[- ]?audio|dubbed|subbed|eng[- ]?sub|hindi[- ]?dubbed|bengali|hindi|english|telugu|tamil|s\\d+|season\\s*\\d+)\\b")
+            // Remove isolated quality, audio, and release tags
+            val cleanRegex = Regex("(?i)\\b(web[- ]?dl|web[- ]?rip|bluray|bdrip|brrip|remux|hdrip|dvdrip|hdtv|uhd|cam|ts|tc|1080p|720p|480p|2160p|4k|hevc|h264|h265|x264|x265|10bit|hdr|dual[- ]?audio|multi[- ]?audio|dubbed|subbed|eng[- ]?sub|hindi[- ]?dubbed|bengali|hindi|english|telugu|tamil|s\\d+|season\\s*\\d+|sprinter|xvid|evo|full|movie|south|indian|dubbed|in|hindi|full)\\b")
             cleaned = cleanRegex.replace(cleaned, "")
 
             // Clean double spaces, dangling characters, and trim
             cleaned = cleaned.replace(Regex("\\s+"), " ")
                 .replace(Regex("^[-_\\s]+|[-_\\s]+$"), "")
                 .trim()
+
+            // Capitalize title words nicely
+            cleaned = cleaned.split(" ").joinToString(" ") { it.replaceFirstChar { char -> char.uppercase() } }
 
             return Pair(cleaned, audioTag)
         }
@@ -821,11 +829,13 @@ class CircleFtpProvider : MainAPI() {
                 this.duration = duration
                 this.score = rating?.let { Score.from10(it) }
                 
-                // Trackers mapping (Problem 2)
+                // Trackers mapping (Problem 2: Non-anime must NOT have MAL, Alist, Kitsu. Simkl is on for all via IMDb!)
                 try { metadata.imdbId?.let { addImdbId(it) } } catch(_: Throwable){}
-                try { metadata.malId?.let { addMalId(it) } } catch(_: Throwable){}
-                try { metadata.anilistId?.let { addAniListId(it) } } catch(_: Throwable){}
-                try { metadata.kitsuId?.let { addKitsuId(it) } } catch(_: Throwable){}
+                if (isAnime) {
+                    try { metadata.malId?.let { addMalId(it) } } catch(_: Throwable){}
+                    try { metadata.anilistId?.let { addAniListId(it) } } catch(_: Throwable){}
+                    try { metadata.kitsuId?.let { addKitsuId(it) } } catch(_: Throwable){}
+                }
                 try { trailer?.let { addTrailer(it) } } catch(_: Throwable){}
                 try { logo?.let { this.logoUrl = it } } catch(_: Throwable){}
             }
@@ -902,7 +912,7 @@ class CircleFtpProvider : MainAPI() {
                     this.plot = plot
                     this.recommendations = recommendationsList
                     
-                    // Trackers mapping (Problem 2)
+                    // Trackers mapping (Problem 2: Anime has all tracking)
                     try { metadata.malId?.let { addMalId(it) } } catch(_: Throwable){}
                     try { metadata.anilistId?.let { addAniListId(it) } } catch(_: Throwable){}
                     try { metadata.kitsuId?.let { addKitsuId(it) } } catch(_: Throwable){}
@@ -964,7 +974,7 @@ class CircleFtpProvider : MainAPI() {
                         this.year = year
                         this.plot = plot
                         
-                        // Trackers mapping (Problem 2)
+                        // Trackers mapping (Problem 2: Anime has all tracking)
                         try { metadata.malId?.let { addMalId(it) } } catch(_: Throwable){}
                         try { metadata.anilistId?.let { addAniListId(it) } } catch(_: Throwable){}
                         try { metadata.kitsuId?.let { addKitsuId(it) } } catch(_: Throwable){}
@@ -979,7 +989,7 @@ class CircleFtpProvider : MainAPI() {
                         this.year = year
                         this.plot = plot
                         
-                        // Trackers mapping (Problem 2)
+                        // Trackers mapping (Problem 2: Non-anime has only Simkl via IMDb ID)
                         try { metadata.imdbId?.let { addImdbId(it) } } catch(_: Throwable){}
                         try { trailer?.let { addTrailer(it) } } catch(_: Throwable){}
                         try { logo?.let { this.logoUrl = it } } catch(_: Throwable){}
