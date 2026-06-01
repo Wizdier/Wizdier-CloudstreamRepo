@@ -677,25 +677,27 @@ class CircleFtpProvider : MainAPI() {
         }
 
         // Unified High-Intelligence Metadata Routing Engine (Problem 2 & 5)
-        suspend fun fetchUnifiedMetadata(title: String, season: Int): Pair<MetadataInfo, Boolean> {
-            val animeMeta = fetchMetadata(title, isAnime = true, season = season)
-            if (animeMeta != null && animeMeta.malId != null) {
-                return Pair(animeMeta, true)
+        suspend fun fetchUnifiedMetadata(title: String, season: Int, isAnime: Boolean): Pair<MetadataInfo, Boolean> {
+            if (isAnime) {
+                val animeMeta = fetchMetadata(title, isAnime = true, season = season)
+                if (animeMeta != null && animeMeta.malId != null) {
+                    return Pair(animeMeta, true)
+                }
             }
             
             val movieMeta = fetchMetadata(title, isAnime = false, season = season)
             if (movieMeta != null) {
-                val isAnime = movieMeta.genres?.contains("16") == true && 
-                              (movieMeta.originalLanguage in setOf("ja", "zh", "ko") || 
-                               movieMeta.origTitle?.contains(Regex("[\\u3000-\\u303f\\u3040-\\u309f\\u30a0-\\u30ff\\uff00-\\uff9f\\u4e00-\\u9faf\\u3400-\\u4dbf]")) == true || 
-                               movieMeta.title.contains("anime", true))
-                if (isAnime) {
+                val resolvedAnime = isAnime || (movieMeta.genres?.contains("16") == true && 
+                                  (movieMeta.originalLanguage in setOf("ja", "zh", "ko") || 
+                                   movieMeta.origTitle?.contains(Regex("[\\u3000-\\u303f\\u3040-\\u309f\\u30a0-\\u30ff\\uff00-\\uff9f\\u4e00-\\u9faf\\u3400-\\u4dbf]")) == true || 
+                                   movieMeta.title.contains("anime", true)))
+                if (resolvedAnime) {
                     val retryAnime = fetchMetadata(movieMeta.title, isAnime = true, season = season)
                     if (retryAnime != null) {
                         return Pair(retryAnime, true)
                     }
                 }
-                return Pair(movieMeta, isAnime)
+                return Pair(movieMeta, resolvedAnime)
             }
             
             return Pair(
@@ -710,7 +712,7 @@ class CircleFtpProvider : MainAPI() {
                     trailerUrl = null,
                     logoUrl = null
                 ),
-                false
+                isAnime
             )
         }
 
@@ -839,12 +841,18 @@ class CircleFtpProvider : MainAPI() {
             cleanedTitle.lowercase().trim()
         }
 
+        // Resolve Anime status using zero-network categories first, falling back to very fast cached AniList query if ambiguous
+        val postsWithAnimeStatus = posts.map { post ->
+            val isAnime = isPostAnime(post.categories, post.title)
+            post to isAnime
+        }.toMap()
+
         grouped.values.map { postGroup ->
             val mainPost = postGroup.first()
             val (cleanedTitle, _) = cleanFtpTitle(mainPost.name, mainPost.title)
             
             // Highly accurate anime detection mapping (Issue 2)
-            val isAnime = isPostAnime(mainPost.categories, mainPost.title)
+            val isAnime = postsWithAnimeStatus[mainPost] ?: isPostAnime(mainPost.categories, mainPost.title)
 
             val postsInfo = postGroup.map { post ->
                 val (_, audio) = cleanFtpTitle(post.name, post.title)
@@ -943,7 +951,7 @@ class CircleFtpProvider : MainAPI() {
         }
 
         // Fetch high-intelligence metadata and auto-detect isAnime! (Problem 2 & 5)
-        val (metadata, isAnime) = fetchUnifiedMetadata(cleanedTitle, selectedSeason)
+        val (metadata, isAnime) = fetchUnifiedMetadata(cleanedTitle, selectedSeason, group.isAnime)
 
         val finalTitle = metadata.title
         val poster = metadata.posterUrl ?: postsDetails.first().first.let { "$apiUrl/uploads/${it.optString("image")}" }
