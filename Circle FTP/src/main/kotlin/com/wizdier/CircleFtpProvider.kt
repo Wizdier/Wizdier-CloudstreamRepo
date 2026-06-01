@@ -29,8 +29,6 @@ import com.lagradost.cloudstream3.LoadResponse.Companion.addKitsuId
 import com.lagradost.cloudstream3.LoadResponse.Companion.addMalId
 import com.lagradost.cloudstream3.LoadResponse.Companion.addTrailer
 import com.lagradost.cloudstream3.syncproviders.SyncIdName
-import com.lagradost.cloudstream3.utils.AppUtils
-import com.lagradost.cloudstream3.utils.AppUtils.toJson
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.newExtractorLink
 import com.lagradost.api.Log
@@ -309,10 +307,14 @@ class CircleFtpProvider : MainAPI() {
                         }
                     """.trimIndent()
 
-                    val requestBody = mapOf(
-                        "query" to query,
-                        "variables" to mapOf("search" to queryTitle)
-                    ).toJson().toRequestBody("application/json".toMediaTypeOrNull())
+                    val variablesObj = JSONObject()
+                    variablesObj.put("search", queryTitle)
+
+                    val requestObj = JSONObject()
+                    requestObj.put("query", query)
+                    requestObj.put("variables", variablesObj)
+
+                    val requestBody = requestObj.toString().toRequestBody("application/json".toMediaTypeOrNull())
 
                     val resText = app.post("https://graphql.anilist.co", requestBody = requestBody).text
                     val json = JSONObject(resText)
@@ -506,8 +508,31 @@ class CircleFtpProvider : MainAPI() {
                 cacheTime = 60
             )
         }
-        val posts = AppUtils.parseJson<PageData>(json.text).posts
-        val home = groupAndMapPosts(posts)
+        
+        // Fully safe manual JSON parsing with Zero dependence on Jackson/AppUtils.parseJson (NoSuchMethodError prevention!)
+        val postsList = mutableListOf<Post>()
+        try {
+            val jsonObj = JSONObject(json.text)
+            val postsArr = jsonObj.optJSONArray("posts")
+            if (postsArr != null) {
+                for (i in 0 until postsArr.length()) {
+                    val pObj = postsArr.getJSONObject(i)
+                    postsList.add(
+                        Post(
+                            id = pObj.getInt("id"),
+                            type = pObj.getString("type"),
+                            imageSm = pObj.getString("imageSm"),
+                            title = pObj.getString("title"),
+                            name = pObj.optString("name", null)
+                        )
+                    )
+                }
+            }
+        } catch (e: Exception) {
+            Log.e("CircleFtp", "Failed to parse page posts JSON: ${e.message}")
+        }
+
+        val home = groupAndMapPosts(postsList)
         return newHomePageResponse(request.name, home, true)
     }
 
@@ -525,8 +550,31 @@ class CircleFtpProvider : MainAPI() {
                 cacheTime = 60
             )
         }
-        val posts = AppUtils.parseJson<PageData>(json.text).posts
-        return groupAndMapPosts(posts)
+        
+        // Fully safe manual JSON parsing with Zero dependence on Jackson/AppUtils.parseJson (NoSuchMethodError prevention!)
+        val postsList = mutableListOf<Post>()
+        try {
+            val jsonObj = JSONObject(json.text)
+            val postsArr = jsonObj.optJSONArray("posts")
+            if (postsArr != null) {
+                for (i in 0 until postsArr.length()) {
+                    val pObj = postsArr.getJSONObject(i)
+                    postsList.add(
+                        Post(
+                            id = pObj.getInt("id"),
+                            type = pObj.getString("type"),
+                            imageSm = pObj.getString("imageSm"),
+                            title = pObj.getString("title"),
+                            name = pObj.optString("name", null)
+                        )
+                    )
+                }
+            }
+        } catch (e: Exception) {
+            Log.e("CircleFtp", "Failed to parse search posts JSON: ${e.message}")
+        }
+
+        return groupAndMapPosts(postsList)
     }
 
     // High performance post grouping and search result builder
