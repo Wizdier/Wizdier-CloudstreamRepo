@@ -662,6 +662,11 @@ class CircleFtpProvider : MainAPI() {
             )
         }
 
+        private suspend fun getSeasonPoster(title: String, isAnime: Boolean, season: Int): String? {
+            val meta = fetchMetadata(title, isAnime, season)
+            return meta?.posterUrl
+        }
+
         fun JSONObject.optStringSafe(key: String): String? {
             if (this.isNull(key)) return null
             val value = this.optString(key)
