@@ -8,7 +8,7 @@ import com.lagradost.cloudstream3.MainPageRequest
 import com.lagradost.cloudstream3.SearchQuality
 import com.lagradost.cloudstream3.SearchResponse
 import com.lagradost.cloudstream3.SubtitleFile
-import._i.m.p.o.r.t. .c.o.m...l.a.g.r.a.d.o.s.t...c.l.o.u.d.s.t.r.e.a.m.3...T.v.T.y.p.e.
+import com.lagradost.cloudstream3.TvType
 import com.lagradost.cloudstream3.DubStatus
 import com.lagradost.cloudstream3.addDubStatus
 import com.lagradost.cloudstream3.addEpisodes
