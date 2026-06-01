@@ -8,7 +8,7 @@ import com.lagradost.cloudstream3.MainPageRequest
 import com.lagradost.cloudstream3.SearchQuality
 import com.lagradost.cloudstream3.SearchResponse
 import com.lagradost.cloudstream3.SubtitleFile
-import com.lagradost.cloudstream3.TvType
+import._i.m.p.o.r.t. .c.o.m...l.a.g.r.a.d.o.s.t...c.l.o.u.d.s.t.r.e.a.m.3...T.v.T.y.p.e.
 import com.lagradost.cloudstream3.DubStatus
 import com.lagradost.cloudstream3.addDubStatus
 import com.lagradost.cloudstream3.addEpisodes
@@ -126,7 +126,7 @@ class CircleFtpProvider : MainAPI() {
             val genres: List<String>? = null
         )
 
-        // Utility to encode GroupedUrlData into a custom base64-encoded URL string
+        // Utility to encode GroupedUrlData into a relative URL string (prevents absolute schema pre-pending errors in Cloudstream!)
         fun encodeGroupedUrl(data: GroupedUrlData): String {
             val obj = JSONObject()
             val arr = JSONArray()
@@ -144,14 +144,14 @@ class CircleFtpProvider : MainAPI() {
                 obj.put("selectedSeason", data.selectedSeason)
             }
             val base64Data = Base64.getEncoder().encodeToString(obj.toString().toByteArray())
-            return "circleftp://load?data=$base64Data"
+            return "load?data=$base64Data"
         }
 
-        // Utility to decode GroupedUrlData from our custom URL string
+        // Utility to decode GroupedUrlData from any incoming URL containing the data payload
         fun decodeGroupedUrl(url: String): GroupedUrlData? {
             try {
-                if (!url.startsWith("circleftp://load?data=")) return null
-                val base64Data = url.substringAfter("circleftp://load?data=")
+                if (!url.contains("load?data=")) return null
+                val base64Data = url.substringAfter("load?data=")
                 val jsonStr = String(Base64.getDecoder().decode(base64Data))
                 val obj = JSONObject(jsonStr)
                 val arr = obj.getJSONArray("posts")
@@ -656,7 +656,8 @@ class CircleFtpProvider : MainAPI() {
     }
 
     override suspend fun load(url: String): LoadResponse {
-        val urlCheck = url.contains(mainApiUrl) || !url.startsWith("circleftp://")
+        // Safe, robust network classification (supports relative load URLs, custom schemas, and absolute paths)
+        val urlCheck = !url.contains(apiUrl)
 
         var groupedData = decodeGroupedUrl(url)
         if (groupedData == null) {
@@ -883,8 +884,8 @@ class CircleFtpProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        if (data.startsWith("circleftp://movie?data=")) {
-            val base64Data = data.substringAfter("circleftp://movie?data=")
+        if (data.contains("movie?data=")) {
+            val base64Data = data.substringAfter("movie?data=")
             val jsonStr = String(Base64.getDecoder().decode(base64Data))
             val arr = JSONArray(jsonStr)
             for (i in 0 until arr.length()) {
@@ -901,8 +902,8 @@ class CircleFtpProvider : MainAPI() {
                 )
             }
             return true
-        } else if (data.startsWith("circleftp://episode?data=")) {
-            val base64Data = data.substringAfter("circleftp://episode?data=")
+        } else if (data.contains("episode?data=")) {
+            val base64Data = data.substringAfter("episode?data=")
             val jsonStr = String(Base64.getDecoder().decode(base64Data))
             val arr = JSONArray(jsonStr)
             for (i in 0 until arr.length()) {
