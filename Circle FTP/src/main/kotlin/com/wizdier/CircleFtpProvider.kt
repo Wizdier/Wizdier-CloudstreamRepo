@@ -178,36 +178,25 @@ class CircleFtpProvider : MainAPI() {
             }
         }
 
-        // Clean titles: Standardizes dividers (. and _ to spaces) and removes years & audio initials (Problem 1)
-        fun cleanFtpTitle(title: String): Pair<String, String?> {
-            // Extract audio tags if any
+        // Clean titles: Uses the pre-cleaned, pre-sorted "name" field from CircleFTP directly! (Problem 1)
+        fun cleanFtpTitle(postName: String?, postTitle: String): Pair<String, String?> {
+            // Extract audio tags if any from the raw file title
             val audioRegex = Regex("(?i)\\b(dual[- ]?audio|multi[- ]?audio|dubbed|hindi[- ]?dubbed|eng[- ]?sub|bengali|hindi|dual|multi)\\b")
-            val audioMatches = audioRegex.findAll(title).map { it.value.trim() }.toList()
+            val audioMatches = audioRegex.findAll(postTitle).map { it.value.trim() }.toList()
             val audioTag = if (audioMatches.isNotEmpty()) {
                 audioMatches.joinToString(" ").uppercase()
             } else null
 
-            // Clean title by replacing dots and underscores with spaces to separate tags correctly (Problem 1)
-            var cleaned = title.replace(Regex("\\.[a-zA-Z0-9]{2,4}$"), "") // strip extension first
-                .replace(".", " ")
-                .replace("_", " ")
-                .replace("-", " ")
-
-            // Clean title by removing brackets/parentheses containing years, quality, or audio tags
-            val bracketRegex = Regex("[\\[\\(][^\\]\\(]*(?:web[- ]?dl|web[- ]?rip|bluray|bdrip|brrip|remux|hdrip|dvdrip|hdtv|uhd|cam|ts|tc|1080p|720p|480p|2160p|4k|hevc|h264|h265|x264|x265|10bit|hdr|dual|multi|dub|sub|bengali|hindi|english|telugu|tamil|19\\d{2}|20\\d{2})[^\\]\\(]*[\\]\\)]", RegexOption.IGNORE_CASE)
-            cleaned = bracketRegex.replace(cleaned, "")
-
-            // Remove any remaining standalone years completely (Problem 1)
-            cleaned = cleaned.replace(Regex("\\b(19|20)\\d{2}\\b"), "")
-
-            // Remove isolated quality, audio, and release tags
-            val cleanRegex = Regex("(?i)\\b(web[- ]?dl|web[- ]?rip|bluray|bdrip|brrip|remux|hdrip|dvdrip|hdtv|uhd|cam|ts|tc|1080p|720p|480p|2160p|4k|hevc|h264|h265|x264|x265|10bit|hdr|dual[- ]?audio|multi[- ]?audio|dubbed|subbed|eng[- ]?sub|hindi[- ]?dubbed|bengali|hindi|english|telugu|tamil|s\\d+|season\\s*\\d+|sprinter|xvid|evo|full|movie|south|indian|dubbed|in|hindi|full)\\b")
-            cleaned = cleanRegex.replace(cleaned, "")
-
-            // Clean double spaces, dangling characters, and trim
-            cleaned = cleaned.replace(Regex("\\s+"), " ")
-                .replace(Regex("^[-_\\s]+|[-_\\s]+$"), "")
-                .trim()
+            // Use the beautifully sorted "name" field directly. If null or blank, fallback to cleaned title.
+            var cleaned = postName?.trim().orEmpty()
+            if (cleaned.isEmpty() || cleaned.equals("null", ignoreCase = true)) {
+                cleaned = postTitle.replace(Regex("\\.[a-zA-Z0-9]{2,4}$"), "") // strip extension first
+                    .replace(".", " ")
+                    .replace("_", " ")
+                    .replace("-", " ")
+                    .replace(Regex("\\b(19|20)\\d{2}\\b"), "")
+                    .trim()
+            }
 
             // Capitalize title words nicely
             cleaned = cleaned.split(" ").joinToString(" ") { it.replaceFirstChar { char -> char.uppercase() } }
@@ -676,20 +665,20 @@ class CircleFtpProvider : MainAPI() {
     // High performance post grouping and instant search result builder (Problem 4: instant mapping!)
     private suspend fun groupAndMapPosts(posts: List<Post>): List<SearchResponse> = coroutineScope {
         val grouped = posts.groupBy { post ->
-            val (cleanedTitle, _) = cleanFtpTitle(post.title)
+            val (cleanedTitle, _) = cleanFtpTitle(post.name, post.title)
             cleanedTitle.lowercase().trim()
         }
 
         grouped.values.map { postGroup ->
             val mainPost = postGroup.first()
-            val (cleanedTitle, _) = cleanFtpTitle(mainPost.title)
+            val (cleanedTitle, _) = cleanFtpTitle(mainPost.name, mainPost.title)
             
             val isAnime = mainPost.title.contains("anime", true) || 
                           mainPost.title.contains("animation", true) ||
                           mainPost.title.contains("cartoon", true)
 
             val postsInfo = postGroup.map { post ->
-                val (_, audio) = cleanFtpTitle(post.title)
+                val (_, audio) = cleanFtpTitle(post.name, post.title)
                 GroupedPostInfo(post.id, post.title, audio)
             }
 
@@ -748,10 +737,11 @@ class CircleFtpProvider : MainAPI() {
             if (id != null) {
                 val detailsObj = getPostDetails(id)
                 val title = detailsObj.optString("title")
+                val name = detailsObj.optString("name", null)
                 val isAnime = title.contains("anime", true) || 
                               title.contains("animation", true) ||
                               title.contains("cartoon", true)
-                val (cleanedTitle, audio) = cleanFtpTitle(title)
+                val (cleanedTitle, audio) = cleanFtpTitle(name, title)
                 groupedData = GroupedUrlData(
                     posts = listOf(GroupedPostInfo(id, title, audio)),
                     cleanedTitle = cleanedTitle,
