@@ -34,15 +34,26 @@ jobs:
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
 
+      # NOTE: we deliberately exclude ~/.gradle/caches/cloudstream from the
+      # cache. That directory is owned by the recloudstream gradle plugin and
+      # holds a pre-built `cloudstream.jar` of API stubs which changes silently
+      # upstream. Caching it has, in the past, pinned us to a stale stubs JAR
+      # compiled with a newer Kotlin metadata version than our project's
+      # compiler could read, producing ~70 "Class … was compiled with an
+      # incompatible version of Kotlin" errors. Always refetch.
       - name: Cache Gradle
         uses: actions/cache@v4
         with:
           path: |
-            ~/.gradle/caches
+            ~/.gradle/caches/modules-2
+            ~/.gradle/caches/jars-9
             ~/.gradle/wrapper
           key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
           restore-keys: |
             ${{ runner.os }}-gradle-
+
+      - name: Purge stale cloudstream stubs JAR
+        run: rm -rf ~/.gradle/caches/cloudstream || true
 
       - name: Build plugins
         working-directory: src

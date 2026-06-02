@@ -9,7 +9,17 @@ import org.jetbrains.kotlin.gradle.tasks.KotlinJvmCompile
 // Version pins mirror the recloudstream reference templates so builds
 // reproduce reliably on CI:
 //   • AGP    8.7.3
-//   • Kotlin 2.1.0
+//   • Kotlin 2.3.0   ← MUST match the Kotlin version used to compile the
+//                      pre-built `cloudstream.jar` stubs that the recloudstream
+//                      gradle plugin downloads into
+//                      ~/.gradle/caches/cloudstream/cloudstream/.
+//                      The current upstream stubs are built with Kotlin 2.3.0;
+//                      using 2.1.0 here triggers ~70 "Class … was compiled
+//                      with an incompatible version of Kotlin. The actual
+//                      metadata version is 2.3.0, but the compiler version
+//                      2.1.0 can read versions up to 2.2.0." errors, which
+//                      then cascade into Unresolved reference 'MainAPI' /
+//                      'mainPageOf' / 'TvType' etc.
 //   • recloudstream gradle plugin – `-SNAPSHOT`
 //
 // Note: `namespace` is intentionally NOT set in this file. AGP 8.7's
@@ -29,7 +39,7 @@ buildscript {
     dependencies {
         classpath("com.android.tools.build:gradle:8.7.3")
         classpath("com.github.recloudstream:gradle:-SNAPSHOT")
-        classpath("org.jetbrains.kotlin:kotlin-gradle-plugin:2.1.0")
+        classpath("org.jetbrains.kotlin:kotlin-gradle-plugin:2.3.0")
     }
 }
 
