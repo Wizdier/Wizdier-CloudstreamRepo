@@ -156,7 +156,8 @@ class CircleFtpProvider : MainAPI() {
         data class ActorMetadata(
             val name: String,
             val role: String?,
-            val image: String?
+            val image: String?,
+            val charImage: String? = null
         )
 
         data class MetadataInfo(
@@ -176,6 +177,7 @@ class CircleFtpProvider : MainAPI() {
             val imdbId: String? = null,
             val originalLanguage: String? = null,
             val genres: List<String>? = null,
+            val genreIds: List<Int>? = null,
             val episodes: List<EpisodeMetadata>? = null,
             val actors: List<ActorMetadata>? = null
         )
@@ -395,6 +397,26 @@ class CircleFtpProvider : MainAPI() {
                               averageScore
                               genres
                               episodes
+                              characters(page: 1, perPage: 10) {
+                                edges {
+                                  node {
+                                    name {
+                                      full
+                                    }
+                                    image {
+                                      large
+                                    }
+                                  }
+                                  voiceActors(language: JAPANESE) {
+                                    name {
+                                      full
+                                    }
+                                    image {
+                                      large
+                                    }
+                                  }
+                                }
+                              }
                             }
                           }
                         }
@@ -564,7 +586,7 @@ class CircleFtpProvider : MainAPI() {
                             } catch (_: Exception) {}
                             
                             try {
-                                val tvDetailsUrl = "https://api.themoviedb.org/3/tv/$tmdbId?api_key=98ae14df2b8d8f8f8136499daf79f0e0&append_to_response=external_ids,videos,credits"
+                                val tvDetailsUrl = "https://api.themoviedb.org/3/tv/$tmdbId?api_key=98ae14df2b8d8f8f8136499daf79f0e0&append_to_response=external_ids,videos"
                                 val tvDetails = JSONObject(app.get(tvDetailsUrl).text)
                                 val extIds = tvDetails.optJSONObject("external_ids")
                                 imdbId = extIds?.optStringSafe("imdb_id") ?: tvDetails.optStringSafe("imdb_id")
@@ -579,22 +601,29 @@ class CircleFtpProvider : MainAPI() {
                                         }
                                     }
                                 }
+                            } catch (_: Exception) {}
+                        }
 
-                                // Parse actors for anime
-                                val castArr = tvDetails.optJSONObject("credits")?.optJSONArray("cast")
-                                if (castArr != null) {
-                                    for (i in 0 until castArr.length()) {
-                                        val castObj = castArr.getJSONObject(i)
-                                        val name = castObj.optString("name", "")
-                                        val role = castObj.optString("character", null)
-                                        val profilePath = castObj.optString("profile_path", "")
-                                        val imageUrl = if (profilePath.isNotEmpty() && profilePath != "null") "https://image.tmdb.org/t/p/original$profilePath" else null
-                                        if (name.isNotEmpty()) {
-                                            castList.add(ActorMetadata(name, role, imageUrl))
-                                        }
+                        // Parse both the character avatar and voice artist avatar & names from AniList (Feature 1!)
+                        val charObj = bestMedia.optJSONObject("characters")
+                        val edgesArr = charObj?.optJSONArray("edges")
+                        if (edgesArr != null) {
+                            for (i in 0 until edgesArr.length()) {
+                                val edge = edgesArr.getJSONObject(i)
+                                val nodeObj = edge.optJSONObject("node")
+                                val charName = nodeObj?.optJSONObject("name")?.optString("full", "") ?: ""
+                                val charImg = nodeObj?.optJSONObject("image")?.optString("large", null)
+                                
+                                val vaArr = edge.optJSONArray("voiceActors")
+                                if (vaArr != null && vaArr.length() > 0) {
+                                    val va = vaArr.getJSONObject(0)
+                                    val vaName = va.optJSONObject("name")?.optString("full", "") ?: ""
+                                    val vaImage = va.optJSONObject("image")?.optString("large", null)
+                                    if (vaName.isNotEmpty()) {
+                                        castList.add(ActorMetadata(vaName, charName, vaImage, charImg))
                                     }
                                 }
-                            } catch (_: Exception) {}
+                            }
                         }
 
                         if (malId != null && simklId == null) {
@@ -735,10 +764,13 @@ class CircleFtpProvider : MainAPI() {
                         }
 
                         val genres = mutableListOf<String>()
+                        val genreIds = mutableListOf<Int>()
                         val genresArr = details.optJSONArray("genres")
                         if (genresArr != null) {
                             for (i in 0 until genresArr.length()) {
-                                genres.add(genresArr.getJSONObject(i).optInt("id").toString())
+                                val gObj = genresArr.getJSONObject(i)
+                                genres.add(gObj.optString("name"))
+                                genreIds.add(gObj.optInt("id"))
                             }
                         }
 
@@ -775,6 +807,7 @@ class CircleFtpProvider : MainAPI() {
                             anilistId = null,
                             malId = null,
                             genres = genres,
+                            genreIds = genreIds,
                             episodes = epList,
                             actors = castList
                         )
@@ -1075,12 +1108,22 @@ class CircleFtpProvider : MainAPI() {
 
         val recommendationsList = mutableListOf<SearchResponse>()
 
-        // Map ActorMetadata to Cloudstream's ActorData (Actors Metadata!)
+        // Map ActorMetadata to Cloudstream's ActorData (Actors Metadata!) (Supports both Character avatar & Voice Actor avatar!)
         val actorsList = metadata.actors?.map { actor ->
-            ActorData(
-                Actor(actor.name, actor.image),
-                roleString = actor.role
-            )
+            if (actor.charImage != null) {
+                // For Anime: Load Character name/avatar and Voice Artist name/avatar (Features 1 & 2!)
+                ActorData(
+                    actor = Actor(actor.role ?: "Unknown Character", actor.charImage),
+                    roleString = "Voice Artist",
+                    voiceActor = Actor(actor.name, actor.image)
+                )
+            } else {
+                // For TV/Movies
+                ActorData(
+                    actor = Actor(actor.name, actor.image),
+                    roleString = actor.role
+                )
+            }
         } ?: emptyList()
 
         if (mainPostType == "singleVideo") {
@@ -1107,6 +1150,7 @@ class CircleFtpProvider : MainAPI() {
                 this.duration = duration
                 this.score = rating?.let { Score.from10(it) }
                 this.actors = actorsList
+                this.tags = metadata.genres
                 
                 // Trackers mapping (Problem 2: Non-anime must NOT have MAL, Alist, Kitsu. Simkl is on for all via IMDb!)
                 try { metadata.imdbId?.let { addImdbId(it) } } catch(_: Throwable){}
@@ -1200,6 +1244,7 @@ class CircleFtpProvider : MainAPI() {
                     this.plot = plot
                     this.recommendations = recommendationsList
                     this.actors = actorsList
+                    this.tags = metadata.genres
                     
                     // Trackers mapping (Problem 2: Anime has all tracking)
                     try { metadata.malId?.let { addMalId(it) } } catch(_: Throwable){}
@@ -1273,6 +1318,7 @@ class CircleFtpProvider : MainAPI() {
                         this.year = year
                         this.plot = plot
                         this.actors = actorsList
+                        this.tags = metadata.genres
                         
                         // Trackers mapping (Problem 2: Anime has all tracking)
                         try { metadata.malId?.let { addMalId(it) } } catch(_: Throwable){}
@@ -1289,17 +1335,18 @@ class CircleFtpProvider : MainAPI() {
                         this.year = year
                         this.plot = plot
                         this.actors = actorsList
+                        this.tags = metadata.genres
                         
                         // Trackers mapping (Problem 2: Non-anime has only Simkl via IMDb ID)
                         try { metadata.imdbId?.let { addImdbId(it) } } catch(_: Throwable){}
-                        try { trailer?.let { addTrailer(it) } } catch(_: Throwable){}
+                        try { trailer?.let { addTrailer(it) } catch(_: Throwable){}
                         try { logo?.let { this.logoUrl = it } } catch(_: Throwable){}
                     }
                 }
             }
         }
-
     }
+
     private fun linkToIp(data: String?): String {
         if (data != null) {
             return when {
@@ -1421,4 +1468,6 @@ class CircleFtpProvider : MainAPI() {
     data class Movies(
         val content: String?
     )
+}
+
 }
