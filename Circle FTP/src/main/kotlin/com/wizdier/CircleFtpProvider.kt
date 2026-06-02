@@ -468,7 +468,6 @@ class CircleFtpProvider : MainAPI() {
                         }
 
                         var logoUrl: String? = null
-                        var animeTrailerUrl: String? = null
                         val epList = mutableListOf<EpisodeMetadata>()
                         if (tmdbId != null) {
                             try {
@@ -497,25 +496,10 @@ class CircleFtpProvider : MainAPI() {
                             } catch (_: Exception) {}
                             
                             try {
-                                val tvDetailsUrl = "https://api.themoviedb.org/3/tv/$tmdbId?api_key=98ae14df2b8d8f8f8136499daf79f0e0&append_to_response=external_ids,videos"
+                                val tvDetailsUrl = "https://api.themoviedb.org/3/tv/$tmdbId?api_key=98ae14df2b8d8f8f8136499daf79f0e0"
                                 val tvDetails = JSONObject(app.get(tvDetailsUrl).text)
                                 val extIds = tvDetails.optJSONObject("external_ids")
                                 imdbId = extIds?.optString("imdb_id", null) ?: tvDetails.optString("imdb_id", null)
-                                // Anime trailer — previously hard-coded to null
-                                // in the anime branch. Now we pull the first
-                                // official YouTube trailer from TMDB videos.
-                                val videosArr = tvDetails.optJSONObject("videos")?.optJSONArray("results")
-                                if (videosArr != null) {
-                                    for (i in 0 until videosArr.length()) {
-                                        val v = videosArr.getJSONObject(i)
-                                        if (v.optString("site").equals("YouTube", true)
-                                            && v.optString("type").equals("Trailer", true)
-                                        ) {
-                                            animeTrailerUrl = "https://www.youtube.com/watch?v=${v.optString("key")}"
-                                            if (v.optBoolean("official", false)) break
-                                        }
-                                    }
-                                }
                             } catch (_: Exception) {}
                         }
 
@@ -546,7 +530,7 @@ class CircleFtpProvider : MainAPI() {
                             plot = plot,
                             rating = score,
                             year = null,
-                            trailerUrl = animeTrailerUrl,
+                            trailerUrl = null,
                             logoUrl = logoUrl,
                             malId = malId,
                             anilistId = aniId,
