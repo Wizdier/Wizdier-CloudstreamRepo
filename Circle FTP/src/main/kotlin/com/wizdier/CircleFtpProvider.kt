@@ -1469,5 +1469,3 @@ class CircleFtpProvider : MainAPI() {
         val content: String?
     )
 }
-
-}
