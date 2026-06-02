@@ -68,13 +68,11 @@ class CircleFtpProvider : MainAPI() {
         TvType.Others
     )
 
-    // Dynamic configuration of tracking sync providers (Issue 3)
     override val supportedSyncNames = setOfNotNull(
         SyncIdName.Anilist,
         SyncIdName.MyAnimeList,
-        runCatching { SyncIdName.valueOf("Kitsu") }.getOrNull(),
-        runCatching { SyncIdName.valueOf("Simkl") }.getOrNull(),
-        runCatching { SyncIdName.valueOf("Trakt") }.getOrNull()
+        runCatching { SyncIdName.Kitsu }.getOrNull(),
+        runCatching { SyncIdName.Simkl }.getOrNull()
     )
 
     override val mainPage = mainPageOf(
@@ -302,27 +300,11 @@ class CircleFtpProvider : MainAPI() {
         }
 
         // Strict Alphanumeric Title Similarity Matcher (Issue 1)
-        fun isTitleSimilar(searchTitle: String, matchTitle: String): Boolean {
-            val sClean = searchTitle.lowercase().replace(Regex("[^a-z0-9]"), "").trim()
-            val mClean = matchTitle.lowercase().replace(Regex("[^a-z0-9]"), "").trim()
-            if (sClean.isEmpty() || mClean.isEmpty()) return false
-            
-            if (sClean == mClean) return true
-            
-            if (sClean.length <= 6) {
-                return sClean == mClean
-            }
-            
-            if (mClean.contains(sClean)) {
-                val ratio = mClean.length.toDouble() / sClean.length.toDouble()
-                if (ratio <= 2.5) return true
-            }
-            if (sClean.contains(mClean)) {
-                val ratio = sClean.length.toDouble() / mClean.length.toDouble()
-                if (ratio <= 2.5) return true
-            }
-            
-            return false
+        fun isTitleSimilar(title1: String, title2: String): Boolean {
+            val clean1 = title1.lowercase().replace(Regex("[^a-z0-9]"), "")
+            val clean2 = title2.lowercase().replace(Regex("[^a-z0-9]"), "")
+            if (clean1.isEmpty() || clean2.isEmpty()) return false
+            return clean1 == clean2 || clean1.contains(clean2) || clean2.contains(clean1)
         }
 
         // Core Metadata Fetcher from TMDB (for movies/TV) and AniList (for Anime)
@@ -677,27 +659,25 @@ class CircleFtpProvider : MainAPI() {
         }
 
         // Unified High-Intelligence Metadata Routing Engine (Problem 2 & 5)
-        suspend fun fetchUnifiedMetadata(title: String, season: Int, isAnime: Boolean): Pair<MetadataInfo, Boolean> {
-            if (isAnime) {
-                val animeMeta = fetchMetadata(title, isAnime = true, season = season)
-                if (animeMeta != null && animeMeta.malId != null) {
-                    return Pair(animeMeta, true)
-                }
+        suspend fun fetchUnifiedMetadata(title: String, season: Int): Pair<MetadataInfo, Boolean> {
+            val animeMeta = fetchMetadata(title, isAnime = true, season = season)
+            if (animeMeta != null && animeMeta.malId != null) {
+                return Pair(animeMeta, true)
             }
             
             val movieMeta = fetchMetadata(title, isAnime = false, season = season)
             if (movieMeta != null) {
-                val resolvedAnime = isAnime || (movieMeta.genres?.contains("16") == true && 
-                                  (movieMeta.originalLanguage in setOf("ja", "zh", "ko") || 
-                                   movieMeta.origTitle?.contains(Regex("[\\u3000-\\u303f\\u3040-\\u309f\\u30a0-\\u30ff\\uff00-\\uff9f\\u4e00-\\u9faf\\u3400-\\u4dbf]")) == true || 
-                                   movieMeta.title.contains("anime", true)))
-                if (resolvedAnime) {
+                val isAnime = movieMeta.genres?.contains("16") == true && 
+                              (movieMeta.originalLanguage in setOf("ja", "zh", "ko") || 
+                               movieMeta.origTitle?.contains(Regex("[\\u3000-\\u303f\\u3040-\\u309f\\u30a0-\\u30ff\\uff00-\\uff9f\\u4e00-\\u9faf\\u3400-\\u4dbf]")) == true || 
+                               movieMeta.title.contains("anime", true))
+                if (isAnime) {
                     val retryAnime = fetchMetadata(movieMeta.title, isAnime = true, season = season)
                     if (retryAnime != null) {
                         return Pair(retryAnime, true)
                     }
                 }
-                return Pair(movieMeta, resolvedAnime)
+                return Pair(movieMeta, isAnime)
             }
             
             return Pair(
@@ -712,7 +692,7 @@ class CircleFtpProvider : MainAPI() {
                     trailerUrl = null,
                     logoUrl = null
                 ),
-                isAnime
+                false
             )
         }
 
@@ -726,25 +706,6 @@ class CircleFtpProvider : MainAPI() {
             val value = this.optString(key)
             if (value == "null" || value.trim().lowercase() == "null") return null
             return value
-        }
-
-        // Highly accurate, zero-network anime detection using category mapping (Issue 2)
-        fun isPostAnime(categoriesArr: JSONArray?, postTitle: String): Boolean {
-            val titleLower = postTitle.lowercase()
-            if (titleLower.contains("anime") || titleLower.contains("animation") || titleLower.contains("cartoon")) {
-                return true
-            }
-            if (categoriesArr != null) {
-                for (i in 0 until categoriesArr.length()) {
-                    val catObj = categoriesArr.getJSONObject(i)
-                    val catId = catObj.optInt("id")
-                    val catName = catObj.optString("name", "").lowercase()
-                    if (catId == 21 || catId == 1 || catName.contains("anime") || catName.contains("animation") || catName.contains("cartoon")) {
-                        return true
-                    }
-                }
-            }
-            return false
         }
     }
 
@@ -779,8 +740,7 @@ class CircleFtpProvider : MainAPI() {
                             type = pObj.getString("type"),
                             imageSm = pObj.getString("imageSm"),
                             title = pObj.getString("title"),
-                            name = pObj.optStringSafe("name"),
-                            categories = pObj.optJSONArray("categories")
+                            name = pObj.optStringSafe("name")
                         )
                     )
                 }
@@ -821,8 +781,7 @@ class CircleFtpProvider : MainAPI() {
                             type = pObj.getString("type"),
                             imageSm = pObj.getString("imageSm"),
                             title = pObj.getString("title"),
-                            name = pObj.optStringSafe("name"),
-                            categories = pObj.optJSONArray("categories")
+                            name = pObj.optStringSafe("name")
                         )
                     )
                 }
@@ -841,18 +800,13 @@ class CircleFtpProvider : MainAPI() {
             cleanedTitle.lowercase().trim()
         }
 
-        // Resolve Anime status using zero-network categories first, falling back to very fast cached AniList query if ambiguous
-        val postsWithAnimeStatus = posts.map { post ->
-            val isAnime = isPostAnime(post.categories, post.title)
-            post to isAnime
-        }.toMap()
-
         grouped.values.map { postGroup ->
             val mainPost = postGroup.first()
             val (cleanedTitle, _) = cleanFtpTitle(mainPost.name, mainPost.title)
             
-            // Highly accurate anime detection mapping (Issue 2)
-            val isAnime = postsWithAnimeStatus[mainPost] ?: isPostAnime(mainPost.categories, mainPost.title)
+            val isAnime = mainPost.title.contains("anime", true) || 
+                          mainPost.title.contains("animation", true) ||
+                          mainPost.title.contains("cartoon", true)
 
             val postsInfo = postGroup.map { post ->
                 val (_, audio) = cleanFtpTitle(post.name, post.title)
@@ -915,10 +869,9 @@ class CircleFtpProvider : MainAPI() {
                 val detailsObj = getPostDetails(id)
                 val title = detailsObj.optString("title")
                 val name = detailsObj.optStringSafe("name")
-                
-                val cats = detailsObj.optJSONArray("categories")
-                val isAnime = isPostAnime(cats, title)
-
+                val isAnime = title.contains("anime", true) || 
+                              title.contains("animation", true) ||
+                              title.contains("cartoon", true)
                 val (cleanedTitle, audio) = cleanFtpTitle(name, title)
                 groupedData = GroupedUrlData(
                     posts = listOf(GroupedPostInfo(id, title, audio)),
@@ -951,7 +904,7 @@ class CircleFtpProvider : MainAPI() {
         }
 
         // Fetch high-intelligence metadata and auto-detect isAnime! (Problem 2 & 5)
-        val (metadata, isAnime) = fetchUnifiedMetadata(cleanedTitle, selectedSeason, group.isAnime)
+        val (metadata, isAnime) = fetchUnifiedMetadata(cleanedTitle, selectedSeason)
 
         val finalTitle = metadata.title
         val poster = metadata.posterUrl ?: postsDetails.first().first.let { "$apiUrl/uploads/${it.optString("image")}" }
@@ -1304,7 +1257,6 @@ class CircleFtpProvider : MainAPI() {
         val imageSm: String,
         val title: String,
         val name: String?,
-        val categories: JSONArray? = null
     )
 
     data class Data(
