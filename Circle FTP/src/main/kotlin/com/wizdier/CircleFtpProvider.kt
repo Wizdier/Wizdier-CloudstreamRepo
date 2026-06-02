@@ -1292,14 +1292,14 @@ class CircleFtpProvider : MainAPI() {
                         
                         // Trackers mapping (Problem 2: Non-anime has only Simkl via IMDb ID)
                         try { metadata.imdbId?.let { addImdbId(it) } } catch(_: Throwable){}
-                        try { trailer?.let { addTrailer(it) } catch(_: Throwable){}
+                        try { trailer?.let { addTrailer(it) } } catch(_: Throwable){}
                         try { logo?.let { this.logoUrl = it } } catch(_: Throwable){}
                     }
                 }
             }
         }
-    }
 
+    }
     private fun linkToIp(data: String?): String {
         if (data != null) {
             return when {
