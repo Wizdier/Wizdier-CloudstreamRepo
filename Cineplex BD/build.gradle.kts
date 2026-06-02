@@ -1,14 +1,24 @@
 // ───────────────────────────────────────────────────────────────────────────
-// Per-plugin metadata for the Cineplex BD extension.
+// Per-plugin Gradle config for the "Cineplex BD" Cloudstream extension.
 //
-// The android { namespace = ... } block is intentionally OMITTED here because
-// the root build.gradle.kts derives a unique namespace per module from the
-// folder name (`com.wizdier.cineplexbd`). Adding a manual override here would
-// silently shadow that and risk collisions with sibling modules.
+// AGP 8+ REQUIREMENT
+// ──────────────────
+// Every Android library module MUST declare its own `namespace`. Setting it
+// only inside the root `subprojects { android { ... } }` block is NOT enough
+// for AGP 8.7's LibraryVariantBuilderImpl — the variant builder reads the
+// namespace from the module's own LibraryExtension before the root
+// configuration lambda fully resolves, which produced this failure:
+//
+//   > Could not create an instance of type
+//     com.android.build.api.variant.impl.LibraryVariantBuilderImpl.
+//   > Namespace not specified. Specify a namespace in the module's build file
+//
+// Hence the explicit `android { namespace = "…" }` below. Each module gets a
+// UNIQUE namespace to avoid R-class / manifest merge collisions with sibling
+// plugins that share the `com.wizdier` package root.
 // ───────────────────────────────────────────────────────────────────────────
 
-// Integer plugin version — bump on every release.
-version = 2
+version = 3
 
 cloudstream {
     language = "bn"
@@ -31,4 +41,8 @@ cloudstream {
     )
 
     iconUrl = "https://www.google.com/s2/favicons?domain=cineplexbd.net&sz=%size%"
+}
+
+android {
+    namespace = "com.wizdier.cineplexbd"
 }

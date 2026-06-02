@@ -4,49 +4,73 @@ on:
   push:
     branches:
       - main
+      - master
   workflow_dispatch:
+
+# Cancel any superseded in-flight build so we never publish stale .cs3s.
+concurrency:
+  group: "build"
+  cancel-in-progress: true
 
 jobs:
   build:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+
     steps:
-      - name: Checkout
+      - name: Checkout source
         uses: actions/checkout@v4
         with:
+          fetch-depth: 0
           path: "src"
 
       - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
-          java-version: '17'
-          distribution: 'adopt'
+          java-version: "17"
+          distribution: "temurin"
 
-      - name: Setup Android SDK
+      - name: Set up Android SDK
         uses: android-actions/setup-android@v3
 
-      - name: Build with Gradle
-        env:
-          TMDB_API: ${{ secrets.TMDB_API }}
-        run: |
-          cd src
-          chmod +x gradlew
-          ./gradlew make makePluginsJson
-          mkdir -p ../dist
-          cp **/build/*.cs3 ../dist/ || true
-          cp build/plugins.json ../dist/ || true
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
+          restore-keys: |
+            ${{ runner.os }}-gradle-
 
-      - name: Push to builds branch
+      - name: Build plugins
+        working-directory: src
         run: |
-          mkdir -p final_builds
-          cp -r dist/* final_builds/
-          cd final_builds
-          git init
-          git config user.name "GitHub Actions"
-          git config user.email "actions@github.com"
-          git checkout -b builds
-          git add .
-          git commit -m "Build $GITHUB_SHA"
-          git remote add origin https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}
-          git push -f origin builds
+          chmod +x ./gradlew
+          ./gradlew --no-daemon --stacktrace make makePluginsJson
+
+      # `find` instead of bash globstar (which is off by default and silently
+      # produced empty output in the previous workflow).
+      - name: Collect build artefacts
+        run: |
+          set -euo pipefail
+          mkdir -p builds
+          find src -type f -name '*.cs3' -exec cp -v {} builds/ \;
+          if [ -f src/build/plugins.json ]; then
+            cp -v src/build/plugins.json builds/plugins.json
+          else
+            echo "::error::plugins.json was not produced by makePluginsJson"
+            exit 1
+          fi
+          echo "--- Final artefacts ---"
+          ls -la builds/
+
+      - name: Deploy to 'builds' branch
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./builds
+          publish_branch: builds
+          force_orphan: true
+          commit_message: "Build ${{ github.sha }}"
