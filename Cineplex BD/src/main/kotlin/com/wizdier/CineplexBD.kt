@@ -101,9 +101,14 @@ class CineplexBD : MainAPI() {
         var description = doc.selectFirst("p.leading-relaxed, #synopsis, .description")
             ?.text().orEmpty()
 
-        val genres = doc.select("span.chip:contains(,)").text().takeIf { it.isNotBlank() }
-            ?.split(",")?.map { it.trim() }
-            ?: doc.select("div.ganre-wrapper a, .meta-cat, .genre a").map { it.text() }
+        val genres = doc.select("span.chip:contains(,)").text()
+            .takeIf { it.isNotBlank() }
+            ?.split(",")
+            ?.map { it.trim() }
+            ?.filter { it.isNotBlank() }
+            ?: doc.select("div.ganre-wrapper a, .meta-cat, .genre a")
+                .map { it.text().trim() }
+                .filter { it.isNotBlank() }
 
         val director = doc.select("div.mt-4.text-sm:contains(Director:) span").text()
             .ifBlank { doc.select("a[href*='cast.php'][href*='Director']").text() }
@@ -120,8 +125,8 @@ class CineplexBD : MainAPI() {
         val score = doc.select("span.pill:contains(User Score:)").text()
 
         val extra = buildString {
-            if (!langChip.isNullOrBlank()) append("\n").append(langChip)
-            if (!score.isNullOrBlank()) append("\n").append(score)
+            if (langChip.isNotBlank()) append("\n").append(langChip)
+            if (score.isNotBlank()) append("\n").append(score)
         }
         if (extra.isNotBlank()) description = (description + extra).trim()
 
@@ -138,7 +143,6 @@ class CineplexBD : MainAPI() {
                 this.year = year
                 this.duration = duration
                 this.tags = genres
-                addActors(listOf())
                 if (director.isNotBlank()) {
                     this.actors = listOf(
                         ActorData(Actor(director, null), roleString = "Director")

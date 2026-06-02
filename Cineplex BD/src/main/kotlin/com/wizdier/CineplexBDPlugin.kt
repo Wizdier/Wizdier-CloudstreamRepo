@@ -1,12 +1,11 @@
 package com.wizdier
 
+import com.lagradost.cloudstream3.plugins.BasePlugin
 import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
-import com.lagradost.cloudstream3.plugins.Plugin
-import android.content.Context
 
 @CloudstreamPlugin
-class CineplexBDPlugin : Plugin() {
-    override fun load(context: Context) {
+class CineplexBDPlugin : BasePlugin() {
+    override fun load() {
         registerMainAPI(CineplexBD())
     }
 }
