@@ -13,6 +13,8 @@ import com.lagradost.cloudstream3.DubStatus
 import com.lagradost.cloudstream3.addDubStatus
 import com.lagradost.cloudstream3.addEpisodes
 import com.lagradost.cloudstream3.Score
+import com.lagradost.cloudstream3.Actor
+import com.lagradost.cloudstream3.ActorData
 import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.getDurationFromString
 import com.lagradost.cloudstream3.mainPageOf
@@ -151,6 +153,12 @@ class CircleFtpProvider : MainAPI() {
             val rating: Double?
         )
 
+        data class ActorMetadata(
+            val name: String,
+            val role: String?,
+            val image: String?
+        )
+
         data class MetadataInfo(
             val title: String,
             val origTitle: String?,
@@ -168,7 +176,8 @@ class CircleFtpProvider : MainAPI() {
             val imdbId: String? = null,
             val originalLanguage: String? = null,
             val genres: List<String>? = null,
-            val episodes: List<EpisodeMetadata>? = null
+            val episodes: List<EpisodeMetadata>? = null,
+            val actors: List<ActorMetadata>? = null
         )
 
         // Utility to encode GroupedUrlData into a relative URL string (prevents absolute schema pre-pending errors in Cloudstream!)
@@ -307,9 +316,9 @@ class CircleFtpProvider : MainAPI() {
                 if (!voted(logo)) continue
 
                 if (isSvg(logo)) {
-                    if (better(bestSvg, logo)) bestSvg = logo
+                    if (bestSvg == null || better(bestSvg, logo)) bestSvg = logo
                 } else {
-                    if (better(best, logo)) best = logo
+                    if (best == null || better(best, logo)) best = logo
                 }
             }
 
@@ -502,6 +511,7 @@ class CircleFtpProvider : MainAPI() {
 
                         var logoUrl: String? = null
                         val epList = mutableListOf<EpisodeMetadata>()
+                        val castList = mutableListOf<ActorMetadata>()
                         var trailerUrl: String? = null
                         if (tmdbId != null) {
                             try {
@@ -530,7 +540,7 @@ class CircleFtpProvider : MainAPI() {
                             } catch (_: Exception) {}
                             
                             try {
-                                val tvDetailsUrl = "https://api.themoviedb.org/3/tv/$tmdbId?api_key=98ae14df2b8d8f8f8136499daf79f0e0&append_to_response=external_ids,videos"
+                                val tvDetailsUrl = "https://api.themoviedb.org/3/tv/$tmdbId?api_key=98ae14df2b8d8f8f8136499daf79f0e0&append_to_response=external_ids,videos,credits"
                                 val tvDetails = JSONObject(app.get(tvDetailsUrl).text)
                                 val extIds = tvDetails.optJSONObject("external_ids")
                                 imdbId = extIds?.optStringSafe("imdb_id") ?: tvDetails.optStringSafe("imdb_id")
@@ -542,6 +552,21 @@ class CircleFtpProvider : MainAPI() {
                                         if (video.optString("type") == "Trailer" && video.optString("site") == "YouTube") {
                                             trailerUrl = "https://www.youtube.com/watch?v=${video.getString("key")}"
                                             break
+                                        }
+                                    }
+                                }
+
+                                // Parse actors for anime
+                                val castArr = tvDetails.optJSONObject("credits")?.optJSONArray("cast")
+                                if (castArr != null) {
+                                    for (i in 0 until castArr.length()) {
+                                        val castObj = castArr.getJSONObject(i)
+                                        val name = castObj.optString("name", "")
+                                        val role = castObj.optString("character", null)
+                                        val profilePath = castObj.optString("profile_path", "")
+                                        val imageUrl = if (profilePath.isNotEmpty() && profilePath != "null") "https://image.tmdb.org/t/p/original$profilePath" else null
+                                        if (name.isNotEmpty()) {
+                                            castList.add(ActorMetadata(name, role, imageUrl))
                                         }
                                     }
                                 }
@@ -583,7 +608,8 @@ class CircleFtpProvider : MainAPI() {
                             simklId = simklId,
                             imdbId = imdbId,
                             genres = genres,
-                            episodes = epList
+                            episodes = epList,
+                            actors = castList
                         )
                         metadataCache[cacheKey] = metadata
                         return metadata
@@ -692,6 +718,22 @@ class CircleFtpProvider : MainAPI() {
                             }
                         }
 
+                        // Parse actors for TV Shows and Movies
+                        val castList = mutableListOf<ActorMetadata>()
+                        val castArr = details.optJSONObject("credits")?.optJSONArray("cast")
+                        if (castArr != null) {
+                            for (i in 0 until castArr.length()) {
+                                val castObj = castArr.getJSONObject(i)
+                                val name = castObj.optString("name", "")
+                                val role = castObj.optString("character", null)
+                                val profilePath = castObj.optString("profile_path", "")
+                                val imageUrl = if (profilePath.isNotEmpty() && profilePath != "null") "https://image.tmdb.org/t/p/original$profilePath" else null
+                                if (name.isNotEmpty()) {
+                                    castList.add(ActorMetadata(name, role, imageUrl))
+                                }
+                            }
+                        }
+
                         val metadata = MetadataInfo(
                             title = displayTitle,
                             origTitle = details.optString("original_title", details.optString("original_name", null)),
@@ -709,7 +751,8 @@ class CircleFtpProvider : MainAPI() {
                             anilistId = null,
                             malId = null,
                             genres = genres,
-                            episodes = epList
+                            episodes = epList,
+                            actors = castList
                         )
                         metadataCache[cacheKey] = metadata
                         return metadata
@@ -1008,6 +1051,14 @@ class CircleFtpProvider : MainAPI() {
 
         val recommendationsList = mutableListOf<SearchResponse>()
 
+        // Map ActorMetadata to Cloudstream's ActorData (Actors Metadata!)
+        val actorsList = metadata.actors?.map { actor ->
+            ActorData(
+                Actor(actor.name, actor.image),
+                roleString = actor.role
+            )
+        } ?: emptyList()
+
         if (mainPostType == "singleVideo") {
             val movieLinks = mutableListOf<JSONObject>()
             for ((postObj, audio) in postsDetails) {
@@ -1031,6 +1082,7 @@ class CircleFtpProvider : MainAPI() {
                 this.plot = plot
                 this.duration = duration
                 this.score = rating?.let { Score.from10(it) }
+                this.actors = actorsList
                 
                 // Trackers mapping (Problem 2: Non-anime must NOT have MAL, Alist, Kitsu. Simkl is on for all via IMDb!)
                 try { metadata.imdbId?.let { addImdbId(it) } } catch(_: Throwable){}
@@ -1123,6 +1175,7 @@ class CircleFtpProvider : MainAPI() {
                     this.year = year
                     this.plot = plot
                     this.recommendations = recommendationsList
+                    this.actors = actorsList
                     
                     // Trackers mapping (Problem 2: Anime has all tracking)
                     try { metadata.malId?.let { addMalId(it) } } catch(_: Throwable){}
@@ -1195,6 +1248,7 @@ class CircleFtpProvider : MainAPI() {
                         this.backgroundPosterUrl = backdrop
                         this.year = year
                         this.plot = plot
+                        this.actors = actorsList
                         
                         // Trackers mapping (Problem 2: Anime has all tracking)
                         try { metadata.malId?.let { addMalId(it) } } catch(_: Throwable){}
@@ -1210,6 +1264,7 @@ class CircleFtpProvider : MainAPI() {
                         this.backgroundPosterUrl = backdrop
                         this.year = year
                         this.plot = plot
+                        this.actors = actorsList
                         
                         // Trackers mapping (Problem 2: Non-anime has only Simkl via IMDb ID)
                         try { metadata.imdbId?.let { addImdbId(it) } } catch(_: Throwable){}
