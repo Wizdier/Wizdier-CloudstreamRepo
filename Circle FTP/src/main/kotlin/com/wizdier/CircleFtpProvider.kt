@@ -357,11 +357,11 @@ class CircleFtpProvider : MainAPI() {
             
             if (mClean.contains(sClean)) {
                 val ratio = mClean.length.toDouble() / sClean.length.toDouble()
-                if (ratio <= 2.5) return true
+                if (ratio <= 3.5) return true
             }
             if (sClean.contains(mClean)) {
                 val ratio = sClean.length.toDouble() / mClean.length.toDouble()
-                if (ratio <= 2.5) return true
+                if (ratio <= 3.5) return true
             }
             
             return false
@@ -461,6 +461,30 @@ class CircleFtpProvider : MainAPI() {
                                     break
                                 }
                             }
+                            
+                            // High-Intelligence Season Fallback algorithm (Issue 1: Fallback downwards to highest available season!)
+                            if (bestMedia == null && targetSeason > 1) {
+                                for (s in (targetSeason - 1) downTo 1) {
+                                    val subKeywords = getSeasonKeywords(s)
+                                    for (i in 0 until mediaList.length()) {
+                                        val media = mediaList.getJSONObject(i)
+                                        val eng = media.optJSONObject("title")?.optString("english", "")?.lowercase() ?: ""
+                                        val rom = media.optJSONObject("title")?.optString("romaji", "")?.lowercase() ?: ""
+                                        
+                                        if (!isTitleSimilar(title, eng) && !isTitleSimilar(title, rom)) {
+                                            continue
+                                        }
+
+                                        val matches = subKeywords.any { kw -> eng.contains(kw.lowercase()) || rom.contains(kw.lowercase()) }
+                                        if (matches) {
+                                            bestMedia = media
+                                            break
+                                        }
+                                    }
+                                    if (bestMedia != null) break
+                                }
+                            }
+                            
                             if (bestMedia == null) {
                                 val fallback = mediaList.getJSONObject(0)
                                 val eng = fallback.optJSONObject("title")?.optString("english", "") ?: ""
@@ -863,7 +887,7 @@ class CircleFtpProvider : MainAPI() {
                             type = pObj.getString("type"),
                             imageSm = pObj.getString("imageSm"),
                             title = pObj.getString("title"),
-                            name = pObj.optStringSafe("name"),
+                            name = pObj.optStringSafe("name"), // Fixed the copy-paste bug (jsonObj.optStringSafe -> pObj.optStringSafe!)
                             categories = pObj.optJSONArray("categories")
                         )
                     )
@@ -1268,7 +1292,7 @@ class CircleFtpProvider : MainAPI() {
                         
                         // Trackers mapping (Problem 2: Non-anime has only Simkl via IMDb ID)
                         try { metadata.imdbId?.let { addImdbId(it) } } catch(_: Throwable){}
-                        try { trailer?.let { addTrailer(it) } } catch(_: Throwable){}
+                        try { trailer?.let { addTrailer(it) } catch(_: Throwable){}
                         try { logo?.let { this.logoUrl = it } } catch(_: Throwable){}
                     }
                 }
