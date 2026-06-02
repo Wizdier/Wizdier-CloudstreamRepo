@@ -140,7 +140,7 @@ class CircleFtpProvider : MainAPI() {
         )
 
         data class GroupedUrlData(
-            val posts: List<GroupedPostInfo>,
+            val posts = List<GroupedPostInfo>,
             val cleanedTitle: String,
             val isAnime: Boolean,
             val selectedSeason: Int? = null
@@ -1302,7 +1302,7 @@ class CircleFtpProvider : MainAPI() {
                             newEpisode(epDataString) {
                                 this.episode = epNum
                                 this.season = sNum
-                                this.name = epName
+                               .this.name = epName
                                 this.description = epOverview
                                 this.posterUrl = epStill
                             }
