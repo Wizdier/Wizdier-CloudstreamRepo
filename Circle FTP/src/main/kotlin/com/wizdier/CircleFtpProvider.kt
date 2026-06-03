@@ -545,7 +545,8 @@ class CircleFtpProvider : MainAPI() {
 
                         if (tmdbId == null) {
                             try {
-                                val searchUrl = "https://api.themoviedb.org/3/search/tv?api_key=98ae14df2b8d8f8f8136499daf79f0e0&query=${URLEncoder.encode(title, "UTF-8")}"
+                                val encodedTmdbQuery = URLEncoder.encode(title, "UTF-8")
+                                val searchUrl = "https://api.themoviedb.org/3/search/tv?api_key=98ae14df2b8d8f8f8136499daf79f0e0&query=$encodedTmdbQuery"
                                 val searchJson = JSONObject(app.get(searchUrl).text)
                                 val results = searchJson.optJSONArray("results")
                                 if (results != null && results.length() > 0) {
@@ -886,6 +887,7 @@ class CircleFtpProvider : MainAPI() {
         }
         
         val postsList = mutableListOf<Post>()
+        var totalCount = -1
         try {
             val jsonObj = JSONObject(json.text)
             val postsArr = jsonObj.optJSONArray("posts")
@@ -898,30 +900,41 @@ class CircleFtpProvider : MainAPI() {
                             type = pObj.getString("type"),
                             imageSm = pObj.getString("imageSm"),
                             title = pObj.getString("title"),
-                            name = pObj.optStringSafe("name"), // Fixed the copy-paste bug (jsonObj.optStringSafe -> pObj.optStringSafe!)
+                            name = pObj.optStringSafe("name"),
                             categories = pObj.optJSONArray("categories")
                         )
                     )
                 }
             }
+            // Check API metadata for total count / next page
+            totalCount = jsonObj.optInt("total", -1)
+            if (totalCount < 0) totalCount = jsonObj.optInt("count", -1)
         } catch (e: Exception) {
             Log.e("CircleFtp", "Failed to parse page posts JSON: ${e.message}")
         }
 
         val home = groupAndMapPosts(postsList)
-        return newHomePageResponse(request.name, home, true)
+        val hasNext = if (totalCount > 0) {
+            // If API reports total, we can accurately determine pagination
+            (page * 10) < totalCount
+        } else {
+            // Fallback: assume more pages if we got a full page
+            postsList.size >= 10
+        }
+        return newHomePageResponse(request.name, home, hasNext)
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
+        val encodedQuery = URLEncoder.encode(query, "UTF-8")
         val json = try {
             app.get(
-                "$mainApiUrl/api/posts?searchTerm=$query&order=desc",
+                "$mainApiUrl/api/posts?searchTerm=$encodedQuery&order=desc",
                 verify = false,
                 cacheTime = 60
             )
         } catch (_: Exception) {
             app.get(
-                "$apiUrl/api/posts?searchTerm=$query&order=desc",
+                "$apiUrl/api/posts?searchTerm=$encodedQuery&order=desc",
                 verify = false,
                 cacheTime = 60
             )
@@ -1063,11 +1076,13 @@ class CircleFtpProvider : MainAPI() {
             throw ErrorLoadingException("Failed loading details for $cleanedTitle")
         }
 
-        // Fetch high-intelligence metadata and auto-detect isAnime! (Problem 2 & 5)
+        // Fetch high-intelligence metadata and auto-detect isAnime!
         val (metadata, isAnime) = fetchUnifiedMetadata(cleanedTitle, selectedSeason, group.isAnime)
 
+        val recommendationsList = mutableListOf<SearchResponse>()
+
         val finalTitle = metadata.title
-        val poster = metadata.posterUrl ?: postsDetails.first().first.let { "$apiUrl/uploads/${it.optString("image")}" }
+        val poster = metadata.posterUrl ?: postsDetails.first().first.let { "$mainApiUrl/uploads/${it.optString("image")}" }
         val backdrop = metadata.backdropUrl
         val plot = metadata.plot ?: postsDetails.first().first.optString("metaData", "")
         val year = metadata.year ?: selectUntilNonInt(postsDetails.first().first.optString("year"))

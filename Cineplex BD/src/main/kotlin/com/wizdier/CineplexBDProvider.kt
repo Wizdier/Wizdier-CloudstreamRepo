@@ -135,10 +135,10 @@ class CineplexBD : MainAPI() {
             if (it.startsWith("http")) it else "$mainUrl/${it.trimStart('/')}"
         }
 
-        val scrapedYear = doc.select("span.chip:matches(\\d{4})").text()
-            .let { Regex("\\d{4}").find(it)?.value?.toIntOrNull() }
-        val scrapedDuration = doc.select("span.chip:matches(\\d+h \\d+m)").text()
-            .let { parseDuration(it) }
+        val scrapedYear = doc.select("span.chip").map { it.text() }
+            .firstNotNullOfOrNull { txt -> Regex("\\d{4}").find(txt)?.value?.toIntOrNull() }
+        val scrapedDuration = doc.select("span.chip").map { it.text() }
+            .firstNotNullOfOrNull { txt -> parseDuration(txt) }
 
         val isSeries = absUrl.contains("watch.php")
         val looksLikeAnime = isAnimeContent(absUrl, scrapedGenres, rawTitle)
@@ -424,18 +424,38 @@ class CineplexBD : MainAPI() {
             else -> "$mainUrl/$data"
         }
 
-        if (url.endsWith(".mp4") || url.endsWith(".mkv") || url.contains("/Data/")) {
-            callback.invoke(
-                newExtractorLink(
+        // Direct media URLs or player page paths: fetch the actual video
+        if (url.endsWith(".mp4") || url.endsWith(".mkv") || url.endsWith(".m3u8")
+            || url.contains("/Data/") || url.contains("/player.php")) {
+            // For player.php, we need to fetch it to extract the video source
+            val resolvedUrl = if (url.contains("/player.php")) {
+                val playerHtml = app.get(url, headers = cfHeaders).text
+                Regex("""const\s+videoSrc\s*=\s*["'](.*?)["']""")
+                    .find(playerHtml)?.groupValues?.get(1)
+                    ?.let { if (it.startsWith("http")) it else "$mainUrl/${it.trimStart('/')}" }
+                    ?: url
+            } else url
+
+            val linkType = if (resolvedUrl.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+            if (linkType == ExtractorLinkType.M3U8) {
+                M3u8Helper.generateM3u8(
                     source = name,
-                    name = "Direct",
-                    url = url,
-                    type = if (url.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO,
-                ) {
-                    this.referer = "$mainUrl/"
-                    this.quality = Qualities.Unknown.value
-                }
-            )
+                    streamUrl = resolvedUrl,
+                    referer = "$mainUrl/",
+                ).forEach(callback)
+            } else {
+                callback.invoke(
+                    newExtractorLink(
+                        source = name,
+                        name = "Direct",
+                        url = resolvedUrl,
+                        type = ExtractorLinkType.VIDEO,
+                    ) {
+                        this.referer = "$mainUrl/"
+                        this.quality = Qualities.Unknown.value
+                    }
+                )
+            }
             return true
         }
 
@@ -568,17 +588,27 @@ class CineplexBD : MainAPI() {
             if (it.startsWith("http")) it else "$mainUrl/${it.trimStart('/')}"
         }
 
+        // Detect content type based on URL path and category hints
+        val lcHref = href.lowercase()
+        val lcTitle = title.lowercase()
+        val isAnim = lcHref.contains("category=anime") || lcHref.contains("category=animation")
+                || lcTitle.contains("anime") || lcTitle.contains("animation") || lcTitle.contains("cartoon")
+        val isSeries = href.contains("watch.php") || href.contains("tview.php")
         val type = when {
-            href.contains("watch.php") -> TvType.TvSeries
+            isAnim && isSeries -> TvType.Anime
+            isAnim -> TvType.AnimeMovie
+            isSeries -> TvType.TvSeries
             else -> TvType.Movie
         }
 
-        return if (type == TvType.TvSeries) {
-            newTvSeriesSearchResponse(title, href, TvType.TvSeries) {
+        return when (type) {
+            TvType.Anime, TvType.AnimeMovie -> newAnimeSearchResponse(title, href, type) {
                 this.posterUrl = poster
             }
-        } else {
-            newMovieSearchResponse(title, href, TvType.Movie) {
+            TvType.TvSeries -> newTvSeriesSearchResponse(title, href, TvType.TvSeries) {
+                this.posterUrl = poster
+            }
+            else -> newMovieSearchResponse(title, href, TvType.Movie) {
                 this.posterUrl = poster
             }
         }
