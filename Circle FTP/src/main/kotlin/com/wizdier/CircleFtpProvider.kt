@@ -70,13 +70,12 @@ class CircleFtpProvider : MainAPI() {
         TvType.Others
     )
 
-    // Simkl syncs via IMDB mapping — Cloudstream handles the API with the
-    // user's logged-in Simkl account. No plugin-level API key needed.
+    // Supported Sync Trackers: MAL, AniList, Kitsu, and Simkl (Issue 2)
     override val supportedSyncNames = setOfNotNull(
         SyncIdName.Anilist,
         SyncIdName.MyAnimeList,
         runCatching { SyncIdName.valueOf("Kitsu") }.getOrNull(),
-        runCatching { SyncIdName.valueOf("Simkl") }.getOrNull(),
+        runCatching { SyncIdName.valueOf("Simkl") }.getOrNull()
     )
 
     override val mainPage = mainPageOf(
@@ -545,8 +544,7 @@ class CircleFtpProvider : MainAPI() {
 
                         if (tmdbId == null) {
                             try {
-                                val encodedTmdbQuery = URLEncoder.encode(title, "UTF-8")
-                                val searchUrl = "https://api.themoviedb.org/3/search/tv?api_key=98ae14df2b8d8f8f8136499daf79f0e0&query=$encodedTmdbQuery"
+                                val searchUrl = "https://api.themoviedb.org/3/search/tv?api_key=98ae14df2b8d8f8f8136499daf79f0e0&query=${URLEncoder.encode(title, "UTF-8")}"
                                 val searchJson = JSONObject(app.get(searchUrl).text)
                                 val results = searchJson.optJSONArray("results")
                                 if (results != null && results.length() > 0) {
@@ -887,7 +885,6 @@ class CircleFtpProvider : MainAPI() {
         }
         
         val postsList = mutableListOf<Post>()
-        var totalCount = -1
         try {
             val jsonObj = JSONObject(json.text)
             val postsArr = jsonObj.optJSONArray("posts")
@@ -900,41 +897,30 @@ class CircleFtpProvider : MainAPI() {
                             type = pObj.getString("type"),
                             imageSm = pObj.getString("imageSm"),
                             title = pObj.getString("title"),
-                            name = pObj.optStringSafe("name"),
+                            name = pObj.optStringSafe("name"), // Fixed the copy-paste bug (jsonObj.optStringSafe -> pObj.optStringSafe!)
                             categories = pObj.optJSONArray("categories")
                         )
                     )
                 }
             }
-            // Check API metadata for total count / next page
-            totalCount = jsonObj.optInt("total", -1)
-            if (totalCount < 0) totalCount = jsonObj.optInt("count", -1)
         } catch (e: Exception) {
             Log.e("CircleFtp", "Failed to parse page posts JSON: ${e.message}")
         }
 
         val home = groupAndMapPosts(postsList)
-        val hasNext = if (totalCount > 0) {
-            // If API reports total, we can accurately determine pagination
-            (page * 10) < totalCount
-        } else {
-            // Fallback: assume more pages if we got a full page
-            postsList.size >= 10
-        }
-        return newHomePageResponse(request.name, home, hasNext)
+        return newHomePageResponse(request.name, home, true)
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
-        val encodedQuery = URLEncoder.encode(query, "UTF-8")
         val json = try {
             app.get(
-                "$mainApiUrl/api/posts?searchTerm=$encodedQuery&order=desc",
+                "$mainApiUrl/api/posts?searchTerm=$query&order=desc",
                 verify = false,
                 cacheTime = 60
             )
         } catch (_: Exception) {
             app.get(
-                "$apiUrl/api/posts?searchTerm=$encodedQuery&order=desc",
+                "$apiUrl/api/posts?searchTerm=$query&order=desc",
                 verify = false,
                 cacheTime = 60
             )
@@ -1076,13 +1062,11 @@ class CircleFtpProvider : MainAPI() {
             throw ErrorLoadingException("Failed loading details for $cleanedTitle")
         }
 
-        // Fetch high-intelligence metadata and auto-detect isAnime!
+        // Fetch high-intelligence metadata and auto-detect isAnime! (Problem 2 & 5)
         val (metadata, isAnime) = fetchUnifiedMetadata(cleanedTitle, selectedSeason, group.isAnime)
 
-        val recommendationsList = mutableListOf<SearchResponse>()
-
         val finalTitle = metadata.title
-        val poster = metadata.posterUrl ?: postsDetails.first().first.let { "$mainApiUrl/uploads/${it.optString("image")}" }
+        val poster = metadata.posterUrl ?: postsDetails.first().first.let { "$apiUrl/uploads/${it.optString("image")}" }
         val backdrop = metadata.backdropUrl
         val plot = metadata.plot ?: postsDetails.first().first.optString("metaData", "")
         val year = metadata.year ?: selectUntilNonInt(postsDetails.first().first.optString("year"))
@@ -1145,7 +1129,7 @@ class CircleFtpProvider : MainAPI() {
                 this.actors = actorsList
                 this.tags = metadata.genres
                 
-                // IMDb enables Simkl sync via Cloudstream's internal mapping
+                // Trackers mapping (Problem 2: Non-anime must NOT have MAL, Alist, Kitsu. Simkl is on for all via IMDb!)
                 try { metadata.imdbId?.let { addImdbId(it) } } catch(_: Throwable){}
                 if (isAnime) {
                     try { metadata.malId?.let { addMalId(it) } } catch(_: Throwable){}
@@ -1154,7 +1138,6 @@ class CircleFtpProvider : MainAPI() {
                 }
                 try { trailer?.let { addTrailer(it) } } catch(_: Throwable){}
                 try { logo?.let { this.logoUrl = it } } catch(_: Throwable){}
-                try { if (recommendationsList.isNotEmpty()) this.recommendations = recommendationsList } catch(_: Throwable){}
             }
         } else {
             var maxSeasons = 0
@@ -1240,7 +1223,7 @@ class CircleFtpProvider : MainAPI() {
                     this.actors = actorsList
                     this.tags = metadata.genres
                     
-                    // Trackers mapping: Anime — all IDs including MAL, AniList, Kitsu; IMDb for Simkl
+                    // Trackers mapping (Problem 2: Anime has all tracking)
                     try { metadata.malId?.let { addMalId(it) } } catch(_: Throwable){}
                     try { metadata.anilistId?.let { addAniListId(it) } } catch(_: Throwable){}
                     try { metadata.kitsuId?.let { addKitsuId(it) } } catch(_: Throwable){}
@@ -1314,7 +1297,7 @@ class CircleFtpProvider : MainAPI() {
                         this.actors = actorsList
                         this.tags = metadata.genres
                         
-                        // Trackers mapping: Anime — all IDs including MAL, AniList, Kitsu; IMDb for Simkl
+                        // Trackers mapping (Problem 2: Anime has all tracking)
                         try { metadata.malId?.let { addMalId(it) } } catch(_: Throwable){}
                         try { metadata.anilistId?.let { addAniListId(it) } } catch(_: Throwable){}
                         try { metadata.kitsuId?.let { addKitsuId(it) } } catch(_: Throwable){}
@@ -1331,7 +1314,7 @@ class CircleFtpProvider : MainAPI() {
                         this.actors = actorsList
                         this.tags = metadata.genres
                         
-                        // IMDb provides Simkl sync via Cloudstream mapping
+                        // Trackers mapping (Problem 2: Non-anime has only Simkl via IMDb ID)
                         try { metadata.imdbId?.let { addImdbId(it) } } catch(_: Throwable){}
                         try { trailer?.let { addTrailer(it) } } catch(_: Throwable){}
                         try { logo?.let { this.logoUrl = it } } catch(_: Throwable){}
