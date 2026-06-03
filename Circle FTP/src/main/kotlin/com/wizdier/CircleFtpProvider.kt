@@ -70,12 +70,13 @@ class CircleFtpProvider : MainAPI() {
         TvType.Others
     )
 
-    // Supported Sync Trackers: MAL, AniList, Kitsu, and Simkl (Issue 2)
+    // Simkl syncs via IMDB mapping — Cloudstream handles the API with the
+    // user's logged-in Simkl account. No plugin-level API key needed.
     override val supportedSyncNames = setOfNotNull(
         SyncIdName.Anilist,
         SyncIdName.MyAnimeList,
         runCatching { SyncIdName.valueOf("Kitsu") }.getOrNull(),
-        runCatching { SyncIdName.valueOf("Simkl") }.getOrNull()
+        runCatching { SyncIdName.valueOf("Simkl") }.getOrNull(),
     )
 
     override val mainPage = mainPageOf(
@@ -173,7 +174,6 @@ class CircleFtpProvider : MainAPI() {
             val malId: Int? = null,
             val anilistId: Int? = null,
             val kitsuId: String? = null,
-            val simklId: Int? = null,
             val imdbId: String? = null,
             val originalLanguage: String? = null,
             val genres: List<String>? = null,
@@ -531,7 +531,6 @@ class CircleFtpProvider : MainAPI() {
                         val score = bestMedia.optDouble("averageScore", 0.0).takeIf { it > 0.0 }
                         
                         var kitsuId: String? = null
-                        var simklId: Int? = null
                         var tmdbId: Int? = null
                         var imdbId: String? = null
                         
@@ -626,16 +625,7 @@ class CircleFtpProvider : MainAPI() {
                             }
                         }
 
-                        if (malId != null && simklId == null) {
-                            try {
-                                val simklRes = app.get("https://api.simkl.com/search/id?mal=$malId&client_id=1285090f70f69a53235b91b984d7a8e7e10b106093849ea267e1a681c62fbc04").text
-                                val simklArr = JSONArray(simklRes)
-                                if (simklArr.length() > 0) {
-                                    val ids = simklArr.getJSONObject(0).optJSONObject("ids")
-                                    simklId = ids?.optInt("simkl_id") ?: ids?.optInt("simkl")
-                                }
-                            } catch (_: Exception) {}
-                        }
+
 
                         val genres = mutableListOf<String>()
                         val genresArr = bestMedia.optJSONArray("genres")
@@ -658,7 +648,6 @@ class CircleFtpProvider : MainAPI() {
                             malId = malId,
                             anilistId = aniId,
                             kitsuId = kitsuId,
-                            simklId = simklId,
                             imdbId = imdbId,
                             genres = genres,
                             episodes = epList,
@@ -719,17 +708,7 @@ class CircleFtpProvider : MainAPI() {
 
                         val extIds = details.optJSONObject("external_ids")
                         val imdbId = extIds?.optStringSafe("imdb_id") ?: details.optStringSafe("imdb_id")
-                        var simklId: Int? = null
-                        if (imdbId != null) {
-                            try {
-                                val simklRes = app.get("https://api.simkl.com/search/id?imdb=$imdbId&client_id=1285090f70f69a53235b91b984d7a8e7e10b106093849ea267e1a681c62fbc04").text
-                                val simklArr = JSONArray(simklRes)
-                                if (simklArr.length() > 0) {
-                                    val ids = simklArr.getJSONObject(0).optJSONObject("ids")
-                                    simklId = ids?.optInt("simkl_id") ?: ids?.optInt("simkl")
-                                }
-                            } catch (_: Exception) {}
-                        }
+
 
                         val epList = mutableListOf<EpisodeMetadata>()
                         var seasonPoster: String? = null
@@ -800,7 +779,6 @@ class CircleFtpProvider : MainAPI() {
                             year = year,
                             trailerUrl = trailerUrl,
                             logoUrl = logoUrl,
-                            simklId = simklId,
                             imdbId = imdbId,
                             originalLanguage = details.optString("original_language", null),
                             kitsuId = null,
@@ -1152,7 +1130,7 @@ class CircleFtpProvider : MainAPI() {
                 this.actors = actorsList
                 this.tags = metadata.genres
                 
-                // Trackers mapping (Problem 2: Non-anime must NOT have MAL, Alist, Kitsu. Simkl is on for all via IMDb!)
+                // IMDb enables Simkl sync via Cloudstream's internal mapping
                 try { metadata.imdbId?.let { addImdbId(it) } } catch(_: Throwable){}
                 if (isAnime) {
                     try { metadata.malId?.let { addMalId(it) } } catch(_: Throwable){}
@@ -1161,6 +1139,7 @@ class CircleFtpProvider : MainAPI() {
                 }
                 try { trailer?.let { addTrailer(it) } } catch(_: Throwable){}
                 try { logo?.let { this.logoUrl = it } } catch(_: Throwable){}
+                try { if (recommendationsList.isNotEmpty()) this.recommendations = recommendationsList } catch(_: Throwable){}
             }
         } else {
             var maxSeasons = 0
@@ -1246,7 +1225,7 @@ class CircleFtpProvider : MainAPI() {
                     this.actors = actorsList
                     this.tags = metadata.genres
                     
-                    // Trackers mapping (Problem 2: Anime has all tracking)
+                    // Trackers mapping: Anime — all IDs including MAL, AniList, Kitsu; IMDb for Simkl
                     try { metadata.malId?.let { addMalId(it) } } catch(_: Throwable){}
                     try { metadata.anilistId?.let { addAniListId(it) } } catch(_: Throwable){}
                     try { metadata.kitsuId?.let { addKitsuId(it) } } catch(_: Throwable){}
@@ -1320,7 +1299,7 @@ class CircleFtpProvider : MainAPI() {
                         this.actors = actorsList
                         this.tags = metadata.genres
                         
-                        // Trackers mapping (Problem 2: Anime has all tracking)
+                        // Trackers mapping: Anime — all IDs including MAL, AniList, Kitsu; IMDb for Simkl
                         try { metadata.malId?.let { addMalId(it) } } catch(_: Throwable){}
                         try { metadata.anilistId?.let { addAniListId(it) } } catch(_: Throwable){}
                         try { metadata.kitsuId?.let { addKitsuId(it) } } catch(_: Throwable){}
@@ -1337,7 +1316,7 @@ class CircleFtpProvider : MainAPI() {
                         this.actors = actorsList
                         this.tags = metadata.genres
                         
-                        // Trackers mapping (Problem 2: Non-anime has only Simkl via IMDb ID)
+                        // IMDb provides Simkl sync via Cloudstream mapping
                         try { metadata.imdbId?.let { addImdbId(it) } } catch(_: Throwable){}
                         try { trailer?.let { addTrailer(it) } } catch(_: Throwable){}
                         try { logo?.let { this.logoUrl = it } } catch(_: Throwable){}

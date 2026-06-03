@@ -6,6 +6,6 @@ import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
 @CloudstreamPlugin
 class CineplexBDPlugin : BasePlugin() {
     override fun load() {
-        registerMainAPI(CineplexBD())
+        registerMainAPI(CineplexBDProvider())
     }
 }

@@ -10,7 +10,7 @@ import java.net.URLEncoder
 // ─────────────────────────────────────────────────────────────────────────────
 // MetadataEnricher
 //
-// Pulls rich metadata from TMDB / AniList / ani.zip / Simkl and packs it into
+// Pulls rich metadata from TMDB / AniList / ani.zip and packs it into
 // one MetaInfo blob that the plugin's load() can splat onto a LoadResponse.
 //
 // Public surface (all suspend, all best-effort — never throws):
@@ -18,7 +18,7 @@ import java.net.URLEncoder
 //   • enrichAnime(rawTitle, seasonHint?)
 //   • Returned MetaInfo includes:
 //       - landscape backdrop, title logo PNG, YouTube trailer
-//       - IMDB / MAL / AniList / Kitsu / Simkl IDs
+//       - IMDB / MAL / AniList / Kitsu IDs
 //       - per-episode stills + overviews + ratings (for the target season)
 //       - "recommendations" list — title, poster, year — for the More-like-this
 //         carousel CloudStream renders below the synopsis
@@ -35,8 +35,6 @@ internal object MetadataEnricher {
     private const val TMDB_API = "https://api.themoviedb.org/3"
     private const val TMDB_KEY = "98ae14df2b8d8f8f8136499daf79f0e0"
     private const val IMG_BASE = "https://image.tmdb.org/t/p"
-    private const val SIMKL_CLIENT_ID =
-        "1285090f70f69a53235b91b984d7a8e7e10b106093849ea267e1a681c62fbc04"
 
     data class EpisodeMeta(
         val name: String? = null,
@@ -70,7 +68,6 @@ internal object MetadataEnricher {
         val malId: Int? = null,
         val anilistId: Int? = null,
         val kitsuId: String? = null,
-        val simklId: Int? = null,
         val tags: List<String>? = null,
         val isAnimeHint: Boolean = false,
         // Per-target-season episode metadata (parallel-indexed when possible).
@@ -267,20 +264,6 @@ internal object MetadataEnricher {
             }
         }
 
-        var simklId: Int? = null
-        if (malId != null) {
-            runCatching {
-                val arr = JSONArray(
-                    app.get("https://api.simkl.com/search/id?mal=$malId&client_id=$SIMKL_CLIENT_ID").text
-                )
-                if (arr.length() > 0) {
-                    val ids = arr.getJSONObject(0).optJSONObject("ids")
-                    simklId = ids?.optInt("simkl_id")?.takeIf { it != 0 }
-                        ?: ids?.optInt("simkl")?.takeIf { it != 0 }
-                }
-            }
-        }
-
         var logo: String? = null
         var betterBackdrop: String? = null
         var trailer: String? = null
@@ -324,7 +307,6 @@ internal object MetadataEnricher {
             malId = malId,
             anilistId = aniId,
             kitsuId = kitsuId,
-            simklId = simklId,
             tags = genres.takeIf { it.isNotEmpty() },
             isAnimeHint = true,
             episodes = episodes,

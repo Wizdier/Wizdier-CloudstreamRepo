@@ -31,6 +31,8 @@ class CineplexBD : MainAPI() {
         TvType.Cartoon,
     )
 
+    // Simkl sync works via IMDB mapping — Cloudstream handles it with the
+    // user's logged-in account. No API keys needed at the plugin level.
     override val supportedSyncNames = setOfNotNull(
         SyncIdName.Anilist,
         SyncIdName.MyAnimeList,
