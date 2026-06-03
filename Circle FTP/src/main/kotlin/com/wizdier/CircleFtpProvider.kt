@@ -537,8 +537,8 @@ class CircleFtpProvider : MainAPI() {
                             val aniZipText = app.get("https://api.ani.zip/mappings?anilist_id=$aniId").text
                             val aniZip = JSONObject(aniZipText)
                             val mappings = aniZip.optJSONObject("mappings")
-                            kitsuId = mappings?.optString("kitsu_id", "").takeIf { it.isNotBlank() }
-                            val rawTmdb = mappings?.optString("themoviedb_id", "").takeIf { it.isNotBlank() }
+                            kitsuId = mappings?.optString("kitsu_id", "")?.takeIf { it.isNotBlank() }
+                            val rawTmdb = mappings?.optString("themoviedb_id", "")?.takeIf { it.isNotBlank() }
                             tmdbId = rawTmdb?.toIntOrNull()
                         } catch (_: Exception) {}
 
@@ -610,13 +610,13 @@ class CircleFtpProvider : MainAPI() {
                                 val edge = edgesArr.getJSONObject(i)
                                 val nodeObj = edge.optJSONObject("node")
                                 val charName = nodeObj?.optJSONObject("name")?.optString("full", "") ?: ""
-                                val charImg = nodeObj?.optJSONObject("image")?.optString("large", "").takeIf { it.isNotBlank() }
+                                val charImg = nodeObj?.optJSONObject("image")?.optString("large", "")?.takeIf { it.isNotBlank() }
                                 
                                 val vaArr = edge.optJSONArray("voiceActors")
                                 if (vaArr != null && vaArr.length() > 0) {
                                     val va = vaArr.getJSONObject(0)
                                     val vaName = va.optJSONObject("name")?.optString("full", "") ?: ""
-                                    val vaImage = va.optJSONObject("image")?.optString("large", "").takeIf { it.isNotBlank() }
+                                    val vaImage = va.optJSONObject("image")?.optString("large", "")?.takeIf { it.isNotBlank() }
                                     if (vaName.isNotEmpty()) {
                                         castList.add(ActorMetadata(vaName, charName, vaImage, charImg))
                                     }
