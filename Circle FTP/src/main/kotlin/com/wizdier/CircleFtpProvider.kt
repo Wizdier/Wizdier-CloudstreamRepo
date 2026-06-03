@@ -217,7 +217,7 @@ class CircleFtpProvider : MainAPI() {
                         GroupedPostInfo(
                             id = pObj.getInt("id"),
                             originalTitle = pObj.getString("title"),
-                            audio = pObj.optString("audio", null)
+                            audio = pObj.optString("audio", "").takeIf { it.isNotBlank() }
                         )
                     )
                 }
@@ -525,8 +525,8 @@ class CircleFtpProvider : MainAPI() {
                         val nativeTitle = bestMedia.optJSONObject("title")?.optString("native")
                         val poster = bestMedia.optJSONObject("coverImage")?.optString("extraLarge")
                             ?: bestMedia.optJSONObject("coverImage")?.optString("large")
-                        val banner = bestMedia.optString("bannerImage", null)
-                        val plot = bestMedia.optString("description", null)
+                        val banner = bestMedia.optString("bannerImage", "").takeIf { it.isNotBlank() }
+                        val plot = bestMedia.optString("description", "").takeIf { it.isNotBlank() }
                         val score = bestMedia.optDouble("averageScore", 0.0).takeIf { it > 0.0 }
                         
                         var kitsuId: String? = null
@@ -537,8 +537,8 @@ class CircleFtpProvider : MainAPI() {
                             val aniZipText = app.get("https://api.ani.zip/mappings?anilist_id=$aniId").text
                             val aniZip = JSONObject(aniZipText)
                             val mappings = aniZip.optJSONObject("mappings")
-                            kitsuId = mappings?.optString("kitsu_id", null)
-                            val rawTmdb = mappings?.optString("themoviedb_id", null)
+                            kitsuId = mappings?.optString("kitsu_id", "").takeIf { it.isNotBlank() }
+                            val rawTmdb = mappings?.optString("themoviedb_id", "").takeIf { it.isNotBlank() }
                             tmdbId = rawTmdb?.toIntOrNull()
                         } catch (_: Exception) {}
 
@@ -573,8 +573,8 @@ class CircleFtpProvider : MainAPI() {
                                         val stillUrl = if (stillPath.isNotEmpty() && stillPath != "null") "https://image.tmdb.org/t/p/original$stillPath" else null
                                         epList.add(
                                             EpisodeMetadata(
-                                                name = epObj.optString("name", null),
-                                                overview = epObj.optString("overview", null),
+                                                name = epObj.optString("name", "").takeIf { it.isNotBlank() },
+                                                overview = epObj.optString("overview", "").takeIf { it.isNotBlank() },
                                                 stillPath = stillUrl,
                                                 rating = epObj.optDouble("vote_average", 0.0).takeIf { it > 0.0 }
                                             )
@@ -610,13 +610,13 @@ class CircleFtpProvider : MainAPI() {
                                 val edge = edgesArr.getJSONObject(i)
                                 val nodeObj = edge.optJSONObject("node")
                                 val charName = nodeObj?.optJSONObject("name")?.optString("full", "") ?: ""
-                                val charImg = nodeObj?.optJSONObject("image")?.optString("large", null)
+                                val charImg = nodeObj?.optJSONObject("image")?.optString("large", "").takeIf { it.isNotBlank() }
                                 
                                 val vaArr = edge.optJSONArray("voiceActors")
                                 if (vaArr != null && vaArr.length() > 0) {
                                     val va = vaArr.getJSONObject(0)
                                     val vaName = va.optJSONObject("name")?.optString("full", "") ?: ""
-                                    val vaImage = va.optJSONObject("image")?.optString("large", null)
+                                    val vaImage = va.optJSONObject("image")?.optString("large", "").takeIf { it.isNotBlank() }
                                     if (vaName.isNotEmpty()) {
                                         castList.add(ActorMetadata(vaName, charName, vaImage, charImg))
                                     }
@@ -677,9 +677,9 @@ class CircleFtpProvider : MainAPI() {
                         val details = JSONObject(detailsText)
 
                         val displayTitle = details.optString("title", details.optString("name", title))
-                        val posterPath = details.optString("poster_path", null)
-                        val backdropPath = details.optString("backdrop_path", null)
-                        val overview = details.optString("overview", null)
+                        val posterPath = details.optString("poster_path", "").takeIf { it.isNotBlank() }
+                        val backdropPath = details.optString("backdrop_path", "").takeIf { it.isNotBlank() }
+                        val overview = details.optString("overview", "").takeIf { it.isNotBlank() }
                         val rating = details.optDouble("vote_average", 0.0).takeIf { it > 0.0 }
                         
                         val releaseDate = details.optString("release_date", details.optString("first_air_date", ""))
@@ -716,11 +716,11 @@ class CircleFtpProvider : MainAPI() {
                             try {
                                 val seasonUrl = "https://api.themoviedb.org/3/tv/$tmdbId/season/$targetSeason?api_key=98ae14df2b8d8f8f8136499daf79f0e0"
                                 val seasonRes = JSONObject(app.get(seasonUrl).text)
-                                val sPosterPath = seasonRes.optString("poster_path", null)
+                                val sPosterPath = seasonRes.optString("poster_path", "").takeIf { it.isNotBlank() }
                                 if (sPosterPath != null) {
                                     seasonPoster = "https://image.tmdb.org/t/p/original$sPosterPath"
                                 }
-                                seasonPlot = seasonRes.optString("overview", null)
+                                seasonPlot = seasonRes.optString("overview", "").takeIf { it.isNotBlank() }
 
                                 val epArr = seasonRes.optJSONArray("episodes")
                                 if (epArr != null) {
@@ -730,8 +730,8 @@ class CircleFtpProvider : MainAPI() {
                                         val stillUrl = if (stillPath.isNotEmpty() && stillPath != "null") "https://image.tmdb.org/t/p/original$stillPath" else null
                                         epList.add(
                                             EpisodeMetadata(
-                                                name = epObj.optString("name", null),
-                                                overview = epObj.optString("overview", null),
+                                                name = epObj.optString("name", "").takeIf { it.isNotBlank() },
+                                                overview = epObj.optString("overview", "").takeIf { it.isNotBlank() },
                                                 stillPath = stillUrl,
                                                 rating = epObj.optDouble("vote_average", 0.0).takeIf { it > 0.0 }
                                             )
@@ -759,7 +759,7 @@ class CircleFtpProvider : MainAPI() {
                             for (i in 0 until castArr.length()) {
                                 val castObj = castArr.getJSONObject(i)
                                 val name = castObj.optString("name", "")
-                                val role = castObj.optString("character", null)
+                                val role = castObj.optString("character", "").takeIf { it.isNotBlank() }
                                 val profilePath = castObj.optString("profile_path", "")
                                 val imageUrl = if (profilePath.isNotEmpty() && profilePath != "null") "https://image.tmdb.org/t/p/original$profilePath" else null
                                 if (name.isNotEmpty()) {
@@ -770,7 +770,7 @@ class CircleFtpProvider : MainAPI() {
 
                         val metadata = MetadataInfo(
                             title = displayTitle,
-                            origTitle = details.optString("original_title", details.optString("original_name", null)),
+                            origTitle = details.optString("original_title", details.optString("original_name", "").takeIf { it.isNotBlank() }),
                             posterUrl = seasonPoster ?: poster,
                             backdropUrl = backdrop,
                             plot = seasonPlot ?: overview,
@@ -779,7 +779,7 @@ class CircleFtpProvider : MainAPI() {
                             trailerUrl = trailerUrl,
                             logoUrl = logoUrl,
                             imdbId = imdbId,
-                            originalLanguage = details.optString("original_language", null),
+                            originalLanguage = details.optString("original_language", "").takeIf { it.isNotBlank() },
                             kitsuId = null,
                             anilistId = null,
                             malId = null,
@@ -1042,7 +1042,7 @@ class CircleFtpProvider : MainAPI() {
             }
         }
 
-        val group = groupedData!!
+        val group = groupedData ?: throw ErrorLoadingException("Could not decode URL: $url")
         val cleanedTitle = group.cleanedTitle
         val selectedSeason = group.selectedSeason ?: 1
 
@@ -1362,7 +1362,7 @@ class CircleFtpProvider : MainAPI() {
             for (i in 0 until arr.length()) {
                 val linkObj = arr.getJSONObject(i)
                 val url = linkObj.getString("url")
-                val audio = linkObj.optString("audio", null)
+                val audio = linkObj.optString("audio", "").takeIf { it.isNotBlank() }
                 val nameWithAudio = if (audio != null) "$name [$audio]" else name
                 callback.invoke(
                     newExtractorLink(
@@ -1380,7 +1380,7 @@ class CircleFtpProvider : MainAPI() {
             for (i in 0 until arr.length()) {
                 val linkObj = arr.getJSONObject(i)
                 val url = linkObj.getString("url")
-                val audio = linkObj.optString("audio", null)
+                val audio = linkObj.optString("audio", "").takeIf { it.isNotBlank() }
                 val nameWithAudio = if (audio != null) "$name [$audio]" else name
                 callback.invoke(
                     newExtractorLink(
