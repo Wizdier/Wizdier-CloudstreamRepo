@@ -1,0 +1,247 @@
+package com.wizdier
+
+import com.lagradost.cloudstream3.*
+import com.lagradost.cloudstream3.utils.ExtractorLink
+import com.lagradost.cloudstream3.utils.Qualities
+import org.jsoup.nodes.Element
+import java.net.URLDecoder
+
+class CTGMoviesProvider : MainAPI() {
+    override var mainUrl = "https://ctgmovies.com"
+    override var name = "CTG Movies"
+    override val hasMainPage = true
+    override var lang = "en"
+    override val hasDownloadSupport = true
+    override val supportedTypes = setOf(
+        TvType.Movie,
+        TvType.TvSeries
+    )
+
+    override val mainPage = mainPageOf(
+        "/movies?page=" to "Movies",
+        "/tv?page=" to "TV Shows",
+    )
+
+    private fun cleanUrl(url: String?): String? {
+        if (url == null) return null
+        if (url.startsWith("/_next/image?url=")) {
+            return URLDecoder.decode(url.substringAfter("url=").substringBefore("&"), "UTF-8")
+        }
+        return if (url.startsWith("http")) url else "$mainUrl$url"
+    }
+
+    override suspend fun getMainPage(
+        page: Int,
+        request: MainPageRequest
+    ): HomePageResponse {
+        val url = "$mainUrl${request.data}$page"
+        val doc = app.get(url).document
+
+        val items = doc.select("a[href*='/movies/'], a[href*='/tv/']").mapNotNull { element ->
+            val title = element.selectFirst("h3")?.text()?.substringBefore("(")?.trim() ?: return@mapNotNull null
+            val href = element.attr("href")
+            val img = element.selectFirst("img")
+            val posterUrl = cleanUrl(img?.attr("src") ?: img?.attr("srcset")?.split(" ")?.firstOrNull())
+            
+            val isTv = href.contains("/tv/")
+            val tvType = if (isTv) TvType.TvSeries else TvType.Movie
+
+            val qualityEl = element.selectFirst("span.absolute.top-2.right-2")?.text()
+
+            newTvSeriesSearchResponse(title, href, tvType) {
+                this.posterUrl = posterUrl
+                if (qualityEl != null) {
+                    addQuality(qualityEl)
+                }
+            }
+        }.distinctBy { it.url }
+
+        return newHomePageResponse(
+            list = HomePageList(request.name, items),
+            hasNext = items.isNotEmpty()
+        )
+    }
+
+    override suspend fun search(query: String): List<SearchResponse> {
+        val url = "$mainUrl/search?q=$query"
+        val doc = app.get(url).document
+
+        return doc.select("a[href*='/movies/'], a[href*='/tv/']").mapNotNull { element ->
+            val title = element.selectFirst("h3")?.text()?.substringBefore("(")?.trim() ?: return@mapNotNull null
+            val href = element.attr("href")
+            val img = element.selectFirst("img")
+            val posterUrl = cleanUrl(img?.attr("src") ?: img?.attr("srcset")?.split(" ")?.firstOrNull())
+
+            val isTv = href.contains("/tv/")
+            val tvType = if (isTv) TvType.TvSeries else TvType.Movie
+
+            newTvSeriesSearchResponse(title, href, tvType) {
+                this.posterUrl = posterUrl
+            }
+        }.distinctBy { it.url }
+    }
+
+    override suspend fun load(url: String): LoadResponse? {
+        val absUrl = if (url.startsWith("http")) url else "$mainUrl$url"
+        val doc = app.get(absUrl).document
+
+        val title = doc.selectFirst("h1")?.text()?.substringBefore("(")?.trim() ?: return null
+        
+        val posterImg = doc.selectFirst("img[alt*='${title.take(5)}']") ?: doc.selectFirst("img.object-cover")
+        val posterUrl = cleanUrl(posterImg?.attr("src") ?: posterImg?.attr("srcset")?.split(" ")?.firstOrNull())
+
+        // Extract description
+        var desc = doc.selectFirst("h3:contains(Synopsis) + p")?.text()
+        if (desc.isNullOrBlank()) {
+             // Fallback: look for the longest p tag
+             desc = doc.select("p").maxByOrNull { it.text().length }?.text()
+        }
+
+        // Parse Table Data
+        val metadata = mutableMapOf<String, String>()
+        doc.select("tr").forEach { tr ->
+            val tds = tr.select("td")
+            if (tds.size >= 2) {
+                metadata[tds[0].text().trim()] = tds[1].text().trim()
+            }
+        }
+
+        val year = metadata["Year"]?.toIntOrNull()
+        val tags = metadata["Genre"]?.split(",")?.map { it.trim() }
+        val actors = metadata["Stars"]?.split(",")?.map { Actor(it.trim(), null) }
+        val duration = metadata["Runtime"]?.let { getDurationFromString(it) }
+
+        // Extract Rating
+        val ratingMatch = Regex("([0-9.]+)\\s*/\\s*10").find(doc.text())
+        val rating = ratingMatch?.groupValues?.get(1)?.toIntOrNull() // * 10 to keep it standard if needed, or leave as Score
+
+        val isTv = absUrl.contains("/tv/")
+        val tvType = if (isTv) TvType.TvSeries else TvType.Movie
+
+        if (isTv) {
+            val episodes = mutableListOf<Episode>()
+            
+            // Look for episode cards
+            doc.select("li.border").forEach { li ->
+                val epWatchLink = li.selectFirst("a[href*='/watch/']")?.attr("href") ?: return@forEach
+                
+                val epText = li.text()
+                val match = Regex("S(\\d+)E(\\d+)").find(epText)
+                var season = 1
+                var epNum = 1
+                if (match != null) {
+                    season = match.groupValues[1].toInt()
+                    epNum = match.groupValues[2].toInt()
+                }
+
+                // Episode Thumbnail
+                val epImg = li.selectFirst("img")
+                val epTitle = epImg?.attr("alt")?.takeIf { it.isNotBlank() } ?: "Episode $epNum"
+                val epThumb = cleanUrl(epImg?.attr("src"))
+                
+                // Plot usually the last paragraph in the list item
+                val epPlot = li.select("p").lastOrNull()?.text()
+
+                episodes.add(
+                    newEpisode(epWatchLink) {
+                        this.name = epTitle
+                        this.season = season
+                        this.episode = epNum
+                        this.posterUrl = epThumb
+                        this.description = epPlot
+                    }
+                )
+            }
+            
+            // Fallback if the li structure changes but links are present
+            if (episodes.isEmpty()) {
+                doc.select("a[href*='/watch/']").forEach { a ->
+                    val epHref = a.attr("href")
+                    if (epHref.contains("type=episode")) {
+                        episodes.add(
+                            newEpisode(epHref) {
+                                this.name = "Episode"
+                            }
+                        )
+                    }
+                }
+            }
+            
+            return newTvSeriesLoadResponse(title, absUrl, tvType, episodes.distinctBy { it.data }) {
+                this.posterUrl = posterUrl
+                this.year = year
+                this.plot = desc
+                this.tags = tags
+                this.actors = actors
+                if (rating != null) this.rating = rating
+            }
+        } else {
+            val watchLink = doc.selectFirst("a[href*='/watch/']")?.attr("href") ?: absUrl
+            return newMovieLoadResponse(title, absUrl, tvType, watchLink) {
+                this.posterUrl = posterUrl
+                this.year = year
+                this.plot = desc
+                this.tags = tags
+                this.duration = duration
+                this.actors = actors
+                if (rating != null) this.rating = rating
+            }
+        }
+    }
+
+    override suspend fun loadLinks(
+        data: String,
+        isCasting: Boolean,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit
+    ): Boolean {
+        val absUrl = if (data.startsWith("http")) data else "$mainUrl$data"
+        val response = app.get(absUrl)
+        val doc = response.document
+
+        val iframes = doc.select("iframe").mapNotNull { it.attr("src") }
+        for (iframe in iframes) {
+            val iframeUrl = if (iframe.startsWith("//")) "https:$iframe" else iframe
+            callback.invoke(
+                ExtractorLink(
+                    this.name,
+                    "Iframe",
+                    iframeUrl,
+                    this.mainUrl,
+                    Qualities.Unknown.value,
+                    isM3u8 = iframeUrl.contains("m3u8")
+                )
+            )
+        }
+        
+        val htmlText = response.text
+        val videoRegex = Regex("(https?://[^\"]+\\.(?:m3u8|mp4|mkv))")
+        videoRegex.findAll(htmlText).forEach { match ->
+            val link = match.groupValues[1]
+            callback.invoke(
+                ExtractorLink(
+                    this.name,
+                    this.name,
+                    link,
+                    this.mainUrl,
+                    Qualities.Unknown.value,
+                    isM3u8 = link.contains("m3u8")
+                )
+            )
+        }
+
+        // Just in case Cloudstream can resolve the player link directly
+        callback.invoke(
+            ExtractorLink(
+                this.name,
+                "Web Player (Requires Login)",
+                absUrl,
+                this.mainUrl,
+                Qualities.Unknown.value,
+                isM3u8 = false
+            )
+        )
+
+        return true
+    }
+}
