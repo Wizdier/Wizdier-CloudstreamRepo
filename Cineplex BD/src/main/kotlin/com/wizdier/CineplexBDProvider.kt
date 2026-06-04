@@ -366,7 +366,7 @@ class CineplexBD : MainAPI() {
             this.episode = epNum
             this.posterUrl = tmdbEp?.stillUrl
             this.description = tmdbEp?.overview
-            runCatching { tmdbEp?.rating?.let { this.score = Score.from10(it) } }
+            runCatching { tmdbEp?.rating?.let { this.rating = (it * 10).toInt() } }
             runCatching { tmdbEp?.airDate?.let { this.date = it } }
         }
     }
@@ -397,7 +397,7 @@ class CineplexBD : MainAPI() {
                 this.episode = epNum
                 this.posterUrl = tmdbEp?.stillUrl
                 this.description = tmdbEp?.overview
-                runCatching { tmdbEp?.rating?.let { this.score = Score.from10(it) } }
+                runCatching { tmdbEp?.rating?.let { this.rating = (it * 10).toInt() } }
                 runCatching { tmdbEp?.airDate?.let { this.date = it } }
             }
         }
