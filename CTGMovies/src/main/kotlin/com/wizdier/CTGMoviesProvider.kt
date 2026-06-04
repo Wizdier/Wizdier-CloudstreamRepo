@@ -169,12 +169,15 @@ class CTGMoviesProvider : MainAPI() {
             }
             
             if (episodes.isEmpty()) {
+                var fallbackEpNum = 1
                 doc.select("a[href*='/watch/']").forEach { a ->
                     val epHref = a.attr("href")
                     if (epHref.contains("type=episode")) {
                         episodes.add(
                             newEpisode(epHref) {
-                                this.name = "Episode"
+                                this.name = "Episode $fallbackEpNum"
+                                this.episode = fallbackEpNum
+                                fallbackEpNum++
                             }
                         )
                     }
