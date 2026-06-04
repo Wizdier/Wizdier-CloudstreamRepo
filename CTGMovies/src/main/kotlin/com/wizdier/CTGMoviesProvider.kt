@@ -227,7 +227,7 @@ class CTGMoviesProvider : MainAPI() {
                     url = iframeUrl,
                     type = if (iframeUrl.contains("m3u8")) com.lagradost.cloudstream3.utils.ExtractorLinkType.M3U8 else com.lagradost.cloudstream3.utils.ExtractorLinkType.VIDEO
                 ) {
-                    this.referer = this.mainUrl
+                    this.referer = absUrl
                     this.quality = Qualities.Unknown.value
                 }
             )
@@ -244,7 +244,7 @@ class CTGMoviesProvider : MainAPI() {
                     url = link,
                     type = if (link.contains("m3u8")) com.lagradost.cloudstream3.utils.ExtractorLinkType.M3U8 else com.lagradost.cloudstream3.utils.ExtractorLinkType.VIDEO
                 ) {
-                    this.referer = this.mainUrl
+                    this.referer = absUrl
                     this.quality = Qualities.Unknown.value
                 }
             )
@@ -257,7 +257,7 @@ class CTGMoviesProvider : MainAPI() {
                     url = absUrl,
                     type = if (false) com.lagradost.cloudstream3.utils.ExtractorLinkType.M3U8 else com.lagradost.cloudstream3.utils.ExtractorLinkType.VIDEO
                 ) {
-                    this.referer = this.mainUrl
+                    this.referer = absUrl
                     this.quality = Qualities.Unknown.value
                 }
         )
