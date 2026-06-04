@@ -288,7 +288,7 @@ internal object MetadataEnricher {
                     tv.optJSONObject("recommendations")?.optJSONArray("results")
                 )
             }
-            episodes = tmdbId?.let { fetchTmdbSeasonEpisodes(it, seasonHint ?: 1) } ?: emptyList()
+            episodes = fetchTmdbSeasonEpisodes(tmdbId, seasonHint ?: 1)
         }
 
         return MetaInfo(

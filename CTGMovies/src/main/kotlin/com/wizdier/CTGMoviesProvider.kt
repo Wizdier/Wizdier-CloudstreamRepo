@@ -225,10 +225,11 @@ class CTGMoviesProvider : MainAPI() {
                     source = this.name,
                     name = "Iframe",
                     url = iframeUrl,
-                    referer = this.mainUrl,
-                    quality = Qualities.Unknown.value,
-                    isM3u8 = iframeUrl.contains("m3u8")
-                )
+                    type = if (iframeUrl.contains("m3u8")) com.lagradost.cloudstream3.utils.ExtractorLinkType.M3U8 else com.lagradost.cloudstream3.utils.ExtractorLinkType.VIDEO
+                ) {
+                    this.referer = this.mainUrl
+                    this.quality = Qualities.Unknown.value
+                }
             )
         }
         
@@ -241,22 +242,24 @@ class CTGMoviesProvider : MainAPI() {
                     source = this.name,
                     name = this.name,
                     url = link,
-                    referer = this.mainUrl,
-                    quality = Qualities.Unknown.value,
-                    isM3u8 = link.contains("m3u8")
-                )
+                    type = if (link.contains("m3u8")) com.lagradost.cloudstream3.utils.ExtractorLinkType.M3U8 else com.lagradost.cloudstream3.utils.ExtractorLinkType.VIDEO
+                ) {
+                    this.referer = this.mainUrl
+                    this.quality = Qualities.Unknown.value
+                }
             )
         }
 
         callback.invoke(
             newExtractorLink(
-                source = this.name,
-                name = "Web Player (Requires Login)",
-                url = absUrl,
-                referer = this.mainUrl,
-                quality = Qualities.Unknown.value,
-                isM3u8 = false
-            )
+                    source = this.name,
+                    name = "Web Player (Requires Login)",
+                    url = absUrl,
+                    type = if (false) com.lagradost.cloudstream3.utils.ExtractorLinkType.M3U8 else com.lagradost.cloudstream3.utils.ExtractorLinkType.VIDEO
+                ) {
+                    this.referer = this.mainUrl
+                    this.quality = Qualities.Unknown.value
+                }
         )
 
         return true
