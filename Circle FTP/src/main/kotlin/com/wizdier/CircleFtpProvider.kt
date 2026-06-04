@@ -777,7 +777,7 @@ class CircleFtpProvider : MainAPI() {
 
                         val metadata = MetadataInfo(
                             title = displayTitle,
-                            origTitle = details.optString("original_title", details.optStringOrNull("original_name")),
+                            origTitle = details.optStringOrNull("original_title") ?: details.optStringOrNull("original_name"),
                             posterUrl = seasonPoster ?: poster,
                             backdropUrl = backdrop,
                             plot = seasonPlot ?: overview,
@@ -1065,7 +1065,7 @@ class CircleFtpProvider : MainAPI() {
             }
         }
 
-        val group = groupedData!!
+        val group = groupedData
         val cleanedTitle = group.cleanedTitle
         val selectedSeason = group.selectedSeason ?: 1
 

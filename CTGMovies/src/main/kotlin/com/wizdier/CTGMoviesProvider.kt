@@ -3,6 +3,7 @@ package com.wizdier
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.Qualities
+import com.lagradost.cloudstream3.utils.newExtractorLink
 import org.jsoup.nodes.Element
 import java.net.URLDecoder
 
@@ -220,12 +221,12 @@ class CTGMoviesProvider : MainAPI() {
         for (iframe in iframes) {
             val iframeUrl = if (iframe.startsWith("//")) "https:$iframe" else iframe
             callback.invoke(
-                ExtractorLink(
-                    this.name,
-                    "Iframe",
-                    iframeUrl,
-                    this.mainUrl,
-                    Qualities.Unknown.value,
+                newExtractorLink(
+                    source = this.name,
+                    name = "Iframe",
+                    url = iframeUrl,
+                    referer = this.mainUrl,
+                    quality = Qualities.Unknown.value,
                     isM3u8 = iframeUrl.contains("m3u8")
                 )
             )
@@ -236,24 +237,24 @@ class CTGMoviesProvider : MainAPI() {
         videoRegex.findAll(htmlText).forEach { match ->
             val link = match.groupValues[1]
             callback.invoke(
-                ExtractorLink(
-                    this.name,
-                    this.name,
-                    link,
-                    this.mainUrl,
-                    Qualities.Unknown.value,
+                newExtractorLink(
+                    source = this.name,
+                    name = this.name,
+                    url = link,
+                    referer = this.mainUrl,
+                    quality = Qualities.Unknown.value,
                     isM3u8 = link.contains("m3u8")
                 )
             )
         }
 
         callback.invoke(
-            ExtractorLink(
-                this.name,
-                "Web Player (Requires Login)",
-                absUrl,
-                this.mainUrl,
-                Qualities.Unknown.value,
+            newExtractorLink(
+                source = this.name,
+                name = "Web Player (Requires Login)",
+                url = absUrl,
+                referer = this.mainUrl,
+                quality = Qualities.Unknown.value,
                 isM3u8 = false
             )
         )
