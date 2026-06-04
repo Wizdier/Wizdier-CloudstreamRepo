@@ -23,11 +23,11 @@ class CTGMoviesProvider : MainAPI() {
     )
 
     private fun cleanUrl(url: String?): String? {
-        if (url == null) return null
-        if (url.startsWith("/_next/image?url=")) {
-            return URLDecoder.decode(url.substringAfter("url=").substringBefore("&"), "UTF-8")
+        val clean = url?.trim()?.takeIf { it.isNotBlank() } ?: return null
+        if (clean.startsWith("/_next/image?url=")) {
+            return URLDecoder.decode(clean.substringAfter("url=").substringBefore("&"), "UTF-8")
         }
-        return if (url.startsWith("http")) url else "$mainUrl$url"
+        return if (clean.startsWith("http")) clean else "$mainUrl$clean"
     }
 
     private fun getSearchQuality(qStr: String?): SearchQuality? {
@@ -85,15 +85,19 @@ class CTGMoviesProvider : MainAPI() {
             val href = element.attr("href")
             val img = element.selectFirst("img")
             val posterUrl = cleanUrl(img?.attr("src") ?: img?.attr("srcset")?.split(" ")?.firstOrNull())
+            
+            val qualityEl = element.selectFirst("span.absolute.top-2.right-2")?.text()
 
             val isTv = href.contains("/tv/")
             if (isTv) {
                 newTvSeriesSearchResponse(title, href, TvType.TvSeries) {
                     this.posterUrl = posterUrl
+                    this.quality = getSearchQuality(qualityEl)
                 }
             } else {
                 newMovieSearchResponse(title, href, TvType.Movie) {
                     this.posterUrl = posterUrl
+                    this.quality = getSearchQuality(qualityEl)
                 }
             }
         }.distinctBy { it.url }
@@ -123,11 +127,11 @@ class CTGMoviesProvider : MainAPI() {
 
         val year = metadata["Year"]?.toIntOrNull()
         val tags = metadata["Genre"]?.split(",")?.map { it.trim() }
-        val actors = metadata["Stars"]?.split(",")?.map { Actor(it.trim(), null) }
+        val actors = metadata["Stars"]?.split(",")?.map { ActorData(Actor(it.trim(), null), roleString = "Actor") }
         val duration = metadata["Runtime"]?.let { getDurationFromString(it) }
 
         val ratingMatch = Regex("([0-9.]+)\\s*/\\s*10").find(doc.text())
-        val rating = ratingMatch?.groupValues?.get(1)?.toIntOrNull()
+        val rating = ratingMatch?.groupValues?.get(1)?.toDoubleOrNull()
 
         val isTv = absUrl.contains("/tv/")
         val tvType = if (isTv) TvType.TvSeries else TvType.Movie
@@ -183,7 +187,7 @@ class CTGMoviesProvider : MainAPI() {
                 this.plot = desc
                 this.tags = tags
                 this.actors = actors
-                if (rating != null) this.rating = rating
+                runCatching { rating?.let { this.score = Score.from10(it) } }
             }
         } else {
             val watchLink = doc.selectFirst("a[href*='/watch/']")?.attr("href") ?: absUrl
@@ -194,7 +198,7 @@ class CTGMoviesProvider : MainAPI() {
                 this.tags = tags
                 this.duration = duration
                 this.actors = actors
-                if (rating != null) this.rating = rating
+                runCatching { rating?.let { this.score = Score.from10(it) } }
             }
         }
     }
