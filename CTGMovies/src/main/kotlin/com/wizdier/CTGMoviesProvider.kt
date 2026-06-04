@@ -30,6 +30,17 @@ class CTGMoviesProvider : MainAPI() {
         return if (url.startsWith("http")) url else "$mainUrl$url"
     }
 
+    private fun getSearchQuality(qStr: String?): SearchQuality? {
+        val q = qStr?.lowercase() ?: return null
+        if (q.contains("4k")) return SearchQuality.HD
+        if (q.contains("1080")) return SearchQuality.HD
+        if (q.contains("720")) return SearchQuality.HD
+        if (q.contains("web")) return SearchQuality.WebRip
+        if (q.contains("hd")) return SearchQuality.HD
+        if (q.contains("cam")) return SearchQuality.Cam
+        return null
+    }
+
     override suspend fun getMainPage(
         page: Int,
         request: MainPageRequest
@@ -44,14 +55,17 @@ class CTGMoviesProvider : MainAPI() {
             val posterUrl = cleanUrl(img?.attr("src") ?: img?.attr("srcset")?.split(" ")?.firstOrNull())
             
             val isTv = href.contains("/tv/")
-            val tvType = if (isTv) TvType.TvSeries else TvType.Movie
-
             val qualityEl = element.selectFirst("span.absolute.top-2.right-2")?.text()
 
-            newTvSeriesSearchResponse(title, href, tvType) {
-                this.posterUrl = posterUrl
-                if (qualityEl != null) {
-                    addQuality(qualityEl)
+            if (isTv) {
+                newTvSeriesSearchResponse(title, href, TvType.TvSeries) {
+                    this.posterUrl = posterUrl
+                    this.quality = getSearchQuality(qualityEl)
+                }
+            } else {
+                newMovieSearchResponse(title, href, TvType.Movie) {
+                    this.posterUrl = posterUrl
+                    this.quality = getSearchQuality(qualityEl)
                 }
             }
         }.distinctBy { it.url }
@@ -73,10 +87,14 @@ class CTGMoviesProvider : MainAPI() {
             val posterUrl = cleanUrl(img?.attr("src") ?: img?.attr("srcset")?.split(" ")?.firstOrNull())
 
             val isTv = href.contains("/tv/")
-            val tvType = if (isTv) TvType.TvSeries else TvType.Movie
-
-            newTvSeriesSearchResponse(title, href, tvType) {
-                this.posterUrl = posterUrl
+            if (isTv) {
+                newTvSeriesSearchResponse(title, href, TvType.TvSeries) {
+                    this.posterUrl = posterUrl
+                }
+            } else {
+                newMovieSearchResponse(title, href, TvType.Movie) {
+                    this.posterUrl = posterUrl
+                }
             }
         }.distinctBy { it.url }
     }
@@ -90,14 +108,11 @@ class CTGMoviesProvider : MainAPI() {
         val posterImg = doc.selectFirst("img[alt*='${title.take(5)}']") ?: doc.selectFirst("img.object-cover")
         val posterUrl = cleanUrl(posterImg?.attr("src") ?: posterImg?.attr("srcset")?.split(" ")?.firstOrNull())
 
-        // Extract description
         var desc = doc.selectFirst("h3:contains(Synopsis) + p")?.text()
         if (desc.isNullOrBlank()) {
-             // Fallback: look for the longest p tag
              desc = doc.select("p").maxByOrNull { it.text().length }?.text()
         }
 
-        // Parse Table Data
         val metadata = mutableMapOf<String, String>()
         doc.select("tr").forEach { tr ->
             val tds = tr.select("td")
@@ -111,9 +126,8 @@ class CTGMoviesProvider : MainAPI() {
         val actors = metadata["Stars"]?.split(",")?.map { Actor(it.trim(), null) }
         val duration = metadata["Runtime"]?.let { getDurationFromString(it) }
 
-        // Extract Rating
         val ratingMatch = Regex("([0-9.]+)\\s*/\\s*10").find(doc.text())
-        val rating = ratingMatch?.groupValues?.get(1)?.toIntOrNull() // * 10 to keep it standard if needed, or leave as Score
+        val rating = ratingMatch?.groupValues?.get(1)?.toIntOrNull()
 
         val isTv = absUrl.contains("/tv/")
         val tvType = if (isTv) TvType.TvSeries else TvType.Movie
@@ -121,7 +135,6 @@ class CTGMoviesProvider : MainAPI() {
         if (isTv) {
             val episodes = mutableListOf<Episode>()
             
-            // Look for episode cards
             doc.select("li.border").forEach { li ->
                 val epWatchLink = li.selectFirst("a[href*='/watch/']")?.attr("href") ?: return@forEach
                 
@@ -134,12 +147,10 @@ class CTGMoviesProvider : MainAPI() {
                     epNum = match.groupValues[2].toInt()
                 }
 
-                // Episode Thumbnail
                 val epImg = li.selectFirst("img")
                 val epTitle = epImg?.attr("alt")?.takeIf { it.isNotBlank() } ?: "Episode $epNum"
                 val epThumb = cleanUrl(epImg?.attr("src"))
                 
-                // Plot usually the last paragraph in the list item
                 val epPlot = li.select("p").lastOrNull()?.text()
 
                 episodes.add(
@@ -153,7 +164,6 @@ class CTGMoviesProvider : MainAPI() {
                 )
             }
             
-            // Fallback if the li structure changes but links are present
             if (episodes.isEmpty()) {
                 doc.select("a[href*='/watch/']").forEach { a ->
                     val epHref = a.attr("href")
@@ -230,7 +240,6 @@ class CTGMoviesProvider : MainAPI() {
             )
         }
 
-        // Just in case Cloudstream can resolve the player link directly
         callback.invoke(
             ExtractorLink(
                 this.name,
