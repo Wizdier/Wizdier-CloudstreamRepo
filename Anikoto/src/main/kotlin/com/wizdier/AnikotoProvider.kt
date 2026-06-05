@@ -131,7 +131,7 @@ class AnikotoProvider : MainAPI() {
                 val epName = a.parent()?.attr("title")?.takeIf { it.isNotBlank() } ?: "Episode $epNum"
                 val dataIds = a.attr("data-ids")
                 
-                val linkData = "{\"data_ids\":\"$dataIds\"}"
+                val linkData = """{"data_ids":"$dataIds"}"""
                 val payload = java.util.Base64.getEncoder().encodeToString(linkData.toByteArray())
                 
                 episodes.add(
@@ -195,7 +195,7 @@ class AnikotoProvider : MainAPI() {
             this.tags = tags
             this.duration = duration
             if (rating != null) {
-                this.rating = rating
+                this.score = rating?.let { Score.from10(it / 10.0) }
             }
             if (actorsList != null) {
                 this.actors = actorsList
@@ -238,8 +238,23 @@ class AnikotoProvider : MainAPI() {
                 val srvRes = app.get(srvUrl, headers = mapOf("X-Requested-With" to "XMLHttpRequest")).parsed<ServerJson>()
                 
                 if (srvRes.status == 200 && srvRes.result?.url != null) {
-                    val finalUrl = srvRes.result.url.replace("\/", "/")
-                    loadExtractor(finalUrl, mainUrl, subtitleCallback, callback)
+                    val finalUrl = srvRes.result.url.replace("\\/", "/")
+                    
+                    val wrappedCallback = { link: ExtractorLink ->
+                        callback.invoke(
+                            newExtractorLink(
+                                source = link.source,
+                                name = link.name,
+                                url = link.url,
+                                type = if (link.isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+                            ) {
+                                this.referer = link.referer
+                                this.quality = link.quality
+                                this.headers = link.headers
+                            }
+                        )
+                    }
+                    loadExtractor(finalUrl, mainUrl, subtitleCallback, wrappedCallback)
                 }
             }
         }
