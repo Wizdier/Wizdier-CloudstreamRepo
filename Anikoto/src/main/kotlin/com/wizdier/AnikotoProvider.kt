@@ -7,6 +7,11 @@ import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.newExtractorLink
 import com.lagradost.cloudstream3.utils.loadExtractor
 import org.jsoup.nodes.Element
+import com.lagradost.cloudstream3.LoadResponse.Companion.addMalId
+import com.lagradost.cloudstream3.LoadResponse.Companion.addAniListId
+import com.lagradost.cloudstream3.LoadResponse.Companion.addKitsuId
+import com.lagradost.cloudstream3.LoadResponse.Companion.addImdbId
+import com.lagradost.cloudstream3.utils.AppUtils.parseJson
 
 class AnikotoProvider : MainAPI() {
     override var mainUrl = "https://anikototv.to"
@@ -55,8 +60,8 @@ class AnikotoProvider : MainAPI() {
 
     private suspend fun fetchAnilistMetadata(malId: Int): AnilistMedia? {
         val query = """
-            query ($idMal: Int) {
-              Media(idMal: $idMal, type: ANIME) {
+            query (${'$'}idMal: Int) {
+              Media(idMal: ${'$'}idMal, type: ANIME) {
                 id
                 bannerImage
                 characters(sort: ROLE, perPage: 10) {
@@ -201,10 +206,10 @@ class AnikotoProvider : MainAPI() {
                 this.actors = actorsList
             }
             
-            runCatching { malId?.let { addMalId(it) } }
-            runCatching { anilistId?.let { addAniListId(it) } }
-            runCatching { kitsuId?.let { addKitsuId(it) } }
-            runCatching { imdbId?.let { addImdbId(it) } }
+            malId?.let { addMalId(it) }
+            anilistId?.let { addAniListId(it) }
+            kitsuId?.let { addKitsuId(it) }
+            imdbId?.let { addImdbId(it) }
             
             addEpisodes(DubStatus.Subbed, episodes)
         }
