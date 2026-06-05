@@ -50,7 +50,7 @@ class CTGMoviesProvider : MainAPI() {
     @Volatile private var sessionActive = false
 
     private val tmdbApiKey: String by lazy {
-        try { com.wizdier.BuildConfig.TMDB_API } catch (_: Exception) { "" }
+        System.getenv("TMDB_API") ?: ""
     }
     private val tmdbBase = "https://api.themoviedb.org/3"
 
@@ -265,7 +265,12 @@ class CTGMoviesProvider : MainAPI() {
             val epThumb   = cleanUrl(li.selectFirst("img")?.attr("src")
                 ?: li.selectFirst("img")?.attr("srcset")?.split(" ")?.firstOrNull())
             val epPlot    = li.select("p").lastOrNull()?.text()?.trim()?.takeIf { it.length > 10 }
-            val airDate   = Regex("""\d{4}-\d{2}-\d{2}""").find(li.text())?.value
+            val airDateStr = Regex("""\d{4}-\d{2}-\d{2}""").find(li.text())?.value
+            val airDate: Long? = airDateStr?.let {
+                runCatching {
+                    java.text.SimpleDateFormat("yyyy-MM-dd", java.util.Locale.US).parse(it)?.time
+                }.getOrNull()
+            }
             val data      = encodeData(title, year, isTv = true, seasonNum, epNum, watchUrl)
             episodes.add(newEpisode(data) {
                 this.name = epTitle; this.season = seasonNum; this.episode = epNum
@@ -422,7 +427,7 @@ class CTGMoviesProvider : MainAPI() {
         return found
     }
 
-    private fun embed(callback: (ExtractorLink) -> Unit, source: String, url: String) {
+    private suspend fun embed(callback: (ExtractorLink) -> Unit, source: String, url: String) {
         val refererUrl = mainUrl  // capture before entering lambda where 'this' changes
         callback.invoke(
             newExtractorLink(
