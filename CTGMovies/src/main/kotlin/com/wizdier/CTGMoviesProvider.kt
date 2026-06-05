@@ -423,6 +423,7 @@ class CTGMoviesProvider : MainAPI() {
     }
 
     private fun embed(callback: (ExtractorLink) -> Unit, source: String, url: String) {
+        val refererUrl = mainUrl  // capture before entering lambda where 'this' changes
         callback.invoke(
             newExtractorLink(
                 source = name,
@@ -430,7 +431,7 @@ class CTGMoviesProvider : MainAPI() {
                 url    = url,
                 type   = ExtractorLinkType.VIDEO,
             ) {
-                referer = mainUrl
+                referer = refererUrl
                 quality = Qualities.Unknown.value
             }
         )
