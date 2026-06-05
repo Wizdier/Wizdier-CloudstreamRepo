@@ -4,8 +4,8 @@ import com.lagradost.cloudstream3.plugins.BasePlugin
 import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
 
 @CloudstreamPlugin
-class CTGMoviesPlugin : BasePlugin() {
+class AnikotoPlugin : BasePlugin() {
     override fun load() {
-        registerMainAPI(CTGMoviesProvider())
+        registerMainAPI(AnikotoProvider())
     }
 }
