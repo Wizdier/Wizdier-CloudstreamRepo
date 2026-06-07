@@ -527,9 +527,21 @@ class AnikotoTV : MainAPI() {
                                         append(link.name)
                                     }
                                 }
-                                // Mutate the link's name in place to avoid the deprecated constructor or suspend builder
-                                link.name = finalName
-                                callback.invoke(link)
+                                // The name property is immutable (val) in this Cloudstream version, so we must create a new ExtractorLink.
+                                // We suppress DEPRECATION_ERROR because the modern 'newExtractorLink' is a suspend function,
+                                // which cannot be called from this non-suspend callback.
+                                @Suppress("DEPRECATION_ERROR")
+                                val newLink = ExtractorLink(
+                                    link.source,
+                                    finalName,
+                                    link.url,
+                                    link.referer,
+                                    link.quality,
+                                    link.isM3u8,
+                                    link.headers,
+                                    link.extractorData
+                                )
+                                callback.invoke(newLink)
                             }
                         )
                         true
@@ -771,7 +783,8 @@ class AnikotoTV : MainAPI() {
     private suspend fun fetchAniListCharacters(anilistId: Int?): List<ActorData> {
         if (anilistId == null || anilistId <= 0) return emptyList()
 
-        val query = "query ($id: Int) { Media(id: $id, type: ANIME) { characters(sort: ROLE, perPage: 15) { edges { node { name { full } image { large } } role voiceActors(language: JAPANESE) { name { full } image { large } } } } } }"
+        // Use a raw string and escape the dollar sign with $ to ensure 100% compile-safe GraphQL queries
+        val query = """query ($id: Int) { Media(id: $id, type: ANIME) { characters(sort: ROLE, perPage: 15) { edges { node { name { full } image { large } } role voiceActors(language: JAPANESE) { name { full } image { large } } } } } }"""
 
         val variables = JSONObject().apply { put("id", anilistId) }
         val payload = JSONObject().apply {
