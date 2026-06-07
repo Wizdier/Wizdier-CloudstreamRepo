@@ -195,9 +195,16 @@ class AnikotoTV : MainAPI() {
         val altTitle = anime.optStringOrNull("alternative")
         val nativeTitle = anime.optStringOrNull("native")
         val slug = anime.optStringOrNull("slug") ?: ""
-        val description = anime.optStringOrNull("description")
-            ?.replace(Regex("<[^>]+>"), "")
-            ?.replace("&#39;", "'").replace("&quot;", "\"").replace("&amp;", "&")?.trim()
+        
+        // Non-nullable let block ensures 100% compile-safe string replacements
+        val description = anime.optStringOrNull("description")?.let { desc ->
+            desc.replace(Regex("<[^>]+>"), "")
+                .replace("&#39;", "'")
+                .replace("&quot;", "\"")
+                .replace("&amp;", "&")
+                .trim()
+        }
+
         val poster = anime.optStringOrNull("poster")
         val background = anime.optStringOrNull("background_image")
         val year = anime.optInt("year", 0).takeIf { it > 0 }
@@ -247,13 +254,19 @@ class AnikotoTV : MainAPI() {
         for (i in 0 until apiEpisodes.length()) {
             val epObj = apiEpisodes.getJSONObject(i)
             val epNum = epObj.optInt("number", i + 1)
-            val epTitle = epObj.optStringOrNull("title")
-                ?.replace("&#39;", "'")?.replace("&quot;", "\"").replace("&amp;", "&")
             val jpTitle = epObj.optStringOrNull("jp_title")
             val embedId = epObj.optStringOrNull("episode_embed_id") ?: ""
             val embedUrlObj = epObj.optJSONObject("embed_url")
 
             val tmdbEp = tmdbEpisodes.getOrNull(epNum - 1)
+            
+            // Non-nullable let block for epTitle replacements
+            val epTitle = epObj.optStringOrNull("title")?.let { titleVal ->
+                titleVal.replace("&#39;", "'")
+                    .replace("&quot;", "\"")
+                    .replace("&amp;", "&")
+            }
+
             val finalEpName = tmdbEp?.name?.takeIf { it.isNotBlank() }
                 ?: epTitle?.takeIf { !it.startsWith("Episode ") }
                 ?: jpTitle?.takeIf { !it.startsWith("Episode ") }
@@ -514,18 +527,9 @@ class AnikotoTV : MainAPI() {
                                         append(link.name)
                                     }
                                 }
-                                callback.invoke(
-                                    ExtractorLink(
-                                        link.source,
-                                        finalName,
-                                        link.url,
-                                        link.referer,
-                                        link.quality,
-                                        link.isM3u8,
-                                        link.headers,
-                                        link.extractorData
-                                    )
-                                )
+                                // Mutate the link's name in place to avoid the deprecated constructor or suspend builder
+                                link.name = finalName
+                                callback.invoke(link)
                             }
                         )
                         true
@@ -767,7 +771,7 @@ class AnikotoTV : MainAPI() {
     private suspend fun fetchAniListCharacters(anilistId: Int?): List<ActorData> {
         if (anilistId == null || anilistId <= 0) return emptyList()
 
-        val query = "query (\$id: Int) { Media(id: \$id, type: ANIME) { characters(sort: ROLE, perPage: 15) { edges { node { name { full } image { large } } role voiceActors(language: JAPANESE) { name { full } image { large } } } } } }"
+        val query = "query ($id: Int) { Media(id: $id, type: ANIME) { characters(sort: ROLE, perPage: 15) { edges { node { name { full } image { large } } role voiceActors(language: JAPANESE) { name { full } image { large } } } } } }"
 
         val variables = JSONObject().apply { put("id", anilistId) }
         val payload = JSONObject().apply {
