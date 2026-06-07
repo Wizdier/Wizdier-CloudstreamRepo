@@ -98,7 +98,7 @@ class NowHDTimeProvider : MainAPI() {
             this.year = year
             this.plot = plot
             this.tags = tags
-            this.rating = rating
+            addScore(rating)
             this.duration = dur
             this.recommendations = recs
             addActors(actors)
@@ -126,7 +126,7 @@ class NowHDTimeProvider : MainAPI() {
             this.year = year
             this.plot = plot
             this.tags = tags
-            this.rating = rating
+            addScore(rating)
             this.recommendations = recs
             addActors(actors)
             addTrailer(trailer)
@@ -153,7 +153,7 @@ class NowHDTimeProvider : MainAPI() {
             this.year = year
             this.plot = plot
             this.tags = tags
-            this.rating = rating
+            addScore(rating)
             this.recommendations = recs
             addEpisodes(DubStatus.Subbed, eps)
             addActors(actors)
@@ -355,18 +355,18 @@ class NowHDTimeProvider : MainAPI() {
         return extractYearFromText(extractTitle(doc))
     }
 
-    private fun extractRating(doc: Document): Int? {
+    private fun extractRating(doc: Document): String? {
         val ratingPattern = Regex("""(\d+\.?\d*)\s*/\s*10""")
         doc.select(".rating, .score, [class*=rating], [class*=score], .vote-average").forEach { el ->
-            ratingPattern.find(el.text())?.groupValues?.get(1)?.toDoubleOrNull()?.let {
-                return (it * 1000).toInt()
+            ratingPattern.find(el.text())?.groupValues?.get(1)?.let {
+                return it
             }
         }
         doc.select("span, div, p").forEach { el ->
             val txt = el.text()
             if (txt.contains("/10") && txt.length < 20) {
-                ratingPattern.find(txt)?.groupValues?.get(1)?.toDoubleOrNull()?.let {
-                    return (it * 1000).toInt()
+                ratingPattern.find(txt)?.groupValues?.get(1)?.let {
+                    return it
                 }
             }
         }
