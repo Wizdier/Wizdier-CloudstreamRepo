@@ -101,7 +101,7 @@ class NowHDTimeProvider : MainAPI() {
             this.year = year
             this.plot = plot
             this.tags = tags
-            this.score = rating?.toDouble()?.div(1000.0)
+            this.rating = rating
             this.duration = dur
             this.recommendations = recs
             addActors(actors.map { it.actor })
@@ -132,7 +132,7 @@ class NowHDTimeProvider : MainAPI() {
             this.year = year
             this.plot = plot
             this.tags = tags
-            this.score = rating?.toDouble()?.div(1000.0)
+            this.rating = rating
             this.recommendations = recs
             addActors(actors.map { it.actor })
             addTrailer(trailer)
@@ -159,7 +159,7 @@ class NowHDTimeProvider : MainAPI() {
             this.year = year
             this.plot = plot
             this.tags = tags
-            this.score = rating?.toDouble()?.div(1000.0)
+            this.rating = rating
             this.recommendations = recs
             addEpisodes(DubStatus.Subbed, eps)
             addActors(actors.map { it.actor })
@@ -282,7 +282,8 @@ class NowHDTimeProvider : MainAPI() {
                 val epUrl = NowHDTimeUtils.fixUrl(href) ?: return@forEach
                 val txt = ep.selectFirst(".ep-title,.title,span")?.text()?.trim() ?: ep.text().trim()
                 val epNum = NowHDTimeUtils.extractEpNum(txt) ?: NowHDTimeUtils.extractEpNum(href) ?: eps.size + 1
-                eps.add(newEpisode(epUrl, txt.ifBlank { "Episode $epNum" }) {
+                eps.add(newEpisode(epUrl) {
+                    this.name = txt.ifBlank { "Episode $epNum" }
                     this.season = sNum
                     this.episode = epNum
                 })
@@ -291,7 +292,7 @@ class NowHDTimeProvider : MainAPI() {
         if (eps.isEmpty()) doc.select("a[href*='episode'], a[href*='ep-']").forEachIndexed { i, ep ->
             val epUrl = NowHDTimeUtils.fixUrl(ep.attr("href")) ?: return@forEachIndexed
             val epNum = NowHDTimeUtils.extractEpNum(ep.attr("href")) ?: (i + 1)
-            eps.add(newEpisode(epUrl, "Episode $epNum") { this.episode = epNum })
+            eps.add(newEpisode(epUrl) { this.name = "Episode $epNum"; this.episode = epNum })
         }
         return eps.distinctBy { it.data }.sortedWith(compareBy({ it.season ?: 0 }, { it.episode ?: 0 }))
     }
@@ -305,13 +306,13 @@ class NowHDTimeProvider : MainAPI() {
                 else if (href.startsWith("/")) "$mainUrl$href"
                 else return@forEach
                 val epNum = NowHDTimeUtils.extractEpNum(href) ?: NowHDTimeUtils.extractEpNum(ep.text()) ?: eps.size + 1
-                eps.add(newEpisode(epUrl, ep.text().trim().ifBlank { "Episode $epNum" }) { this.episode = epNum })
+                eps.add(newEpisode(epUrl) { this.name = ep.text().trim().ifBlank { "Episode $epNum" }; this.episode = epNum })
             }
         }
         if (eps.isEmpty()) doc.select(".episode a, [class*=episode] a, a[href*='/watch/']").forEach { ep ->
             val epUrl = NowHDTimeUtils.fixUrl(ep.attr("href")) ?: return@forEach
             val epNum = NowHDTimeUtils.extractEpNum(ep.attr("href")) ?: eps.size + 1
-            eps.add(newEpisode(epUrl, "Episode $epNum") { this.episode = epNum })
+            eps.add(newEpisode(epUrl) { this.name = "Episode $epNum"; this.episode = epNum })
         }
         return eps.distinctBy { it.data }.sortedBy { it.episode ?: 0 }
     }
