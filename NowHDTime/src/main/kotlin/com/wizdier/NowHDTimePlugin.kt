@@ -7,7 +7,10 @@ import android.content.Context
 @CloudstreamPlugin
 class NowHDTimePlugin : Plugin() {
     override fun load(context: Context) {
+        // Main catalog provider
         registerMainAPI(NowHDTimeProvider())
+
+        // Page-embedded extractor chain
         registerExtractorAPI(NowHDTimeStreamExtractor())
         registerExtractorAPI(NowHDTimeDroploadExtractor())
         registerExtractorAPI(NowHDTimeVidhideExtractor())
