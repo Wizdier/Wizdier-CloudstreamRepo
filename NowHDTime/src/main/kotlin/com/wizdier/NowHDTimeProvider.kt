@@ -1,25 +1,21 @@
 package com.wizdier
 
 import com.lagradost.cloudstream3.*
-import com.lagradost.cloudstream3.Score
 import com.lagradost.cloudstream3.LoadResponse.Companion.addActors
-import com.lagradost.cloudstream3.LoadResponse.Companion.addAniListId
-import com.lagradost.cloudstream3.LoadResponse.Companion.addImdbId
-import com.lagradost.cloudstream3.LoadResponse.Companion.addMalId
-import com.lagradost.cloudstream3.LoadResponse.Companion.addKitsuId
 import com.lagradost.cloudstream3.LoadResponse.Companion.addTrailer
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.Qualities
-import com.lagradost.cloudstream3.utils.newExtractorLink
 import com.lagradost.cloudstream3.utils.loadExtractor
+import com.lagradost.cloudstream3.utils.newExtractorLink
 import org.jsoup.nodes.Document
+import org.jsoup.nodes.Element
 
 class NowHDTimeProvider : MainAPI() {
 
-    override var mainUrl = NowHDTimeUtils.mainUrl
-    override var name = NowHDTimeUtils.name
-    override var lang = "bn"
+    override var mainUrl = "https://nowhdtime.to"
+    override var name = "NowHDTime"
+    override var lang = "en"
     override val hasMainPage = true
     override val hasDownloadSupport = true
     override val hasQuickSearch = false
@@ -36,379 +32,560 @@ class NowHDTimeProvider : MainAPI() {
         "$mainUrl/tv-shows" to "Latest TV Shows",
         "$mainUrl/trending" to "Trending Now",
         "$mainUrl/anime" to "Anime",
-        "$mainUrl/movies?page=" to "More Movies",
-        "$mainUrl/tv-shows?page=" to "More TV Shows"
     )
 
-    // ── Home ─────────────────────────────────────────────────────────────
+    // ── Home ─────────────────────────────────────────────────────────
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        val url = when {
-            request.data.endsWith("?page=") -> "${request.data}$page"
-            page > 1 -> "${request.data}?page=$page"
-            else -> request.data
+        val items = mutableListOf<SearchResponse>()
+        val doc = when (request.data) {
+            "$mainUrl/movies" -> app.get("$mainUrl/movies", timeout = 30).document
+            "$mainUrl/tv-shows" -> app.get("$mainUrl/tv-shows", timeout = 30).document
+            "$mainUrl/trending" -> app.get("$mainUrl/trending", timeout = 30).document
+            "$mainUrl/anime" -> app.get("$mainUrl/anime", timeout = 30).document
+            else -> app.get(mainUrl, timeout = 30).document
         }
-        val doc = app.get(url, timeout = 30).document
-        val items = if (request.data.contains("/anime")) parseAnimePage(doc)
-        else parseMovieTvPage(doc)
+        items.addAll(parseCardItems(doc))
         return newHomePageResponse(
-            list = HomePageList(request.name, items, isHorizontalImages = false),
-            hasNext = hasNext(doc, page)
+            list = HomePageList(request.name, items.distinctBy { it.url }, isHorizontalImages = false),
+            hasNext = page < 10
         )
     }
 
-    // ── Search ───────────────────────────────────────────────────────────
+    // ── Search ───────────────────────────────────────────────────────
     override suspend fun search(query: String): List<SearchResponse> {
         val results = mutableListOf<SearchResponse>()
         val enc = query.replace(" ", "+")
         try {
             val doc = app.get("$mainUrl/search?query=$enc", timeout = 30).document
-            results.addAll(parseMovieTvPage(doc))
-            results.addAll(parseAnimePage(doc))
+            results.addAll(parseCardItems(doc))
         } catch (_: Exception) {}
         if (results.isEmpty()) {
             try {
-                val aDoc = app.get("$mainUrl/anime?q=$enc", timeout = 30).document
-                results.addAll(parseAnimePage(aDoc))
+                val doc2 = app.get("$mainUrl/trending", timeout = 30).document
+                results.addAll(parseCardItems(doc2).filter {
+                    it.name.contains(query, ignoreCase = true)
+                })
             } catch (_: Exception) {}
         }
         return results.distinctBy { it.url }
     }
 
-    // ── Load ─────────────────────────────────────────────────────────────
+    // ── Load ─────────────────────────────────────────────────────────
     override suspend fun load(url: String): LoadResponse {
         return when {
-            url.contains("/anime/") && !url.contains("/watch/") -> loadAnime(url)
+            url.contains("/anime/") -> loadAnimeShow(url)
             url.contains("/tv-show/") -> loadTvShow(url)
             else -> loadMovie(url)
         }
     }
 
+    // ── Movie ────────────────────────────────────────────────────────
     private suspend fun loadMovie(url: String): LoadResponse {
         val doc = app.get(url, timeout = 30).document
         val title = extractTitle(doc)
-        val poster = bestImage(doc)
+        val poster = extractPoster(doc)
         val plot = extractPlot(doc)
         val year = extractYear(doc)
-        val score = extractRating(doc)
-        val dur = extractDuration(doc)
-        val tags = NowHDTimeUtils.extractTags(doc).ifEmpty { extractGenres(doc) }
-        val actors = NowHDTimeUtils.extractActors(doc)
+        val rating = extractRating(doc)
+        val tags = extractGenres(doc)
+        val actors = extractCast(doc)
         val trailer = extractTrailer(doc)
+        val dur = extractDuration(doc)
         val recs = extractRecs(doc)
-        val ids = NowHDTimeUtils.extractTrackingIds(doc)
 
         return newMovieLoadResponse(title, url, TvType.Movie, url) {
             this.posterUrl = poster
             this.year = year
             this.plot = plot
             this.tags = tags
-            this.score = score
+            this.rating = rating
             this.duration = dur
             this.recommendations = recs
-            addActors(actors.map { it.actor })
+            addActors(actors)
             addTrailer(trailer)
-            addImdbId(ids.imdbId)
-            addMalId(ids.malId)
-            addAniListId(ids.anilistId)
-            addKitsuId(ids.kitsuId)
         }
     }
 
+    // ── TV Show ──────────────────────────────────────────────────────
     private suspend fun loadTvShow(url: String): LoadResponse {
         val doc = app.get(url, timeout = 30).document
         val title = extractTitle(doc)
-        val poster = bestImage(doc)
+        val poster = extractPoster(doc)
         val plot = extractPlot(doc)
         val year = extractYear(doc)
-        val score = extractRating(doc)
-        val tags = NowHDTimeUtils.extractTags(doc).ifEmpty { extractGenres(doc) }
-        val actors = NowHDTimeUtils.extractActors(doc)
+        val rating = extractRating(doc)
+        val tags = extractGenres(doc)
+        val actors = extractCast(doc)
         val trailer = extractTrailer(doc)
         val recs = extractRecs(doc)
-        val ids = NowHDTimeUtils.extractTrackingIds(doc)
-        val eps = extractTvEpisodes(doc)
+        val tvShowId = extractTvShowId(doc)
+        val eps = extractEpisodes(doc, tvShowId, url)
 
         return newTvSeriesLoadResponse(title, url, TvType.TvSeries, eps) {
             this.posterUrl = poster
             this.year = year
             this.plot = plot
             this.tags = tags
-            this.score = score
+            this.rating = rating
             this.recommendations = recs
-            addActors(actors.map { it.actor })
+            addActors(actors)
             addTrailer(trailer)
-            addImdbId(ids.imdbId)
         }
     }
 
-    private suspend fun loadAnime(url: String): LoadResponse {
+    // ── Anime ────────────────────────────────────────────────────────
+    private suspend fun loadAnimeShow(url: String): LoadResponse {
         val doc = app.get(url, timeout = 30).document
         val title = extractTitle(doc)
-        val poster = bestImage(doc)
+        val poster = extractPoster(doc)
         val plot = extractPlot(doc)
         val year = extractYear(doc)
-        val score = extractRating(doc)
-        val tags = NowHDTimeUtils.extractTags(doc).ifEmpty { extractGenres(doc) }
-        val actors = NowHDTimeUtils.extractActors(doc)
+        val rating = extractRating(doc)
+        val tags = extractGenres(doc)
+        val actors = extractCast(doc)
         val trailer = extractTrailer(doc)
         val recs = extractAnimeRecs(doc)
-        val ids = NowHDTimeUtils.extractTrackingIds(doc)
-        val eps = extractAnimeEpisodes(doc, ids.anilistId)
+        val tvShowId = extractTvShowId(doc)
+        val eps = extractEpisodes(doc, tvShowId, url)
 
         return newAnimeLoadResponse(title, url, TvType.Anime) {
             this.posterUrl = poster
             this.year = year
             this.plot = plot
             this.tags = tags
-            this.score = score
+            this.rating = rating
             this.recommendations = recs
             addEpisodes(DubStatus.Subbed, eps)
-            addActors(actors.map { it.actor })
+            addActors(actors)
             addTrailer(trailer)
-            addMalId(ids.malId)
-            addAniListId(ids.anilistId)
-            addKitsuId(ids.kitsuId)
         }
     }
 
-    // ── Links ────────────────────────────────────────────────────────────
+    // ── Load Links ───────────────────────────────────────────────────
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        val doc = app.get(data, timeout = 30).document
-        val html = doc.html()
-        var found = false
-
-        // iframes
-        doc.select("iframe[src]").forEach { iframe ->
-            val src = NowHDTimeUtils.fixUrl(iframe.attr("src")) ?: return@forEach
-            if (src.startsWith("http")) {
-                try { loadExtractor(src, data, subtitleCallback, callback); found = true }
-                catch (_: Exception) {}
-            }
+        val parts = data.split("|", limit = 4)
+        return when {
+            parts.size >= 4 && parts[0] == "EPISODE" ->
+                loadEpisodeLinks(parts[1], parts[2], parts[3], data, subtitleCallback, callback)
+            else -> loadMovieLinks(data, subtitleCallback, callback)
         }
+    }
 
-        // embedded video URLs
-        NowHDTimeUtils.extractEmbeds(html).forEach { embedUrl ->
+    private suspend fun loadMovieLinks(
+        url: String,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit
+    ): Boolean {
+        val doc = app.get(url, timeout = 30).document
+        val html = doc.html()
+        val players = parsePlayers(html)
+        if (players.isEmpty()) return false
+
+        var found = false
+        players.forEach { player ->
+            val embedUrl = player.url
             try {
-                if (NowHDTimeUtils.isDirectVideo(embedUrl)) {
-                    callback(newExtractorLink(
-                        source = name, name = name, url = embedUrl,
-                        type = if (embedUrl.contains(".m3u8")) ExtractorLinkType.M3U8
-                        else ExtractorLinkType.VIDEO
-                    ) { this.referer = data; this.quality = NowHDTimeUtils.qualityFromString(embedUrl) })
+                if (isDirectVideoUrl(embedUrl)) {
+                    callback(
+                        newExtractorLink(
+                            source = player.server.ifBlank { name },
+                            name = player.server.ifBlank { name },
+                            url = embedUrl,
+                            type = if (embedUrl.contains(".m3u8", ignoreCase = true))
+                                ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+                        ) {
+                            this.referer = url
+                            this.quality = qualityFromUrl(embedUrl)
+                        }
+                    )
                 } else {
-                    loadExtractor(embedUrl, data, subtitleCallback, callback)
+                    loadExtractor(embedUrl, url, subtitleCallback, callback)
                 }
                 found = true
             } catch (_: Exception) {}
         }
-
-        // server buttons
-        doc.select("button[data-src], a[data-src], [data-embed]").forEach { el ->
-            val src = NowHDTimeUtils.fixUrl(
-                el.attr("data-src").ifBlank { el.attr("data-embed").ifBlank { el.attr("href") } }
-            ) ?: return@forEach
-            if (src.startsWith("http")) {
-                try { loadExtractor(src, data, subtitleCallback, callback); found = true }
-                catch (_: Exception) {}
-            }
-        }
-
-        // subtitles
-        NowHDTimeUtils.extractSubtitles(html).forEach { (label, subUrl) ->
+        extractSubtitles(html).forEach { (label, subUrl) ->
             subtitleCallback(SubtitleFile(label, subUrl))
         }
-
         return found
     }
 
-    // ── Parsers ──────────────────────────────────────────────────────────
-    private fun parseMovieTvPage(doc: Document): List<SearchResponse> {
-        val results = mutableListOf<SearchResponse>()
-        val sels = listOf(
-            "a[href*='/movie/']", "a[href*='/tv-show/']",
-            ".movie-card a", ".content-card a", ".poster-card a"
-        )
-        for (sel in sels) doc.select(sel).forEach { a ->
+    private suspend fun loadEpisodeLinks(
+        tvShowId: String,
+        season: String,
+        episode: String,
+        referer: String,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit
+    ): Boolean {
+        val csrfDoc = app.get(mainUrl, timeout = 15).document
+        val csrfToken = csrfDoc.selectFirst("meta[name=csrf-token]")?.attr("content")
+            ?: return false
+
+        val response = app.post(
+            "$mainUrl/episode-details",
+            data = mapOf(
+                "tv_show_id" to tvShowId,
+                "season" to season,
+                "episode" to episode
+            ),
+            headers = mapOf(
+                "Content-Type" to "application/json",
+                "X-CSRF-TOKEN" to csrfToken
+            ),
+            referer = referer.ifBlank { mainUrl },
+            timeout = 20
+        ).text
+
+        val players = parsePlayers(response)
+        if (players.isEmpty()) return false
+
+        var found = false
+        players.forEach { player ->
+            val embedUrl = player.url
             try {
-                val href = a.attr("href")
-                val fullUrl = NowHDTimeUtils.fixUrl(href) ?: return@forEach
-                if (!fullUrl.contains("/movie/") && !fullUrl.contains("/tv-show/")) return@forEach
-                val img = a.selectFirst("img")
-                val title = a.selectFirst("h2,h3,h4,.title")?.text()?.trim()
-                    ?: img?.attr("alt")?.trim() ?: a.attr("title").trim()
-                if (title.isBlank()) return@forEach
-                val poster = NowHDTimeUtils.fixUrl(img?.attr("src")?.ifBlank { img.attr("data-src") })
-                val year = NowHDTimeUtils.extractYear(a.selectFirst("[class*=year],.year")?.text())
-                val clean = NowHDTimeUtils.cleanTitle(title)
-                if (fullUrl.contains("/tv-show/"))
-                    results.add(newTvSeriesSearchResponse(clean, fullUrl, TvType.TvSeries) { this.posterUrl = poster; this.year = year })
-                else
-                    results.add(newMovieSearchResponse(clean, fullUrl, TvType.Movie) { this.posterUrl = poster; this.year = year })
+                if (isDirectVideoUrl(embedUrl)) {
+                    callback(
+                        newExtractorLink(
+                            source = player.server.ifBlank { name },
+                            name = player.server.ifBlank { name },
+                            url = embedUrl,
+                            type = if (embedUrl.contains(".m3u8", ignoreCase = true))
+                                ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+                        ) {
+                            this.referer = referer
+                            this.quality = qualityFromUrl(embedUrl)
+                        }
+                    )
+                } else {
+                    loadExtractor(embedUrl, referer, subtitleCallback, callback)
+                }
+                found = true
             } catch (_: Exception) {}
+        }
+        return found
+    }
+
+    // ── Listing Parser ───────────────────────────────────────────────
+    private fun parseCardItems(doc: Document): List<SearchResponse> {
+        val results = mutableListOf<SearchResponse>()
+        val linkPattern = Regex("""/(movie|tv-show|anime)/watch-[^"'\s]+""")
+        doc.select("a[href]").forEach { a ->
+            val href = a.attr("href")
+            val match = linkPattern.find(href) ?: return@forEach
+            val fullUrl = if (href.startsWith("http")) href else "$mainUrl$href"
+            val typeStr = match.groupValues[1]
+
+            val img = a.selectFirst("img")
+            val poster = fixUrl(img?.attr("src")?.ifBlank { img?.attr("data-src") })
+            val title = img?.attr("alt")?.trim()?.ifBlank { null }
+                ?: a.selectFirst("h2, h3, h4, .title, [class*=title]")?.text()?.trim()
+                ?: a.attr("title").trim().ifBlank { null }
+                ?: a.text().trim().take(80)
+            if (title.isBlank() || title.length < 2) return@forEach
+
+            val year = extractYearFromText(title)
+            val clean = cleanTitle(title)
+            val tvType = when (typeStr) {
+                "tv-show" -> TvType.TvSeries
+                "anime" -> TvType.Anime
+                else -> TvType.Movie
+            }
+            results.add(
+                when (tvType) {
+                    TvType.TvSeries -> newTvSeriesSearchResponse(clean, fullUrl, tvType) {
+                        this.posterUrl = poster; this.year = year
+                    }
+                    TvType.Anime -> newAnimeSearchResponse(clean, fullUrl, tvType) {
+                        this.posterUrl = poster; this.year = year
+                    }
+                    else -> newMovieSearchResponse(clean, fullUrl, tvType) {
+                        this.posterUrl = poster; this.year = year
+                    }
+                }
+            )
         }
         return results.distinctBy { it.url }
     }
 
-    private fun parseAnimePage(doc: Document): List<SearchResponse> {
-        val results = mutableListOf<SearchResponse>()
-        doc.select("a[href*='/anime/']").forEach { a ->
-            try {
-                val href = a.attr("href")
-                if (href.contains("/watch/")) return@forEach
-                val fullUrl = NowHDTimeUtils.fixUrl(href) ?: return@forEach
-                val img = a.selectFirst("img")
-                val title = a.selectFirst("h2,h3,h4,.title")?.text()?.trim()
-                    ?: img?.attr("alt")?.trim() ?: a.attr("title").trim()
-                if (title.isBlank() || title.length < 2) return@forEach
-                val poster = NowHDTimeUtils.fixUrl(img?.attr("src")?.ifBlank { img.attr("data-src") })
-                val year = NowHDTimeUtils.extractYear(title)
-                results.add(newAnimeSearchResponse(NowHDTimeUtils.cleanTitle(title), fullUrl, TvType.Anime) { this.posterUrl = poster; this.year = year })
-            } catch (_: Exception) {}
-        }
-        return results.distinctBy { it.url }
+    // ── Metadata Extractors ──────────────────────────────────────────
+
+    private fun extractTitle(doc: Document): String {
+        doc.selectFirst("h1")?.text()?.trim()?.takeIf { it.isNotBlank() }
+            ?.let { return cleanTitle(it) }
+        doc.selectFirst("meta[property='og:title']")?.attr("content")?.trim()
+            ?.takeIf { it.isNotBlank() }?.let { return cleanTitle(it) }
+        return doc.title().substringBefore("|").substringBefore("-").trim()
     }
 
-    // ── Episodes ─────────────────────────────────────────────────────────
-    private fun extractTvEpisodes(doc: Document): List<Episode> {
-        val eps = mutableListOf<Episode>()
-        doc.select(".season, [class*=season], .episodes-list").forEach { container ->
-            val sNum = NowHDTimeUtils.extractSeasonNum(container.selectFirst("h3,.season-title")?.text() ?: "") ?: 1
-            container.select("a[href*='/episode/'], a[href*='/watch/'], .episode-item a").forEach { ep ->
-                val href = ep.attr("href").ifBlank { ep.selectFirst("a")?.attr("href") } ?: return@forEach
-                val epUrl = NowHDTimeUtils.fixUrl(href) ?: return@forEach
-                val txt = ep.selectFirst(".ep-title,.title,span")?.text()?.trim() ?: ep.text().trim()
-                val epNum = NowHDTimeUtils.extractEpNum(txt) ?: NowHDTimeUtils.extractEpNum(href) ?: eps.size + 1
-                eps.add(newEpisode(epUrl) {
-                    this.name = txt.ifBlank { "Episode $epNum" }
-                    this.season = sNum
-                    this.episode = epNum
-                })
-            }
+    private fun extractPoster(doc: Document): String? {
+        doc.selectFirst("meta[property='og:image']")?.attr("content")?.let { return fixUrl(it) }
+        doc.selectFirst("img[src*='tmdb.org/t/p/']")?.let {
+            return fixUrl(it.attr("src").ifBlank { it.attr("data-src") })
         }
-        if (eps.isEmpty()) doc.select("a[href*='episode'], a[href*='ep-']").forEachIndexed { i, ep ->
-            val epUrl = NowHDTimeUtils.fixUrl(ep.attr("href")) ?: return@forEachIndexed
-            val epNum = NowHDTimeUtils.extractEpNum(ep.attr("href")) ?: (i + 1)
-            eps.add(newEpisode(epUrl) { this.name = "Episode $epNum"; this.episode = epNum })
+        doc.selectFirst(".poster img, [class*=poster] img, .cover img")?.let {
+            return fixUrl(it.attr("src").ifBlank { it.attr("data-src") })
         }
-        return eps.distinctBy { it.data }.sortedWith(compareBy({ it.season ?: 0 }, { it.episode ?: 0 }))
-    }
-
-    private fun extractAnimeEpisodes(doc: Document, anilistId: Int?): List<Episode> {
-        val eps = mutableListOf<Episode>()
-        if (anilistId != null) {
-            doc.select("a[href*='/anime/$anilistId/'], .episode-link, .ep-item").forEach { ep ->
-                val href = ep.attr("href")
-                val epUrl = if (href.startsWith("http")) href
-                else if (href.startsWith("/")) "$mainUrl$href"
-                else return@forEach
-                val epNum = NowHDTimeUtils.extractEpNum(href) ?: NowHDTimeUtils.extractEpNum(ep.text()) ?: eps.size + 1
-                eps.add(newEpisode(epUrl) { this.name = ep.text().trim().ifBlank { "Episode $epNum" }; this.episode = epNum })
-            }
-        }
-        if (eps.isEmpty()) doc.select(".episode a, [class*=episode] a, a[href*='/watch/']").forEach { ep ->
-            val epUrl = NowHDTimeUtils.fixUrl(ep.attr("href")) ?: return@forEach
-            val epNum = NowHDTimeUtils.extractEpNum(ep.attr("href")) ?: eps.size + 1
-            eps.add(newEpisode(epUrl) { this.name = "Episode $epNum"; this.episode = epNum })
-        }
-        return eps.distinctBy { it.data }.sortedBy { it.episode ?: 0 }
-    }
-
-    // ── Metadata helpers ─────────────────────────────────────────────────
-    private fun extractTitle(doc: Document): String =
-        doc.selectFirst("h1, h2.title")?.text()?.let { NowHDTimeUtils.cleanTitle(it) } ?: doc.title().substringBefore("|").trim()
-
-    private fun bestImage(doc: Document): String? {
-        listOf(
-            doc.selectFirst("meta[property='og:image']")?.attr("content"),
-            doc.selectFirst(".poster img, .cover img, [class*=poster] img")?.let { it.attr("src").ifBlank { it.attr("data-src") } }
-        ).forEach { NowHDTimeUtils.fixUrl(it)?.let { u -> return u } }
         return null
     }
 
     private fun extractPlot(doc: Document): String? {
-        for (sel in listOf(".synopsis p,.overview p,.description p,.plot p", ".synopsis,.overview,.description,.plot",
-            "meta[name='description']", "meta[property='og:description']")) {
-            val el = doc.selectFirst(sel) ?: continue
-            val t = if (sel.startsWith("meta")) el.attr("content") else el.text()
-            if (t.length > 30) return t.trim()
+        doc.selectFirst("meta[property='og:description']")?.attr("content")?.trim()
+            ?.takeIf { it.length > 20 }?.let { return it }
+        doc.selectFirst("meta[name=description]")?.attr("content")?.trim()
+            ?.takeIf { it.length > 20 }?.let { return it }
+        for (sel in listOf(".overview p, .synopsis p, .description p, [class*=overview] p")) {
+            doc.selectFirst(sel)?.text()?.trim()?.takeIf { it.length > 30 }?.let { return it }
         }
         return null
     }
 
     private fun extractYear(doc: Document): Int? {
-        doc.selectFirst("[class*=year], time[datetime], .date")?.let { el ->
-            NowHDTimeUtils.extractYear(el.text().ifBlank { el.attr("datetime") })?.let { return it }
+        doc.selectFirst("meta[property='og:title']")?.attr("content")?.let {
+            extractYearFromText(it)?.let { y -> return y }
         }
-        return NowHDTimeUtils.extractYear(doc.selectFirst("meta[name='keywords']")?.attr("content"))
+        doc.selectFirst("[class*=year], time[datetime], .date, .release-date")?.let { el ->
+            extractYearFromText(el.text().ifBlank { el.attr("datetime") })?.let { return it }
+        }
+        return extractYearFromText(extractTitle(doc))
     }
 
-    private fun extractRating(doc: Document): Score? {
-        doc.selectFirst(".score,.rating,[class*=score],[class*=rating]")?.text()?.let {
-            NowHDTimeUtils.extractRating(it)?.let { r -> return r }
-        }; return null
-    }
-
-    private fun extractDuration(doc: Document): Int? {
-        doc.selectFirst("[class*=duration],[class*=runtime],time")?.text()?.let {
-            NowHDTimeUtils.parseDuration(it)?.let { d -> return d }
+    private fun extractRating(doc: Document): Int? {
+        val ratingPattern = Regex("""(\d+\.?\d*)\s*/\s*10""")
+        doc.select(".rating, .score, [class*=rating], [class*=score], .vote-average").forEach { el ->
+            ratingPattern.find(el.text())?.groupValues?.get(1)?.toDoubleOrNull()?.let {
+                return (it * 1000).toInt()
+            }
         }
-        doc.select("span,li,p").forEach { el ->
-            val t = el.text()
-            if (t.contains("min", true) || t.contains(" h ", true))
-                NowHDTimeUtils.parseDuration(t)?.let { return it }
-        }; return null
+        doc.select("span, div, p").forEach { el ->
+            val txt = el.text()
+            if (txt.contains("/10") && txt.length < 20) {
+                ratingPattern.find(txt)?.groupValues?.get(1)?.toDoubleOrNull()?.let {
+                    return (it * 1000).toInt()
+                }
+            }
+        }
+        return null
     }
 
     private fun extractGenres(doc: Document): List<String> {
-        val g = mutableListOf<String>()
-        doc.select("a[href*='/genre/'], .genre a, .genres a").forEach { g.add(it.text().trim()) }
-        doc.selectFirst("[class*=genre]")?.text()?.split("·",",","/","|")?.map { it.trim() }?.filter { it.isNotBlank() }?.forEach { g.add(it) }
-        return g.distinct().take(8)
+        val genres = mutableListOf<String>()
+        doc.select("a[href*='/genre/'], .genre a, .genres a, a[href*='genre']").forEach {
+            val t = it.text().trim()
+            if (t.isNotBlank() && t.length < 30) genres.add(t)
+        }
+        doc.selectFirst("meta[name=keywords]")?.attr("content")
+            ?.split(",")?.map { it.trim() }?.filter { it.isNotBlank() }?.forEach { genres.add(it) }
+        return genres.distinct().take(8)
+    }
+
+    private fun extractCast(doc: Document): List<Actor> {
+        val actors = mutableListOf<Actor>()
+        doc.select(".cast-list li, .cast a, .actors a, .starring a, [class*=cast] a, .featured-cast a").forEach { el ->
+            val name = el.selectFirst("h3, h4, .name, p, .actor-name")?.text()?.trim()
+                ?: el.text().trim()
+            val image = el.selectFirst("img")?.let {
+                fixUrl(it.attr("src").ifBlank { it.attr("data-src") })
+            }
+            if (name.isNotBlank() && name.length < 80) {
+                actors.add(Actor(name, image))
+            }
+        }
+        return actors.distinctBy { it.name }.take(20)
     }
 
     private fun extractTrailer(doc: Document): String? {
-        doc.selectFirst("iframe[src*='youtube'],iframe[src*='youtu.be']")?.attr("src")?.let {
+        doc.selectFirst("iframe[src*='youtube'], iframe[src*='youtu.be']")?.attr("src")?.let {
             return if (it.startsWith("//")) "https:$it" else it
         }
-        Regex("(?:youtube\\.com/embed/|youtu\\.be/)([A-Za-z0-9_-]{11})").find(doc.html())?.groupValues?.get(1)?.let {
-            return "https://www.youtube.com/watch?v=$it"
-        }; return null
+        Regex("""(?:youtube\.com/embed/|youtu\.be/)([A-Za-z0-9_-]{11})""")
+            .find(doc.html())?.groupValues?.get(1)?.let {
+                return "https://www.youtube.com/watch?v=$it"
+            }
+        return null
+    }
+
+    private fun extractDuration(doc: Document): Int? {
+        val patterns = listOf(
+            Regex("""(\d+)\s*min""", RegexOption.IGNORE_CASE),
+            Regex("""(\d+)h\s*(\d+)m"""),
+            Regex("""(\d+)\s*minutes""", RegexOption.IGNORE_CASE)
+        )
+        for (sel in listOf("[class*=duration], [class*=runtime], .runtime, time")) {
+            doc.selectFirst(sel)?.text()?.let { txt ->
+                for (p in patterns) {
+                    p.find(txt)?.let { m ->
+                        if (m.groupValues.size >= 2) {
+                            val h = m.groupValues.getOrNull(1)?.toIntOrNull() ?: 0
+                            val min = m.groupValues.getOrNull(2)?.toIntOrNull() ?: 0
+                            val total = h * 60 + min
+                            if (total > 0) return total
+                        }
+                    }
+                }
+                Regex("""(\d+)\s*[mM]""").find(txt)?.groupValues?.get(1)?.toIntOrNull()?.let { return it }
+            }
+        }
+        return null
     }
 
     private fun extractRecs(doc: Document): List<SearchResponse> {
         val recs = mutableListOf<SearchResponse>()
-        doc.select("[class*=similar] a,[class*=related] a,[class*=recommend] a,.more-like-this a").forEach { a ->
+        doc.select("a[href*='/movie/'], a[href*='/tv-show/']").forEach { a ->
+            if (recs.size >= 12) return@forEach
             val href = a.attr("href")
-            if (!href.contains("/movie/") && !href.contains("/tv-show/")) return@forEach
-            val url2 = NowHDTimeUtils.fixUrl(href) ?: return@forEach
+            if (!href.contains("watch-")) return@forEach
+            val fullUrl = if (href.startsWith("http")) href else "$mainUrl$href"
             val img = a.selectFirst("img")
-            val title2 = a.selectFirst("h3,h4,.title")?.text()?.trim() ?: img?.attr("alt")?.trim() ?: return@forEach
-            val poster = NowHDTimeUtils.fixUrl(img?.attr("src"))
-            if (href.contains("/tv-show/")) recs.add(newTvSeriesSearchResponse(title2, url2, TvType.TvSeries) { this.posterUrl = poster })
-            else recs.add(newMovieSearchResponse(title2, url2, TvType.Movie) { this.posterUrl = poster })
+            val title = a.selectFirst("h3, h4, .title, [class*=title]")?.text()?.trim()
+                ?: img?.attr("alt")?.trim()
+                ?: a.text().trim().take(60)
+            if (title.isBlank() || title.length < 2) return@forEach
+            val poster = fixUrl(img?.attr("src")?.ifBlank { img?.attr("data-src") })
+            val type = if (href.contains("/tv-show/")) TvType.TvSeries else TvType.Movie
+            recs.add(
+                when (type) {
+                    TvType.TvSeries -> newTvSeriesSearchResponse(
+                        cleanTitle(title), fullUrl, type
+                    ) { this.posterUrl = poster }
+                    else -> newMovieSearchResponse(
+                        cleanTitle(title), fullUrl, type
+                    ) { this.posterUrl = poster }
+                }
+            )
         }
         return recs.distinctBy { it.url }.take(12)
     }
 
     private fun extractAnimeRecs(doc: Document): List<SearchResponse> {
-        val recs = mutableListOf<SearchResponse>()
-        doc.select("a[href*='/anime/']").filter { !it.attr("href").contains("/watch/") }.take(12).forEach { a ->
-            val url2 = NowHDTimeUtils.fixUrl(a.attr("href")) ?: return@forEach
-            val img = a.selectFirst("img")
-            val title2 = a.selectFirst("h3,h4,.title")?.text()?.trim() ?: img?.attr("alt")?.trim() ?: return@forEach
-            val poster = NowHDTimeUtils.fixUrl(img?.attr("src"))
-            recs.add(newAnimeSearchResponse(title2, url2, TvType.Anime) { this.posterUrl = poster })
-        }
-        return recs.distinctBy { it.url }
+        return extractRecs(doc).filter {
+            it.url.contains("/anime/")
+        }.take(12)
     }
 
-    private fun hasNext(doc: Document, page: Int): Boolean {
-        if (doc.selectFirst("a.next,.next a,.pagination .next,[rel='next']") != null) return true
-        return page < 20
+    // ── Episode Parsing ──────────────────────────────────────────────
+
+    private fun extractTvShowId(doc: Document): String? {
+        doc.selectFirst("[data-tv-show-id]")?.attr("data-tv-show-id")?.let { return it }
+        Regex("""toggleEpisodeSources\((\d+)""")
+            .find(doc.html())?.groupValues?.get(1)?.let { return it }
+        return null
     }
+
+    private fun extractEpisodes(
+        doc: Document, tvShowId: String?, baseUrl: String
+    ): List<Episode> {
+        val eps = mutableListOf<Episode>()
+        doc.select("[data-episode-id]").forEach { el ->
+            val season = el.attr("data-season").toIntOrNull() ?: 1
+            val epNum = el.attr("data-episode").toIntOrNull() ?: (eps.size + 1)
+            val epName = el.selectFirst("h3, h4, .ep-title, [class*=title], .name")
+                ?.text()?.trim() ?: "Episode $epNum"
+            val poster = el.selectFirst("img")?.let {
+                fixUrl(it.attr("src").ifBlank { it.attr("data-src") })
+            }
+            val plot = el.selectFirst("p, .overview, .description, [class*=desc]")?.text()?.trim()
+            val runtime = el.selectFirst("[class*=runtime], [class*=duration]")?.text()?.let {
+                Regex("""(\d+)""").find(it)?.groupValues?.get(1)?.toIntOrNull()
+            }
+            val data = "EPISODE|${tvShowId ?: "0"}|$season|$epNum"
+            eps.add(
+                newEpisode(data) {
+                    this.name = epName
+                    this.season = season
+                    this.episode = epNum
+                    this.posterUrl = poster
+                    this.description = plot
+                    this.runTime = runtime
+                }
+            )
+        }
+        return eps.distinctBy { it.data }.sortedWith(
+            compareBy({ it.season ?: 0 }, { it.episode ?: 0 })
+        )
+    }
+
+    // ── Player Parsing ───────────────────────────────────────────────
+    private fun parsePlayers(source: String): List<PlayerInfo> {
+        val players = mutableListOf<PlayerInfo>()
+        val jsonPattern = Regex(
+            """\{[^}]*"type"\s*:\s*"[^"]*"[^}]*"url"\s*:\s*"[^"]*"[^}]*\}"""
+        )
+        jsonPattern.findAll(source).forEach { match ->
+            try {
+                val json = match.value
+                val url = Regex(""""url"\s*:\s*"([^"]*)"""")
+                    .find(json)?.groupValues?.get(1)?.replace("\\/", "/") ?: return@forEach
+                val server = Regex(""""server"\s*:\s*"([^"]*)"""")
+                    .find(json)?.groupValues?.get(1) ?: ""
+                players.add(PlayerInfo(url, server))
+            } catch (_: Exception) {}
+        }
+        return players.distinctBy { it.url }
+    }
+
+    // ── Subtitle Extraction ──────────────────────────────────────────
+    private fun extractSubtitles(html: String): List<Pair<String, String>> {
+        val subs = mutableListOf<Pair<String, String>>()
+        Regex("""["'](https?://[^"']+\.(?:srt|vtt|ass)[^"']*)["']""", RegexOption.IGNORE_CASE)
+            .findAll(html).forEach { match ->
+                val url = match.groupValues[1]
+                if (url.startsWith("http")) subs.add("Auto" to url)
+            }
+        Regex("""<track[^>]+src=["']([^"']+)["'][^>]*(?:label=["']([^"']*)["'])?[^>]*>""", RegexOption.IGNORE_CASE)
+            .findAll(html).forEach { match ->
+                val url = match.groupValues[1]
+                val label = match.groupValues[2].ifBlank { "Auto" }
+                val fixed = fixUrl(url) ?: return@forEach
+                subs.add(label to fixed)
+            }
+        return subs.distinctBy { it.second }
+    }
+
+    // ── Helpers ──────────────────────────────────────────────────────
+    private fun cleanTitle(title: String): String =
+        title
+            .replace(Regex("""\s*\(\d{4}\)\s*"""), " ")
+            .replace(Regex("""(?i)\s*(web-dl|webrip|bluray|bdrip|hdtv|hdrip|dvdrip|camrip|hdcam|1080p|720p|480p|2160p|4k)\s*"""), " ")
+            .replace(Regex("""\s+"""), " ")
+            .trim()
+
+    private fun extractYearFromText(text: String): Int? =
+        Regex("""\b(19|20)\d{2}\b""").find(text)?.value?.toIntOrNull()
+
+    private fun fixUrl(url: String?): String? {
+        if (url.isNullOrBlank()) return null
+        return when {
+            url.startsWith("//") -> "https:$url"
+            url.startsWith("/") -> "$mainUrl$url"
+            !url.startsWith("http") -> "https://$url"
+            else -> url
+        }
+    }
+
+    private fun isDirectVideoUrl(url: String): Boolean {
+        val lower = url.lowercase()
+        return lower.endsWith(".mp4") || lower.endsWith(".m3u8") ||
+                lower.endsWith(".mkv") || lower.endsWith(".mpd") ||
+                lower.endsWith(".webm") || lower.endsWith(".avi")
+    }
+
+    private fun qualityFromUrl(url: String): Int {
+        val lower = url.lowercase()
+        return when {
+            lower.contains("2160") || lower.contains("4k") -> Qualities.P2160.value
+            lower.contains("1080") || lower.contains("fhd") -> Qualities.P1080.value
+            lower.contains("720") || lower.contains("hd") -> Qualities.P720.value
+            lower.contains("480") -> Qualities.P480.value
+            lower.contains("360") -> Qualities.P360.value
+            else -> Qualities.Unknown.value
+        }
+    }
+
+    data class PlayerInfo(val url: String, val server: String)
 }
