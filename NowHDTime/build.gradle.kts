@@ -22,5 +22,9 @@ cloudstream {
 
     iconUrl = "https://i.postimg.cc/bvKvW66z/nowhd-logo.png"
 
-    requiresResources = false
 }
+
+android {
+    namespace = "com.wizdier.circleftp"
+}
+
