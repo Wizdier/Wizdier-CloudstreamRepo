@@ -7,23 +7,23 @@ import org.jsoup.nodes.Document
 object NowHDTimeUtils {
 
     const val mainUrl = "https://nowhdtime.com.bd"
-    const val name    = "NowHDTime"
+    const val name = "NowHDTime"
 
     // ── Quality ──────────────────────────────────────────────────────────────
     fun qualityFromString(text: String?): Int {
         if (text.isNullOrBlank()) return Qualities.Unknown.value
         return when {
             text.contains("2160") || text.contains("4k", ignoreCase = true) || text.contains("uhd", ignoreCase = true)
-                                                          -> Qualities.UHD4K.value
+                -> Qualities.P2160.value
             text.contains("1080") || text.contains("fhd", ignoreCase = true)
-                                                          -> Qualities.P1080.value
-            text.contains("720")  || text.contains("hd",  ignoreCase = true)
-                                                          -> Qualities.P720.value
-            text.contains("480")                          -> Qualities.P480.value
-            text.contains("360")                          -> Qualities.P360.value
-            text.contains("240")                          -> Qualities.P240.value
-            text.contains("cam", ignoreCase = true)       -> Qualities.CamQuality.value
-            else                                          -> Qualities.Unknown.value
+                -> Qualities.P1080.value
+            text.contains("720") || text.contains("hd", ignoreCase = true)
+                -> Qualities.P720.value
+            text.contains("480") -> Qualities.P480.value
+            text.contains("360") -> Qualities.P360.value
+            text.contains("240") -> Qualities.P240.value
+            text.contains("cam", ignoreCase = true) -> Qualities.P240.value
+            else -> Qualities.Unknown.value
         }
     }
 
@@ -31,7 +31,7 @@ object NowHDTimeUtils {
     fun cleanTitle(title: String): String =
         title
             .replace(Regex("\\s*\\(\\d{4}\\)\\s*"), " ")
-            .replace(Regex("\\[.*?]"), "")
+            .replace(Regex("\\[.*?\\]"), "")
             .replace(Regex("(?i)\\s*(web-dl|webrip|bluray|bdrip|hdtv|hdrip|dvdrip|camrip|hdcam|1080p|720p|480p)\\s*"), " ")
             .replace(Regex("\\s+"), " ")
             .trim()
@@ -60,11 +60,22 @@ object NowHDTimeUtils {
     fun fixUrl(url: String?): String? {
         if (url.isNullOrBlank()) return null
         return when {
-            url.startsWith("//")   -> "https:$url"
-            url.startsWith("/")    -> "$mainUrl$url"
+            url.startsWith("//") -> "https:$url"
+            url.startsWith("/") -> "$mainUrl$url"
             !url.startsWith("http") -> "https://$url"
-            else                   -> url
+            else -> url
         }
+    }
+
+    // ── Check if URL is a direct video link ───────────────────────────────────
+    fun isDirectVideo(url: String): Boolean {
+        val lower = url.lowercase()
+        return lower.endsWith(".mp4") ||
+                lower.endsWith(".m3u8") ||
+                lower.endsWith(".mkv") ||
+                lower.endsWith(".mpd") ||
+                lower.endsWith(".webm") ||
+                lower.endsWith(".avi")
     }
 
     // ── Extract all raw embed / iframe / direct-video URLs from HTML ──────────
@@ -72,32 +83,56 @@ object NowHDTimeUtils {
         val urls = mutableListOf<String>()
         // iframes
         Regex("<iframe[^>]+src=[\"']([^\"']+)[\"']", RegexOption.IGNORE_CASE).findAll(html).forEach { urls.add(it.groupValues[1]) }
-        // <source>
-        Regex("<source[^>]+src=[\"']([^\"']+)[\"']", RegexOption.IGNORE_CASE).findAll(html).forEach { urls.add(it.groupValues[1]) }
+        // embed
+        Regex("<embed[^>]+src=[\"']([^\"']+)[\"']", RegexOption.IGNORE_CASE).findAll(html).forEach { urls.add(it.groupValues[1]) }
         // JS file/src keys pointing to video
         Regex("""["'](https?://[^"']+\.(?:mp4|m3u8|mkv|mpd)(?:\?[^"']*)?)["']""", RegexOption.IGNORE_CASE).findAll(html).forEach { urls.add(it.groupValues[1]) }
         return urls.distinct().filter { it.startsWith("http") }
     }
 
+    // ── Extract subtitles from HTML ───────────────────────────────────────────
+    fun extractSubtitles(html: String): List<Pair<String, String>> {
+        val subs = mutableListOf<Pair<String, String>>()
+        // Look for .srt / .vtt / .ass links with optional label
+        val subRegex = Regex("""(["'])(https?://[^"']+\.(?:srt|vtt|ass)[^"']*)\1""", RegexOption.IGNORE_CASE)
+        subRegex.findAll(html).forEach { match ->
+            val url = match.groupValues[2]
+            if (url.startsWith("http")) {
+                subs.add("Auto" to url)
+            }
+        }
+        // Also try track elements
+        val trackRegex = Regex("""<track[^>]+src=["']([^"']+)["'][^>]*(?:label=["']([^"']*)["'])?[^>]*>""", RegexOption.IGNORE_CASE)
+        trackRegex.findAll(html).forEach { match ->
+            val url = match.groupValues[1]
+            val label = match.groupValues[2].ifBlank { "Auto" }
+            if (url.startsWith("http") || url.startsWith("//")) {
+                val fixedUrl = fixUrl(url) ?: return@forEach
+                subs.add(label to fixedUrl)
+            }
+        }
+        return subs.distinctBy { it.second }
+    }
+
     // ── Extract tracking IDs embedded in HTML ─────────────────────────────────
     data class TrackingIds(
-        val imdbId: String?  = null,
-        val tmdbId: Int?     = null,
-        val malId:  Int?     = null,
-        val anilistId: Int?  = null,
-        val kitsuId: Int?    = null,
-        val simklId: Int?    = null,
+        val imdbId: String? = null,
+        val tmdbId: Int? = null,
+        val malId: Int? = null,
+        val anilistId: Int? = null,
+        val kitsuId: Int? = null,
+        val simklId: Int? = null,
     )
 
     fun extractTrackingIds(document: Document): TrackingIds {
         val html = document.html()
         return TrackingIds(
-            imdbId    = Regex("(tt\\d{7,8})").find(html)?.groupValues?.get(1),
-            tmdbId    = Regex("themoviedb\\.org/(?:movie|tv)/(\\d+)").find(html)?.groupValues?.get(1)?.toIntOrNull(),
-            malId     = Regex("myanimelist\\.net/anime/(\\d+)").find(html)?.groupValues?.get(1)?.toIntOrNull(),
+            imdbId = Regex("(tt\\d{7,8})").find(html)?.groupValues?.get(1),
+            tmdbId = Regex("themoviedb\\.org/(?:movie|tv)/(\\d+)").find(html)?.groupValues?.get(1)?.toIntOrNull(),
+            malId = Regex("myanimelist\\.net/anime/(\\d+)").find(html)?.groupValues?.get(1)?.toIntOrNull(),
             anilistId = Regex("anilist\\.co/anime/(\\d+)").find(html)?.groupValues?.get(1)?.toIntOrNull(),
-            kitsuId   = Regex("kitsu\\.io/anime/(\\d+)").find(html)?.groupValues?.get(1)?.toIntOrNull(),
-            simklId   = Regex("simkl\\.com/anime/(\\d+)").find(html)?.groupValues?.get(1)?.toIntOrNull(),
+            kitsuId = Regex("kitsu\\.io/anime/(\\d+)").find(html)?.groupValues?.get(1)?.toIntOrNull(),
+            simklId = Regex("simkl\\.com/anime/(\\d+)").find(html)?.groupValues?.get(1)?.toIntOrNull(),
         )
     }
 
@@ -136,7 +171,7 @@ object NowHDTimeUtils {
     fun extractActors(document: Document): List<ActorData> {
         val actors = mutableListOf<ActorData>()
         document.select(".cast-list li, .cast a, .actors a, .starring a, .featured-cast .cast-card").forEach { el ->
-            val name  = el.selectFirst("h3, h4, .name, p")?.text()?.trim()
+            val name = el.selectFirst("h3, h4, .name, p")?.text()?.trim()
                 ?: el.text().trim()
             val image = el.selectFirst("img")?.let { img ->
                 fixUrl(img.attr("src").ifBlank { img.attr("data-src") })
@@ -145,206 +180,5 @@ object NowHDTimeUtils {
             if (name.isNotBlank()) actors.add(ActorData(Actor(name, image), roleString = role))
         }
         return actors.distinctBy { it.actor.name }.take(20)
-    }
-}
-al castSelectors = listOf(
-            ".cast-list li",
-            ".cast a",
-            ".actors a",
-            ".starring a",
-            "span:contains(Cast) ~ a",
-            "span:contains(Stars) ~ a",
-            "span:contains(Actor) ~ a"
-        )
-        for (selector in castSelectors) {
-            document.select(selector).forEach { element ->
-                val actorName = element.text().trim()
-                val actorImage = element.selectFirst("img")?.let { img ->
-                    img.attr("data-src").ifBlank { img.attr("src") }
-                }
-                if (actorName.isNotBlank()) {
-                    actors.add(ActorData(Actor(actorName, fixPosterUrl(actorImage))))
-                }
-            }
-        }
-        return actors.distinctBy { it.actor.name }
-    }
-
-    /* ── Episode / Season number extraction ── */
-    fun extractEpisodeNumber(text: String): Int? {
-        val patterns = listOf(
-            Pattern.compile("(?:episode|ep|e)[\\s.-]*(\\d+)", Pattern.CASE_INSENSITIVE),
-            Pattern.compile("(\\d+)\\s*(?:st|nd|rd|th)\\s*episode", Pattern.CASE_INSENSITIVE),
-            Pattern.compile("^(\\d+)$")
-        )
-        for (pattern in patterns) {
-            val matcher = pattern.matcher(text.trim())
-            if (matcher.find()) return matcher.group(1)?.toIntOrNull()
-        }
-        return null
-    }
-
-    fun extractSeasonNumber(text: String): Int? {
-        val patterns = listOf(
-            Pattern.compile("(?:season|s)[\\s.-]*(\\d+)", Pattern.CASE_INSENSITIVE),
-            Pattern.compile("(\\d+)\\s*(?:st|nd|rd|th)\\s*season", Pattern.CASE_INSENSITIVE)
-        )
-        for (pattern in patterns) {
-            val matcher = pattern.matcher(text.trim())
-            if (matcher.find()) return matcher.group(1)?.toIntOrNull()
-        }
-        return null
-    }
-}
-tDownloadLinks(document: Document): List<Pair<String, String>> {
-        val links = mutableListOf<Pair<String, String>>() // Pair<URL, Quality/Name>
-
-        // Common download button/link selectors for WordPress movie sites
-        val downloadSelectors = listOf(
-            "a[href*=download]",
-            "a.download-link",
-            "a.btn-download",
-            ".download-links a",
-            ".download a",
-            ".dwnl a",
-            ".dlbtn a",
-            "a[download]",
-            ".entry-content a[href*='.mkv']",
-            ".entry-content a[href*='.mp4']",
-            "a[href*='drive.google']",
-            "a[href*='mega.nz']",
-            "a[href*='mediafire']",
-            "a[href*='dropload']",
-            "a[href*='filelions']",
-            "a[href*='streamwish']",
-            "a[href*='vidhide']",
-            "a[href*='dood']",
-            "a[href*='mixdrop']",
-            "a[href*='voe']",
-            "a[href*='upstream']",
-            "a[href*='gdtot']",
-            "a[href*='hubcloud']",
-            "a[href*='gdflix']",
-            "a[href*='filebox']",
-            "a[href*='fastdl']",
-            "a[href*='direct']",
-            "a[href*='worker']",
-            "a[href*='pixeldrain']",
-            "a[href*='gofile']",
-            ".post-content a[href]",
-            "article a[href]"
-        )
-
-        for (selector in downloadSelectors) {
-            document.select(selector).forEach { element ->
-                val href = element.attr("href")
-                if (href.isNotBlank() && href.startsWith("http") && !href.contains("nowhdtime.com.bd")) {
-                    val text = element.text().ifBlank { element.attr("title") }
-                    links.add(Pair(href, text))
-                }
-            }
-        }
-
-        return links.distinctBy { it.first }
-    }
-
-    // ===== Decode encoded/obfuscated URLs =====
-    fun decodeUrl(url: String): String {
-        return try {
-            URLDecoder.decode(url, "UTF-8")
-        } catch (e: Exception) {
-            url
-        }
-    }
-
-    // ===== Build proper poster URL =====
-    fun fixPosterUrl(url: String?): String? {
-        if (url.isNullOrBlank()) return null
-        return when {
-            url.startsWith("//") -> "https:$url"
-            url.startsWith("/") -> "$mainUrl$url"
-            !url.startsWith("http") -> "https://$url"
-            else -> url
-        }
-    }
-
-    // ===== Tag extraction for better categorization =====
-    fun extractTags(document: Document): List<String> {
-        val tags = mutableListOf<String>()
-
-        // Genre tags
-        document.select(".genre a, .genres a, .tag a, .tags a, a[rel='tag']").forEach {
-            tags.add(it.text().trim())
-        }
-
-        // Category tags
-        document.select(".category a, .categories a, a[rel='category']").forEach {
-            tags.add(it.text().trim())
-        }
-
-        return tags.distinct().filter { it.isNotBlank() }
-    }
-
-    // ===== Actor/Cast extraction =====
-    fun extractActors(document: Document): List<ActorData> {
-        val actors = mutableListOf<ActorData>()
-
-        // Common selectors for cast information
-        val castSelectors = listOf(
-            ".cast-list li",
-            ".cast a",
-            ".actors a",
-            ".starring a",
-            "span:contains(Cast) ~ a",
-            "span:contains(Stars) ~ a",
-            "span:contains(Actor) ~ a"
-        )
-
-        for (selector in castSelectors) {
-            document.select(selector).forEach { element ->
-                val actorName = element.text().trim()
-                val actorImage = element.selectFirst("img")?.let { img ->
-                    img.attr("data-src").ifBlank { img.attr("src") }
-                }
-                if (actorName.isNotBlank()) {
-                    actors.add(ActorData(Actor(actorName, fixPosterUrl(actorImage))))
-                }
-            }
-        }
-
-        return actors.distinctBy { it.actor.name }
-    }
-
-    // ===== Episode number extraction =====
-    fun extractEpisodeNumber(text: String): Int? {
-        val patterns = listOf(
-            Pattern.compile("(?:episode|ep|e)[\\s.-]*(\\d+)", Pattern.CASE_INSENSITIVE),
-            Pattern.compile("(\\d+)\\s*(?:st|nd|rd|th)\\s*episode", Pattern.CASE_INSENSITIVE),
-            Pattern.compile("^(\\d+)$")
-        )
-
-        for (pattern in patterns) {
-            val matcher = pattern.matcher(text.trim())
-            if (matcher.find()) {
-                return matcher.group(1)?.toIntOrNull()
-            }
-        }
-        return null
-    }
-
-    // ===== Season number extraction =====
-    fun extractSeasonNumber(text: String): Int? {
-        val patterns = listOf(
-            Pattern.compile("(?:season|s)[\\s.-]*(\\d+)", Pattern.CASE_INSENSITIVE),
-            Pattern.compile("(\\d+)\\s*(?:st|nd|rd|th)\\s*season", Pattern.CASE_INSENSITIVE)
-        )
-
-        for (pattern in patterns) {
-            val matcher = pattern.matcher(text.trim())
-            if (matcher.find()) {
-                return matcher.group(1)?.toIntOrNull()
-            }
-        }
-        return null
     }
 }

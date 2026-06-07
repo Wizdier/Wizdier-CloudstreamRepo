@@ -4,33 +4,35 @@ import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.utils.ExtractorApi
 import com.lagradost.cloudstream3.utils.ExtractorLink
+import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.loadExtractor
+import com.lagradost.cloudstream3.utils.newExtractorLink
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // JavaScript p,a,c,k,e,d Unpacker
 // ═══════════════════════════════════════════════════════════════════════════════
 
 object JsUnpacker {
-    
+
     private val PACKED_REGEX = Regex(
         """eval\(function\(p,a,c,k,e,[dr]\)\{.*?\}\('(.+?)',(\d+),(\d+),'([^']*)'""",
         setOf(RegexOption.DOT_MATCHES_ALL)
     )
-    
+
     fun unpack(packed: String?): String? {
         if (packed == null) return null
-        
+
         return try {
             val match = PACKED_REGEX.find(packed) ?: return null
-            
+
             val payload = match.groupValues[1]
             val radix = match.groupValues[2].toIntOrNull() ?: return null
             val count = match.groupValues[3].toIntOrNull() ?: return null
             val keywords = match.groupValues[4].split("|")
-            
+
             if (keywords.size != count) return null
-            
+
             var result = payload
             for (i in count - 1 downTo 0) {
                 val keyword = keywords.getOrNull(i) ?: continue
@@ -44,7 +46,7 @@ object JsUnpacker {
             null
         }
     }
-    
+
     fun containsPacked(html: String): Boolean {
         return html.contains("eval(function(p,a,c,k,e,")
     }
@@ -56,12 +58,12 @@ object JsUnpacker {
 
 private fun deobfuscate(html: String): String {
     if (!JsUnpacker.containsPacked(html)) return html
-    
+
     val packedMatch = Regex(
         """eval\(function\(p,a,c,k,e,[dr]\)\{.*?\}\('[^']*'""",
         setOf(RegexOption.DOT_MATCHES_ALL)
     ).find(html)
-    
+
     val unpacked = packedMatch?.let { JsUnpacker.unpack(it.value) } ?: ""
     return "$html\n$unpacked"
 }
@@ -69,11 +71,11 @@ private fun deobfuscate(html: String): String {
 private fun qualityOf(url: String): Int {
     val lower = url.lowercase()
     return when {
-        lower.contains("2160") || lower.contains("4k") -> Qualities.UHD4K.value
+        lower.contains("2160") || lower.contains("4k") -> Qualities.P2160.value
         lower.contains("1080") -> Qualities.P1080.value
-        lower.contains("720")  -> Qualities.P720.value
-        lower.contains("480")  -> Qualities.P480.value
-        lower.contains("360")  -> Qualities.P360.value
+        lower.contains("720") -> Qualities.P720.value
+        lower.contains("480") -> Qualities.P480.value
+        lower.contains("360") -> Qualities.P360.value
         else -> Qualities.Unknown.value
     }
 }
@@ -100,7 +102,7 @@ class NowHDTimeStreamExtractor : ExtractorApi() {
     override val name = "NowHDTime"
     override val mainUrl = NowHDTimeUtils.mainUrl
     override val requiresReferer = true
-    
+
     override suspend fun getUrl(
         url: String,
         referer: String?,
@@ -109,7 +111,7 @@ class NowHDTimeStreamExtractor : ExtractorApi() {
     ) {
         val html = app.get(url, referer = referer ?: mainUrl, timeout = 20).text
         val fullHtml = deobfuscate(html)
-        
+
         // Extract video sources
         listOf(
             Regex("""(?i)(?:file|src|source|url|video_url)\s*[:=]\s*["'](https?://[^"']+\.(?:mp4|m3u8|mkv|mpd)[^"']*)["']"""),
@@ -119,23 +121,26 @@ class NowHDTimeStreamExtractor : ExtractorApi() {
             pattern.findAll(fullHtml).forEach { match ->
                 val videoUrl = match.groupValues[1]
                 if (videoUrl.startsWith("http")) {
-                    callback(ExtractorLink(
-                        source  = name,
-                        name    = name,
-                        url     = videoUrl,
-                        referer = url,
-                        quality = qualityOf(videoUrl),
-                        isM3u8  = videoUrl.contains(".m3u8")
-                    ))
+                    callback(
+                        newExtractorLink(
+                            source = name,
+                            name = name,
+                            url = videoUrl,
+                            type = if (videoUrl.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+                        ) {
+                            this.referer = url
+                            this.quality = qualityOf(videoUrl)
+                        }
+                    )
                 }
             }
         }
-        
+
         // Extract subtitles
         SUB_REGEX.findAll(fullHtml).forEach { match ->
             subtitleCallback(SubtitleFile("Auto", match.groupValues[1]))
         }
-        
+
         // Process nested iframes
         Regex("""<iframe[^>]+src=["']([^"']+)["']""", RegexOption.IGNORE_CASE)
             .findAll(html).forEach { match ->
@@ -158,7 +163,7 @@ class NontongoExtractor : ExtractorApi() {
     override val name = "Nontongo"
     override val mainUrl = "https://nontongo.win"
     override val requiresReferer = true
-    
+
     override suspend fun getUrl(
         url: String,
         referer: String?,
@@ -167,27 +172,30 @@ class NontongoExtractor : ExtractorApi() {
     ) {
         val html = app.get(url, referer = referer ?: NowHDTimeUtils.mainUrl, timeout = 20).text
         val fullHtml = deobfuscate(html)
-        
+
         listOf(SOURCE_REGEX, VIDEO_REGEX).forEach { pattern ->
             pattern.findAll(fullHtml).forEach { match ->
                 val videoUrl = match.groupValues[1]
                 if (videoUrl.startsWith("http")) {
-                    callback(ExtractorLink(
-                        source  = name,
-                        name    = name,
-                        url     = videoUrl,
-                        referer = url,
-                        quality = qualityOf(videoUrl),
-                        isM3u8  = videoUrl.contains(".m3u8")
-                    ))
+                    callback(
+                        newExtractorLink(
+                            source = name,
+                            name = name,
+                            url = videoUrl,
+                            type = if (videoUrl.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+                        ) {
+                            this.referer = url
+                            this.quality = qualityOf(videoUrl)
+                        }
+                    )
                 }
             }
         }
-        
+
         SUB_REGEX.findAll(fullHtml).forEach { match ->
             subtitleCallback(SubtitleFile("Auto", match.groupValues[1]))
         }
-        
+
         // Nested iframes
         Regex("""<iframe[^>]+src=["']([^"']+)["']""", RegexOption.IGNORE_CASE)
             .findAll(html).forEach { match ->
@@ -210,7 +218,7 @@ class DroploadExtractor : ExtractorApi() {
     override val name = "Dropload"
     override val mainUrl = "https://dropload.io"
     override val requiresReferer = true
-    
+
     override suspend fun getUrl(
         url: String,
         referer: String?,
@@ -218,18 +226,21 @@ class DroploadExtractor : ExtractorApi() {
         callback: (ExtractorLink) -> Unit
     ) {
         val html = deobfuscate(app.get(url, referer = referer, timeout = 20).text)
-        
+
         VIDEO_REGEX.findAll(html).forEach { match ->
             val videoUrl = match.groupValues[1]
             if (!videoUrl.contains("dropload.io")) {
-                callback(ExtractorLink(
-                    source  = name,
-                    name    = name,
-                    url     = videoUrl,
-                    referer = url,
-                    quality = qualityOf(videoUrl),
-                    isM3u8  = videoUrl.contains(".m3u8")
-                ))
+                callback(
+                    newExtractorLink(
+                        source = name,
+                        name = name,
+                        url = videoUrl,
+                        type = if (videoUrl.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+                    ) {
+                        this.referer = url
+                        this.quality = qualityOf(videoUrl)
+                    }
+                )
             }
         }
     }
@@ -243,7 +254,7 @@ class VidHideExtractor : ExtractorApi() {
     override val name = "VidHide"
     override val mainUrl = "https://vidhide.com"
     override val requiresReferer = true
-    
+
     override suspend fun getUrl(
         url: String,
         referer: String?,
@@ -253,25 +264,28 @@ class VidHideExtractor : ExtractorApi() {
         // Handle multiple domains
         val normalizedUrl = url.replace(Regex("vidhide\\.(to|pro|cc)"), "vidhide.com")
         val html = deobfuscate(app.get(normalizedUrl, referer = referer, timeout = 20).text)
-        
+
         listOf(SOURCE_REGEX, VIDEO_REGEX).forEach { pattern ->
             pattern.findAll(html).forEach { match ->
                 val videoUrl = match.groupValues[1]
                 if (videoUrl.startsWith("http") && !videoUrl.contains("vidhide")) {
-                    callback(ExtractorLink(
-                        source  = name,
-                        name    = name,
-                        url     = videoUrl,
-                        referer = normalizedUrl,
-                        quality = qualityOf(videoUrl),
-                        isM3u8  = videoUrl.contains(".m3u8")
-                    ))
+                    callback(
+                        newExtractorLink(
+                            source = name,
+                            name = name,
+                            url = videoUrl,
+                            type = if (videoUrl.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+                        ) {
+                            this.referer = normalizedUrl
+                            this.quality = qualityOf(videoUrl)
+                        }
+                    )
                 }
             }
         }
-        
+
         // Extract subtitle tracks
-        Regex("""(?i)tracks\s*[:=]\s*\[([^\]]+)]""").find(html)?.let { tracksMatch ->
+        Regex("""(?i)tracks\s*[:=]\s*\[([^\]]+)\]""").find(html)?.let { tracksMatch ->
             Regex("""(?i)["'](?:file|src)["']\s*:\s*["']([^"']+\.(?:srt|vtt))["']""")
                 .findAll(tracksMatch.groupValues[1]).forEach { match ->
                     subtitleCallback(SubtitleFile("Auto", match.groupValues[1]))
@@ -288,7 +302,7 @@ class FileLionsExtractor : ExtractorApi() {
     override val name = "FileLions"
     override val mainUrl = "https://filelions.to"
     override val requiresReferer = true
-    
+
     override suspend fun getUrl(
         url: String,
         referer: String?,
@@ -297,19 +311,22 @@ class FileLionsExtractor : ExtractorApi() {
     ) {
         val normalizedUrl = url.replace(Regex("filelions\\.(live|online|site)"), "filelions.to")
         val html = deobfuscate(app.get(normalizedUrl, referer = referer, timeout = 20).text)
-        
+
         listOf(SOURCE_REGEX, VIDEO_REGEX).forEach { pattern ->
             pattern.findAll(html).forEach { match ->
                 val videoUrl = match.groupValues[1]
                 if (videoUrl.startsWith("http") && !videoUrl.contains("filelions")) {
-                    callback(ExtractorLink(
-                        source  = name,
-                        name    = name,
-                        url     = videoUrl,
-                        referer = normalizedUrl,
-                        quality = qualityOf(videoUrl),
-                        isM3u8  = videoUrl.contains(".m3u8")
-                    ))
+                    callback(
+                        newExtractorLink(
+                            source = name,
+                            name = name,
+                            url = videoUrl,
+                            type = if (videoUrl.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+                        ) {
+                            this.referer = normalizedUrl
+                            this.quality = qualityOf(videoUrl)
+                        }
+                    )
                 }
             }
         }
@@ -324,7 +341,7 @@ class StreamWishExtractor : ExtractorApi() {
     override val name = "StreamWish"
     override val mainUrl = "https://streamwish.to"
     override val requiresReferer = true
-    
+
     override suspend fun getUrl(
         url: String,
         referer: String?,
@@ -333,23 +350,26 @@ class StreamWishExtractor : ExtractorApi() {
     ) {
         val normalizedUrl = url.replace(Regex("streamwish\\.(com|site)"), "streamwish.to")
         val html = deobfuscate(app.get(normalizedUrl, referer = referer, timeout = 20).text)
-        
+
         listOf(SOURCE_REGEX, VIDEO_REGEX).forEach { pattern ->
             pattern.findAll(html).forEach { match ->
                 val videoUrl = match.groupValues[1]
                 if (videoUrl.startsWith("http")) {
-                    callback(ExtractorLink(
-                        source  = name,
-                        name    = name,
-                        url     = videoUrl,
-                        referer = normalizedUrl,
-                        quality = qualityOf(videoUrl),
-                        isM3u8  = videoUrl.contains(".m3u8")
-                    ))
+                    callback(
+                        newExtractorLink(
+                            source = name,
+                            name = name,
+                            url = videoUrl,
+                            type = if (videoUrl.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+                        ) {
+                            this.referer = normalizedUrl
+                            this.quality = qualityOf(videoUrl)
+                        }
+                    )
                 }
             }
         }
-        
+
         SUB_REGEX.findAll(html).forEach { match ->
             subtitleCallback(SubtitleFile("Auto", match.groupValues[1]))
         }
@@ -364,7 +384,7 @@ class DoodExtractor : ExtractorApi() {
     override val name = "DoodStream"
     override val mainUrl = "https://dood.to"
     override val requiresReferer = true
-    
+
     override suspend fun getUrl(
         url: String,
         referer: String?,
@@ -373,40 +393,43 @@ class DoodExtractor : ExtractorApi() {
     ) {
         // Normalize URL to primary domain
         val normalizedUrl = url.replace(
-            Regex("dood\\.(to|la|li|re|pm|sh|yt|watch|stream|cx|ws|one)"), 
+            Regex("dood\\.(to|la|li|re|pm|sh|yt|watch|stream|cx|ws|one)"),
             "dood.to"
         )
-        
+
         val html = app.get(normalizedUrl, referer = referer, timeout = 20).text
-        
+
         // Extract pass_md5 path
         val passPath = Regex("""\$\.get\('/pass_md5/([^']+)'""")
             .find(html)?.groupValues?.get(1) ?: return
-        
+
         // Extract token
         val token = Regex("""token=([^&"'\s]+)""")
             .find(html)?.groupValues?.get(1) ?: ""
-        
+
         try {
             val md5Response = app.get(
                 "$mainUrl/pass_md5/$passPath",
                 referer = normalizedUrl,
                 timeout = 15
             ).text
-            
+
             if (md5Response.startsWith("http")) {
                 // Generate random string for URL suffix
                 val randomSuffix = (1..10).map { ('a'..'z').random() }.joinToString("")
                 val finalUrl = "$md5Response$randomSuffix?token=$token"
-                
-                callback(ExtractorLink(
-                    source  = name,
-                    name    = name,
-                    url     = finalUrl,
-                    referer = normalizedUrl,
-                    quality = Qualities.Unknown.value,
-                    isM3u8  = false
-                ))
+
+                callback(
+                    newExtractorLink(
+                        source = name,
+                        name = name,
+                        url = finalUrl,
+                        type = ExtractorLinkType.VIDEO
+                    ) {
+                        this.referer = normalizedUrl
+                        this.quality = Qualities.Unknown.value
+                    }
+                )
             }
         } catch (_: Exception) {}
     }
@@ -420,7 +443,7 @@ class MixdropExtractor : ExtractorApi() {
     override val name = "MixDrop"
     override val mainUrl = "https://mixdrop.co"
     override val requiresReferer = true
-    
+
     override suspend fun getUrl(
         url: String,
         referer: String?,
@@ -428,26 +451,29 @@ class MixdropExtractor : ExtractorApi() {
         callback: (ExtractorLink) -> Unit
     ) {
         val normalizedUrl = url.replace(
-            Regex("mixdrop\\.(to|club|bz|ch|gl|ag|sx|nu)"), 
+            Regex("mixdrop\\.(to|club|bz|ch|gl|ag|sx|nu)"),
             "mixdrop.co"
         )
-        
+
         val html = deobfuscate(app.get(normalizedUrl, referer = referer, timeout = 20).text)
-        
+
         // Extract wurl or MDCore video URL
         Regex("""(?i)(?:wurl|surl|wvideo|MDCore\.v)\s*[:=]\s*["']([^"']+)["']""")
             .find(html)?.let { match ->
                 var videoUrl = match.groupValues[1]
                 if (videoUrl.startsWith("//")) videoUrl = "https:$videoUrl"
-                
-                callback(ExtractorLink(
-                    source  = name,
-                    name    = name,
-                    url     = videoUrl,
-                    referer = normalizedUrl,
-                    quality = Qualities.Unknown.value,
-                    isM3u8  = false
-                ))
+
+                callback(
+                    newExtractorLink(
+                        source = name,
+                        name = name,
+                        url = videoUrl,
+                        type = ExtractorLinkType.VIDEO
+                    ) {
+                        this.referer = normalizedUrl
+                        this.quality = Qualities.Unknown.value
+                    }
+                )
             }
     }
 }
@@ -460,7 +486,7 @@ class VoeExtractor : ExtractorApi() {
     override val name = "Voe"
     override val mainUrl = "https://voe.sx"
     override val requiresReferer = true
-    
+
     override suspend fun getUrl(
         url: String,
         referer: String?,
@@ -468,48 +494,57 @@ class VoeExtractor : ExtractorApi() {
         callback: (ExtractorLink) -> Unit
     ) {
         val html = app.get(url, referer = referer, timeout = 20).text
-        
+
         // Try HLS first
         Regex("""["'](https?://[^"']+\.m3u8[^"']*)["']""", RegexOption.IGNORE_CASE)
             .find(html)?.let { match ->
-                callback(ExtractorLink(
-                    source  = name,
-                    name    = name,
-                    url     = match.groupValues[1],
-                    referer = url,
-                    quality = Qualities.Unknown.value,
-                    isM3u8  = true
-                ))
+                callback(
+                    newExtractorLink(
+                        source = name,
+                        name = name,
+                        url = match.groupValues[1],
+                        type = ExtractorLinkType.M3U8
+                    ) {
+                        this.referer = url
+                        this.quality = Qualities.Unknown.value
+                    }
+                )
                 return
             }
-        
+
         // Try MP4
         Regex("""["'](https?://[^"']+\.mp4[^"']*)["']""", RegexOption.IGNORE_CASE)
             .find(html)?.let { match ->
-                callback(ExtractorLink(
-                    source  = name,
-                    name    = name,
-                    url     = match.groupValues[1],
-                    referer = url,
-                    quality = Qualities.Unknown.value,
-                    isM3u8  = false
-                ))
+                callback(
+                    newExtractorLink(
+                        source = name,
+                        name = name,
+                        url = match.groupValues[1],
+                        type = ExtractorLinkType.VIDEO
+                    ) {
+                        this.referer = url
+                        this.quality = Qualities.Unknown.value
+                    }
+                )
                 return
             }
-        
+
         // Try Base64 encoded URL
         Regex("""atob\(["']([A-Za-z0-9+/=]+)["']\)""").find(html)?.let { match ->
             try {
                 val decoded = String(android.util.Base64.decode(match.groupValues[1], android.util.Base64.DEFAULT))
                 if (decoded.startsWith("http")) {
-                    callback(ExtractorLink(
-                        source  = name,
-                        name    = name,
-                        url     = decoded,
-                        referer = url,
-                        quality = Qualities.Unknown.value,
-                        isM3u8  = decoded.contains(".m3u8")
-                    ))
+                    callback(
+                        newExtractorLink(
+                            source = name,
+                            name = name,
+                            url = decoded,
+                            type = if (decoded.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+                        ) {
+                            this.referer = url
+                            this.quality = Qualities.Unknown.value
+                        }
+                    )
                 }
             } catch (_: Exception) {}
         }
@@ -524,7 +559,7 @@ class UpstreamExtractor : ExtractorApi() {
     override val name = "Upstream"
     override val mainUrl = "https://upstream.to"
     override val requiresReferer = true
-    
+
     override suspend fun getUrl(
         url: String,
         referer: String?,
@@ -532,18 +567,21 @@ class UpstreamExtractor : ExtractorApi() {
         callback: (ExtractorLink) -> Unit
     ) {
         val html = deobfuscate(app.get(url, referer = referer, timeout = 20).text)
-        
+
         VIDEO_REGEX.findAll(html).forEach { match ->
             val videoUrl = match.groupValues[1]
             if (!videoUrl.contains("upstream.to")) {
-                callback(ExtractorLink(
-                    source  = name,
-                    name    = name,
-                    url     = videoUrl,
-                    referer = url,
-                    quality = qualityOf(videoUrl),
-                    isM3u8  = videoUrl.contains(".m3u8")
-                ))
+                callback(
+                    newExtractorLink(
+                        source = name,
+                        name = name,
+                        url = videoUrl,
+                        type = if (videoUrl.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+                    ) {
+                        this.referer = url
+                        this.quality = qualityOf(videoUrl)
+                    }
+                )
             }
         }
     }
@@ -557,7 +595,7 @@ class GenericM3u8Extractor : ExtractorApi() {
     override val name = "Direct"
     override val mainUrl = "https://"
     override val requiresReferer = true
-    
+
     override suspend fun getUrl(
         url: String,
         referer: String?,
@@ -566,14 +604,17 @@ class GenericM3u8Extractor : ExtractorApi() {
     ) {
         // Only handle direct video URLs
         if (!NowHDTimeUtils.isDirectVideo(url)) return
-        
-        callback(ExtractorLink(
-            source  = name,
-            name    = "Direct Stream",
-            url     = url,
-            referer = referer ?: "",
-            quality = qualityOf(url),
-            isM3u8  = url.contains(".m3u8")
-        ))
+
+        callback(
+            newExtractorLink(
+                source = name,
+                name = "Direct Stream",
+                url = url,
+                type = if (url.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+            ) {
+                this.referer = referer ?: ""
+                this.quality = qualityOf(url)
+            }
+        )
     }
 }

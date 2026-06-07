@@ -16,12 +16,12 @@ import org.jsoup.nodes.Document
 
 class NowHDTimeProvider : MainAPI() {
 
-    override var mainUrl            = NowHDTimeUtils.mainUrl
-    override var name               = NowHDTimeUtils.name
-    override var lang               = "bn"
-    override val hasMainPage        = true
+    override var mainUrl = NowHDTimeUtils.mainUrl
+    override var name = NowHDTimeUtils.name
+    override var lang = "bn"
+    override val hasMainPage = true
     override val hasDownloadSupport = true
-    override val hasQuickSearch     = false
+    override val hasQuickSearch = false
 
     override val supportedTypes = setOf(
         TvType.Movie,
@@ -31,11 +31,11 @@ class NowHDTimeProvider : MainAPI() {
     )
 
     override val mainPage = mainPageOf(
-        "$mainUrl/movies"         to "Latest Movies",
-        "$mainUrl/tv-shows"       to "Latest TV Shows",
-        "$mainUrl/trending"       to "Trending Now",
-        "$mainUrl/anime"          to "Anime",
-        "$mainUrl/movies?page="   to "More Movies",
+        "$mainUrl/movies" to "Latest Movies",
+        "$mainUrl/tv-shows" to "Latest TV Shows",
+        "$mainUrl/trending" to "Trending Now",
+        "$mainUrl/anime" to "Anime",
+        "$mainUrl/movies?page=" to "More Movies",
         "$mainUrl/tv-shows?page=" to "More TV Shows"
     )
 
@@ -43,14 +43,14 @@ class NowHDTimeProvider : MainAPI() {
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val url = when {
             request.data.endsWith("?page=") -> "${request.data}$page"
-            page > 1                        -> "${request.data}?page=$page"
-            else                            -> request.data
+            page > 1 -> "${request.data}?page=$page"
+            else -> request.data
         }
-        val doc   = app.get(url, timeout = 30).document
+        val doc = app.get(url, timeout = 30).document
         val items = if (request.data.contains("/anime")) parseAnimePage(doc)
-                    else parseMovieTvPage(doc)
+        else parseMovieTvPage(doc)
         return newHomePageResponse(
-            list    = HomePageList(request.name, items, isHorizontalImages = false),
+            list = HomePageList(request.name, items, isHorizontalImages = false),
             hasNext = hasNext(doc, page)
         )
     }
@@ -77,34 +77,34 @@ class NowHDTimeProvider : MainAPI() {
     override suspend fun load(url: String): LoadResponse {
         return when {
             url.contains("/anime/") && !url.contains("/watch/") -> loadAnime(url)
-            url.contains("/tv-show/")                           -> loadTvShow(url)
-            else                                                -> loadMovie(url)
+            url.contains("/tv-show/") -> loadTvShow(url)
+            else -> loadMovie(url)
         }
     }
 
     private suspend fun loadMovie(url: String): LoadResponse {
-        val doc     = app.get(url, timeout = 30).document
-        val title   = extractTitle(doc)
-        val poster  = bestImage(doc)
-        val plot    = extractPlot(doc)
-        val year    = extractYear(doc)
-        val rating  = extractRating(doc)
-        val dur     = extractDuration(doc)
-        val tags    = NowHDTimeUtils.extractTags(doc).ifEmpty { extractGenres(doc) }
-        val actors  = NowHDTimeUtils.extractActors(doc)
+        val doc = app.get(url, timeout = 30).document
+        val title = extractTitle(doc)
+        val poster = bestImage(doc)
+        val plot = extractPlot(doc)
+        val year = extractYear(doc)
+        val rating = extractRating(doc)
+        val dur = extractDuration(doc)
+        val tags = NowHDTimeUtils.extractTags(doc).ifEmpty { extractGenres(doc) }
+        val actors = NowHDTimeUtils.extractActors(doc)
         val trailer = extractTrailer(doc)
-        val recs    = extractRecs(doc)
-        val ids     = NowHDTimeUtils.extractTrackingIds(doc)
+        val recs = extractRecs(doc)
+        val ids = NowHDTimeUtils.extractTrackingIds(doc)
 
         return newMovieLoadResponse(title, url, TvType.Movie, url) {
-            this.posterUrl  = poster
-            this.year       = year
-            this.plot       = plot
-            this.tags       = tags
-            this.rating     = rating
-            this.duration   = dur
+            this.posterUrl = poster
+            this.year = year
+            this.plot = plot
+            this.tags = tags
+            this.score = rating?.toDouble()?.div(1000.0)
+            this.duration = dur
             this.recommendations = recs
-            addActors(actors)
+            addActors(actors.map { it.actor })
             addTrailer(trailer)
             addImdbId(ids.imdbId)
             addMalId(ids.malId)
@@ -114,55 +114,55 @@ class NowHDTimeProvider : MainAPI() {
     }
 
     private suspend fun loadTvShow(url: String): LoadResponse {
-        val doc     = app.get(url, timeout = 30).document
-        val title   = extractTitle(doc)
-        val poster  = bestImage(doc)
-        val plot    = extractPlot(doc)
-        val year    = extractYear(doc)
-        val rating  = extractRating(doc)
-        val tags    = NowHDTimeUtils.extractTags(doc).ifEmpty { extractGenres(doc) }
-        val actors  = NowHDTimeUtils.extractActors(doc)
+        val doc = app.get(url, timeout = 30).document
+        val title = extractTitle(doc)
+        val poster = bestImage(doc)
+        val plot = extractPlot(doc)
+        val year = extractYear(doc)
+        val rating = extractRating(doc)
+        val tags = NowHDTimeUtils.extractTags(doc).ifEmpty { extractGenres(doc) }
+        val actors = NowHDTimeUtils.extractActors(doc)
         val trailer = extractTrailer(doc)
-        val recs    = extractRecs(doc)
-        val ids     = NowHDTimeUtils.extractTrackingIds(doc)
-        val eps     = extractTvEpisodes(doc)
+        val recs = extractRecs(doc)
+        val ids = NowHDTimeUtils.extractTrackingIds(doc)
+        val eps = extractTvEpisodes(doc)
 
         return newTvSeriesLoadResponse(title, url, TvType.TvSeries, eps) {
-            this.posterUrl  = poster
-            this.year       = year
-            this.plot       = plot
-            this.tags       = tags
-            this.rating     = rating
+            this.posterUrl = poster
+            this.year = year
+            this.plot = plot
+            this.tags = tags
+            this.score = rating?.toDouble()?.div(1000.0)
             this.recommendations = recs
-            addActors(actors)
+            addActors(actors.map { it.actor })
             addTrailer(trailer)
             addImdbId(ids.imdbId)
         }
     }
 
     private suspend fun loadAnime(url: String): LoadResponse {
-        val doc     = app.get(url, timeout = 30).document
-        val title   = extractTitle(doc)
-        val poster  = bestImage(doc)
-        val plot    = extractPlot(doc)
-        val year    = extractYear(doc)
-        val rating  = extractRating(doc)
-        val tags    = NowHDTimeUtils.extractTags(doc).ifEmpty { extractGenres(doc) }
-        val actors  = NowHDTimeUtils.extractActors(doc)
+        val doc = app.get(url, timeout = 30).document
+        val title = extractTitle(doc)
+        val poster = bestImage(doc)
+        val plot = extractPlot(doc)
+        val year = extractYear(doc)
+        val rating = extractRating(doc)
+        val tags = NowHDTimeUtils.extractTags(doc).ifEmpty { extractGenres(doc) }
+        val actors = NowHDTimeUtils.extractActors(doc)
         val trailer = extractTrailer(doc)
-        val recs    = extractAnimeRecs(doc)
-        val ids     = NowHDTimeUtils.extractTrackingIds(doc)
-        val eps     = extractAnimeEpisodes(doc, ids.anilistId)
+        val recs = extractAnimeRecs(doc)
+        val ids = NowHDTimeUtils.extractTrackingIds(doc)
+        val eps = extractAnimeEpisodes(doc, ids.anilistId)
 
         return newAnimeLoadResponse(title, url, TvType.Anime) {
-            this.posterUrl  = poster
-            this.year       = year
-            this.plot       = plot
-            this.tags       = tags
-            this.rating     = rating
+            this.posterUrl = poster
+            this.year = year
+            this.plot = plot
+            this.tags = tags
+            this.score = rating?.toDouble()?.div(1000.0)
             this.recommendations = recs
             addEpisodes(DubStatus.Subbed, eps)
-            addActors(actors)
+            addActors(actors.map { it.actor })
             addTrailer(trailer)
             addMalId(ids.malId)
             addAniListId(ids.anilistId)
@@ -177,7 +177,7 @@ class NowHDTimeProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        val doc  = app.get(data, timeout = 30).document
+        val doc = app.get(data, timeout = 30).document
         val html = doc.html()
         var found = false
 
@@ -197,7 +197,7 @@ class NowHDTimeProvider : MainAPI() {
                     callback(newExtractorLink(
                         source = name, name = name, url = embedUrl,
                         type = if (embedUrl.contains(".m3u8")) ExtractorLinkType.M3U8
-                               else ExtractorLinkType.VIDEO
+                        else ExtractorLinkType.VIDEO
                     ) { this.referer = data; this.quality = NowHDTimeUtils.qualityFromString(embedUrl) })
                 } else {
                     loadExtractor(embedUrl, data, subtitleCallback, callback)
@@ -237,13 +237,13 @@ class NowHDTimeProvider : MainAPI() {
                 val href = a.attr("href")
                 val fullUrl = NowHDTimeUtils.fixUrl(href) ?: return@forEach
                 if (!fullUrl.contains("/movie/") && !fullUrl.contains("/tv-show/")) return@forEach
-                val img   = a.selectFirst("img")
+                val img = a.selectFirst("img")
                 val title = a.selectFirst("h2,h3,h4,.title")?.text()?.trim()
                     ?: img?.attr("alt")?.trim() ?: a.attr("title").trim()
                 if (title.isBlank()) return@forEach
                 val poster = NowHDTimeUtils.fixUrl(img?.attr("src")?.ifBlank { img.attr("data-src") })
-                val year   = NowHDTimeUtils.extractYear(a.selectFirst("[class*=year],.year")?.text())
-                val clean  = NowHDTimeUtils.cleanTitle(title)
+                val year = NowHDTimeUtils.extractYear(a.selectFirst("[class*=year],.year")?.text())
+                val clean = NowHDTimeUtils.cleanTitle(title)
                 if (fullUrl.contains("/tv-show/"))
                     results.add(newTvSeriesSearchResponse(clean, fullUrl, TvType.TvSeries) { this.posterUrl = poster; this.year = year })
                 else
@@ -260,12 +260,12 @@ class NowHDTimeProvider : MainAPI() {
                 val href = a.attr("href")
                 if (href.contains("/watch/")) return@forEach
                 val fullUrl = NowHDTimeUtils.fixUrl(href) ?: return@forEach
-                val img   = a.selectFirst("img")
+                val img = a.selectFirst("img")
                 val title = a.selectFirst("h2,h3,h4,.title")?.text()?.trim()
                     ?: img?.attr("alt")?.trim() ?: a.attr("title").trim()
                 if (title.isBlank() || title.length < 2) return@forEach
                 val poster = NowHDTimeUtils.fixUrl(img?.attr("src")?.ifBlank { img.attr("data-src") })
-                val year   = NowHDTimeUtils.extractYear(title)
+                val year = NowHDTimeUtils.extractYear(title)
                 results.add(newAnimeSearchResponse(NowHDTimeUtils.cleanTitle(title), fullUrl, TvType.Anime) { this.posterUrl = poster; this.year = year })
             } catch (_: Exception) {}
         }
@@ -278,17 +278,20 @@ class NowHDTimeProvider : MainAPI() {
         doc.select(".season, [class*=season], .episodes-list").forEach { container ->
             val sNum = NowHDTimeUtils.extractSeasonNum(container.selectFirst("h3,.season-title")?.text() ?: "") ?: 1
             container.select("a[href*='/episode/'], a[href*='/watch/'], .episode-item a").forEach { ep ->
-                val href  = ep.attr("href").ifBlank { ep.selectFirst("a")?.attr("href") } ?: return@forEach
+                val href = ep.attr("href").ifBlank { ep.selectFirst("a")?.attr("href") } ?: return@forEach
                 val epUrl = NowHDTimeUtils.fixUrl(href) ?: return@forEach
-                val txt   = ep.selectFirst(".ep-title,.title,span")?.text()?.trim() ?: ep.text().trim()
+                val txt = ep.selectFirst(".ep-title,.title,span")?.text()?.trim() ?: ep.text().trim()
                 val epNum = NowHDTimeUtils.extractEpNum(txt) ?: NowHDTimeUtils.extractEpNum(href) ?: eps.size + 1
-                eps.add(Episode(epUrl, txt.ifBlank { "Episode $epNum" }, sNum, epNum))
+                eps.add(newEpisode(epUrl, txt.ifBlank { "Episode $epNum" }) {
+                    this.season = sNum
+                    this.episode = epNum
+                })
             }
         }
         if (eps.isEmpty()) doc.select("a[href*='episode'], a[href*='ep-']").forEachIndexed { i, ep ->
             val epUrl = NowHDTimeUtils.fixUrl(ep.attr("href")) ?: return@forEachIndexed
             val epNum = NowHDTimeUtils.extractEpNum(ep.attr("href")) ?: (i + 1)
-            eps.add(Episode(epUrl, "Episode $epNum", episode = epNum))
+            eps.add(newEpisode(epUrl, "Episode $epNum") { this.episode = epNum })
         }
         return eps.distinctBy { it.data }.sortedWith(compareBy({ it.season ?: 0 }, { it.episode ?: 0 }))
     }
@@ -297,18 +300,18 @@ class NowHDTimeProvider : MainAPI() {
         val eps = mutableListOf<Episode>()
         if (anilistId != null) {
             doc.select("a[href*='/anime/$anilistId/'], .episode-link, .ep-item").forEach { ep ->
-                val href  = ep.attr("href")
+                val href = ep.attr("href")
                 val epUrl = if (href.startsWith("http")) href
-                            else if (href.startsWith("/")) "$mainUrl$href"
-                            else return@forEach
+                else if (href.startsWith("/")) "$mainUrl$href"
+                else return@forEach
                 val epNum = NowHDTimeUtils.extractEpNum(href) ?: NowHDTimeUtils.extractEpNum(ep.text()) ?: eps.size + 1
-                eps.add(Episode(epUrl, ep.text().trim().ifBlank { "Episode $epNum" }, episode = epNum))
+                eps.add(newEpisode(epUrl, ep.text().trim().ifBlank { "Episode $epNum" }) { this.episode = epNum })
             }
         }
         if (eps.isEmpty()) doc.select(".episode a, [class*=episode] a, a[href*='/watch/']").forEach { ep ->
             val epUrl = NowHDTimeUtils.fixUrl(ep.attr("href")) ?: return@forEach
             val epNum = NowHDTimeUtils.extractEpNum(ep.attr("href")) ?: eps.size + 1
-            eps.add(Episode(epUrl, "Episode $epNum", episode = epNum))
+            eps.add(newEpisode(epUrl, "Episode $epNum") { this.episode = epNum })
         }
         return eps.distinctBy { it.data }.sortedBy { it.episode ?: 0 }
     }
@@ -327,7 +330,7 @@ class NowHDTimeProvider : MainAPI() {
 
     private fun extractPlot(doc: Document): String? {
         for (sel in listOf(".synopsis p,.overview p,.description p,.plot p", ".synopsis,.overview,.description,.plot",
-                           "meta[name='description']", "meta[property='og:description']")) {
+            "meta[name='description']", "meta[property='og:description']")) {
             val el = doc.selectFirst(sel) ?: continue
             val t = if (sel.startsWith("meta")) el.attr("content") else el.text()
             if (t.length > 30) return t.trim()
@@ -380,8 +383,8 @@ class NowHDTimeProvider : MainAPI() {
         doc.select("[class*=similar] a,[class*=related] a,[class*=recommend] a,.more-like-this a").forEach { a ->
             val href = a.attr("href")
             if (!href.contains("/movie/") && !href.contains("/tv-show/")) return@forEach
-            val url2   = NowHDTimeUtils.fixUrl(href) ?: return@forEach
-            val img    = a.selectFirst("img")
+            val url2 = NowHDTimeUtils.fixUrl(href) ?: return@forEach
+            val img = a.selectFirst("img")
             val title2 = a.selectFirst("h3,h4,.title")?.text()?.trim() ?: img?.attr("alt")?.trim() ?: return@forEach
             val poster = NowHDTimeUtils.fixUrl(img?.attr("src"))
             if (href.contains("/tv-show/")) recs.add(newTvSeriesSearchResponse(title2, url2, TvType.TvSeries) { this.posterUrl = poster })
@@ -393,8 +396,8 @@ class NowHDTimeProvider : MainAPI() {
     private fun extractAnimeRecs(doc: Document): List<SearchResponse> {
         val recs = mutableListOf<SearchResponse>()
         doc.select("a[href*='/anime/']").filter { !it.attr("href").contains("/watch/") }.take(12).forEach { a ->
-            val url2   = NowHDTimeUtils.fixUrl(a.attr("href")) ?: return@forEach
-            val img    = a.selectFirst("img")
+            val url2 = NowHDTimeUtils.fixUrl(a.attr("href")) ?: return@forEach
+            val img = a.selectFirst("img")
             val title2 = a.selectFirst("h3,h4,.title")?.text()?.trim() ?: img?.attr("alt")?.trim() ?: return@forEach
             val poster = NowHDTimeUtils.fixUrl(img?.attr("src"))
             recs.add(newAnimeSearchResponse(title2, url2, TvType.Anime) { this.posterUrl = poster })
