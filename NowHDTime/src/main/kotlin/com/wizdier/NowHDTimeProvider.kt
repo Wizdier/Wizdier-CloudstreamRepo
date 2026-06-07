@@ -1,6 +1,7 @@
 package com.wizdier
 
 import com.lagradost.cloudstream3.*
+import com.lagradost.cloudstream3.Score
 import com.lagradost.cloudstream3.LoadResponse.Companion.addActors
 import com.lagradost.cloudstream3.LoadResponse.Companion.addAniListId
 import com.lagradost.cloudstream3.LoadResponse.Companion.addImdbId
@@ -88,7 +89,7 @@ class NowHDTimeProvider : MainAPI() {
         val poster = bestImage(doc)
         val plot = extractPlot(doc)
         val year = extractYear(doc)
-        val rating = extractRating(doc)
+        val score = extractRating(doc)
         val dur = extractDuration(doc)
         val tags = NowHDTimeUtils.extractTags(doc).ifEmpty { extractGenres(doc) }
         val actors = NowHDTimeUtils.extractActors(doc)
@@ -101,7 +102,7 @@ class NowHDTimeProvider : MainAPI() {
             this.year = year
             this.plot = plot
             this.tags = tags
-            this.rating = rating
+            this.score = score
             this.duration = dur
             this.recommendations = recs
             addActors(actors.map { it.actor })
@@ -119,7 +120,7 @@ class NowHDTimeProvider : MainAPI() {
         val poster = bestImage(doc)
         val plot = extractPlot(doc)
         val year = extractYear(doc)
-        val rating = extractRating(doc)
+        val score = extractRating(doc)
         val tags = NowHDTimeUtils.extractTags(doc).ifEmpty { extractGenres(doc) }
         val actors = NowHDTimeUtils.extractActors(doc)
         val trailer = extractTrailer(doc)
@@ -132,7 +133,7 @@ class NowHDTimeProvider : MainAPI() {
             this.year = year
             this.plot = plot
             this.tags = tags
-            this.rating = rating
+            this.score = score
             this.recommendations = recs
             addActors(actors.map { it.actor })
             addTrailer(trailer)
@@ -146,7 +147,7 @@ class NowHDTimeProvider : MainAPI() {
         val poster = bestImage(doc)
         val plot = extractPlot(doc)
         val year = extractYear(doc)
-        val rating = extractRating(doc)
+        val score = extractRating(doc)
         val tags = NowHDTimeUtils.extractTags(doc).ifEmpty { extractGenres(doc) }
         val actors = NowHDTimeUtils.extractActors(doc)
         val trailer = extractTrailer(doc)
@@ -159,7 +160,7 @@ class NowHDTimeProvider : MainAPI() {
             this.year = year
             this.plot = plot
             this.tags = tags
-            this.rating = rating
+            this.score = score
             this.recommendations = recs
             addEpisodes(DubStatus.Subbed, eps)
             addActors(actors.map { it.actor })
@@ -346,7 +347,7 @@ class NowHDTimeProvider : MainAPI() {
         return NowHDTimeUtils.extractYear(doc.selectFirst("meta[name='keywords']")?.attr("content"))
     }
 
-    private fun extractRating(doc: Document): Int? {
+    private fun extractRating(doc: Document): Score? {
         doc.selectFirst(".score,.rating,[class*=score],[class*=rating]")?.text()?.let {
             NowHDTimeUtils.extractRating(it)?.let { r -> return r }
         }; return null

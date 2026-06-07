@@ -1,6 +1,7 @@
 package com.wizdier
 
 import com.lagradost.cloudstream3.*
+import com.lagradost.cloudstream3.Score
 import com.lagradost.cloudstream3.utils.Qualities
 import org.jsoup.nodes.Document
 
@@ -40,10 +41,10 @@ object NowHDTimeUtils {
     fun extractYear(text: String?): Int? =
         text?.let { Regex("((?:19|20)\\d{2})").find(it)?.groupValues?.get(1)?.toIntOrNull() }
 
-    // ── Rating (CloudStream uses score * 1000) ────────────────────────────────
-    fun extractRating(text: String?): Int? =
+    // ── Rating ────────────────────────────────────────────────────────────────
+    fun extractRating(text: String?): Score? =
         text?.let { Regex("(\\d+(?:\\.\\d+)?)").find(it)?.groupValues?.get(1)?.toDoubleOrNull() }
-            ?.let { (it * 1000).toInt() }
+            ?.let { Score.from10(it.coerceIn(0.0, 10.0)) }
 
     // ── Duration ──────────────────────────────────────────────────────────────
     fun parseDuration(text: String?): Int? {
