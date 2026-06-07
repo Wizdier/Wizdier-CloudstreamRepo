@@ -3,26 +3,24 @@ version = 1
 cloudstream {
     language = "bn"
 
-    description = "NowHDTime - Premium Bangla & Multi-language Movie/Series Streaming"
+    description = "NowHDTime – Movies, TV Shows, Anime. Bangla · Hindi · English · Korean · Japanese and more."
     authors = listOf("Wizdier")
 
     /**
-     * Status int as the following:
-     * 0: Down
-     * 1: Ok
-     * 2: Slow
-     * 3: Beta only
+     * Status:
+     * 0 = Down   1 = OK   2 = Slow   3 = Beta
      */
     status = 1
 
     tvTypes = listOf(
         "Movie",
         "TvSeries",
-        "AsianDrama",
-        "Anime"
+        "Anime",
+        "AnimeMovie",
+        "AsianDrama"
     )
 
-    iconUrl = "https://nowhdtime.com.bd/wp-content/uploads/2024/01/cropped-favicon-32x32.png"
+    iconUrl = "https://i.postimg.cc/bvKvW66z/nowhd-logo.png"
 
     requiresResources = false
 }
