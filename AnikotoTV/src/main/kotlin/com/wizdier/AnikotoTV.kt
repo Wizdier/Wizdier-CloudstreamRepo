@@ -514,7 +514,18 @@ class AnikotoTV : MainAPI() {
                                         append(link.name)
                                     }
                                 }
-                                callback.invoke(link.copy(name = finalName))
+                                callback.invoke(
+                                    ExtractorLink(
+                                        link.source,
+                                        finalName,
+                                        link.url,
+                                        link.referer,
+                                        link.quality,
+                                        link.isM3u8,
+                                        link.headers,
+                                        link.extractorData
+                                    )
+                                )
                             }
                         )
                         true
@@ -543,7 +554,7 @@ class AnikotoTV : MainAPI() {
     // ═══════════════════════════════════════════════════════════════════
     //                   SOURCE EXTRACTION FROM HTML
     // ═══════════════════════════════════════════════════════════════════
-    private fun extractSourcesFromHtml(
+    private suspend fun extractSourcesFromHtml(
         html: String,
         referer: String,
         sourceLabel: String,
@@ -613,8 +624,8 @@ class AnikotoTV : MainAPI() {
         val added = mutableSetOf<String>()
 
         listOf(
-            Regex("""(?:tracks|subtitles|captions)\s*[:=]\s*(\[[\s\S]*?\])"""),
-            Regex(""""(?:tracks|subtitles|captions)"\s*:\s*(\[[\s\S]*?\])"""),
+            Regex("""(?:tracks|subtitles|captions)\s*[:=]\s*([[\s\S]*?\])"""),
+            Regex(""""(?:tracks|subtitles|captions)"\s*:\s*([[\s\S]*?\])"""),
         ).forEach { pattern ->
             pattern.findAll(html).forEach { match ->
                 runCatching {
@@ -756,33 +767,7 @@ class AnikotoTV : MainAPI() {
     private suspend fun fetchAniListCharacters(anilistId: Int?): List<ActorData> {
         if (anilistId == null || anilistId <= 0) return emptyList()
 
-        val query = """
-            query (\$id: Int) {
-              Media(id: \$id, type: ANIME) {
-                characters(sort: ROLE, perPage: 15) {
-                  edges {
-                    node {
-                      name {
-                        full
-                      }
-                      image {
-                        large
-                      }
-                    }
-                    role
-                    voiceActors(language: JAPANESE) {
-                      name {
-                        full
-                      }
-                      image {
-                        large
-                      }
-                    }
-                  }
-                }
-              }
-            }
-        """.trimIndent()
+        val query = "query (\$id: Int) { Media(id: \$id, type: ANIME) { characters(sort: ROLE, perPage: 15) { edges { node { name { full } image { large } } role voiceActors(language: JAPANESE) { name { full } image { large } } } } } }"
 
         val variables = JSONObject().apply { put("id", anilistId) }
         val payload = JSONObject().apply {
@@ -900,8 +885,8 @@ class AnikotoTV : MainAPI() {
 
     private fun parseDuration(text: String?): Int? {
         if (text.isNullOrBlank()) return null
-        val h = Regex("(\d+)h").find(text)?.groupValues?.get(1)?.toIntOrNull() ?: 0
-        val m = Regex("(\d+)\s*m").find(text)?.groupValues?.get(1)?.toIntOrNull() ?: 0
+        val h = Regex("""(d+)h""").find(text)?.groupValues?.get(1)?.toIntOrNull() ?: 0
+        val m = Regex("""(d+)s*m""").find(text)?.groupValues?.get(1)?.toIntOrNull() ?: 0
         return (h * 60 + m).takeIf { it > 0 }
     }
 
