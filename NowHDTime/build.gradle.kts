@@ -3,7 +3,9 @@ version = 1
 cloudstream {
     language = "bn"
 
-    description = "NowHDTime – Movies, TV Shows, Anime. Bangla · Hindi · English · Korean · Japanese and more."
+    description = "NowHDTime – Movies, TV Shows, Anime & Asian Dramas.\n" +
+        "Bangla · Hindi · English · Korean · Japanese and more."
+
     authors = listOf("Wizdier")
 
     /**
@@ -21,10 +23,8 @@ cloudstream {
     )
 
     iconUrl = "https://i.postimg.cc/bvKvW66z/nowhd-logo.png"
-
 }
 
 android {
-    namespace = "com.wizdier.circleftp"
+    namespace = "com.wizdier.nowhdtime"
 }
-
