@@ -5,6 +5,8 @@ import com.lagradost.cloudstream3.utils.*
 import org.jsoup.nodes.Element
 import com.fasterxml.jackson.module.kotlin.readValue
 import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
+import com.lagradost.cloudstream3.utils.AppUtils.toJson
+import com.lagradost.cloudstream3.utils.AppUtils.parseJson
 
 class NowHDTime : MainAPI() {
     override var mainUrl = "https://nowhdtime.com.bd"
@@ -121,14 +123,13 @@ class NowHDTime : MainAPI() {
                 val epTitle = el.selectFirst("img")?.attr("alt") ?: "Episode $episode"
                 val epPoster = el.selectFirst("img")?.attr("src")
                 
-                newEpisode(
-                    EpisodeData(tvId = tvId, season = season, episode = episode, players = players).toJson()
-                ) {
-                    this.name = epTitle
-                    this.season = season
-                    this.episode = episode
-                    this.posterUrl = epPoster
-                }
+                Episode(
+                    data = EpisodeData(tvId = tvId, season = season, episode = episode, players = players).toJson(),
+                    name = epTitle,
+                    season = season,
+                    episode = episode,
+                    posterUrl = epPoster
+                )
             }.distinctBy { it.season to it.episode }
             
             return newTvSeriesLoadResponse(title, url, TvType.TvSeries, episodes) {
