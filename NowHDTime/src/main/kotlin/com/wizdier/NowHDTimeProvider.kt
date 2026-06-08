@@ -98,7 +98,8 @@ class NowHDTimeProvider : MainAPI() {
             this.year = year
             this.plot = plot
             this.tags = tags
-            addScore(rating)
+            @Suppress("DEPRECATION_ERROR")
+            this.rating = rating
             this.duration = dur
             this.recommendations = recs
             addActors(actors)
@@ -126,7 +127,8 @@ class NowHDTimeProvider : MainAPI() {
             this.year = year
             this.plot = plot
             this.tags = tags
-            addScore(rating)
+            @Suppress("DEPRECATION_ERROR")
+            this.rating = rating
             this.recommendations = recs
             addActors(actors)
             addTrailer(trailer)
@@ -153,7 +155,8 @@ class NowHDTimeProvider : MainAPI() {
             this.year = year
             this.plot = plot
             this.tags = tags
-            addScore(rating)
+            @Suppress("DEPRECATION_ERROR")
+            this.rating = rating
             this.recommendations = recs
             addEpisodes(DubStatus.Subbed, eps)
             addActors(actors)
@@ -355,18 +358,18 @@ class NowHDTimeProvider : MainAPI() {
         return extractYearFromText(extractTitle(doc))
     }
 
-    private fun extractRating(doc: Document): String? {
+    private fun extractRating(doc: Document): Int? {
         val ratingPattern = Regex("""(\d+\.?\d*)\s*/\s*10""")
         doc.select(".rating, .score, [class*=rating], [class*=score], .vote-average").forEach { el ->
-            ratingPattern.find(el.text())?.groupValues?.get(1)?.let {
-                return it
+            ratingPattern.find(el.text())?.groupValues?.get(1)?.toDoubleOrNull()?.let {
+                return (it * 1000).toInt()
             }
         }
         doc.select("span, div, p").forEach { el ->
             val txt = el.text()
             if (txt.contains("/10") && txt.length < 20) {
-                ratingPattern.find(txt)?.groupValues?.get(1)?.let {
-                    return it
+                ratingPattern.find(txt)?.groupValues?.get(1)?.toDoubleOrNull()?.let {
+                    return (it * 1000).toInt()
                 }
             }
         }
