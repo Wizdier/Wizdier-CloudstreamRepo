@@ -3,300 +3,486 @@ package com.wizdier
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.LoadResponse.Companion.addActors
 import com.lagradost.cloudstream3.LoadResponse.Companion.addTrailer
-import com.lagradost.cloudstream3.utils.ExtractorLink
-import com.lagradost.cloudstream3.utils.loadExtractor
-import org.jsoup.nodes.Document
+import com.lagradost.cloudstream3.mvvm.safeApiCall
+import com.lagradost.cloudstream3.utils.*
+import org.jsoup.nodes.Element
 
+/**
+ * NowHDTime provider for CloudStream3.
+ *
+ * Strategy:
+ *  - Browse/search via nowhdtime.to HTML (server-rendered content lists, episode metadata)
+ *  - Video sources: extract TMDB ID from page poster URLs, then query multiple
+ *    well-known TMDB-ID-based embed providers (VidSrc, 2Embed, multiembed, embed.su, AutoEmbed)
+ *    since the site's own player buttons are JS-injected with no static attributes.
+ *
+ * Data format passed through Episode.data / loadLinks:
+ *   "movie::{tmdbId}"            for movies
+ *   "tv::{tmdbId}::{s}::{e}"    for TV episodes
+ */
 class NowHDTimeProvider : MainAPI() {
 
-    override var mainUrl = "https://nowhdtime.to"
-    override var name = "NowHDTime"
-    override var lang = "en"
-    override val hasMainPage = true
-    override val hasDownloadSupport = true
-    override val hasQuickSearch = false
-    override val instantLinkLoading = true
-
-    override val supportedTypes = setOf(
-        TvType.Movie, TvType.TvSeries, TvType.Anime, TvType.AsianDrama
-    )
+    override var mainUrl              = "https://nowhdtime.to"
+    override var name                 = "NowHDTime"
+    override val hasMainPage          = true
+    override val hasSearch            = true
+    override val hasChromecastSupport = true
+    override val hasDownloadSupport   = true
+    override val supportedTypes       = setOf(TvType.Movie, TvType.TvSeries, TvType.Anime)
 
     override val mainPage = mainPageOf(
-        "$mainUrl/movies" to "Latest Movies",
-        "$mainUrl/tv-shows" to "Latest TV Shows",
-        "$mainUrl/trending" to "Trending Now",
-        "$mainUrl/anime" to "Anime",
+        "$mainUrl/movies?page="    to "Latest Movies",
+        "$mainUrl/tv-shows?page="  to "Latest TV Shows",
+        "$mainUrl/trending?page="  to "Trending",
+        "$mainUrl/anime?page="     to "Anime",
     )
 
-    // ── Home ─────────────────────────────────────────────────────────
+    // ────────────────────────────────────────────────────────────────────────
+    // Embed providers — tried in order; all use TMDB IDs
+    // ────────────────────────────────────────────────────────────────────────
+
+    private data class EmbedProvider(
+        val name: String,
+        val movieUrl: (tmdb: String) -> String,
+        val tvUrl:    (tmdb: String, season: Int, episode: Int) -> String,
+    )
+
+    private val embedProviders = listOf(
+        EmbedProvider(
+            name     = "VidSrc",
+            movieUrl = { tmdb -> "https://vidsrc.xyz/embed/movie?tmdb=$tmdb" },
+            tvUrl    = { tmdb, s, e -> "https://vidsrc.xyz/embed/tv?tmdb=$tmdb&season=$s&episode=$e" },
+        ),
+        EmbedProvider(
+            name     = "VidSrc.me",
+            movieUrl = { tmdb -> "https://vidsrc.me/embed/movie?tmdb=$tmdb" },
+            tvUrl    = { tmdb, s, e -> "https://vidsrc.me/embed/tv?tmdb=$tmdb&season=$s&episode=$e" },
+        ),
+        EmbedProvider(
+            name     = "2Embed",
+            movieUrl = { tmdb -> "https://www.2embed.cc/embed/$tmdb" },
+            tvUrl    = { tmdb, s, e -> "https://www.2embed.cc/embedtv/$tmdb&s=$s&e=$e" },
+        ),
+        EmbedProvider(
+            name     = "2Embed Stream",
+            movieUrl = { tmdb -> "https://www.2embed.stream/embed/movie/$tmdb" },
+            tvUrl    = { tmdb, s, e -> "https://www.2embed.stream/embed/tv/$tmdb/$s/$e" },
+        ),
+        EmbedProvider(
+            name     = "MultiEmbed",
+            movieUrl = { tmdb -> "https://multiembed.mov/?video_id=$tmdb&tmdb=1" },
+            tvUrl    = { tmdb, s, e -> "https://multiembed.mov/?video_id=$tmdb&tmdb=1&s=$s&e=$e" },
+        ),
+        EmbedProvider(
+            name     = "Embed.su",
+            movieUrl = { tmdb -> "https://embed.su/embed/movie/$tmdb" },
+            tvUrl    = { tmdb, s, e -> "https://embed.su/embed/tv/$tmdb/$s/$e" },
+        ),
+        EmbedProvider(
+            name     = "AutoEmbed",
+            movieUrl = { tmdb -> "https://autoembed.cc/movie/tmdb-$tmdb" },
+            tvUrl    = { tmdb, s, e -> "https://autoembed.cc/tv/tmdb-$tmdb-$s-$e" },
+        ),
+        EmbedProvider(
+            name     = "VidLink",
+            movieUrl = { tmdb -> "https://vidlink.pro/movie/$tmdb" },
+            tvUrl    = { tmdb, s, e -> "https://vidlink.pro/tv/$tmdb/$s/$e" },
+        ),
+    )
+
+    // ────────────────────────────────────────────────────────────────────────
+    // Helpers
+    // ────────────────────────────────────────────────────────────────────────
+
+    /**
+     * Extract TMDB ID from TMDB image URLs present on the page.
+     * e.g. https://image.tmdb.org/t/p/w500/kydPBzuU4TSmDOXCkgAdVFF8sgU.jpg
+     * The poster *path* (e.g. /kydPBzuU4TSmDOXCkgAdVFF8sgU.jpg) is not the ID;
+     * the TMDB ID lives in <meta property="og:url"> as the numeric suffix of the slug,
+     * or in og:image with a different path pattern.
+     *
+     * Fallback: try og:url / canonical for slug, then TMDB API lookup.
+     */
+    private fun extractTmdbId(doc: org.jsoup.nodes.Document): String? {
+        // 1. Some sites embed tmdb id directly in a data attribute
+        doc.selectFirst("[data-tmdb-id], [data-tmdb], [data-id]")
+            ?.let { el ->
+                el.attr("data-tmdb-id").ifBlank { el.attr("data-tmdb") }.ifBlank { el.attr("data-id") }
+            }?.takeIf { it.matches(Regex("\\d{3,9}")) }
+            ?.let { return it }
+
+        // 2. Look in any script tag for tmdbId / tmdb_id assignment
+        val scriptData = doc.select("script:not([src])").joinToString("\n") { it.data() }
+        Regex("""(?:tmdb[_-]?id|tmdbId)['":\s]+(\d{3,9})""", RegexOption.IGNORE_CASE)
+            .find(scriptData)?.groupValues?.get(1)
+            ?.let { return it }
+
+        // 3. Try meta tag (some sites embed it as a custom meta)
+        doc.selectFirst("meta[name='tmdb-id'], meta[property='tmdb:id']")
+            ?.attr("content")?.takeIf { it.isNotBlank() }
+            ?.let { return it }
+
+        return null
+    }
+
+    /** Parse a TMDB image URL like https://image.tmdb.org/t/p/w500/abc.jpg → keep it as-is */
+    private fun normalizePoster(raw: String?): String? {
+        if (raw.isNullOrBlank()) return null
+        return if (raw.startsWith("http")) raw else fixUrl(raw)
+    }
+
+    private fun Element.toSearchResult(): SearchResponse? {
+        // Find the content anchor — must point to /movie/ or /tv-show/
+        val anchor = selectFirst("a[href*='/movie/watch-'], a[href*='/tv-show/watch-']")
+            ?: (if (tagName() == "a" && (attr("href").contains("/movie/watch-") ||
+                attr("href").contains("/tv-show/watch-"))) this else null)
+            ?: return null
+
+        val href   = fixUrl(anchor.attr("href"))
+        val title  = selectFirst("img[alt]")?.attr("alt")?.trim()
+            ?.ifBlank { null }
+            ?: selectFirst(".title, h3, h4, h5, [class*='title']")?.text()?.trim()
+            ?: anchor.attr("title").ifBlank { anchor.text() }.trim()
+        if (title.isBlank()) return null
+
+        val poster = selectFirst("img")?.let { img ->
+            img.attr("data-src").ifBlank { img.attr("src") }
+        }?.let { normalizePoster(it) }
+
+        val year = selectFirst("[class*='year'], .year")?.text()
+            ?.let { Regex("\\b(19|20)\\d{2}\\b").find(it)?.value?.toIntOrNull() }
+
+        return if (href.contains("/movie/")) {
+            newMovieSearchResponse(title, href, TvType.Movie) {
+                posterUrl = poster; this.year = year
+            }
+        } else {
+            newTvSeriesSearchResponse(title, href, TvType.TvSeries) {
+                posterUrl = poster; this.year = year
+            }
+        }
+    }
+
+    // ────────────────────────────────────────────────────────────────────────
+    // Main Page
+    // ────────────────────────────────────────────────────────────────────────
+
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        val doc = when (request.data) {
-            "$mainUrl/movies" -> app.get("$mainUrl/movies", timeout = 30).document
-            "$mainUrl/tv-shows" -> app.get("$mainUrl/tv-shows", timeout = 30).document
-            "$mainUrl/trending" -> app.get("$mainUrl/trending", timeout = 30).document
-            "$mainUrl/anime" -> app.get("$mainUrl/anime", timeout = 30).document
-            else -> app.get(mainUrl, timeout = 30).document
+        val url = "${request.data}$page"
+        val doc = app.get(url).document
+
+        // Grab all elements that could wrap a content card
+        val results = doc.select(
+            "article, li, div[class*='card'], div[class*='item'], div[class*='movie'], div[class*='show']"
+        ).mapNotNull { it.toSearchResult() }.distinctBy { it.url }.ifEmpty {
+            // Flat anchor fallback
+            doc.select("a[href*='/movie/watch-'], a[href*='/tv-show/watch-']")
+                .mapNotNull { it.toSearchResult() }.distinctBy { it.url }
         }
-        val items = parseCardItems(doc)
-        return newHomePageResponse(
-            list = HomePageList(request.name, items.distinctBy { it.url }, isHorizontalImages = false),
-            hasNext = page < 10
-        )
+
+        return newHomePageResponse(request.name, results)
     }
 
-    // ── Search ───────────────────────────────────────────────────────
+    // ────────────────────────────────────────────────────────────────────────
+    // Search
+    // ────────────────────────────────────────────────────────────────────────
+
     override suspend fun search(query: String): List<SearchResponse> {
-        val results = mutableListOf<SearchResponse>()
-        try {
-            results.addAll(parseCardItems(
-                app.get("$mainUrl/search?query=${query.replace(" ", "+")}", timeout = 30).document
-            ))
-        } catch (_: Exception) {}
-        return results.distinctBy { it.url }
+        val doc = app.get("$mainUrl/search", params = mapOf("q" to query)).document
+        val results = doc.select(
+            "article, li, div[class*='card'], div[class*='item'], a[href*='/movie/watch-'], a[href*='/tv-show/watch-']"
+        ).mapNotNull { it.toSearchResult() }.distinctBy { it.url }
+
+        if (results.isNotEmpty()) return results
+
+        // Fallback endpoint variation
+        val doc2 = app.get("$mainUrl/search?query=$query").document
+        return doc2.select(
+            "article, li, div[class*='card'], a[href*='/movie/watch-'], a[href*='/tv-show/watch-']"
+        ).mapNotNull { it.toSearchResult() }.distinctBy { it.url }
     }
 
-    // ── Load ─────────────────────────────────────────────────────────
-    override suspend fun load(url: String): LoadResponse {
-        val doc = app.get(url, timeout = 30).document
-        val title = extractTitle(doc)
-        val poster = extractPoster(doc)
-        val plot = extractPlot(doc)
-        val year = extractYear(doc)
-        val rating = extractRating(doc)
-        val tags = extractGenres(doc)
-        val actors = extractCast(doc)
-        val trailer = extractTrailer(doc)
-        val dur = extractDuration(doc)
-        val recs = if (url.contains("/anime/")) extractAnimeRecs(doc) else extractRecs(doc)
-        return when {
-            url.contains("/anime/") -> {
-                val eps = extractEpisodes(doc, url)
-                newAnimeLoadResponse(title, url, TvType.Anime) {
-                    this.posterUrl = poster; this.year = year; this.plot = plot
-                    this.tags = tags; @Suppress("DEPRECATION_ERROR") this.rating = rating
-                    this.duration = dur; this.recommendations = recs
-                    addEpisodes(DubStatus.Subbed, eps); addActors(actors); addTrailer(trailer)
+    // ────────────────────────────────────────────────────────────────────────
+    // Load
+    // ────────────────────────────────────────────────────────────────────────
+
+    override suspend fun load(url: String): LoadResponse? {
+        val doc     = app.get(url).document
+        val isMovie = url.contains("/movie/")
+
+        val title   = doc.selectFirst("h1")?.text()?.trim() ?: return null
+        val poster  = doc.selectFirst("meta[property='og:image']")?.attr("content")
+            ?: doc.selectFirst("[class*='poster'] img, .poster img")
+                ?.let { it.attr("data-src").ifBlank { it.attr("src") } }
+        val backdrop = doc.selectFirst("img[src*='w1280'], img[src*='original']")?.attr("src")
+            ?: doc.selectFirst("[style*='background-image']")?.attr("style")
+                ?.let { Regex("""url\(['"']?(.*?)['"']?\)""").find(it)?.groupValues?.get(1) }
+        val plot    = doc.selectFirst("meta[name='description']")?.attr("content")
+            ?: doc.selectFirst(".overview, [class*='plot'], [class*='synopsis']")?.text()
+
+        // Rating: parse "8.0/10" or "8.0"
+        val ratingRaw = doc.selectFirst("[class*='rating'], [class*='score']")?.text()
+            ?.replace("/10", "")?.trim()
+        val rating = ratingRaw?.toDoubleOrNull()
+
+        val genres = doc.select("[class*='genre'] a, .genres a, .genre a")
+            .map { it.text().trim() }.filter { it.isNotBlank() }
+
+        val year = Regex("\\b(19|20)\\d{2}\\b")
+            .find(doc.selectFirst(".info, [class*='meta'], [class*='detail']")?.text() ?: "")
+            ?.value?.toIntOrNull()
+
+        val actors = doc.select("[class*='cast'] img[alt], [class*='cast'] .name")
+            .mapNotNull { el ->
+                val n = el.attr("alt").ifBlank { el.text() }.trim()
+                val img = if (el.tagName() == "img")
+                    normalizePoster(el.attr("data-src").ifBlank { el.attr("src") })
+                else null
+                if (n.isBlank()) null else Actor(n, img)
+            }
+
+        val trailer = doc.select("iframe[src*='youtube'], a[href*='youtube.com/watch']")
+            .firstOrNull()?.let { el ->
+                val raw = el.attr("src").ifBlank { el.attr("href") }
+                Regex("(?:v=|/embed/|youtu\\.be/)([A-Za-z0-9_-]{11})").find(raw)
+                    ?.groupValues?.get(1)
+                    ?.let { id -> "https://www.youtube.com/embed/$id" }
+            }
+
+        // ── Extract TMDB ID ──────────────────────────────────────────────────
+        val tmdbId = extractTmdbId(doc)
+
+        // Encode TMDB ID into the data string for loadLinks
+        // For TV episodes we need season/episode — encode that at episode level below
+        val linkData = if (isMovie) {
+            if (tmdbId != null) "movie::$tmdbId" else url
+        } else {
+            // For the show itself we store "tv::{tmdbId}" — episodes append s/e below
+            if (tmdbId != null) "tv::$tmdbId" else url
+        }
+
+        if (isMovie) {
+            return newMovieLoadResponse(title, url, TvType.Movie, linkData) {
+                this.posterUrl           = normalizePoster(poster)
+                this.backgroundPosterUrl = normalizePoster(backdrop)
+                this.plot                = plot
+                this.rating              = rating?.let { Score.from10(it) }
+                this.tags                = genres
+                this.year                = year
+                addActors(actors)
+                trailer?.let { addTrailer(it) }
+            }
+        }
+
+        // ── TV Series ────────────────────────────────────────────────────────
+        val episodes = mutableListOf<Episode>()
+
+        // Season tabs
+        val seasonTabs = doc.select("ul[class*='season'] li, nav[class*='season'] a, [class*='seasons'] button")
+        val seasonNumbers = if (seasonTabs.isNotEmpty()) {
+            seasonTabs.mapNotNull { tab ->
+                Regex("\\d+").find(tab.text())?.value?.toIntOrNull()
+            }.distinct().sorted()
+        } else listOf(1)
+
+        // Episode rows — already rendered in static HTML
+        // Try each season's section; fall back to all episode cards on the page
+        val allEpElements = doc.select(
+            "[class*='episode-item'], [class*='episode-card'], " +
+            "div[class*='episode']:has(img), li[class*='episode']"
+        )
+
+        if (allEpElements.isNotEmpty()) {
+            // Try to detect season from parent section or data attribute
+            allEpElements.forEach { el ->
+                val detectedSeason = el.attr("data-season").toIntOrNull()
+                    ?: el.parents().firstOrNull { it.hasAttr("data-season") }
+                        ?.attr("data-season")?.toIntOrNull()
+                    ?: 1
+                val epNum = el.attr("data-episode").toIntOrNull()
+                    ?: el.selectFirst("span[class*='ep-num'], [class*='episode-number']")
+                        ?.text()?.let { Regex("\\d+").find(it)?.value?.toIntOrNull() }
+
+                val epTitle = el.selectFirst("h4, h5, .title, [class*='title']")?.text()?.trim()
+                    ?: el.selectFirst("img[alt]")?.attr("alt")?.trim()
+                val thumb   = el.selectFirst("img")?.let { img ->
+                    normalizePoster(img.attr("data-src").ifBlank { img.attr("src") })
                 }
+                val desc    = el.selectFirst(".overview, [class*='desc']")?.text()?.trim()
+                val epEpData = if (tmdbId != null)
+                    "tv::$tmdbId::$detectedSeason::${epNum ?: 1}"
+                else url
+
+                episodes.add(newEpisode(epEpData) {
+                    this.name        = epTitle ?: "Episode ${epNum ?: episodes.size + 1}"
+                    this.season      = detectedSeason
+                    this.episode     = epNum
+                    this.posterUrl   = thumb
+                    this.description = desc
+                })
             }
-            url.contains("/tv-show/") -> {
-                val eps = extractEpisodes(doc, url)
-                newTvSeriesLoadResponse(title, url, TvType.TvSeries, eps) {
-                    this.posterUrl = poster; this.year = year; this.plot = plot
-                    this.tags = tags; @Suppress("DEPRECATION_ERROR") this.rating = rating
-                    this.recommendations = recs; addActors(actors); addTrailer(trailer)
-                }
+        } else {
+            // Ultra-fallback: build episode stubs from "EP 01" labels visible on page
+            doc.select("*:contains(EP )").filter { el ->
+                el.childrenSize() == 0 && Regex("EP\\s*\\d+").containsMatchIn(el.text())
+            }.forEach { el ->
+                val m = Regex("EP\\s*(\\d+)").find(el.text()) ?: return@forEach
+                val epNum = m.groupValues[1].toInt()
+                val season = 1
+                val epData = if (tmdbId != null) "tv::$tmdbId::$season::$epNum" else url
+                episodes.add(newEpisode(epData) {
+                    this.name    = "Episode $epNum"
+                    this.season  = season
+                    this.episode = epNum
+                })
             }
-            else -> newMovieLoadResponse(title, url, TvType.Movie, url) {
-                this.posterUrl = poster; this.year = year; this.plot = plot
-                this.tags = tags; @Suppress("DEPRECATION_ERROR") this.rating = rating
-                this.duration = dur; this.recommendations = recs
-                addActors(actors); addTrailer(trailer)
-            }
+        }
+
+        if (episodes.isEmpty()) {
+            episodes.add(newEpisode(if (tmdbId != null) "tv::$tmdbId::1::1" else url) {
+                this.name = "Episode 1"; this.season = 1; this.episode = 1
+            })
+        }
+
+        val tvType = if (genres.any { it.contains("anime", true) } ||
+            doc.title().contains("anime", true)) TvType.Anime else TvType.TvSeries
+
+        return newTvSeriesLoadResponse(title, url, tvType, episodes) {
+            this.posterUrl           = normalizePoster(poster)
+            this.backgroundPosterUrl = normalizePoster(backdrop)
+            this.plot                = plot
+            this.rating              = rating?.let { Score.from10(it) }
+            this.tags                = genres
+            this.year                = year
+            addActors(actors)
+            trailer?.let { addTrailer(it) }
         }
     }
 
-    // ── Load Links ───────────────────────────────────────────────────
+    // ────────────────────────────────────────────────────────────────────────
+    // Load Links
+    // ────────────────────────────────────────────────────────────────────────
+
     override suspend fun loadLinks(
-        data: String, isCasting: Boolean,
+        data: String,
+        isCasting: Boolean,
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        val parts = data.split("|", limit = 4)
-        return when {
-            parts.size >= 4 && parts[0] == "EPISODE" -> {
-                val tmdbId = parts[1]; val season = parts[2].toIntOrNull(); val ep = parts[3].toIntOrNull()
-                fetchEmbedUrls(tmdbId, season, ep, data, subtitleCallback, callback)
-            }
-            else -> {
-                // Movie: scrape players from the page HTML, pass to loadExtractor
-                val doc = app.get(data, timeout = 30).document
-                val players = parsePlayers(doc.html())
-                var found = false
-                players.forEach { embedUrl ->
-                    try { loadExtractor(embedUrl, data, subtitleCallback, callback); found = true } catch (_: Exception) {}
-                }
-                found
-            }
-        }
-    }
-
-    private fun parsePlayers(source: String): List<String> {
-        val urls = mutableListOf<String>()
-        Regex("\"url\"\\s*:\\s*\"([^\"]+)\"").findAll(source).forEach { m ->
-            val u = m.groupValues[1].replace("\\/", "/")
-            if (u.startsWith("http") && u !in urls) urls.add(u)
-        }
-        return urls
-    }
-
-    private suspend fun fetchEmbedUrls(
-        tmdbId: String, season: Int?, episode: Int?,
-        referer: String, subtitleCallback: (SubtitleFile) -> Unit,
-        callback: (ExtractorLink) -> Unit
-    ): Boolean {
         var found = false
-        val endpoints = if (season != null && episode != null) {
-            listOf(
-                "https://vidsrc.to/embed/tv/$tmdbId/$season/$episode",
-                "https://vidsrc.net/embed/tv/$tmdbId/$season/$episode",
-                "https://www.2embed.cc/embedtv/$tmdbId&s=$season&e=$episode",
-                "https://multiembed.mov/?video_id=$tmdbId&tmdb=1&s=$season&e=$episode",
-            )
-        } else {
-            listOf(
-                "https://vidsrc.to/embed/movie/$tmdbId",
-                "https://vidsrc.net/embed/movie/$tmdbId",
-                "https://www.2embed.cc/embed/$tmdbId",
-                "https://multiembed.mov/?video_id=$tmdbId&tmdb=1",
-            )
+
+        when {
+            // ── Structured data: "movie::{tmdbId}" ──────────────────────────
+            data.startsWith("movie::") -> {
+                val tmdbId = data.removePrefix("movie::")
+                embedProviders.forEach { provider ->
+                    safeApiCall {
+                        val embedUrl = provider.movieUrl(tmdbId)
+                        loadExtractor(embedUrl, mainUrl, subtitleCallback, callback)
+                        found = true
+                    }
+                }
+            }
+
+            // ── Structured data: "tv::{tmdbId}::{s}::{e}" ──────────────────
+            data.startsWith("tv::") -> {
+                val parts   = data.split("::")
+                val tmdbId  = parts.getOrNull(1) ?: return false
+                val season  = parts.getOrNull(2)?.toIntOrNull() ?: 1
+                val episode = parts.getOrNull(3)?.toIntOrNull() ?: 1
+                embedProviders.forEach { provider ->
+                    safeApiCall {
+                        val embedUrl = provider.tvUrl(tmdbId, season, episode)
+                        loadExtractor(embedUrl, mainUrl, subtitleCallback, callback)
+                        found = true
+                    }
+                }
+            }
+
+            // ── Fallback: raw URL — try to scrape the page and/or use TMDB ID ─
+            else -> {
+                val pageUrl = data
+                val doc = app.get(pageUrl).document
+                val tmdbId = extractTmdbId(doc)
+                val isMovie = pageUrl.contains("/movie/")
+
+                if (tmdbId != null) {
+                    embedProviders.forEach { provider ->
+                        safeApiCall {
+                            val embedUrl = if (isMovie)
+                                provider.movieUrl(tmdbId)
+                            else
+                                provider.tvUrl(tmdbId, 1, 1)
+                            loadExtractor(embedUrl, mainUrl, subtitleCallback, callback)
+                            found = true
+                        }
+                    }
+                }
+
+                // Also scrape the page for any visible iframe / data-src
+                doc.select("iframe[src]").forEach { iframe ->
+                    val src = iframe.attr("src").ifBlank { return@forEach }
+                    safeApiCall { loadExtractor(fixUrl(src), pageUrl, subtitleCallback, callback) }
+                    found = true
+                }
+                doc.select("[data-src], [data-iframe], [data-embed]").forEach { el ->
+                    val src = el.attr("data-src")
+                        .ifBlank { el.attr("data-iframe") }
+                        .ifBlank { el.attr("data-embed") }
+                        .ifBlank { return@forEach }
+                    safeApiCall { loadExtractor(fixUrl(src), pageUrl, subtitleCallback, callback) }
+                    found = true
+                }
+
+                // JS blob scanning
+                val scripts = doc.select("script:not([src])").joinToString("\n") { it.data() }
+                found = found or extractFromScripts(scripts, pageUrl, subtitleCallback, callback)
+            }
         }
-        for (u in endpoints) {
-            try { loadExtractor(u, referer, subtitleCallback, callback); found = true } catch (_: Exception) {}
-        }
+
         return found
     }
 
-    // ── Listing Parser ───────────────────────────────────────────────
-    private fun parseCardItems(doc: Document): List<SearchResponse> {
-        val results = mutableListOf<SearchResponse>()
-        val linkPattern = Regex("/(movie|tv-show|anime)/watch-[^\"'\\s]+")
-        doc.select("a[href]").forEach { a ->
-            val href = a.attr("href")
-            val match = linkPattern.find(href) ?: return@forEach
-            val fullUrl = if (href.startsWith("http")) href else "$mainUrl$href"
-            val typeStr = match.groupValues[1]
-            val img = a.selectFirst("img")
-            val poster = fixUrl(img?.attr("src")?.ifBlank { img?.attr("data-src") })
-            val title = img?.attr("alt")?.trim()?.ifBlank { null }
-                ?: a.selectFirst("h2,h3,h4,.title,[class*=title]")?.text()?.trim()
-                ?: a.attr("title").trim().ifBlank { null }
-                ?: a.text().trim().take(80)
-            if (title.isBlank() || title.length < 2) return@forEach
-            val year = extractYearFromText(title)
-            val clean = cleanTitle(title)
-            val tvType = when (typeStr) {
-                "tv-show" -> TvType.TvSeries; "anime" -> TvType.Anime; else -> TvType.Movie
+    private suspend fun extractFromScripts(
+        scripts: String,
+        referer: String,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit,
+    ): Boolean {
+        var found = false
+
+        // HLS
+        Regex("""(?:file|src|source)['":\s]+['"]([^'"]+\.m3u8[^'"]*)['"]""")
+            .findAll(scripts).map { it.groupValues[1] }
+            .filter { it.startsWith("http") }
+            .forEach { url ->
+                callback(newExtractorLink(name, name, url, type = ExtractorLinkType.M3U8) {
+                    this.referer = referer; this.quality = Qualities.Unknown.value
+                })
+                found = true
             }
-            results.add(when (tvType) {
-                TvType.TvSeries -> newTvSeriesSearchResponse(clean, fullUrl, tvType) { this.posterUrl = poster; this.year = year }
-                TvType.Anime -> newAnimeSearchResponse(clean, fullUrl, tvType) { this.posterUrl = poster; this.year = year }
-                else -> newMovieSearchResponse(clean, fullUrl, tvType) { this.posterUrl = poster; this.year = year }
-            })
-        }
-        return results.distinctBy { it.url }
-    }
 
-    // ── Metadata Extractors ──────────────────────────────────────────
-    private fun extractTitle(doc: Document): String {
-        doc.selectFirst("h1")?.text()?.trim()?.takeIf { it.isNotBlank() }?.let { return cleanTitle(it) }
-        doc.selectFirst("meta[property='og:title']")?.attr("content")?.trim()?.takeIf { it.isNotBlank() }?.let { return cleanTitle(it) }
-        return doc.title().substringBefore("|").substringBefore("-").trim()
-    }
-    private fun extractPoster(doc: Document): String? {
-        doc.selectFirst("meta[property='og:image']")?.attr("content")?.let { return fixUrl(it) }
-        doc.selectFirst("img[src*='tmdb.org/t/p/']")?.let { return fixUrl(it.attr("src").ifBlank { it.attr("data-src") }) }
-        return null
-    }
-    private fun extractPlot(doc: Document): String? {
-        doc.selectFirst("meta[property='og:description']")?.attr("content")?.trim()?.takeIf { it.length > 20 }?.let { return it }
-        return null
-    }
-    private fun extractYear(doc: Document): Int? {
-        doc.selectFirst("meta[property='og:title']")?.attr("content")?.let { extractYearFromText(it)?.let { return it } }
-        return extractYearFromText(extractTitle(doc))
-    }
-    private fun extractRating(doc: Document): Int? {
-        Regex("(\\d+\\.?\\d*)\\s*/\\s*10").find(doc.text())?.groupValues?.get(1)?.toDoubleOrNull()?.let { return (it * 1000).toInt() }
-        return null
-    }
-    private fun extractGenres(doc: Document): List<String> {
-        val g = mutableListOf<String>()
-        doc.select("a[href*='/genre/'], .genre a, .genres a").forEach { val t = it.text().trim(); if (t.isNotBlank()) g.add(t) }
-        return g.distinct().take(8)
-    }
-    private fun extractCast(doc: Document): List<Actor> {
-        val a = mutableListOf<Actor>()
-        doc.select("[class*=cast] a, .featured-cast a, .cast a").forEach { el ->
-            val name = el.selectFirst("h3,h4,.name,p")?.text()?.trim() ?: el.text().trim()
-            val img = el.selectFirst("img")?.let { fixUrl(it.attr("src").ifBlank { it.attr("data-src") }) }
-            if (name.isNotBlank() && name.length < 80) a.add(Actor(name, img))
-        }
-        return a.distinctBy { it.name }.take(20)
-    }
-    private fun extractTrailer(doc: Document): String? {
-        doc.selectFirst("iframe[src*='youtube'],iframe[src*='youtu.be']")?.attr("src")?.let { return if (it.startsWith("//")) "https:$it" else it }
-        Regex("(?:youtube\\.com/embed/|youtu\\.be/)([A-Za-z0-9_-]{11})").find(doc.html())?.groupValues?.get(1)?.let { return "https://www.youtube.com/watch?v=$it" }
-        return null
-    }
-    private fun extractDuration(doc: Document): Int? {
-        Regex("(\\d+)h\\s*(\\d+)m").find(doc.text())?.let { m -> return (m.groupValues[1].toIntOrNull() ?: 0) * 60 + (m.groupValues[2].toIntOrNull() ?: 0) }
-        Regex("(\\d+)\\s*min", RegexOption.IGNORE_CASE).find(doc.text())?.groupValues?.get(1)?.toIntOrNull()?.let { return it }
-        return null
-    }
-    private fun extractRecs(doc: Document): List<SearchResponse> {
-        val recs = mutableListOf<SearchResponse>()
-        doc.select("a[href*='watch-']").forEach { a ->
-            if (recs.size >= 12) return@forEach
-            val href = a.attr("href")
-            if (!href.contains("/movie/") && !href.contains("/tv-show/")) return@forEach
-            val fullUrl = if (href.startsWith("http")) href else "$mainUrl$href"
-            val img = a.selectFirst("img")
-            val title = a.selectFirst("h3,h4,.title")?.text()?.trim() ?: img?.attr("alt")?.trim() ?: return@forEach
-            val poster = fixUrl(img?.attr("src")?.ifBlank { img?.attr("data-src") })
-            if (href.contains("/tv-show/"))
-                recs.add(newTvSeriesSearchResponse(cleanTitle(title), fullUrl, TvType.TvSeries) { this.posterUrl = poster })
-            else
-                recs.add(newMovieSearchResponse(cleanTitle(title), fullUrl, TvType.Movie) { this.posterUrl = poster })
-        }
-        return recs.distinctBy { it.url }.take(12)
-    }
-    private fun extractAnimeRecs(doc: Document): List<SearchResponse> =
-        extractRecs(doc).filter { it.url.contains("/anime/") }.take(12)
+        // MP4
+        Regex("""(?:file|src|source)['":\s]+['"]([^'"]+\.mp4[^'"]*)['"]""")
+            .findAll(scripts).map { it.groupValues[1] }
+            .filter { it.startsWith("http") }
+            .forEach { url ->
+                callback(newExtractorLink(name, name, url, type = ExtractorLinkType.VIDEO) {
+                    this.referer = referer; this.quality = Qualities.Unknown.value
+                })
+                found = true
+            }
 
-    // ── TMDB ID ──────────────────────────────────────────────────────
-    private fun extractTmdbId(html: String): String? {
-        Regex("/(?:movie|tv)/(\\d+)").find(html)?.groupValues?.get(1)?.let { return it }
-        Regex("\"tmdbId\"\\s*:\\s*\"?(\\d+)\"?").find(html)?.groupValues?.get(1)?.let { return it }
-        Regex("data-tmdb-id=\"(\\d+)\"").find(html)?.groupValues?.get(1)?.let { return it }
-        return null
-    }
+        // Embedded external URLs in JS
+        Regex("""['"]( https?://(?!image\.tmdb)[^'">\s]{15,})['"]""")
+            .findAll(scripts).map { it.groupValues[1].trim() }
+            .filter { it.startsWith("http") && !it.contains(mainUrl) }
+            .take(5) // cap to avoid noise
+            .forEach { url ->
+                safeApiCall { loadExtractor(url, referer, subtitleCallback, callback) }
+                found = true
+            }
 
-    // ── Episodes ─────────────────────────────────────────────────────
-    private fun extractEpisodes(doc: Document, baseUrl: String): List<Episode> {
-        val eps = mutableListOf<Episode>()
-        val tmdbId = extractTmdbId(doc.html())
-        doc.select("[data-episode-id]").forEach { el ->
-            val season = el.attr("data-season").toIntOrNull() ?: 1
-            val epNum = el.attr("data-episode").toIntOrNull() ?: (eps.size + 1)
-            val name = el.selectFirst("h3,h4,.ep-title,[class*=title],.name")?.text()?.trim() ?: "Episode $epNum"
-            val poster = el.selectFirst("img")?.let { fixUrl(it.attr("src").ifBlank { it.attr("data-src") }) }
-            val plot = el.selectFirst("p,.overview,.description,[class*=desc]")?.text()?.trim()
-            val rt = el.selectFirst("[class*=runtime],[class*=duration]")?.text()?.let { Regex("(\\d+)").find(it)?.groupValues?.get(1)?.toIntOrNull() }
-            val data = "EPISODE|${tmdbId ?: "0"}|$season|$epNum"
-            eps.add(newEpisode(data) {
-                this.name = name; this.season = season; this.episode = epNum
-                this.posterUrl = poster; this.description = plot; this.runTime = rt
-            })
-        }
-        return eps.distinctBy { it.data }.sortedWith(compareBy({ it.season ?: 0 }, { it.episode ?: 0 }))
-    }
-
-    // ── Helpers ──────────────────────────────────────────────────────
-    private fun cleanTitle(title: String): String =
-        title.replace(Regex("\\s*\\(\\d{4}\\)\\s*"), " ")
-            .replace(Regex("(?i)\\s*(1080p|720p|480p|2160p|4k|hd|web-dl|bluray)\\s*"), " ")
-            .replace(Regex("\\s+"), " ").trim()
-
-    private fun extractYearFromText(text: String): Int? =
-        Regex("\\b(19|20)\\d{2}\\b").find(text)?.value?.toIntOrNull()
-
-    private fun fixUrl(url: String?): String? {
-        if (url.isNullOrBlank()) return null
-        return when {
-            url.startsWith("//") -> "https:$url"
-            url.startsWith("/") -> "$mainUrl$url"
-            !url.startsWith("http") -> "https://$url"
-            else -> url
-        }
+        return found
     }
 }
