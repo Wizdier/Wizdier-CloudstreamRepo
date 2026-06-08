@@ -5,7 +5,6 @@ import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.utils.ExtractorApi
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
-import com.lagradost.cloudstream3.utils.M3u8Helper
 import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.loadExtractor
 import com.lagradost.cloudstream3.utils.newExtractorLink
@@ -22,9 +21,6 @@ class NowHDTimeExtractor : ExtractorApi() {
     ) {
         val html = fetchPage(url, referer)
         val full = deobfuscate(html)
-
-        // 1. M3U8 / HLS streams
-        M3u8Helper.generateM3u8(name, url, full, referer ?: "").forEach { callback(it) }
 
         // 2. Direct video URLs
         Regex("""["'](https?://[^"']+\.(?:mp4|m3u8|mkv|mpd|webm)(?:\?[^"']*)?)["']""", RegexOption.IGNORE_CASE)
