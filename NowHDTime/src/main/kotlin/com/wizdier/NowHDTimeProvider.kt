@@ -74,7 +74,7 @@ class NowHDTime : MainAPI() {
         val players = try { jacksonObjectMapper().readValue<List<Player>>(playersJson) } catch (_:Exception){ emptyList() }
         
         return if (!isTv) {
-            val tmdbId = players.firstOrNull()?.url?.let { Regex("/(\\d+)").find(it)?.value?.trim('/') }
+            val tmdbId = players.firstOrNull()?.url?.let { Regex("/(\\d+)").find(it)?.groupValues?.get(1) }
             val data = mapOf("url" to url, "id" to (tmdbId ?: ""), "players" to players.map { it.url })
             newMovieLoadResponse(title, url, TvType.Movie, data.toJson()) {
                 this.posterUrl = poster; this.plot = plot; this.year = year
@@ -100,6 +100,17 @@ class NowHDTime : MainAPI() {
         val map = try { jacksonObjectMapper().readValue<Map<String,Any>>(data) } catch (_:Exception){ emptyMap() }
         val sources = mutableListOf<String>()
         
+        // Always fetch fresh players from page - most robust
+        val pageUrl = map["url"] as? String
+        if (pageUrl != null) {
+            try {
+                val doc = app.get(pageUrl, headers = headers).text
+                val playersJson = Regex("const players = (\\[.*?\\]);").find(doc)?.groupValues?.get(1) ?: "[]"
+                val players = try { jacksonObjectMapper().readValue<List<Player>>(playersJson) } catch (_:Exception){ emptyList() }
+                sources.addAll(players.map { it.url })
+            } catch (_:Exception) {}
+        }
+        
         if (map.containsKey("players")) {
             @Suppress("UNCHECKED_CAST")
             (map["players"] as? List<String>)?.let { sources.addAll(it) }
@@ -111,7 +122,7 @@ class NowHDTime : MainAPI() {
         val e = (map["e"] as? Int) ?: (map["e"] as? String)?.toIntOrNull()
         
         if (sources.isEmpty()) {
-            if (tvId != null && s != null && e != null) {
+            if (tvId != null && s != null && e != null && tvId != "0") {
                 sources.addAll(listOf(
                     "https://nhdapi.com/embed/tv/$tvId/$s/$e",
                     "https://vidnest.fun/tv/$tvId/$s/$e",
@@ -123,13 +134,46 @@ class NowHDTime : MainAPI() {
                     "https://vidnest.fun/movie/$id",
                     "https://player.videasy.net/movie/$id"
                 ))
+            } else if (pageUrl != null) {
+                // Last resort: try to extract ID from page
+                val doc = app.get(pageUrl, headers = headers).text
+                val foundId = Regex("embed/(?:movie|tv)/(\\d+)").find(doc)?.groupValues?.get(1)
+                if (foundId != null) {
+                    val isTv = pageUrl.contains("/tv-show/")
+                    if (isTv && s != null && e != null) {
+                        sources.addAll(listOf(
+                            "https://nhdapi.com/embed/tv/$foundId/$s/$e",
+                            "https://vidnest.fun/tv/$foundId/$s/$e",
+                            "https://player.videasy.net/tv/$foundId/$s/$e"
+                        ))
+                    } else {
+                        sources.addAll(listOf(
+                            "https://nhdapi.com/embed/movie/$foundId",
+                            "https://vidnest.fun/movie/$foundId",
+                            "https://player.videasy.net/movie/$foundId"
+                        ))
+                    }
+                }
             }
         }
         
+        // Load every server with proper extractor
+        var count = 0
         sources.distinct().forEach { url ->
-            loadExtractor(url, mainUrl, subtitleCallback, callback)
+            try {
+                loadExtractor(url, mainUrl, subtitleCallback) { link ->
+                    callback(link)
+                    count++
+                }
+            } catch (_:Exception) {
+                // Direct fallback
+                callback(newExtractorLink(name, url.substringAfter("://").substringBefore("/"), url, INFER_TYPE) {
+                    referer = mainUrl
+                })
+                count++
+            }
         }
-        return sources.isNotEmpty()
+        return count > 0
     }
 
     data class SearchApi(val movies: List<Item> = emptyList(), val tvShows: List<Item> = emptyList())
