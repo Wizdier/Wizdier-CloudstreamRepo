@@ -34,7 +34,6 @@ class NowHDTimeProvider : MainAPI() {
         "$mainUrl/anime" to "Anime",
     )
 
-    // ── Home ─────────────────────────────────────────────────────────
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val items = mutableListOf<SearchResponse>()
         val doc = when (request.data) {
@@ -51,7 +50,6 @@ class NowHDTimeProvider : MainAPI() {
         )
     }
 
-    // ── Search ───────────────────────────────────────────────────────
     override suspend fun search(query: String): List<SearchResponse> {
         val results = mutableListOf<SearchResponse>()
         val enc = query.replace(" ", "+")
@@ -70,7 +68,6 @@ class NowHDTimeProvider : MainAPI() {
         return results.distinctBy { it.url }
     }
 
-    // ── Load ─────────────────────────────────────────────────────────
     override suspend fun load(url: String): LoadResponse {
         return when {
             url.contains("/anime/") -> loadAnimeShow(url)
@@ -79,7 +76,6 @@ class NowHDTimeProvider : MainAPI() {
         }
     }
 
-    // ── Movie ────────────────────────────────────────────────────────
     private suspend fun loadMovie(url: String): LoadResponse {
         val doc = app.get(url, timeout = 30).document
         val title = extractTitle(doc)
@@ -92,7 +88,6 @@ class NowHDTimeProvider : MainAPI() {
         val trailer = extractTrailer(doc)
         val dur = extractDuration(doc)
         val recs = extractRecs(doc)
-
         return newMovieLoadResponse(title, url, TvType.Movie, url) {
             this.posterUrl = poster
             this.year = year
@@ -107,7 +102,6 @@ class NowHDTimeProvider : MainAPI() {
         }
     }
 
-    // ── TV Show ──────────────────────────────────────────────────────
     private suspend fun loadTvShow(url: String): LoadResponse {
         val doc = app.get(url, timeout = 30).document
         val title = extractTitle(doc)
@@ -121,7 +115,6 @@ class NowHDTimeProvider : MainAPI() {
         val recs = extractRecs(doc)
         val tvShowId = extractTvShowId(doc)
         val eps = extractEpisodes(doc, tvShowId, url)
-
         return newTvSeriesLoadResponse(title, url, TvType.TvSeries, eps) {
             this.posterUrl = poster
             this.year = year
@@ -135,7 +128,6 @@ class NowHDTimeProvider : MainAPI() {
         }
     }
 
-    // ── Anime ────────────────────────────────────────────────────────
     private suspend fun loadAnimeShow(url: String): LoadResponse {
         val doc = app.get(url, timeout = 30).document
         val title = extractTitle(doc)
@@ -149,7 +141,6 @@ class NowHDTimeProvider : MainAPI() {
         val recs = extractAnimeRecs(doc)
         val tvShowId = extractTvShowId(doc)
         val eps = extractEpisodes(doc, tvShowId, url)
-
         return newAnimeLoadResponse(title, url, TvType.Anime) {
             this.posterUrl = poster
             this.year = year
@@ -164,7 +155,6 @@ class NowHDTimeProvider : MainAPI() {
         }
     }
 
-    // ── Load Links ───────────────────────────────────────────────────
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
@@ -186,30 +176,13 @@ class NowHDTimeProvider : MainAPI() {
     ): Boolean {
         val doc = app.get(url, timeout = 30).document
         val html = doc.html()
-        val players = parsePlayers(html)
-        if (players.isEmpty()) return false
+        val embedUrls = parsePlayers(html)
+        if (embedUrls.isEmpty()) return false
 
         var found = false
-        players.forEach { player ->
-            val embedUrl = player.url
+        embedUrls.forEach { embedUrl ->
             try {
-                if (isDirectVideoUrl(embedUrl)) {
-                    callback(
-                        newExtractorLink(
-                            source = player.server.ifBlank { name },
-                            name = player.server.ifBlank { name },
-                            url = embedUrl,
-                            type = if (embedUrl.contains(".m3u8", ignoreCase = true))
-                                ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
-                        ) {
-                            this.referer = url
-                            this.quality = qualityFromUrl(embedUrl)
-                        }
-                    )
-                } else {
-                    loadExtractor(embedUrl, url, subtitleCallback, callback)
-                }
-                found = true
+                found = resolveEmbedUrl(embedUrl, url, subtitleCallback, callback) || found
             } catch (_: Exception) {}
         }
         extractSubtitles(html).forEach { (label, subUrl) ->
@@ -245,32 +218,125 @@ class NowHDTimeProvider : MainAPI() {
             timeout = 20
         ).text
 
-        val players = parsePlayers(response)
-        if (players.isEmpty()) return false
+        val embedUrls = parsePlayers(response)
+        if (embedUrls.isEmpty()) return false
 
         var found = false
-        players.forEach { player ->
-            val embedUrl = player.url
+        embedUrls.forEach { embedUrl ->
             try {
-                if (isDirectVideoUrl(embedUrl)) {
-                    callback(
-                        newExtractorLink(
-                            source = player.server.ifBlank { name },
-                            name = player.server.ifBlank { name },
-                            url = embedUrl,
-                            type = if (embedUrl.contains(".m3u8", ignoreCase = true))
-                                ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
-                        ) {
-                            this.referer = referer
-                            this.quality = qualityFromUrl(embedUrl)
-                        }
-                    )
-                } else {
-                    loadExtractor(embedUrl, referer, subtitleCallback, callback)
-                }
-                found = true
+                found = resolveEmbedUrl(embedUrl, referer, subtitleCallback, callback) || found
             } catch (_: Exception) {}
         }
+        return found
+    }
+
+    // Deep-resolve an embed URL: fetch it, extract direct video links, or recurse
+    private suspend fun resolveEmbedUrl(
+        embedUrl: String,
+        referer: String,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit
+    ): Boolean {
+        if (isDirectVideoUrl(embedUrl)) {
+            callback(
+                newExtractorLink(
+                    source = name,
+                    name = name,
+                    url = embedUrl,
+                    type = if (embedUrl.contains(".m3u8", ignoreCase = true))
+                        ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+                ) {
+                    this.referer = referer
+                    this.quality = qualityFromUrl(embedUrl)
+                }
+            )
+            return true
+        }
+
+        // Fetch the embed page and extract videos
+        val html = app.get(embedUrl, referer = referer, timeout = 20).text
+        val fullHtml = deobfuscateJs(html)
+
+        var found = false
+
+        // 1. Direct video URLs
+        val videoRegex = Regex(
+            """["'](https?://[^"']+\.(?:mp4|m3u8|mkv|mpd|webm)(?:\?[^"']*)?)["']""",
+            RegexOption.IGNORE_CASE
+        )
+        videoRegex.findAll(fullHtml).forEach { m ->
+            val vUrl = m.groupValues[1]
+            if (vUrl.startsWith("http")) {
+                callback(
+                    newExtractorLink(
+                        source = name, name = name, url = vUrl,
+                        type = if (vUrl.contains(".m3u8", ignoreCase = true))
+                            ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+                    ) {
+                        this.referer = embedUrl
+                        this.quality = qualityFromUrl(vUrl)
+                    }
+                )
+                found = true
+            }
+        }
+
+        // 2. JS source/file keys
+        val jsRegex = Regex(
+            """(?i)(?:file|src|source|url|video_url)\s*[:=]\s*["'](https?://[^"']+)["']"""
+        )
+        jsRegex.findAll(fullHtml).forEach { m ->
+            val vUrl = m.groupValues[1]
+            if (vUrl.startsWith("http") && !vUrl.contains("google") &&
+                !vUrl.contains("facebook") && !vUrl.contains("youtube")
+            ) {
+                val isVideo = listOf(".mp4", ".m3u8", ".mkv", ".mpd", ".webm").any {
+                    vUrl.contains(it, ignoreCase = true)
+                }
+                if (isVideo) {
+                    callback(
+                        newExtractorLink(
+                            source = name, name = name, url = vUrl,
+                            type = if (vUrl.contains(".m3u8", ignoreCase = true))
+                                ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+                        ) {
+                            this.referer = embedUrl
+                            this.quality = qualityFromUrl(vUrl)
+                        }
+                    )
+                    found = true
+                }
+            }
+        }
+
+        // 3. Nested iframes — try loadExtractor (other plugins) and recurse ourselves
+        val iframeRegex = Regex(
+            """<iframe[^>]+src=["']([^"']+)["']""",
+            RegexOption.IGNORE_CASE
+        )
+        iframeRegex.findAll(html).forEach { m ->
+            var src = m.groupValues[1]
+            if (src.startsWith("//")) src = "https:$src"
+            if (src.startsWith("http")) {
+                try {
+                    found = resolveEmbedUrl(src, embedUrl, subtitleCallback, callback) || found
+                } catch (_: Exception) {}
+                try {
+                    loadExtractor(src, embedUrl, subtitleCallback, callback)
+                    found = true
+                } catch (_: Exception) {}
+            }
+        }
+
+        // 4. Subtitle tracks
+        val subRegex = Regex(
+            """["'](https?://[^"']+\.(?:srt|vtt|ass)[^"']*)["']""",
+            RegexOption.IGNORE_CASE
+        )
+        subRegex.findAll(fullHtml).forEach { m ->
+            subtitleCallback(SubtitleFile("Auto", m.groupValues[1]))
+        }
+
         return found
     }
 
@@ -283,7 +349,6 @@ class NowHDTimeProvider : MainAPI() {
             val match = linkPattern.find(href) ?: return@forEach
             val fullUrl = if (href.startsWith("http")) href else "$mainUrl$href"
             val typeStr = match.groupValues[1]
-
             val img = a.selectFirst("img")
             val poster = fixUrl(img?.attr("src")?.ifBlank { img?.attr("data-src") })
             val title = img?.attr("alt")?.trim()?.ifBlank { null }
@@ -291,7 +356,6 @@ class NowHDTimeProvider : MainAPI() {
                 ?: a.attr("title").trim().ifBlank { null }
                 ?: a.text().trim().take(80)
             if (title.isBlank() || title.length < 2) return@forEach
-
             val year = extractYearFromText(title)
             val clean = cleanTitle(title)
             val tvType = when (typeStr) {
@@ -317,7 +381,6 @@ class NowHDTimeProvider : MainAPI() {
     }
 
     // ── Metadata Extractors ──────────────────────────────────────────
-
     private fun extractTitle(doc: Document): String {
         doc.selectFirst("h1")?.text()?.trim()?.takeIf { it.isNotBlank() }
             ?.let { return cleanTitle(it) }
@@ -395,9 +458,7 @@ class NowHDTimeProvider : MainAPI() {
             val image = el.selectFirst("img")?.let {
                 fixUrl(it.attr("src").ifBlank { it.attr("data-src") })
             }
-            if (name.isNotBlank() && name.length < 80) {
-                actors.add(Actor(name, image))
-            }
+            if (name.isNotBlank() && name.length < 80) actors.add(Actor(name, image))
         }
         return actors.distinctBy { it.name }.take(20)
     }
@@ -453,12 +514,12 @@ class NowHDTimeProvider : MainAPI() {
             val type = if (href.contains("/tv-show/")) TvType.TvSeries else TvType.Movie
             recs.add(
                 when (type) {
-                    TvType.TvSeries -> newTvSeriesSearchResponse(
-                        cleanTitle(title), fullUrl, type
-                    ) { this.posterUrl = poster }
-                    else -> newMovieSearchResponse(
-                        cleanTitle(title), fullUrl, type
-                    ) { this.posterUrl = poster }
+                    TvType.TvSeries -> newTvSeriesSearchResponse(cleanTitle(title), fullUrl, type) {
+                        this.posterUrl = poster
+                    }
+                    else -> newMovieSearchResponse(cleanTitle(title), fullUrl, type) {
+                        this.posterUrl = poster
+                    }
                 }
             )
         }
@@ -466,13 +527,10 @@ class NowHDTimeProvider : MainAPI() {
     }
 
     private fun extractAnimeRecs(doc: Document): List<SearchResponse> {
-        return extractRecs(doc).filter {
-            it.url.contains("/anime/")
-        }.take(12)
+        return extractRecs(doc).filter { it.url.contains("/anime/") }.take(12)
     }
 
     // ── Episode Parsing ──────────────────────────────────────────────
-
     private fun extractTvShowId(doc: Document): String? {
         doc.selectFirst("[data-tv-show-id]")?.attr("data-tv-show-id")?.let { return it }
         Regex("""toggleEpisodeSources\((\d+)""")
@@ -480,9 +538,7 @@ class NowHDTimeProvider : MainAPI() {
         return null
     }
 
-    private fun extractEpisodes(
-        doc: Document, tvShowId: String?, baseUrl: String
-    ): List<Episode> {
+    private fun extractEpisodes(doc: Document, tvShowId: String?, baseUrl: String): List<Episode> {
         val eps = mutableListOf<Episode>()
         doc.select("[data-episode-id]").forEach { el ->
             val season = el.attr("data-season").toIntOrNull() ?: 1
@@ -514,22 +570,60 @@ class NowHDTimeProvider : MainAPI() {
     }
 
     // ── Player Parsing ───────────────────────────────────────────────
-    private fun parsePlayers(source: String): List<PlayerInfo> {
-        val players = mutableListOf<PlayerInfo>()
-        val jsonPattern = Regex(
-            """\{[^}]*"type"\s*:\s*"[^"]*"[^}]*"url"\s*:\s*"[^"]*"[^}]*\}"""
+    private fun parsePlayers(source: String): List<String> {
+        val urls = mutableListOf<String>()
+        // Extract "url" fields from JSON objects in the player array
+        val urlRegex = Regex(""""url"\s*:\s*"([^"]+)"""")
+        urlRegex.findAll(source).forEach { match ->
+            val url = match.groupValues[1].replace("\\/", "/")
+            if (url.startsWith("http") && url !in urls) {
+                urls.add(url)
+            }
+        }
+        return urls
+    }
+
+    // ── JS Deobfuscation ─────────────────────────────────────────────
+    private fun deobfuscateJs(html: String): String {
+        val packed = unpackJs(html) ?: ""
+        val decoded = decodeBase64(html) ?: ""
+        return "$html\n$packed\n$decoded"
+    }
+
+    private fun unpackJs(source: String): String? {
+        val packedRegex = Regex(
+            """eval\(function\(p,a,c,k,e,[dr]\)\{.*?\}\('(.+?)',(\d+),(\d+),'([^']*)'""",
+            setOf(RegexOption.DOT_MATCHES_ALL)
         )
-        jsonPattern.findAll(source).forEach { match ->
+        val match = packedRegex.find(source) ?: return null
+        return try {
+            val payload = match.groupValues[1]
+            val radix = match.groupValues[2].toIntOrNull() ?: return null
+            val count = match.groupValues[3].toIntOrNull() ?: return null
+            val keywords = match.groupValues[4].split("|")
+            if (keywords.size != count) return null
+            var result = payload
+            for (i in count - 1 downTo 0) {
+                val keyword = keywords.getOrNull(i) ?: continue
+                if (keyword.isNotBlank()) {
+                    val key = Integer.toString(i, radix)
+                    result = result.replace(Regex("\\b$key\\b"), keyword)
+                }
+            }
+            result
+        } catch (_: Exception) { null }
+    }
+
+    private fun decodeBase64(html: String): String? {
+        val sb = StringBuilder()
+        val b64Pattern = Regex("""atob\(["']([A-Za-z0-9+/=]+)["']\)""")
+        b64Pattern.findAll(html).forEach { match ->
             try {
-                val json = match.value
-                val url = Regex(""""url"\s*:\s*"([^"]*)"""")
-                    .find(json)?.groupValues?.get(1)?.replace("\\/", "/") ?: return@forEach
-                val server = Regex(""""server"\s*:\s*"([^"]*)"""")
-                    .find(json)?.groupValues?.get(1) ?: ""
-                players.add(PlayerInfo(url, server))
+                val decoded = String(android.util.Base64.decode(match.groupValues[1], android.util.Base64.DEFAULT))
+                sb.appendLine(decoded)
             } catch (_: Exception) {}
         }
-        return players.distinctBy { it.url }
+        return sb.toString().takeIf { it.isNotBlank() }
     }
 
     // ── Subtitle Extraction ──────────────────────────────────────────
@@ -544,8 +638,7 @@ class NowHDTimeProvider : MainAPI() {
             .findAll(html).forEach { match ->
                 val url = match.groupValues[1]
                 val label = match.groupValues[2].ifBlank { "Auto" }
-                val fixed = fixUrl(url) ?: return@forEach
-                subs.add(label to fixed)
+                fixUrl(url)?.let { subs.add(label to it) }
             }
         return subs.distinctBy { it.second }
     }
@@ -589,6 +682,4 @@ class NowHDTimeProvider : MainAPI() {
             else -> Qualities.Unknown.value
         }
     }
-
-    data class PlayerInfo(val url: String, val server: String)
 }
