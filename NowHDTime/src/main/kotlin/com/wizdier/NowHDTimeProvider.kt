@@ -181,9 +181,17 @@ class NowHDTimeProvider : MainAPI() {
 
         var found = false
         embedUrls.forEach { embedUrl ->
+            // Try other plugins first (they handle specific embed services better)
+            val wrappedCallback: (ExtractorLink) -> Unit = { link -> found = true; callback(link) }
             try {
-                found = resolveEmbedUrl(embedUrl, url, subtitleCallback, callback) || found
+                loadExtractor(embedUrl, url, subtitleCallback, wrappedCallback)
             } catch (_: Exception) {}
+            // Fallback: try our own extraction recursively
+            if (!found) {
+                try {
+                    found = resolveEmbedUrl(embedUrl, url, subtitleCallback, callback) || found
+                } catch (_: Exception) {}
+            }
         }
         extractSubtitles(html).forEach { (label, subUrl) ->
             subtitleCallback(SubtitleFile(label, subUrl))
@@ -223,9 +231,15 @@ class NowHDTimeProvider : MainAPI() {
 
         var found = false
         embedUrls.forEach { embedUrl ->
+            val wrappedCallback: (ExtractorLink) -> Unit = { link -> found = true; callback(link) }
             try {
-                found = resolveEmbedUrl(embedUrl, referer, subtitleCallback, callback) || found
+                loadExtractor(embedUrl, referer, subtitleCallback, wrappedCallback)
             } catch (_: Exception) {}
+            if (!found) {
+                try {
+                    found = resolveEmbedUrl(embedUrl, referer, subtitleCallback, callback) || found
+                } catch (_: Exception) {}
+            }
         }
         return found
     }

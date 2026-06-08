@@ -10,12 +10,12 @@ import com.lagradost.cloudstream3.utils.loadExtractor
 import com.lagradost.cloudstream3.utils.newExtractorLink
 
 /**
- * Generic extractor for NowHDTime embed pages.
- * Handles embedded iframes containing direct video URLs or nested embeds.
+ * Catch-all extractor — handles embed pages from any domain to find
+ * direct video URLs (mp4, m3u8, etc.), nested iframes, and subtitle tracks.
  */
 class NowHDTimeExtractor : ExtractorApi() {
     override val name = "NowHDTime"
-    override val mainUrl = "https://nowhdtime.to"
+    override val mainUrl = "https://"
     override val requiresReferer = true
 
     override suspend fun getUrl(
@@ -24,125 +24,65 @@ class NowHDTimeExtractor : ExtractorApi() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ) {
-        // For direct video URLs, pass through immediately
-        if (isDirectVideoUrl(url)) {
-            callback(
-                newExtractorLink(
-                    source = name,
-                    name = "Direct Stream",
-                    url = url,
-                    type = if (url.contains(".m3u8", ignoreCase = true))
-                        ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
-                ) {
-                    this.referer = referer ?: mainUrl
-                    this.quality = qualityFromUrl(url)
-                }
-            )
-            return
-        }
-
-        // Fetch the embed page and extract videos
-        val html = app.get(url, referer = referer ?: mainUrl, timeout = 20).text
+        val html = app.get(url, referer = referer ?: "https://nowhdtime.to", timeout = 20).text
         val fullHtml = deobfuscate(html)
 
-        // Pattern 1: Direct video URLs in the page
-        val videoPattern = Regex(
+        // Direct video URLs
+        val videoRegex = Regex(
             """["'](https?://[^"']+\.(?:mp4|m3u8|mkv|mpd|webm)(?:\?[^"']*)?)["']""",
             RegexOption.IGNORE_CASE
         )
-        videoPattern.findAll(fullHtml).forEach { match ->
-            val videoUrl = match.groupValues[1]
-            if (videoUrl.startsWith("http")) {
+        videoRegex.findAll(fullHtml).forEach { m ->
+            val vUrl = m.groupValues[1]
+            if (vUrl.startsWith("http")) {
                 callback(
                     newExtractorLink(
-                        source = name,
-                        name = name,
-                        url = videoUrl,
-                        type = if (videoUrl.contains(".m3u8", ignoreCase = true))
+                        source = name, name = name, url = vUrl,
+                        type = if (vUrl.contains(".m3u8", ignoreCase = true))
                             ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
                     ) {
                         this.referer = url
-                        this.quality = qualityFromUrl(videoUrl)
+                        this.quality = qualityFromUrl(vUrl)
                     }
                 )
             }
         }
 
-        // Pattern 2: Source/file declarations in JS objects
-        val sourcePattern = Regex(
-            """(?i)(?:file|src|source|url|video_url)\s*[:=]\s*["'](https?://[^"']+)["']"""
+        // JS source/file keys
+        val jsRegex = Regex(
+            """(?i)(?:file|src|source|url|video_url)\s*[:=]\s*["'](https?://[^"']+\.(?:mp4|m3u8|mkv|mpd|webm)(?:\?[^"']*)?)["']"""
         )
-        sourcePattern.findAll(fullHtml).forEach { match ->
-            val videoUrl = match.groupValues[1]
-            if (videoUrl.startsWith("http") && !videoUrl.contains("google") &&
-                !videoUrl.contains("facebook") && !videoUrl.contains("youtube")
-            ) {
-                val isVideo = videoUrl.contains(".mp4", ignoreCase = true) ||
-                        videoUrl.contains(".m3u8", ignoreCase = true) ||
-                        videoUrl.contains(".mkv", ignoreCase = true) ||
-                        videoUrl.contains(".mpd", ignoreCase = true)
-                if (isVideo) {
-                    callback(
-                        newExtractorLink(
-                            source = name,
-                            name = name,
-                            url = videoUrl,
-                            type = if (videoUrl.contains(".m3u8", ignoreCase = true))
-                                ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
-                        ) {
-                            this.referer = url
-                            this.quality = qualityFromUrl(videoUrl)
-                        }
-                    )
+        jsRegex.findAll(fullHtml).forEach { m ->
+            val vUrl = m.groupValues[1]
+            if (vUrl.startsWith("http")) {
+                callback(
+                    newExtractorLink(
+                        source = name, name = name, url = vUrl,
+                        type = if (vUrl.contains(".m3u8", ignoreCase = true))
+                            ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+                    ) {
+                        this.referer = url
+                        this.quality = qualityFromUrl(vUrl)
+                    }
+                )
+            }
+        }
+
+        // Nested iframes
+        Regex("""<iframe[^>]+src=["']([^"']+)["']""", RegexOption.IGNORE_CASE)
+            .findAll(html).forEach { m ->
+                var src = m.groupValues[1]
+                if (src.startsWith("//")) src = "https:$src"
+                if (src.startsWith("http")) {
+                    try { loadExtractor(src, url, subtitleCallback, callback) } catch (_: Exception) {}
                 }
             }
-        }
 
-        // Pattern 3: Nested iframes
-        val iframePattern = Regex(
-            """<iframe[^>]+src=["']([^"']+)["']""",
-            RegexOption.IGNORE_CASE
-        )
-        iframePattern.findAll(html).forEach { match ->
-            var src = match.groupValues[1]
-            if (src.startsWith("//")) src = "https:$src"
-            if (src.startsWith("http") && !src.contains("nowhdtime.to")) {
-                try {
-                    loadExtractor(src, url, subtitleCallback, callback)
-                } catch (_: Exception) {}
+        // Subtitle tracks
+        Regex("""["'](https?://[^"']+\.(?:srt|vtt|ass)[^"']*)["']""", RegexOption.IGNORE_CASE)
+            .findAll(fullHtml).forEach { m ->
+                subtitleCallback(SubtitleFile("Auto", m.groupValues[1]))
             }
-        }
-
-        // Pattern 4: Subtitle tracks
-        val subPattern = Regex(
-            """["'](https?://[^"']+\.(?:srt|vtt|ass)[^"']*)["']""",
-            RegexOption.IGNORE_CASE
-        )
-        subPattern.findAll(fullHtml).forEach { match ->
-            subtitleCallback(SubtitleFile("Auto", match.groupValues[1]))
-        }
-
-        val trackPattern = Regex(
-            """<track[^>]+src=["']([^"']+)["'][^>]*(?:label=["']([^"']*)["'])?[^>]*>""",
-            RegexOption.IGNORE_CASE
-        )
-        trackPattern.findAll(html).forEach { match ->
-            val subUrl = match.groupValues[1]
-            val label = match.groupValues[2].ifBlank { "Auto" }
-            val fixedUrl = if (subUrl.startsWith("//")) "https:$subUrl"
-            else if (subUrl.startsWith("/")) "$mainUrl$subUrl"
-            else subUrl
-            if (fixedUrl.startsWith("http")) {
-                subtitleCallback(SubtitleFile(label, fixedUrl))
-            }
-        }
-    }
-
-    private fun isDirectVideoUrl(url: String): Boolean {
-        val lower = url.lowercase()
-        return lower.endsWith(".mp4") || lower.endsWith(".m3u8") ||
-                lower.endsWith(".mkv") || lower.endsWith(".mpd") ||
-                lower.endsWith(".webm") || lower.endsWith(".avi")
     }
 
     private fun qualityFromUrl(url: String): Int {
@@ -159,47 +99,39 @@ class NowHDTimeExtractor : ExtractorApi() {
 
     private fun deobfuscate(html: String): String {
         val packed = unpackJs(html) ?: ""
-        val decoded = decodeBase64Strings(html)
+        val decoded = decodeBase64(html) ?: ""
         return "$html\n$packed\n$decoded"
     }
 
     private fun unpackJs(source: String): String? {
-        val packedRegex = Regex(
+        val re = Regex(
             """eval\(function\(p,a,c,k,e,[dr]\)\{.*?\}\('(.+?)',(\d+),(\d+),'([^']*)'""",
             setOf(RegexOption.DOT_MATCHES_ALL)
         )
-        val match = packedRegex.find(source) ?: return null
+        val m = re.find(source) ?: return null
         return try {
-            val payload = match.groupValues[1]
-            val radix = match.groupValues[2].toIntOrNull() ?: return null
-            val count = match.groupValues[3].toIntOrNull() ?: return null
-            val keywords = match.groupValues[4].split("|")
+            val payload = m.groupValues[1]
+            val radix = m.groupValues[2].toIntOrNull() ?: return null
+            val count = m.groupValues[3].toIntOrNull() ?: return null
+            val keywords = m.groupValues[4].split("|")
             if (keywords.size != count) return null
             var result = payload
             for (i in count - 1 downTo 0) {
-                val keyword = keywords.getOrNull(i) ?: continue
-                if (keyword.isNotBlank()) {
-                    val key = Integer.toString(i, radix)
-                    result = result.replace(Regex("\\b$key\\b"), keyword)
+                keywords.getOrNull(i)?.takeIf { it.isNotBlank() }?.let {
+                    result = result.replace(Regex("\\b${Integer.toString(i, radix)}\\b"), it)
                 }
             }
             result
-        } catch (_: Exception) {
-            null
-        }
+        } catch (_: Exception) { null }
     }
 
-    private fun decodeBase64Strings(html: String): String {
+    private fun decodeBase64(html: String): String? {
         val sb = StringBuilder()
-        val b64Pattern = Regex("""atob\(["']([A-Za-z0-9+/=]+)["']\)""")
-        b64Pattern.findAll(html).forEach { match ->
+        Regex("""atob\(["']([A-Za-z0-9+/=]+)["']\)""").findAll(html).forEach { m ->
             try {
-                val decoded = String(
-                    android.util.Base64.decode(match.groupValues[1], android.util.Base64.DEFAULT)
-                )
-                sb.appendLine(decoded)
+                sb.appendLine(String(android.util.Base64.decode(m.groupValues[1], android.util.Base64.DEFAULT)))
             } catch (_: Exception) {}
         }
-        return sb.toString()
+        return sb.toString().takeIf { it.isNotBlank() }
     }
 }
