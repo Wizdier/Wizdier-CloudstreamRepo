@@ -1,4 +1,4 @@
-package com.wizdier
+package com.nowhdtime
 
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.LoadResponse.Companion.addActors
@@ -25,7 +25,6 @@ class NowHDTimeProvider : MainAPI() {
     override var mainUrl              = "https://nowhdtime.to"
     override var name                 = "NowHDTime"
     override val hasMainPage          = true
-    override val hasSearch            = true
     override val hasChromecastSupport = true
     override val hasDownloadSupport   = true
     override val supportedTypes       = setOf(TvType.Movie, TvType.TvSeries, TvType.Anime)
@@ -266,7 +265,7 @@ class NowHDTimeProvider : MainAPI() {
                 this.posterUrl           = normalizePoster(poster)
                 this.backgroundPosterUrl = normalizePoster(backdrop)
                 this.plot                = plot
-                this.rating              = rating?.let { Score.from10(it) }
+                this.score               = rating?.let { Score.from10(it) }
                 this.tags                = genres
                 this.year                = year
                 addActors(actors)
@@ -351,7 +350,7 @@ class NowHDTimeProvider : MainAPI() {
             this.posterUrl           = normalizePoster(poster)
             this.backgroundPosterUrl = normalizePoster(backdrop)
             this.plot                = plot
-            this.rating              = rating?.let { Score.from10(it) }
+            this.score               = rating?.let { Score.from10(it) }
             this.tags                = genres
             this.year                = year
             addActors(actors)
