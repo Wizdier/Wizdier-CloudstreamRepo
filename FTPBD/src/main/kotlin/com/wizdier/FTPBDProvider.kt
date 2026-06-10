@@ -283,8 +283,7 @@ class FTPBD : MainAPI() {
         val normalized = title.normalizedTitle()
         val cards = parseCards(doc, expectedPath)
         cards.firstOrNull { result ->
-            result.name.cleanMediaTitle().normalizedTitle() == normalized &&
-                    (year == null || result.year == null || result.year == year)
+            result.name.cleanMediaTitle().normalizedTitle() == normalized
         }?.url ?: cards.firstOrNull()?.url
     }.getOrNull()
 
