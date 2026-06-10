@@ -1,4 +1,4 @@
-version = 2
+version = 3
 
 cloudstream {
     language = "bn"
@@ -25,3 +25,4 @@ cloudstream {
 android {
     namespace = "com.wizdier.ctgmovies"
 }
+s

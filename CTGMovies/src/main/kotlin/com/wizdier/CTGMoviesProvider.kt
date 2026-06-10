@@ -125,10 +125,9 @@ class CTGMovies(private val prefs: SharedPreferences? = null) : MainAPI() {
         }
 
         val obj = JSONObject(apiGet("/$kind/${idOrSlug.encodeUrl()}"))
-        val isAnime = kind == "anime" || obj.optBoolean("is_anime", false)
-        return when {
-            kind == "movies" -> loadMovie(url, obj)
-            isAnime -> loadAnime(url, obj)
+        return when (kind) {
+            "movies" -> loadMovie(url, obj)
+            "anime" -> loadAnime(url, obj)
             else -> loadTv(url, obj)
         }
     }
@@ -395,7 +394,7 @@ class CTGMovies(private val prefs: SharedPreferences? = null) : MainAPI() {
     private suspend fun loadMovie(pageUrl: String, obj: JSONObject): LoadResponse {
         val baseTitle = obj.optStringOrNull("title") ?: "Untitled"
         val meta = fetchTmdbMeta(obj, "movie", baseTitle)
-        val title = meta.title ?: baseTitle
+        val title = baseTitle
         val data = JSONObject()
             .put("kind", "movie")
             .put("id", obj.optStringOrNull("id"))
@@ -403,12 +402,12 @@ class CTGMovies(private val prefs: SharedPreferences? = null) : MainAPI() {
             .toString()
 
         return newMovieLoadResponse(title, pageUrl, TvType.Movie, data) {
-            posterUrl = meta.posterUrl ?: obj.optStringOrNull("poster_url")
+            posterUrl = obj.optStringOrNull("poster_url")
             backgroundPosterUrl = meta.backdropUrl ?: obj.optStringOrNull("backdrop_url")
-            plot = meta.plot ?: obj.optStringOrNull("overview")
-            year = meta.year ?: obj.optIntOrNull("year") ?: yearFromDate(obj.optStringOrNull("release_date"))
+            plot = obj.optStringOrNull("overview") ?: meta.plot
+            year = obj.optIntOrNull("year") ?: yearFromDate(obj.optStringOrNull("release_date")) ?: meta.year
             duration = meta.runtime ?: obj.optIntOrNull("runtime")
-            tags = meta.tags ?: obj.optStringOrNull("genres")?.splitCsv()
+            tags = obj.optStringOrNull("genres")?.splitCsv() ?: meta.tags
             runCatching { meta.actors?.let { actors = it } }
             runCatching { (meta.rating ?: obj.optDoubleOrNull("rating"))?.let { score = Score.from10(it) } }
             runCatching { (meta.trailerUrl ?: obj.optStringOrNull("trailer_url"))?.let { addTrailer(it) } }
@@ -420,14 +419,14 @@ class CTGMovies(private val prefs: SharedPreferences? = null) : MainAPI() {
     private suspend fun loadTv(pageUrl: String, obj: JSONObject): LoadResponse {
         val baseTitle = obj.optStringOrNull("name") ?: obj.optStringOrNull("title") ?: "Untitled"
         val meta = fetchTmdbMeta(obj, "tv", baseTitle)
-        val title = meta.title ?: baseTitle
+        val title = baseTitle
         val episodes = parseEpisodes(obj.optJSONArray("episodes"), anime = false)
         return newTvSeriesLoadResponse(title, pageUrl, TvType.TvSeries, episodes) {
-            posterUrl = meta.posterUrl ?: obj.optStringOrNull("poster_url") ?: obj.optStringOrNull("cover_url")
+            posterUrl = obj.optStringOrNull("poster_url") ?: obj.optStringOrNull("cover_url")
             backgroundPosterUrl = meta.backdropUrl ?: obj.optStringOrNull("backdrop_url") ?: obj.optStringOrNull("banner_url")
-            plot = meta.plot ?: obj.optStringOrNull("overview") ?: obj.optStringOrNull("description")
-            year = meta.year ?: yearFromDate(obj.optStringOrNull("first_air_date")) ?: obj.optIntOrNull("year")
-            tags = meta.tags ?: obj.optStringOrNull("genres")?.splitCsv()
+            plot = obj.optStringOrNull("overview") ?: obj.optStringOrNull("description") ?: meta.plot
+            year = yearFromDate(obj.optStringOrNull("first_air_date")) ?: obj.optIntOrNull("year") ?: meta.year
+            tags = obj.optStringOrNull("genres")?.splitCsv() ?: meta.tags
             runCatching { meta.actors?.let { actors = it } }
             runCatching { (meta.rating ?: obj.optDoubleOrNull("rating"))?.let { score = Score.from10(it) } }
             runCatching { (meta.trailerUrl ?: obj.optStringOrNull("trailer_url"))?.let { addTrailer(it) } }
@@ -444,7 +443,7 @@ class CTGMovies(private val prefs: SharedPreferences? = null) : MainAPI() {
         val episodes = parseEpisodes(obj.optJSONArray("episodes"), anime = true)
         val tvType = if (episodes.isEmpty()) TvType.AnimeMovie else TvType.Anime
         val meta = fetchTmdbMeta(obj, if (tvType == TvType.AnimeMovie) "movie" else "tv", baseTitle)
-        val title = meta.title ?: baseTitle
+        val title = baseTitle
 
         return if (tvType == TvType.AnimeMovie) {
             val data = JSONObject()
@@ -453,12 +452,12 @@ class CTGMovies(private val prefs: SharedPreferences? = null) : MainAPI() {
                 .put("links", obj.optJSONArray("links") ?: JSONArray())
                 .toString()
             newMovieLoadResponse(title, pageUrl, TvType.AnimeMovie, data) {
-                posterUrl = meta.posterUrl ?: obj.optStringOrNull("cover_url") ?: obj.optStringOrNull("poster_url")
+                posterUrl = obj.optStringOrNull("cover_url") ?: obj.optStringOrNull("poster_url")
                 backgroundPosterUrl = meta.backdropUrl ?: obj.optStringOrNull("banner_url") ?: obj.optStringOrNull("backdrop_url")
-                plot = meta.plot ?: obj.optStringOrNull("description") ?: obj.optStringOrNull("overview")
-                year = meta.year ?: obj.optIntOrNull("year") ?: yearFromDate(obj.optStringOrNull("first_air_date"))
+                plot = obj.optStringOrNull("description") ?: obj.optStringOrNull("overview") ?: meta.plot
+                year = obj.optIntOrNull("year") ?: yearFromDate(obj.optStringOrNull("first_air_date")) ?: meta.year
                 duration = meta.runtime
-                tags = meta.tags ?: obj.optStringOrNull("genres")?.splitCsv()
+                tags = obj.optStringOrNull("genres")?.splitCsv() ?: meta.tags
                 runCatching { meta.actors?.let { actors = it } }
                 runCatching { (meta.rating ?: obj.optDoubleOrNull("rating"))?.let { score = Score.from10(it) } }
                 runCatching { (meta.trailerUrl ?: obj.optStringOrNull("trailer_url"))?.let { addTrailer(it) } }
@@ -468,11 +467,11 @@ class CTGMovies(private val prefs: SharedPreferences? = null) : MainAPI() {
         } else {
             newAnimeLoadResponse(title, pageUrl, TvType.Anime) {
                 addEpisodes(DubStatus.Subbed, episodes)
-                posterUrl = meta.posterUrl ?: obj.optStringOrNull("cover_url") ?: obj.optStringOrNull("poster_url")
+                posterUrl = obj.optStringOrNull("cover_url") ?: obj.optStringOrNull("poster_url")
                 backgroundPosterUrl = meta.backdropUrl ?: obj.optStringOrNull("banner_url") ?: obj.optStringOrNull("backdrop_url")
-                plot = meta.plot ?: obj.optStringOrNull("description") ?: obj.optStringOrNull("overview")
-                year = meta.year ?: obj.optIntOrNull("year") ?: yearFromDate(obj.optStringOrNull("first_air_date"))
-                tags = meta.tags ?: obj.optStringOrNull("genres")?.splitCsv()
+                plot = obj.optStringOrNull("description") ?: obj.optStringOrNull("overview") ?: meta.plot
+                year = obj.optIntOrNull("year") ?: yearFromDate(obj.optStringOrNull("first_air_date")) ?: meta.year
+                tags = obj.optStringOrNull("genres")?.splitCsv() ?: meta.tags
                 runCatching { meta.actors?.let { actors = it } }
                 runCatching { (meta.rating ?: obj.optDoubleOrNull("rating"))?.let { score = Score.from10(it) } }
                 runCatching { (meta.trailerUrl ?: obj.optStringOrNull("trailer_url"))?.let { addTrailer(it) } }

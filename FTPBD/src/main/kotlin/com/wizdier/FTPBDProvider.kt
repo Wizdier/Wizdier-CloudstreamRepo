@@ -1,8 +1,14 @@
 package com.wizdier
 
 import com.lagradost.cloudstream3.*
+import com.lagradost.cloudstream3.LoadResponse.Companion.addImdbId
+import com.lagradost.cloudstream3.LoadResponse.Companion.addSimklId
+import com.lagradost.cloudstream3.LoadResponse.Companion.addTrailer
 import com.lagradost.cloudstream3.Score
+import com.lagradost.cloudstream3.syncproviders.SyncIdName
 import com.lagradost.cloudstream3.utils.*
+import org.json.JSONArray
+import org.json.JSONObject
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
@@ -22,6 +28,16 @@ class FTPBD : MainAPI() {
         TvType.TvSeries,
         TvType.AnimeMovie,
     )
+
+    override val supportedSyncNames = setOfNotNull(
+        runCatching { SyncIdName.valueOf("Simkl") }.getOrNull(),
+    )
+
+    companion object {
+        private const val TMDB_API = "https://api.themoviedb.org/3"
+        private const val TMDB_KEY = "98ae14df2b8d8f8f8136499daf79f0e0"
+        private const val TMDB_IMG = "https://image.tmdb.org/t/p"
+    }
 
     private val headers = mapOf(
         "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
@@ -63,6 +79,21 @@ class FTPBD : MainAPI() {
             out += parseCards(doc, "/tv_shows/")
         }
         return out.distinctBy { it.url }
+    }
+
+    override suspend fun getLoadUrl(name: SyncIdName, id: String): String? {
+        if (!name.name.equals("Simkl", ignoreCase = true)) return null
+        val syncId = id.trim().removeSuffix("/").substringAfterLast("/").substringBefore("?")
+        if (syncId.isBlank()) return null
+        val simkl = fetchSimklDetails(syncId) ?: return null
+        val title = simkl.optStringOrNull("title") ?: return null
+        val year = simkl.optIntOrNull("year")
+        val type = simkl.optStringOrNull("type")?.lowercase().orEmpty()
+        val order = if (type == "movie") listOf("/movie/" to "movies") else listOf("/tv_shows/" to "tv_shows", "/movie/" to "movies")
+        for ((path, postType) in order) {
+            findFtpbdUrlByTitle(title, year, path, postType)?.let { return it }
+        }
+        return null
     }
 
     override suspend fun load(url: String): LoadResponse? {
@@ -148,6 +179,123 @@ class FTPBD : MainAPI() {
         return found
     }
 
+    // ───────────────────────── TMDB / Simkl metadata ─────────────────────────
+
+    private data class TmdbMeta(
+        val plot: String? = null,
+        val backdropUrl: String? = null,
+        val logoUrl: String? = null,
+        val year: Int? = null,
+        val runtime: Int? = null,
+        val tags: List<String>? = null,
+        val rating: Double? = null,
+        val trailerUrl: String? = null,
+        val imdbId: String? = null,
+        val simklId: Int? = null,
+        val actors: List<ActorData>? = null,
+    )
+
+    private suspend fun fetchTmdbMeta(title: String, mediaType: String, siteYear: Int? = null): TmdbMeta {
+        val tmdbId = findTmdbId(title.cleanMediaTitle(), mediaType, siteYear) ?: return TmdbMeta()
+        val detail = tmdbJson(
+            "/$mediaType/$tmdbId",
+            mapOf(
+                "append_to_response" to "credits,external_ids,images,videos",
+                "include_image_language" to "en,null"
+            )
+        ) ?: return TmdbMeta()
+
+        val date = detail.optStringOrNull(if (mediaType == "movie") "release_date" else "first_air_date")
+        val runtime = if (mediaType == "movie") {
+            detail.optIntOrNull("runtime")
+        } else {
+            detail.optJSONArray("episode_run_time")?.optInt(0, 0)?.takeIf { it > 0 }
+        }
+        val imdbId = detail.optJSONObject("external_ids")?.optStringOrNull("imdb_id")
+            ?: detail.optStringOrNull("imdb_id")
+        val logo = detail.optJSONObject("images")
+            ?.optJSONArray("logos")
+            ?.bestTmdbImage("file_path", preferLogo = true)
+            ?.let { tmdbImg("w500", it) }
+        val actors = detail.optJSONObject("credits")?.optJSONArray("cast")?.toActors()
+
+        return TmdbMeta(
+            plot = detail.optStringOrNull("overview"),
+            backdropUrl = detail.optStringOrNull("backdrop_path")?.let { tmdbImg("w1280", it) },
+            logoUrl = logo ?: imdbId?.let { "https://live.metahub.space/logo/medium/$it/img" },
+            year = yearFromDate(date),
+            runtime = runtime,
+            tags = detail.optJSONArray("genres")?.toStringList("name"),
+            rating = detail.optDoubleOrNull("vote_average"),
+            trailerUrl = detail.optJSONObject("videos")?.optJSONArray("results")?.bestYoutubeTrailer(),
+            imdbId = imdbId,
+            simklId = fetchSimklId(imdbId, mediaType),
+            actors = actors,
+        )
+    }
+
+    private suspend fun findTmdbId(title: String, mediaType: String, year: Int?): Int? {
+        if (title.isBlank()) return null
+        val query = buildMap<String, Any?> {
+            put("query", title)
+            put("include_adult", false)
+            if (year != null) put(if (mediaType == "movie") "year" else "first_air_date_year", year)
+        }
+        return tmdbJson("/search/$mediaType", query)
+            ?.optJSONArray("results")
+            ?.optJSONObject(0)
+            ?.optInt("id")
+            ?.takeIf { it != 0 }
+    }
+
+    private suspend fun tmdbJson(path: String, query: Map<String, Any?> = emptyMap()): JSONObject? = runCatching {
+        val params = query + mapOf("api_key" to TMDB_KEY, "language" to "en-US")
+        val res = app.get(TMDB_API + path + queryString(params), headers = headers, timeout = 8000)
+        if (res.code in 200..299) JSONObject(res.text) else null
+    }.getOrNull()
+
+    private suspend fun fetchSimklId(imdbId: String?, mediaType: String): Int? {
+        if (imdbId.isNullOrBlank()) return null
+        val simklType = if (mediaType == "movie") "movies" else "tv"
+        return fetchSimklObject(simklType, imdbId)
+            ?.optJSONObject("ids")
+            ?.optInt("simkl")
+            ?.takeIf { it != 0 }
+    }
+
+    private suspend fun fetchSimklDetails(syncId: String): JSONObject? =
+        fetchSimklObject("movies", syncId) ?: fetchSimklObject("tv", syncId)
+
+    private suspend fun fetchSimklObject(type: String, id: String): JSONObject? = runCatching {
+        val res = app.get(
+            "https://api.simkl.com/$type/${id.encodeUrl()}?client_id=%20&extended=full",
+            headers = headers + mapOf("Accept" to "application/json"),
+            timeout = 8000
+        )
+        if (res.code !in 200..299) return@runCatching null
+        val text = res.text.trim()
+        if (!text.startsWith("{")) return@runCatching null
+        JSONObject(text)
+    }.getOrNull()
+
+    private suspend fun findFtpbdUrlByTitle(title: String, year: Int?, expectedPath: String, postType: String): String? = runCatching {
+        val doc = app.get("$mainUrl/?s=${title.encodeUrl()}&post_type=$postType", headers = headers).document
+        val normalized = title.normalizedTitle()
+        val cards = parseCards(doc, expectedPath)
+        cards.firstOrNull { result ->
+            result.name.cleanMediaTitle().normalizedTitle() == normalized &&
+                    (year == null || result.year == null || result.year == year)
+        }?.url ?: cards.firstOrNull()?.url
+    }.getOrNull()
+
+    private fun queryString(query: Map<String, Any?>): String {
+        val params = query.entries.filter { it.value != null }
+            .joinToString("&") { (k, v) -> "${k.encodeUrl()}=${v.toString().encodeUrl()}" }
+        return if (params.isBlank()) "" else "?$params"
+    }
+
+    private fun tmdbImg(size: String, path: String): String = "$TMDB_IMG/$size$path"
+
     // ───────────────────────── Load builders ─────────────────────────
 
     private suspend fun loadMovie(url: String, doc: Document): LoadResponse {
@@ -159,20 +307,25 @@ class FTPBD : MainAPI() {
         val duration = parseDuration(doc.selectFirst(".video-time")?.text())
         val tags = doc.select(".jws-category a[href*='movies_cat']").map { it.text().trim() }.filter { it.isNotBlank() }.distinct()
         val tvType = if (tags.any { it.contains("anime", ignoreCase = true) }) TvType.AnimeMovie else TvType.Movie
-        val actors = doc.select(".jws-meta-director a[href*='/person/']").mapNotNull { a ->
+        val siteActors = doc.select(".jws-meta-director a[href*='/person/']").mapNotNull { a ->
             val actor = a.text().trim().takeIf { it.isNotBlank() } ?: return@mapNotNull null
             ActorData(Actor(actor, null), roleString = "")
         }.distinctBy { it.actor.name }
+        val meta = fetchTmdbMeta(title, "movie", year)
+        val actors = siteActors.ifEmpty { meta.actors ?: emptyList() }
 
         return newMovieLoadResponse(title, url, tvType, url) {
             posterUrl = poster
-            backgroundPosterUrl = background
-            this.plot = plot
-            this.year = year
-            this.duration = duration
-            this.tags = tags.takeIf { it.isNotEmpty() }
+            backgroundPosterUrl = meta.backdropUrl ?: background
+            this.plot = plot ?: meta.plot
+            this.year = year ?: meta.year
+            this.duration = duration ?: meta.runtime
+            this.tags = tags.takeIf { it.isNotEmpty() } ?: meta.tags
             runCatching { if (actors.isNotEmpty()) this.actors = actors }
-            runCatching { doc.rating()?.let { score = Score.from10(it) } }
+            runCatching { (doc.rating() ?: meta.rating)?.let { score = Score.from10(it) } }
+            runCatching { meta.trailerUrl?.let { addTrailer(it) } }
+            runCatching { meta.logoUrl?.let { logoUrl = it } }
+            addSyncIds(meta)
         }
     }
 
@@ -216,13 +369,19 @@ class FTPBD : MainAPI() {
         }
         if (episodes.isEmpty()) episodes += parseEpisodes(doc, 1)
 
+        val meta = fetchTmdbMeta(title, "tv", year)
+
         return newTvSeriesLoadResponse(title, url, TvType.TvSeries, episodes.distinctBy { it.data }) {
             posterUrl = poster
-            backgroundPosterUrl = background
-            this.plot = plot
-            this.year = year
-            this.tags = tags.takeIf { it.isNotEmpty() }
-            runCatching { doc.rating()?.let { score = Score.from10(it) } }
+            backgroundPosterUrl = meta.backdropUrl ?: background
+            this.plot = plot ?: meta.plot
+            this.year = year ?: meta.year
+            this.tags = tags.takeIf { it.isNotEmpty() } ?: meta.tags
+            runCatching { meta.actors?.let { actors = it } }
+            runCatching { (doc.rating() ?: meta.rating)?.let { score = Score.from10(it) } }
+            runCatching { meta.trailerUrl?.let { addTrailer(it) } }
+            runCatching { meta.logoUrl?.let { logoUrl = it } }
+            addSyncIds(meta)
         }
     }
 
@@ -312,6 +471,68 @@ class FTPBD : MainAPI() {
     private fun Document.rating(): Double? =
         selectFirst(".jws-raring-number")?.text()?.let { Regex("\\d+(?:\\.\\d+)?").find(it)?.value?.toDoubleOrNull() }
 
+    private fun LoadResponse.addSyncIds(meta: TmdbMeta) {
+        runCatching { meta.imdbId?.takeIf { it.isNotBlank() }?.let { addImdbId(it) } }
+        runCatching { meta.simklId?.let { addSimklId(it) } }
+    }
+
+    private fun JSONArray.toStringList(key: String): List<String> =
+        (0 until length()).mapNotNull { i -> optJSONObject(i)?.optStringOrNull(key) }
+            .map { it.trim() }
+            .filter { it.isNotBlank() }
+            .distinct()
+
+    private fun JSONArray.bestTmdbImage(key: String, preferLogo: Boolean = false): String? {
+        if (length() == 0) return null
+        val candidates = (0 until length()).mapNotNull { i -> optJSONObject(i) }
+            .sortedWith(
+                compareByDescending<JSONObject> {
+                    val lang = it.optStringOrNull("iso_639_1")
+                    if (lang == "en") 3 else if (lang == null) 2 else 1
+                }.thenByDescending { it.optDoubleOrNull("vote_average") ?: 0.0 }
+            )
+        val picked = if (preferLogo) {
+            candidates.firstOrNull { it.optDoubleOrNull("aspect_ratio")?.let { ratio -> ratio >= 1.5 } == true }
+                ?: candidates.firstOrNull()
+        } else candidates.firstOrNull()
+        return picked?.optStringOrNull(key)
+    }
+
+    private fun JSONArray.bestYoutubeTrailer(): String? {
+        val videos = (0 until length()).mapNotNull { i -> optJSONObject(i) }
+            .filter { it.optStringOrNull("site")?.equals("YouTube", ignoreCase = true) == true }
+        val picked = videos.firstOrNull {
+            it.optStringOrNull("type")?.equals("Trailer", ignoreCase = true) == true &&
+                    it.optStringOrNull("official")?.equals("true", ignoreCase = true) == true
+        } ?: videos.firstOrNull { it.optStringOrNull("type")?.equals("Trailer", ignoreCase = true) == true }
+            ?: videos.firstOrNull()
+        return picked?.optStringOrNull("key")?.let { "https://youtu.be/$it" }
+    }
+
+    private fun JSONArray.toActors(limit: Int = 20): List<ActorData> =
+        (0 until length()).mapNotNull { i ->
+            val cast = optJSONObject(i) ?: return@mapNotNull null
+            val name = cast.optStringOrNull("name") ?: cast.optStringOrNull("original_name") ?: return@mapNotNull null
+            val profile = cast.optStringOrNull("profile_path")?.let { tmdbImg("w185", it) }
+            val character = cast.optStringOrNull("character")
+            ActorData(Actor(name, profile), roleString = character ?: "")
+        }.take(limit)
+
+    private fun JSONObject.optStringOrNull(key: String): String? =
+        if (!has(key) || isNull(key)) null
+        else optString(key, "").trim().takeIf { it.isNotBlank() && it != "null" }
+
+    private fun JSONObject.optIntOrNull(key: String): Int? =
+        if (!has(key) || isNull(key)) null
+        else optString(key, "").toIntOrNull() ?: optInt(key, Int.MIN_VALUE).takeIf { it != Int.MIN_VALUE }
+
+    private fun JSONObject.optDoubleOrNull(key: String): Double? =
+        if (!has(key) || isNull(key)) null
+        else optString(key, "").toDoubleOrNull() ?: optDouble(key, Double.NaN).takeIf { !it.isNaN() }
+
+    private fun yearFromDate(date: String?): Int? =
+        date?.let { Regex("""\d{4}""").find(it)?.value?.toIntOrNull() }
+
     private fun Element.imgUrl(): String? =
         attr("data-src").ifBlank { attr("data-lazy-src") }.ifBlank { attr("src") }
             .takeIf { it.isNotBlank() }
@@ -344,6 +565,19 @@ class FTPBD : MainAPI() {
         startsWith("/") -> mainUrl + this
         else -> "$mainUrl/$this"
     }
+
+    private fun String.cleanMediaTitle(): String =
+        replace(Regex("\\s*[–-]\\s*\\[[^]]+]\\s*$"), "")
+            .replace(Regex("\\[[^]]+]"), "")
+            .replace(Regex("(?i)\\b(hindi|dubbed|dual audio|season \\d+)\\b"), "")
+            .trim()
+            .ifBlank { this }
+
+    private fun String.normalizedTitle(): String =
+        cleanMediaTitle()
+            .lowercase()
+            .replace(Regex("[^a-z0-9]+"), " ")
+            .trim()
 
     private fun String.encodeUrl(): String = URLEncoder.encode(this, "UTF-8")
 
