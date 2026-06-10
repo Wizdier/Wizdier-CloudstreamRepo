@@ -25,4 +25,3 @@ cloudstream {
 android {
     namespace = "com.wizdier.ctgmovies"
 }
-s
