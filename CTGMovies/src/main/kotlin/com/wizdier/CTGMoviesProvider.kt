@@ -192,7 +192,7 @@ class CTGMovies(private val prefs: SharedPreferences? = null) : MainAPI() {
 
     // ───────────────────────────── Load builders ─────────────────────────────
 
-    private fun loadMovie(pageUrl: String, obj: JSONObject): LoadResponse {
+    private suspend fun loadMovie(pageUrl: String, obj: JSONObject): LoadResponse {
         val title = obj.optStringOrNull("title") ?: "Untitled"
         val data = JSONObject()
             .put("kind", "movie")
@@ -212,7 +212,7 @@ class CTGMovies(private val prefs: SharedPreferences? = null) : MainAPI() {
         }
     }
 
-    private fun loadTv(pageUrl: String, obj: JSONObject): LoadResponse {
+    private suspend fun loadTv(pageUrl: String, obj: JSONObject): LoadResponse {
         val title = obj.optStringOrNull("name") ?: obj.optStringOrNull("title") ?: "Untitled"
         val episodes = parseEpisodes(obj.optJSONArray("episodes"), anime = false)
         return newTvSeriesLoadResponse(title, pageUrl, TvType.TvSeries, episodes) {
@@ -226,7 +226,7 @@ class CTGMovies(private val prefs: SharedPreferences? = null) : MainAPI() {
         }
     }
 
-    private fun loadAnime(pageUrl: String, obj: JSONObject): LoadResponse {
+    private suspend fun loadAnime(pageUrl: String, obj: JSONObject): LoadResponse {
         val title = obj.optStringOrNull("title")
             ?: obj.optStringOrNull("name")
             ?: obj.optStringOrNull("english_title")
