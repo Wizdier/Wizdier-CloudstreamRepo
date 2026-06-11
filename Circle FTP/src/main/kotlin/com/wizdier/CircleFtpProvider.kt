@@ -150,7 +150,8 @@ class CircleFtpProvider : MainAPI() {
             val posts: List<GroupedPostInfo>,
             val cleanedTitle: String,
             val isAnime: Boolean,
-            val selectedSeason: Int? = null
+            val selectedSeason: Int? = null,
+            val year: Int? = null
         )
 
         data class EpisodeMetadata(
@@ -205,6 +206,9 @@ class CircleFtpProvider : MainAPI() {
             if (data.selectedSeason != null) {
                 obj.put("selectedSeason", data.selectedSeason)
             }
+            if (data.year != null) {
+                obj.put("year", data.year)
+            }
             val base64Data = Base64.getEncoder().encodeToString(obj.toString().toByteArray())
             return "load?data=$base64Data"
         }
@@ -232,12 +236,27 @@ class CircleFtpProvider : MainAPI() {
                     posts = postsList,
                     cleanedTitle = obj.getString("cleanedTitle"),
                     isAnime = obj.getBoolean("isAnime"),
-                    selectedSeason = if (obj.has("selectedSeason")) obj.getInt("selectedSeason") else null
+                    selectedSeason = if (obj.has("selectedSeason")) obj.getInt("selectedSeason") else null,
+                    year = if (obj.has("year")) obj.optInt("year").takeIf { it > 0 } else null
                 )
             } catch (_: Exception) {
                 return null
             }
         }
+
+        fun extractYear(text: String?): Int? {
+            if (text.isNullOrBlank()) return null
+            return Regex("(?<!\\d)(?:19|20)\\d{2}(?!\\d)")
+                .findAll(text)
+                .mapNotNull { it.value.toIntOrNull() }
+                .firstOrNull { it in 1900..2035 }
+        }
+
+        fun normalizedGroupTitle(title: String): String =
+            title.lowercase()
+                .replace(Regex("[^a-z0-9]+"), " ")
+                .trim()
+                .replace(Regex("\\s+"), " ")
 
         // Clean titles: Uses the pre-cleaned, pre-sorted "name" field from CircleFTP directly! (Problem 1)
         fun cleanFtpTitle(postName: String?, postTitle: String): Pair<String, String?> {
@@ -963,7 +982,17 @@ class CircleFtpProvider : MainAPI() {
     private suspend fun groupAndMapPosts(posts: List<Post>): List<SearchResponse> = coroutineScope {
         val grouped = posts.groupBy { post ->
             val (cleanedTitle, _) = cleanFtpTitle(post.name, post.title)
-            cleanedTitle.lowercase().trim()
+            val isAnime = isPostAnime(post.categories, post.title)
+            val year = extractYear(post.title) ?: extractYear(post.name)
+
+            // Important: same-name movies/remakes must not merge unless their
+            // year also matches (e.g. Dune 1984 vs Dune 2021). Multi-season
+            // anime intentionally keeps the old title-only grouping so the
+            // season-splitting logic below continues to work exactly as before.
+            buildString {
+                append(normalizedGroupTitle(cleanedTitle))
+                if (!isAnime && year != null) append("|").append(year)
+            }
         }
 
         grouped.values.map { postGroup ->
@@ -972,6 +1001,9 @@ class CircleFtpProvider : MainAPI() {
             
             // Highly accurate anime detection mapping (Issue 2)
             val isAnime = isPostAnime(mainPost.categories, mainPost.title)
+            val groupYear = if (!isAnime) {
+                postGroup.mapNotNull { extractYear(it.title) ?: extractYear(it.name) }.distinct().singleOrNull()
+            } else null
 
             val postsInfo = postGroup.map { post ->
                 val (_, audio) = cleanFtpTitle(post.name, post.title)
@@ -981,7 +1013,8 @@ class CircleFtpProvider : MainAPI() {
             val groupedData = GroupedUrlData(
                 posts = postsInfo,
                 cleanedTitle = cleanedTitle,
-                isAnime = isAnime
+                isAnime = isAnime,
+                year = groupYear
             )
 
             val groupedUrl = encodeGroupedUrl(groupedData)
@@ -998,6 +1031,7 @@ class CircleFtpProvider : MainAPI() {
             if (isAnime) {
                 newAnimeSearchResponse(cleanedTitle, groupedUrl, responseType) {
                     this.posterUrl = posterUrl
+                    this.year = groupYear
                     this.quality = quality
                     addDubStatus(      
                         dubExist = when {
@@ -1012,11 +1046,13 @@ class CircleFtpProvider : MainAPI() {
             } else if (responseType == TvType.TvSeries) {
                 newTvSeriesSearchResponse(cleanedTitle, groupedUrl, responseType) {
                     this.posterUrl = posterUrl
+                    this.year = groupYear
                     this.quality = quality
                 }
             } else {
                 newMovieSearchResponse(cleanedTitle, groupedUrl, responseType) {
                     this.posterUrl = posterUrl
+                    this.year = groupYear
                     this.quality = quality
                 }
             }
@@ -1058,7 +1094,8 @@ class CircleFtpProvider : MainAPI() {
                 groupedData = GroupedUrlData(
                     posts = listOf(GroupedPostInfo(id, title, audio)),
                     cleanedTitle = cleanedTitle,
-                    isAnime = isAnime
+                    isAnime = isAnime,
+                    year = if (!isAnime) extractYear(title) else null
                 )
             } else {
                 throw ErrorLoadingException("Invalid URL: $url")
@@ -1068,6 +1105,7 @@ class CircleFtpProvider : MainAPI() {
         val group = groupedData
         val cleanedTitle = group.cleanedTitle
         val selectedSeason = group.selectedSeason ?: 1
+        val metadataTitle = group.year?.let { "$cleanedTitle $it" } ?: cleanedTitle
 
         val postsDetails = coroutineScope {
             group.posts.map { post ->
@@ -1086,13 +1124,13 @@ class CircleFtpProvider : MainAPI() {
         }
 
         // Fetch high-intelligence metadata and auto-detect isAnime! (Problem 2 & 5)
-        val (metadata, isAnime) = fetchUnifiedMetadata(cleanedTitle, selectedSeason, group.isAnime)
+        val (metadata, isAnime) = fetchUnifiedMetadata(metadataTitle, selectedSeason, group.isAnime)
 
         val finalTitle = metadata.title
         val poster = metadata.posterUrl ?: postsDetails.first().first.optStringOrNull("image")?.let { "$apiUrl/uploads/$it" }
         val backdrop = metadata.backdropUrl
         val plot = metadata.plot ?: postsDetails.first().first.optString("metaData", "")
-        val year = metadata.year ?: selectUntilNonInt(postsDetails.first().first.optString("year"))
+        val year = metadata.year ?: group.year ?: selectUntilNonInt(postsDetails.first().first.optString("year"))
         val rating = metadata.rating
         val trailer = metadata.trailerUrl
         val logo = metadata.logoUrl

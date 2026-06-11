@@ -13,7 +13,7 @@
 //     scoped `android { buildFeatures { buildConfig = true } }` block here.
 // ───────────────────────────────────────────────────────────────────────────
 
-version = 7
+version = 8
 
 cloudstream {
     description = "Circle FTP — movies, TV series and anime with rich metadata."
