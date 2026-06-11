@@ -5,6 +5,7 @@ import com.lagradost.cloudstream3.LoadResponse.Companion.addAniListId
 import com.lagradost.cloudstream3.LoadResponse.Companion.addImdbId
 import com.lagradost.cloudstream3.LoadResponse.Companion.addKitsuId
 import com.lagradost.cloudstream3.LoadResponse.Companion.addMalId
+import com.lagradost.cloudstream3.LoadResponse.Companion.addSimklId
 import com.lagradost.cloudstream3.LoadResponse.Companion.addTrailer
 import com.lagradost.cloudstream3.Score
 import com.lagradost.cloudstream3.syncproviders.SyncIdName
@@ -188,6 +189,7 @@ class CineplexBD : MainAPI() {
                 runCatching { finalLogo?.let { this.logoUrl = it } }
                 runCatching { finalTrailer?.let { addTrailer(it) } }
                 runCatching { meta.imdbId?.let { addImdbId(it) } }
+                runCatching { meta.simklId?.let { addSimklId(it) } }
                 runCatching { meta.malId?.let { addMalId(it) } }
                 runCatching { meta.anilistId?.let { addAniListId(it) } }
                 runCatching { meta.kitsuId?.let { addKitsuId(it) } }
@@ -212,6 +214,7 @@ class CineplexBD : MainAPI() {
                 runCatching { finalLogo?.let { this.logoUrl = it } }
                 runCatching { finalTrailer?.let { addTrailer(it) } }
                 runCatching { meta.imdbId?.let { addImdbId(it) } }
+                runCatching { meta.simklId?.let { addSimklId(it) } }
                 runCatching { meta.malId?.let { addMalId(it) } }
                 runCatching { meta.anilistId?.let { addAniListId(it) } }
                 runCatching { meta.kitsuId?.let { addKitsuId(it) } }

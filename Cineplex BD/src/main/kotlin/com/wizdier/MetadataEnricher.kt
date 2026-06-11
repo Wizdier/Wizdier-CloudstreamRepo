@@ -65,6 +65,7 @@ internal object MetadataEnricher {
         val tmdbId: Int? = null,
         val mediaType: String? = null,   // "movie" | "tv" | null
         val imdbId: String? = null,
+        val simklId: Int? = null,
         val malId: Int? = null,
         val anilistId: Int? = null,
         val kitsuId: String? = null,
@@ -162,6 +163,8 @@ internal object MetadataEnricher {
             details.optJSONObject("recommendations")?.optJSONArray("results")
         )
 
+        val simklId = fetchSimklId(imdbId, mediaType)
+
         return MetaInfo(
             title = titleFromTmdb,
             originalTitle = origTitle,
@@ -175,6 +178,7 @@ internal object MetadataEnricher {
             tmdbId = tmdbId,
             mediaType = mediaType,
             imdbId = imdbId,
+            simklId = simklId,
             tags = genres.takeIf { it.isNotEmpty() },
             isAnimeHint = isAnimeHint,
             episodes = episodes,
@@ -291,6 +295,8 @@ internal object MetadataEnricher {
             episodes = fetchTmdbSeasonEpisodes(tmdbId, seasonHint ?: 1)
         }
 
+        val simklId = fetchSimklId(imdbId, "tv")
+
         return MetaInfo(
             title = eng ?: rom ?: nat ?: rawTitle,
             originalTitle = rom ?: nat,
@@ -304,6 +310,7 @@ internal object MetadataEnricher {
             tmdbId = tmdbId,
             mediaType = if (tmdbId != null) "tv" else null,
             imdbId = imdbId,
+            simklId = simklId,
             malId = malId,
             anilistId = aniId,
             kitsuId = kitsuId,
@@ -333,6 +340,17 @@ internal object MetadataEnricher {
             )
         }
         return out
+    }
+
+    private suspend fun fetchSimklId(imdbId: String?, mediaType: String?): Int? {
+        if (imdbId.isNullOrBlank()) return null
+        val type = if (mediaType == "movie") "movies" else "tv"
+        return runCatching {
+            val url = "https://api.simkl.com/$type/${URLEncoder.encode(imdbId, "UTF-8")}?client_id=%20&extended=full"
+            val res = app.get(url).text.trim()
+            if (!res.startsWith("{")) return@runCatching null
+            JSONObject(res).optJSONObject("ids")?.optInt("simkl")?.takeIf { it != 0 }
+        }.getOrNull()
     }
 
     private fun parseRecommendations(arr: JSONArray?): List<RecommendationItem> {

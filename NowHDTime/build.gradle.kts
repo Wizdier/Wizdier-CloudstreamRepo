@@ -1,7 +1,7 @@
 // ───────────────────────────────────────────────────────────────────────────
 // Per-plugin Gradle config for the "NowHDTime" Cloudstream extension.
 
-version = 1
+version = 2
 
 cloudstream {
     language = "en"
