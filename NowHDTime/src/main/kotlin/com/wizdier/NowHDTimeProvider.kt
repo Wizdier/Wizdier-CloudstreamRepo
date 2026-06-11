@@ -161,19 +161,20 @@ class NowHDTime : MainAPI() {
                 found = true
                 return@forEach
             }
+            var emittedForSource = false
             runCatching {
                 loadExtractor(source, pageUrl ?: mainUrl, subtitleCallback) {
                     callback(it)
+                    emittedForSource = true
                     found = true
                 }
-            }.onFailure {
-                if (source.startsWith("http")) {
-                    callback(newExtractorLink(name, source.hostName(), source, INFER_TYPE) {
-                        referer = pageUrl ?: mainUrl
-                        quality = getQualityFromName(source)
-                    })
-                    found = true
-                }
+            }
+            if (!emittedForSource && source.startsWith("http")) {
+                callback(newExtractorLink(name, source.hostName(), source, INFER_TYPE) {
+                    referer = pageUrl ?: mainUrl
+                    quality = getQualityFromName(source)
+                })
+                found = true
             }
         }
         return found
@@ -216,10 +217,10 @@ class NowHDTime : MainAPI() {
         val sitePoster = doc.posterFromPage()
         val sitePlot = doc.plotFromPage()
         val siteYear = doc.yearFromPage()
-        val tvId = doc.selectFirst("[data-tv-show-id]")?.attr("data-tv-show-id")
-            ?: Regex("openReportModal\\('tv_show',\\s*(\\d+)").find(doc.html())?.groupValues?.getOrNull(1)
-        val meta = fetchTmdbMeta(tvId, "tv", siteTitle, siteYear)
-        val tmdbId = meta.tmdbId?.toString() ?: tvId.orEmpty()
+        // data-tv-show-id on NowHDTime is an internal database id, not TMDB.
+        // Use TMDB search by title/year to avoid wrong embeds like /tv/1/...
+        val meta = fetchTmdbMeta(null, "tv", siteTitle, siteYear)
+        val tmdbId = meta.tmdbId?.toString().orEmpty()
         val episodes = parseTvEpisodes(doc, tmdbId)
 
         return newTvSeriesLoadResponse(siteTitle, url, TvType.TvSeries, episodes) {
@@ -374,33 +375,51 @@ class NowHDTime : MainAPI() {
 
     // ───────────────────────────── Parsers ─────────────────────────────
 
-    private fun parseCards(doc: Document, expected: String): List<SearchResponse> =
-        doc.select("a[href*='$expected']")
+    private fun parseCards(doc: Document, expected: String): List<SearchResponse> {
+        val cardSelector = if (expected == "/anime/") {
+            "div.group:has(a[href*='/anime/']), div[class*='movie-card']:has(a[href*='/anime/'])"
+        } else {
+            "div.group:has(a[href*='$expected']), div[class*='movie-card']:has(a[href*='$expected'])"
+        }
+        val cards = doc.select(cardSelector)
             .mapNotNull { it.toSearchResult(expected) }
             .distinctBy { it.url }
+        if (cards.isNotEmpty()) return cards
+
+        // Safe fallback for layout changes, but ignore hero/watch buttons.
+        return doc.select("a[href*='$expected']")
+            .mapNotNull { it.toSearchResult(expected) }
+            .distinctBy { it.url }
+    }
 
     private fun Element.toSearchResult(expected: String): SearchResponse? {
-        val href = absUrl("href").ifBlank { attr("href").toAbsoluteUrl() }
+        val linkSelector = if (expected == "/anime/") "a[href*='/anime/']:not([href*='/watch/'])" else "a[href*='$expected']"
+        val a = if (tagName() == "a") this else selectFirst(linkSelector) ?: selectFirst("a[href*='$expected']") ?: return null
+        val href = a.absUrl("href").ifBlank { a.attr("href").toAbsoluteUrl() }
         if (href.isBlank() || !href.contains(expected)) return null
         if (expected == "/anime/" && href.contains("/watch/")) return null
-        val img = selectFirst("img")
-        val title = selectFirst("h3, h2, .title")?.text()?.trim()
-            ?: img?.attr("alt")?.trim()
-            ?: text().lineSequence().firstOrNull { it.isNotBlank() }?.trim()
+
+        val img = selectFirst("img[src*='/w500/'], img[src*='anilist'], img")
+        val rawTitle = img?.attr("alt")?.trim()?.takeIf { it.isNotBlank() }
+            ?: selectFirst("h4, h3, h2, .title")?.text()?.trim()?.takeIf { it.isNotBlank() }
+            ?: a.attr("title").trim().takeIf { it.isNotBlank() }
+            ?: a.text().trim().takeIf { it.isNotBlank() }
             ?: return null
-        if (title.isBlank() || title.equals("Watch", true) || title.equals("More", true) || title.equals("Info", true)) return null
+        val title = rawTitle.cleanCardTitle()
+        if (title.isBlank() || title.equals("Watch", true) || title.equals("Watch Now", true) || title.equals("More", true) || title.equals("Info", true)) return null
+
         val poster = img?.imgUrl()
         val year = Regex("(?<!\\d)(?:19|20)\\d{2}(?!\\d)").find(text())?.value?.toIntOrNull()
         return when {
-            expected.contains("tv-show") -> newTvSeriesSearchResponse(title.cleanCardTitle(), href, TvType.TvSeries) {
+            expected.contains("tv-show") -> newTvSeriesSearchResponse(title, href, TvType.TvSeries) {
                 posterUrl = poster
                 this.year = year
             }
-            expected == "/anime/" -> newAnimeSearchResponse(title.cleanCardTitle(), href, TvType.Anime) {
+            expected == "/anime/" -> newAnimeSearchResponse(title, href, TvType.Anime) {
                 posterUrl = poster
                 this.year = year
             }
-            else -> newMovieSearchResponse(title.cleanCardTitle(), href, TvType.Movie) {
+            else -> newMovieSearchResponse(title, href, TvType.Movie) {
                 posterUrl = poster
                 this.year = year
             }
