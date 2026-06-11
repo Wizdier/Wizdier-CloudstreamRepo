@@ -143,7 +143,7 @@ class NowHDTime : MainAPI() {
             if (source.isBlank()) return@forEach
             if (source.startsWith("magnet:", ignoreCase = true)) {
                 callback(
-                    newExtractorLink(name, "${name} - Torrent ${qualityFromUrl(source).orEmpty()}".trim(), source, INFER_TYPE) {
+                    newExtractorLink(name, "${name} - Torrent ${qualityLabelFromUrl(source).orEmpty()}".trim(), source, INFER_TYPE) {
                         referer = pageUrl ?: mainUrl
                         quality = getQualityFromName(source)
                     }
@@ -187,8 +187,7 @@ class NowHDTime : MainAPI() {
         val sitePlot = doc.plotFromPage()
         val siteYear = doc.yearFromPage()
         val players = extractPlayers(doc.html())
-        val tmdbId = players.firstNotNullOfOrNull { it.url.extractTmdbId("movie") }
-            ?: Regex("(?i)watch-[^/]+-(\\d{4})").find(url)?.let { null }
+        val tmdbId = players.firstNotNullOfOrNull { it.url?.extractTmdbId("movie") }
         val meta = fetchTmdbMeta(tmdbId, "movie", siteTitle, siteYear)
         val data = JSONObject()
             .put("url", url)
@@ -218,7 +217,7 @@ class NowHDTime : MainAPI() {
         val sitePlot = doc.plotFromPage()
         val siteYear = doc.yearFromPage()
         val tvId = doc.selectFirst("[data-tv-show-id]")?.attr("data-tv-show-id")
-            ?: Regex("openReportModal\\('tv_show',\s*(\\d+)").find(doc.html())?.groupValues?.getOrNull(1)
+            ?: Regex("openReportModal\\('tv_show',\\s*(\\d+)").find(doc.html())?.groupValues?.getOrNull(1)
         val meta = fetchTmdbMeta(tvId, "tv", siteTitle, siteYear)
         val tmdbId = meta.tmdbId?.toString() ?: tvId.orEmpty()
         val episodes = parseTvEpisodes(doc, tmdbId)
@@ -576,6 +575,9 @@ class NowHDTime : MainAPI() {
     private fun String.cleanEpisodeTitle(): String = replace(Regex("(?i)^EP\\s*\\d+\\s*"), "").trim().ifBlank { this }
 
     private fun String.hostName(): String = substringAfter("://").substringBefore("/").ifBlank { this }
+
+    private fun qualityLabelFromUrl(url: String): String? =
+        Regex("(?i)(2160p|1440p|1080p|720p|480p|360p|4k)").find(url)?.value
 
     private fun String.toAbsoluteUrl(): String = when {
         startsWith("//") -> "https:$this"
