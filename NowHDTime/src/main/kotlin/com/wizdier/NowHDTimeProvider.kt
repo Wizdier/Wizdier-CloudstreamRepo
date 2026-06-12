@@ -757,8 +757,9 @@ class NowHDTime : MainAPI() {
                     val url = src.optStringOrNull("url") ?: continue
                     if (url.isPlayableUrl()) {
                         val referer = "https://player.videasy.net/"
+                        val qualityInt = (src.optStringOrNull("quality") ?: qualityLabelFromUrl(url) ?: "").toQualityInt()
                         if (isReachableM3u8(url, referer)) {
-                            out += ResolvedSource(url, "Server2", referer, ExtractorLinkType.M3U8, quality.toQualityInt())
+                            out += ResolvedSource(url, "Server2", referer, ExtractorLinkType.M3U8, qualityInt)
                         }
                     }
                 }
@@ -837,7 +838,11 @@ class NowHDTime : MainAPI() {
                                     else -> null
                                 }
                                 if (linkType != null) {
-                                    val qualityInt = value.optIntOrNull("resolution") ?: quality.toQualityInt()
+                                    val qualityText = value.optStringOrNull("quality")
+                                        ?: value.optStringOrNull("label")
+                                        ?: qualityLabelFromUrl(child)
+                                        ?: ""
+                                    val qualityInt = value.optIntOrNull("resolution") ?: qualityText.toQualityInt()
                                     out += ResolvedSource(child, "Server1", referer, linkType, qualityInt)
                                 }
                             }
