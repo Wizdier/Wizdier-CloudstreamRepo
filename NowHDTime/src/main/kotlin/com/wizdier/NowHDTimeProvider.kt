@@ -695,7 +695,6 @@ class NowHDTime : MainAPI() {
     }.getOrNull()
 
     private suspend fun isReachableM3u8(url: String, refererUrl: String): Boolean = runCatching {
-        if (!url.contains(".m3u8", true) && !url.contains("/hls/", true)) return@runCatching true
         val res = app.get(url, headers = streamHeaders(refererUrl), timeout = 8000)
         res.code in 200..299 && res.text.trimStart().startsWith("#EXTM3U")
     }.getOrDefault(false)
@@ -757,7 +756,10 @@ class NowHDTime : MainAPI() {
                     val url = src.optStringOrNull("url") ?: continue
                     if (url.isPlayableUrl()) {
                         val quality = src.optStringOrNull("quality") ?: qualityLabelFromUrl(url) ?: "auto"
-                        out += ResolvedSource(url, "Server2 ${server.uppercase()} $quality", "https://player.videasy.net/")
+                        val referer = "https://player.videasy.net/"
+                        if (isReachableM3u8(url, referer)) {
+                            out += ResolvedSource(url, "Server2 ${server.uppercase()} $quality", referer, ExtractorLinkType.M3U8)
+                        }
                     }
                 }
             }
@@ -804,7 +806,15 @@ class NowHDTime : MainAPI() {
             emitVidNestSubtitles(root, subtitleCallback, emittedSubtitles)
             out += collectVidNestMedia(root, label)
         }
-        return out.distinctBy { it.url }.take(20)
+        return out.distinctBy { it.url }
+            .filter { source ->
+                when (source.type) {
+                    ExtractorLinkType.M3U8 -> isReachableM3u8(source.url, source.referer)
+                    ExtractorLinkType.VIDEO -> source.url.isDirectVideo()
+                    else -> false
+                }
+            }
+            .take(20)
     }
 
     private fun collectVidNestMedia(node: Any?, label: String): List<ResolvedSource> {
@@ -824,10 +834,12 @@ class NowHDTime : MainAPI() {
                                 val referer = value.optJSONObject("headers")?.optStringOrNull("Referer") ?: "https://vidnest.fun/"
                                 val linkType = when {
                                     declaredType == "hls" || child.contains(".m3u8", true) || child.contains("/hls/", true) || child.endsWith(".txt", true) -> ExtractorLinkType.M3U8
-                                    declaredType == "mp4" || child.isDirectVideo() -> ExtractorLinkType.VIDEO
-                                    else -> INFER_TYPE
+                                    child.isDirectVideo() -> ExtractorLinkType.VIDEO
+                                    else -> null
                                 }
-                                out += ResolvedSource(child, "Server1 $label $quality", referer, linkType)
+                                if (linkType != null) {
+                                    out += ResolvedSource(child, "Server1 $label $quality", referer, linkType)
+                                }
                             }
                         }
                         walk(child)
