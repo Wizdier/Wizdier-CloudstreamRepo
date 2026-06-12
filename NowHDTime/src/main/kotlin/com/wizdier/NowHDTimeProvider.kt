@@ -22,7 +22,7 @@ import javax.crypto.spec.SecretKeySpec
 class NowHDTime : MainAPI() {
     override var mainUrl = "https://nowhdtime.com.bd"
     override var name = "NowHDTime"
-    override var lang = "en"
+    override var lang = "bn"
     override val hasMainPage = true
     override val hasDownloadSupport = true
     override val hasQuickSearch = true
@@ -182,17 +182,17 @@ class NowHDTime : MainAPI() {
                 if (resolved.isNotEmpty()) {
                     resolved.forEach { emitResolvedSource(it, callback) }
                     found = true
-                    return@forEach
                 }
+                // Never fall through to raw VidNest embed pages: they are HTML
+                // wrappers and cause HTTP 2004/no-audio issues when emitted.
+                return@forEach
             }
 
             if (source.contains("videasy", ignoreCase = true)) {
-                val resolved = resolveVideasySources(siteTitle = payload?.optStringOrNull("title"), mediaType = mediaType, tmdbId = tmdbId, season = season, episode = episode, year = payload?.optIntOrNull("year"), subtitleCallback = subtitleCallback, emittedSubtitles = emittedSubtitles)
-                if (resolved.isNotEmpty()) {
-                    resolved.forEach { emitResolvedSource(it, callback) }
-                    found = true
-                    return@forEach
-                }
+                // Videasy currently returns signed streams that frequently fail
+                // inside Cloudstream with HTTP 2004. Do not emit broken links
+                // or raw HTML embed pages.
+                return@forEach
             }
 
             // NHDAPI is the site's primary/local server. Resolve it directly
@@ -776,17 +776,13 @@ class NowHDTime : MainAPI() {
         val out = mutableListOf<ResolvedSource>()
         val endpoints = if (mediaType == "tv" && season != null && episode != null) {
             listOf(
-                "movies4f/tv/$tmdbId/$season/$episode" to "Catflix",
                 "allmovies/tv/$tmdbId/$season/$episode" to "Lamda",
-                "klikxxi/tv/$tmdbId/$season/$episode" to "Ophim",
-                "hollymoviehd/tv/$tmdbId/$season/$episode" to "Sigma"
+                "klikxxi/tv/$tmdbId/$season/$episode" to "Ophim"
             )
         } else {
             listOf(
-                "movies4f/movie/$tmdbId" to "Catflix",
                 "allmovies/movie/$tmdbId" to "Lamda",
-                "klikxxi/movie/$tmdbId" to "Ophim",
-                "hollymoviehd/movie/$tmdbId" to "Sigma"
+                "klikxxi/movie/$tmdbId" to "Ophim"
             )
         }
         for ((endpoint, label) in endpoints) {
@@ -947,13 +943,11 @@ class NowHDTime : MainAPI() {
     private fun fallbackMovieEmbeds(id: String): List<Pair<String, String>> = listOf(
         "Local" to "https://nhdapi.com/embed/movie/$id",
         "Server1" to "https://vidnest.fun/movie/$id",
-        "Server2" to "https://player.videasy.net/movie/$id",
     )
 
     private fun fallbackTvEmbeds(id: String, season: Int, episode: Int): List<Pair<String, String>> = listOf(
         "Local" to "https://nhdapi.com/embed/tv/$id/$season/$episode",
         "Server1" to "https://vidnest.fun/tv/$id/$season/$episode",
-        "Server2" to "https://player.videasy.net/tv/$id/$season/$episode",
     )
 
     // ───────────────────────────── Helpers ─────────────────────────────
