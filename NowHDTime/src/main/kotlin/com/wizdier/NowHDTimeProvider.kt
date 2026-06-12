@@ -204,10 +204,24 @@ class NowHDTime : MainAPI() {
                 found = true
                 return@forEach
             }
+            var emittedByExtractor = false
             runCatching {
                 loadExtractor(source, pageUrl ?: mainUrl, subtitleCallback) {
                     callback(it)
+                    emittedByExtractor = true
                     found = true
+                }
+            }
+            if (!emittedByExtractor) {
+                // Some extractors require their own embed URL as referer rather
+                // than the NowHDTime page. Try that as a second pass for
+                // VidNest/Videasy without ever exposing the raw HTML page.
+                runCatching {
+                    loadExtractor(source, source, subtitleCallback) {
+                        callback(it)
+                        emittedByExtractor = true
+                        found = true
+                    }
                 }
             }
             // Never expose raw embed HTML pages as playable video links; that
@@ -660,23 +674,21 @@ class NowHDTime : MainAPI() {
         String(cipher.doFinal(combined), Charsets.UTF_8)
     }.getOrNull()
 
-    private suspend fun emitM3u8Link(
+    private fun emitM3u8Link(
         label: String,
         streamUrl: String,
         refererUrl: String,
         callback: (ExtractorLink) -> Unit
     ) {
-        callback(
-            newExtractorLink(
-                source = name,
-                name = "$name - $label",
-                url = streamUrl.withSourceFragment(label),
-                type = ExtractorLinkType.M3U8,
-            ) {
-                referer = refererUrl
-                quality = getQualityFromName(streamUrl)
-            }
-        )
+        // Do not append fragments or fake suffixes to the HLS url. Some HLS
+        // engines treat fragments as part of segment resolution and fail
+        // intermittently. Let M3u8Helper build clean quality links instead.
+        M3u8Helper.generateM3u8(
+            source = "$name - $label",
+            streamUrl = streamUrl,
+            referer = refererUrl,
+            headers = headers
+        ).forEach(callback)
     }
 
     private suspend fun emitSubtitles(
