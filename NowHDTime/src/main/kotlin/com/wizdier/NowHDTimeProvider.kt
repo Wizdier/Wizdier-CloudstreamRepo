@@ -54,15 +54,10 @@ class NowHDTime : MainAPI() {
     )
 
     override val mainPage = mainPageOf(
-        "$mainUrl/|Latest Movies|/movie/" to "Recent Movies",
-        "$mainUrl/|Latest TV Shows|/tv-show/" to "Recent Series",
-        "$mainUrl/anime|Currently Airing|/anime/" to "Recent Anime",
-        "$mainUrl/trending|Trending Content|/movie/" to "Trending Movies",
-        "$mainUrl/trending|Trending Content|/tv-show/" to "Trending Series",
-        "$mainUrl/anime|Trending|/anime/" to "Trending Anime",
-        "$mainUrl/movies?page=|ALL|/movie/" to "Popular Movies",
-        "$mainUrl/tv-shows?page=|ALL|/tv-show/" to "Popular Series",
-        "$mainUrl/anime|All-Time Popular|/anime/" to "Popular Anime",
+        "$mainUrl/trending?page=|ALL|/movie/" to "Trending",
+        "$mainUrl/movies?page=|ALL|/movie/" to "Movies",
+        "$mainUrl/tv-shows?page=|ALL|/tv-show/" to "TV Shows",
+        "$mainUrl/anime?page=|ALL|/anime/" to "Anime",
     )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
@@ -127,22 +122,29 @@ class NowHDTime : MainAPI() {
         val payload = runCatching { JSONObject(data) }.getOrNull()
         val pageUrl = payload?.optStringOrNull("url")
         val sources = linkedSetOf<String>()
+        val sourceNames = mutableMapOf<String, String>()
+        val emittedSubtitles = mutableSetOf<String>()
+
+        fun addSource(url: String?, label: String? = null) {
+            val clean = url?.trim()?.takeIf { it.isNotBlank() } ?: return
+            if (clean.startsWith("magnet:", ignoreCase = true)) return
+            sources += clean
+            (label ?: labelForSource(clean)).takeIf { it.isNotBlank() }?.let { sourceNames[clean] = it }
+        }
 
         payload?.optJSONArray("players")?.let { arr ->
-            for (i in 0 until arr.length()) arr.optString(i)
-                .takeIf { it.isNotBlank() && !it.startsWith("magnet:", ignoreCase = true) }
-                ?.let(sources::add)
+            for (i in 0 until arr.length()) addSource(arr.optString(i), null)
         }
-        payload?.optStringOrNull("direct")
-            ?.takeIf { !it.startsWith("magnet:", ignoreCase = true) }
-            ?.let(sources::add)
+        addSource(payload?.optStringOrNull("direct"), null)
 
         if (!pageUrl.isNullOrBlank()) {
             val fresh = runCatching { app.get(pageUrl, headers = headers).text }.getOrNull()
-            if (fresh != null) sources += extractPlayers(fresh)
-                .filterNot { it.type.equals("torrent", true) || it.url?.startsWith("magnet:", true) == true }
-                .mapNotNull { it.url }
-            if (fresh != null) sources += extractIframeSources(fresh, pageUrl)
+            if (fresh != null) {
+                extractPlayers(fresh)
+                    .filterNot { it.type.equals("torrent", true) || it.url?.startsWith("magnet:", true) == true }
+                    .forEach { addSource(it.url, it.server ?: it.name) }
+                extractIframeSources(fresh, pageUrl).forEach { addSource(it, it.hostName()) }
+            }
         }
 
         val tmdbId = payload?.optStringOrNull("tmdbId")
@@ -151,9 +153,9 @@ class NowHDTime : MainAPI() {
         val episode = payload?.optIntOrNull("episode")
         if (sources.none { it.startsWith("http") }) {
             if (mediaType == "tv" && !tmdbId.isNullOrBlank() && season != null && episode != null) {
-                sources += fallbackTvEmbeds(tmdbId, season, episode)
+                fallbackTvEmbeds(tmdbId, season, episode).forEach { (label, url) -> addSource(url, label) }
             } else if (mediaType == "movie" && !tmdbId.isNullOrBlank()) {
-                sources += fallbackMovieEmbeds(tmdbId)
+                fallbackMovieEmbeds(tmdbId).forEach { (label, url) -> addSource(url, label) }
             }
         }
 
@@ -163,7 +165,7 @@ class NowHDTime : MainAPI() {
             if (src.startsWith("http") && !src.isDirectVideo() && !src.contains(".m3u8", true)) {
                 runCatching { app.get(src, headers = headers, timeout = 8000).text }
                     .getOrNull()
-                    ?.let { sources += extractIframeSources(it, src) }
+                    ?.let { html -> extractIframeSources(html, src).forEach { addSource(it, it.hostName()) } }
             }
         }
 
@@ -175,11 +177,13 @@ class NowHDTime : MainAPI() {
 
             // NHDAPI is the site's primary/local server. Resolve it directly
             // instead of returning an HTML embed page to Cloudstream.
-            val nhdDirect = resolveNhdApiSource(source)
-            if (!nhdDirect.isNullOrBlank()) {
+            val displayName = sourceNames[source] ?: source.hostName()
+            val nhdResolved = resolveNhdApiSource(source)
+            if (nhdResolved?.streamUrl?.isNotBlank() == true) {
+                emitSubtitles(nhdResolved.subtitles, emittedSubtitles, subtitleCallback)
                 M3u8Helper.generateM3u8(
-                    source = "$name - Local",
-                    streamUrl = nhdDirect,
+                    source = "$name - $displayName",
+                    streamUrl = nhdResolved.streamUrl,
                     referer = source,
                     headers = headers
                 ).forEach(callback)
@@ -187,11 +191,12 @@ class NowHDTime : MainAPI() {
                 return@forEach
             }
 
-            val mirroredDirect = resolveMirrorWithNhdApi(source, mediaType, tmdbId, season, episode)
-            if (!mirroredDirect.isNullOrBlank()) {
+            val mirroredResolved = resolveMirrorWithNhdApi(source, mediaType, tmdbId, season, episode)
+            if (mirroredResolved?.streamUrl?.isNotBlank() == true) {
+                emitSubtitles(mirroredResolved.subtitles, emittedSubtitles, subtitleCallback)
                 M3u8Helper.generateM3u8(
-                    source = "$name - ${source.hostName()}",
-                    streamUrl = mirroredDirect,
+                    source = "$name - $displayName",
+                    streamUrl = mirroredResolved.streamUrl,
                     referer = source,
                     headers = headers
                 ).forEach(callback)
@@ -503,7 +508,7 @@ class NowHDTime : MainAPI() {
                 .put("tmdbId", tmdbId)
                 .put("season", season)
                 .put("episode", episode)
-                .put("players", JSONArray(fallbackTvEmbeds(tmdbId, season, episode)))
+                .put("players", JSONArray(fallbackTvEmbeds(tmdbId, season, episode).map { it.second }))
                 .toString()
             episodes += newEpisode(data) {
                 this.name = name.cleanEpisodeTitle()
@@ -553,7 +558,10 @@ class NowHDTime : MainAPI() {
             .filter { it.startsWith("http") }
             .toList()
 
-    private suspend fun resolveNhdApiSource(url: String): String? {
+    private data class NhdSubtitle(val label: String, val url: String)
+    private data class NhdResolved(val streamUrl: String, val subtitles: List<NhdSubtitle> = emptyList())
+
+    private suspend fun resolveNhdApiSource(url: String): NhdResolved? {
         val movieId = Regex("(?i)(?:nhdapi\\.com|player\\.nhdapi\\.com)/embed/movie/(\\d+)").find(url)
             ?.groupValues?.getOrNull(1)
         if (!movieId.isNullOrBlank()) return fetchNhdApiStream("movie", movieId, null, null)
@@ -576,7 +584,7 @@ class NowHDTime : MainAPI() {
         tmdbId: String?,
         season: Int?,
         episode: Int?
-    ): String? {
+    ): NhdResolved? {
         val host = url.hostName().lowercase()
         val isMirror = host.contains("vidnest") || host.contains("videasy")
         if (!isMirror || tmdbId.isNullOrBlank()) return null
@@ -587,7 +595,7 @@ class NowHDTime : MainAPI() {
         } else null
     }
 
-    private suspend fun fetchNhdApiStream(type: String, id: String, season: Int?, episode: Int?): String? = runCatching {
+    private suspend fun fetchNhdApiStream(type: String, id: String, season: Int?, episode: Int?): NhdResolved? = runCatching {
         val tokenRes = app.post(
             "https://player.nhdapi.com/api/token",
             headers = mapOf(
@@ -622,8 +630,39 @@ class NowHDTime : MainAPI() {
         val decrypted = decryptNhdApiPayload(encrypted) ?: return@runCatching null
         val root = JSONObject(decrypted)
         if (root.optString("status") != "success") return@runCatching null
-        root.optJSONObject("stream")?.optStringOrNull("hls_streaming")
+        val stream = root.optJSONObject("stream")?.optStringOrNull("hls_streaming")
             ?: root.optJSONObject("stream")?.optStringOrNull("url")
+            ?: return@runCatching null
+
+        val subEndpoint = buildString {
+            append("https://player.nhdapi.com/api/subtitles?id=").append(secureId)
+            if (type == "tv" && season != null && episode != null) {
+                append("&season=").append(season).append("&episode=").append(episode)
+            }
+        }
+        val subtitles = runCatching {
+            val subRes = app.get(
+                subEndpoint,
+                headers = mapOf(
+                    "User-Agent" to headers["User-Agent"].orEmpty(),
+                    "Referer" to "https://player.nhdapi.com/embed/$type/$id",
+                    "X-API-Token" to token,
+                    "X-Client-IPv4" to "",
+                )
+            )
+            if (subRes.code !in 200..299) return@runCatching emptyList<NhdSubtitle>()
+            val arr = JSONObject(subRes.text).optJSONArray("subtitles") ?: return@runCatching emptyList<NhdSubtitle>()
+            val out = mutableListOf<NhdSubtitle>()
+            for (i in 0 until arr.length()) {
+                val sub = arr.optJSONObject(i) ?: continue
+                val subUrl = sub.optStringOrNull("url") ?: continue
+                val lang = sub.optStringOrNull("language") ?: sub.optStringOrNull("label") ?: "Subtitle"
+                out += NhdSubtitle(lang, subUrl)
+            }
+            out
+        }.getOrNull() ?: emptyList()
+
+        NhdResolved(stream, subtitles)
     }.getOrNull()
 
     private fun decryptNhdApiPayload(obj: JSONObject): String? = runCatching {
@@ -639,16 +678,26 @@ class NowHDTime : MainAPI() {
         String(cipher.doFinal(combined), Charsets.UTF_8)
     }.getOrNull()
 
-    private fun fallbackMovieEmbeds(id: String): List<String> = listOf(
-        "https://nhdapi.com/embed/movie/$id",
-        "https://vidnest.fun/movie/$id",
-        "https://player.videasy.net/movie/$id",
+    private fun emitSubtitles(
+        subtitles: List<NhdSubtitle>,
+        seen: MutableSet<String>,
+        callback: (SubtitleFile) -> Unit
+    ) {
+        subtitles.distinctBy { it.url }.forEach { sub ->
+            if (seen.add(sub.url)) callback(newSubtitleFile(sub.label, sub.url))
+        }
+    }
+
+    private fun fallbackMovieEmbeds(id: String): List<Pair<String, String>> = listOf(
+        "Local" to "https://nhdapi.com/embed/movie/$id",
+        "Server1" to "https://vidnest.fun/movie/$id",
+        "Server2" to "https://player.videasy.net/movie/$id",
     )
 
-    private fun fallbackTvEmbeds(id: String, season: Int, episode: Int): List<String> = listOf(
-        "https://nhdapi.com/embed/tv/$id/$season/$episode",
-        "https://vidnest.fun/tv/$id/$season/$episode",
-        "https://player.videasy.net/tv/$id/$season/$episode",
+    private fun fallbackTvEmbeds(id: String, season: Int, episode: Int): List<Pair<String, String>> = listOf(
+        "Local" to "https://nhdapi.com/embed/tv/$id/$season/$episode",
+        "Server1" to "https://vidnest.fun/tv/$id/$season/$episode",
+        "Server2" to "https://player.videasy.net/tv/$id/$season/$episode",
     )
 
     // ───────────────────────────── Helpers ─────────────────────────────
@@ -735,6 +784,13 @@ class NowHDTime : MainAPI() {
     private fun String.cleanEpisodeTitle(): String = replace(Regex("(?i)^EP\\s*\\d+\\s*"), "").trim().ifBlank { this }
 
     private fun String.hostName(): String = substringAfter("://").substringBefore("/").ifBlank { this }
+
+    private fun labelForSource(url: String): String = when {
+        url.contains("nhdapi.com", true) -> "Local"
+        url.contains("vidnest.fun", true) -> "Server1"
+        url.contains("videasy", true) -> "Server2"
+        else -> url.hostName()
+    }
 
     private fun String.isDirectVideo(): Boolean {
         val clean = substringBefore("?").lowercase()
