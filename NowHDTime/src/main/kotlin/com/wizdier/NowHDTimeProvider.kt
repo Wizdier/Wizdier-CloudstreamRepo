@@ -668,7 +668,7 @@ class NowHDTime : MainAPI() {
         String(cipher.doFinal(combined), Charsets.UTF_8)
     }.getOrNull()
 
-    private fun emitM3u8Link(
+    private suspend fun emitM3u8Link(
         label: String,
         streamUrl: String,
         refererUrl: String,
