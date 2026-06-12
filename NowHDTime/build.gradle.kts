@@ -4,7 +4,7 @@
 version = 5
 
 cloudstream {
-    language = "en"
+    language = "bn"
 
     description = "Stream movies, web-series, anime & TV from nowhdtime.com.bd with all servers."
     authors = listOf("Wizdier")

@@ -585,7 +585,8 @@ class NowHDTime : MainAPI() {
         val url: String,
         val label: String,
         val referer: String,
-        val type: ExtractorLinkType? = null
+        val type: ExtractorLinkType? = null,
+        val quality: Int? = null
     )
 
     private suspend fun resolveNhdApiSource(url: String): NhdResolved? {
@@ -755,10 +756,9 @@ class NowHDTime : MainAPI() {
                     val src = sources.optJSONObject(i) ?: continue
                     val url = src.optStringOrNull("url") ?: continue
                     if (url.isPlayableUrl()) {
-                        val quality = src.optStringOrNull("quality") ?: qualityLabelFromUrl(url) ?: "auto"
                         val referer = "https://player.videasy.net/"
                         if (isReachableM3u8(url, referer)) {
-                            out += ResolvedSource(url, "Server2 ${server.uppercase()} $quality", referer, ExtractorLinkType.M3U8)
+                            out += ResolvedSource(url, "Server2", referer, ExtractorLinkType.M3U8, quality.toQualityInt())
                         }
                     }
                 }
@@ -828,7 +828,6 @@ class NowHDTime : MainAPI() {
                         val child = value.opt(key)
                         if (child is String && key in listOf("url", "file", "playlist", "hls", "src")) {
                             val declaredType = value.optStringOrNull("type")?.lowercase()
-                            val quality = value.optStringOrNull("quality") ?: value.optStringOrNull("label") ?: qualityLabelFromUrl(child) ?: declaredType ?: "auto"
                             val isPlayable = child.isPlayableUrl() || declaredType in listOf("hls", "mp4", "m3u8", "video")
                             if (isPlayable && child.startsWith("http")) {
                                 val referer = value.optJSONObject("headers")?.optStringOrNull("Referer") ?: "https://vidnest.fun/"
@@ -838,7 +837,8 @@ class NowHDTime : MainAPI() {
                                     else -> null
                                 }
                                 if (linkType != null) {
-                                    out += ResolvedSource(child, "Server1 $label $quality", referer, linkType)
+                                    val qualityInt = value.optIntOrNull("resolution") ?: quality.toQualityInt()
+                                    out += ResolvedSource(child, "Server1", referer, linkType, qualityInt)
                                 }
                             }
                         }
@@ -917,7 +917,7 @@ class NowHDTime : MainAPI() {
         } else {
             callback(newExtractorLink(name, "$name - ${source.label}", clean, type) {
                 referer = source.referer
-                quality = getQualityFromName(clean)
+                quality = source.quality ?: getQualityFromName(clean)
                 headers = streamHeaders(source.referer)
             })
         }
@@ -1068,6 +1068,17 @@ class NowHDTime : MainAPI() {
 
     private fun qualityLabelFromUrl(url: String): String? =
         Regex("(?i)(2160p|1440p|1080p|720p|480p|360p|4k)").find(url)?.value
+
+    private fun String.toQualityInt(): Int? = when {
+        equals("4k", true) -> Qualities.P2160.value
+        contains("2160") -> Qualities.P2160.value
+        contains("1440") -> Qualities.P1440.value
+        contains("1080") -> Qualities.P1080.value
+        contains("720") -> Qualities.P720.value
+        contains("480") -> Qualities.P480.value
+        contains("360") -> Qualities.P360.value
+        else -> null
+    }
 
     private fun String.toAbsoluteUrl(baseUrl: String = mainUrl): String = when {
         startsWith("//") -> "https:$this"
