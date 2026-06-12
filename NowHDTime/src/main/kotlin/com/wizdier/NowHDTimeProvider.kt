@@ -54,21 +54,30 @@ class NowHDTime : MainAPI() {
     )
 
     override val mainPage = mainPageOf(
-        "$mainUrl/trending?page=" to "Trending",
-        "$mainUrl/movies?page=" to "Movies",
-        "$mainUrl/tv-shows?page=" to "TV Shows",
-        "$mainUrl/anime?page=" to "Anime",
+        "$mainUrl/|Latest Movies|/movie/" to "Recent Movies",
+        "$mainUrl/|Latest TV Shows|/tv-show/" to "Recent Series",
+        "$mainUrl/anime|Currently Airing|/anime/" to "Recent Anime",
+        "$mainUrl/trending|Trending Content|/movie/" to "Trending Movies",
+        "$mainUrl/trending|Trending Content|/tv-show/" to "Trending Series",
+        "$mainUrl/anime|Trending|/anime/" to "Trending Anime",
+        "$mainUrl/movies?page=|ALL|/movie/" to "Popular Movies",
+        "$mainUrl/tv-shows?page=|ALL|/tv-show/" to "Popular Series",
+        "$mainUrl/anime|All-Time Popular|/anime/" to "Popular Anime",
     )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        val doc = app.get(request.data + page, headers = headers).document
-        val expected = when {
-            request.data.contains("/tv-shows") -> "/tv-show/"
-            request.data.contains("/anime") -> "/anime/"
+        val parts = request.data.split("|")
+        val base = parts.getOrNull(0) ?: request.data
+        val section = parts.getOrNull(1) ?: "ALL"
+        val expected = parts.getOrNull(2) ?: when {
+            base.contains("/tv-shows") -> "/tv-show/"
+            base.contains("/anime") -> "/anime/"
             else -> "/movie/"
         }
-        val items = parseCards(doc, expected)
-        val hasNext = doc.select("a[rel=next], a:contains(Next), a[href*='page=${page + 1}']").isNotEmpty() || items.isNotEmpty()
+        val url = if (base.endsWith("page=")) base + page else base
+        val doc = app.get(url, headers = headers).document
+        val items = if (section == "ALL") parseCards(doc, expected) else parseCardsInSection(doc, section, expected)
+        val hasNext = section == "ALL" && (doc.select("a[rel=next], a:contains(Next), a[href*='page=${page + 1}']").isNotEmpty() || items.isNotEmpty())
         return newHomePageResponse(HomePageList(request.name, items, isHorizontalImages = false), hasNext)
     }
 
@@ -171,6 +180,18 @@ class NowHDTime : MainAPI() {
                 M3u8Helper.generateM3u8(
                     source = "$name - Local",
                     streamUrl = nhdDirect,
+                    referer = source,
+                    headers = headers
+                ).forEach(callback)
+                found = true
+                return@forEach
+            }
+
+            val mirroredDirect = resolveMirrorWithNhdApi(source, mediaType, tmdbId, season, episode)
+            if (!mirroredDirect.isNullOrBlank()) {
+                M3u8Helper.generateM3u8(
+                    source = "$name - ${source.hostName()}",
+                    streamUrl = mirroredDirect,
                     referer = source,
                     headers = headers
                 ).forEach(callback)
@@ -405,15 +426,24 @@ class NowHDTime : MainAPI() {
 
     // ───────────────────────────── Parsers ─────────────────────────────
 
-    private fun parseCards(doc: Document, expected: String): List<SearchResponse> {
-        val selector = when {
-            expected.contains("tv-show") -> ".movie-card:has(a[href*='/tv-show/watch-']), div.group:has(a[href*='/tv-show/watch-'])"
-            expected == "/anime/" -> ".movie-card:has(a[href^='https://nowhdtime.com.bd/anime/']), div.group:has(a[href^='https://nowhdtime.com.bd/anime/'])"
-            else -> ".movie-card:has(a[href*='/movie/watch-']), div.group:has(a[href*='/movie/watch-'])"
-        }
-        return doc.select(selector)
+    private fun parseCards(doc: Document, expected: String): List<SearchResponse> =
+        doc.select(cardSelector(expected))
             .mapNotNull { it.toSearchResult(expected) }
             .distinctBy { it.url }
+
+    private fun parseCardsInSection(doc: Document, heading: String, expected: String): List<SearchResponse> {
+        val section = doc.select("section").firstOrNull { sec ->
+            sec.selectFirst("h1,h2,h3")?.text()?.trim()?.equals(heading, ignoreCase = true) == true
+        } ?: return parseCards(doc, expected)
+        return section.select(cardSelector(expected))
+            .mapNotNull { it.toSearchResult(expected) }
+            .distinctBy { it.url }
+    }
+
+    private fun cardSelector(expected: String): String = when {
+        expected.contains("tv-show") -> ".movie-card:has(a[href*='/tv-show/watch-'])"
+        expected == "/anime/" -> ".movie-card:has(a[href^='https://nowhdtime.com.bd/anime/']), .movie-card:has(a[href^='/anime/'])"
+        else -> ".movie-card:has(a[href*='/movie/watch-'])"
     }
 
     private fun Element.toSearchResult(expected: String): SearchResponse? {
@@ -538,6 +568,23 @@ class NowHDTime : MainAPI() {
             )
         }
         return null
+    }
+
+    private suspend fun resolveMirrorWithNhdApi(
+        url: String,
+        mediaType: String?,
+        tmdbId: String?,
+        season: Int?,
+        episode: Int?
+    ): String? {
+        val host = url.hostName().lowercase()
+        val isMirror = host.contains("vidnest") || host.contains("videasy")
+        if (!isMirror || tmdbId.isNullOrBlank()) return null
+        return if (mediaType == "tv" && season != null && episode != null) {
+            fetchNhdApiStream("tv", tmdbId, season, episode)
+        } else if (mediaType == "movie") {
+            fetchNhdApiStream("movie", tmdbId, null, null)
+        } else null
     }
 
     private suspend fun fetchNhdApiStream(type: String, id: String, season: Int?, episode: Int?): String? = runCatching {
