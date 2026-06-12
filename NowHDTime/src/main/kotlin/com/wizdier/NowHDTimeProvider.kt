@@ -207,18 +207,20 @@ class NowHDTime : MainAPI() {
 
             if (source.contains(".m3u8", ignoreCase = true)) {
                 M3u8Helper.generateM3u8(
-                    source = name,
+                    source = "$name - $displayName",
                     streamUrl = source,
                     referer = pageUrl ?: mainUrl,
-                    headers = headers
+                    headers = streamHeaders(pageUrl ?: mainUrl)
                 ).forEach(callback)
                 found = true
                 return@forEach
             }
             if (source.isDirectVideo()) {
+                val refererUrl = pageUrl ?: mainUrl
                 callback(newExtractorLink(name, "${name} - ${source.hostName()}", source, ExtractorLinkType.VIDEO) {
-                    referer = pageUrl ?: mainUrl
+                    referer = refererUrl
                     quality = getQualityFromName(source)
+                    headers = streamHeaders(refererUrl)
                 })
                 found = true
                 return@forEach
@@ -579,7 +581,12 @@ class NowHDTime : MainAPI() {
 
     private data class NhdSubtitle(val label: String, val url: String)
     private data class NhdResolved(val streamUrl: String, val subtitles: List<NhdSubtitle> = emptyList())
-    private data class ResolvedSource(val url: String, val label: String, val referer: String)
+    private data class ResolvedSource(
+        val url: String,
+        val label: String,
+        val referer: String,
+        val type: ExtractorLinkType? = null
+    )
 
     private suspend fun resolveNhdApiSource(url: String): NhdResolved? {
         val movieId = Regex("(?i)(?:nhdapi\\.com|player\\.nhdapi\\.com)/embed/movie/(\\d+)").find(url)
@@ -653,6 +660,8 @@ class NowHDTime : MainAPI() {
         val stream = root.optJSONObject("stream")?.optStringOrNull("hls_streaming")
             ?: root.optJSONObject("stream")?.optStringOrNull("url")
             ?: return@runCatching null
+        val refererForStream = "https://player.nhdapi.com/embed/$type/$id"
+        if (!isReachableM3u8(stream, refererForStream)) return@runCatching null
 
         val subEndpoint = buildString {
             append("https://player.nhdapi.com/api/subtitles?id=").append(secureId)
@@ -684,6 +693,12 @@ class NowHDTime : MainAPI() {
 
         NhdResolved(stream, subtitles)
     }.getOrNull()
+
+    private suspend fun isReachableM3u8(url: String, refererUrl: String): Boolean = runCatching {
+        if (!url.contains(".m3u8", true) && !url.contains("/hls/", true)) return@runCatching true
+        val res = app.get(url, headers = streamHeaders(refererUrl), timeout = 8000)
+        res.code in 200..299 && res.text.trimStart().startsWith("#EXTM3U")
+    }.getOrDefault(false)
 
     private fun decryptNhdApiPayload(obj: JSONObject): String? = runCatching {
         val iv = Base64.getDecoder().decode(obj.optStringOrNull("iv") ?: return@runCatching null)
@@ -761,25 +776,29 @@ class NowHDTime : MainAPI() {
         if (tmdbId.isNullOrBlank()) return emptyList()
         val out = mutableListOf<ResolvedSource>()
         val endpoints = if (mediaType == "tv" && season != null && episode != null) {
-            // The public VidNest frontend primarily documents movie endpoints;
-            // keep TV support conservative and let Cloudstream extractors try
-            // the raw tv embed if these endpoints change.
-            emptyList()
+            listOf(
+                "movies4f/tv/$tmdbId/$season/$episode" to "Catflix",
+                "allmovies/tv/$tmdbId/$season/$episode" to "Lamda",
+                "klikxxi/tv/$tmdbId/$season/$episode" to "Ophim",
+                "hollymoviehd/tv/$tmdbId/$season/$episode" to "Sigma"
+            )
         } else {
             listOf(
-                "movies4f/movie" to "Catflix",
-                "allmovies/movie" to "Lamda",
-                "klikxxi/movie" to "Ophim",
-                "hollymoviehd/movie" to "Sigma"
+                "movies4f/movie/$tmdbId" to "Catflix",
+                "allmovies/movie/$tmdbId" to "Lamda",
+                "klikxxi/movie/$tmdbId" to "Ophim",
+                "hollymoviehd/movie/$tmdbId" to "Sigma"
             )
         }
         for ((endpoint, label) in endpoints) {
             val raw = runCatching {
-                app.get("https://new.vidnest.fun/$endpoint/$tmdbId", headers = headers + mapOf("Referer" to "https://vidnest.fun/"), timeout = 10000).text
+                app.get("https://new.vidnest.fun/$endpoint", headers = headers + mapOf("Referer" to "https://vidnest.fun/"), timeout = 10000).text
             }.getOrNull() ?: continue
             val json = runCatching { JSONObject(raw) }.getOrNull() ?: continue
-            val decodedText = if (json.optBoolean("encrypted", json.has("data"))) {
-                decodeVidNestData(json.optStringOrNull("data") ?: continue) ?: continue
+            val data = json.optStringOrNull("data")
+            val decodedText = if (json.optBoolean("encrypted", data != null)) {
+                if (data.isNullOrBlank()) continue
+                decodeVidNestData(data) ?: continue
             } else raw
             val root = runCatching { JSONObject(decodedText) }.getOrNull() ?: continue
             emitVidNestSubtitles(root, subtitleCallback, emittedSubtitles)
@@ -798,10 +817,17 @@ class NowHDTime : MainAPI() {
                         val key = keys.next()
                         val child = value.opt(key)
                         if (child is String && key in listOf("url", "file", "playlist", "hls", "src")) {
-                            if (child.isPlayableUrl()) {
-                                val quality = value.optStringOrNull("quality") ?: value.optStringOrNull("label") ?: qualityLabelFromUrl(child) ?: "auto"
+                            val declaredType = value.optStringOrNull("type")?.lowercase()
+                            val quality = value.optStringOrNull("quality") ?: value.optStringOrNull("label") ?: qualityLabelFromUrl(child) ?: declaredType ?: "auto"
+                            val isPlayable = child.isPlayableUrl() || declaredType in listOf("hls", "mp4", "m3u8", "video")
+                            if (isPlayable && child.startsWith("http")) {
                                 val referer = value.optJSONObject("headers")?.optStringOrNull("Referer") ?: "https://vidnest.fun/"
-                                out += ResolvedSource(child, "Server1 $label $quality", referer)
+                                val linkType = when {
+                                    declaredType == "hls" || child.contains(".m3u8", true) || child.contains("/hls/", true) || child.endsWith(".txt", true) -> ExtractorLinkType.M3U8
+                                    declaredType == "mp4" || child.isDirectVideo() -> ExtractorLinkType.VIDEO
+                                    else -> INFER_TYPE
+                                }
+                                out += ResolvedSource(child, "Server1 $label $quality", referer, linkType)
                             }
                         }
                         walk(child)
@@ -863,18 +889,24 @@ class NowHDTime : MainAPI() {
             source = "$name - $label",
             streamUrl = streamUrl,
             referer = refererUrl,
-            headers = headers
+            headers = streamHeaders(refererUrl)
         ).forEach(callback)
     }
 
     private suspend fun emitResolvedSource(source: ResolvedSource, callback: (ExtractorLink) -> Unit) {
         val clean = source.url
-        if (clean.contains(".m3u8", true) || clean.contains("/hls/", true) || clean.contains("master", true) || clean.endsWith(".txt", true)) {
+        val type = source.type ?: when {
+            clean.contains(".m3u8", true) || clean.contains("/hls/", true) || clean.contains("master", true) || clean.endsWith(".txt", true) -> ExtractorLinkType.M3U8
+            clean.isDirectVideo() -> ExtractorLinkType.VIDEO
+            else -> INFER_TYPE
+        }
+        if (type == ExtractorLinkType.M3U8) {
             emitM3u8Link(source.label, clean, source.referer, callback)
         } else {
-            callback(newExtractorLink(name, "$name - ${source.label}", clean, ExtractorLinkType.VIDEO) {
+            callback(newExtractorLink(name, "$name - ${source.label}", clean, type) {
                 referer = source.referer
                 quality = getQualityFromName(clean)
+                headers = streamHeaders(source.referer)
             })
         }
     }
@@ -907,6 +939,13 @@ class NowHDTime : MainAPI() {
         runCatching { meta.imdbId?.takeIf { it.isNotBlank() }?.let { addImdbId(it) } }
         runCatching { meta.simklId?.let { addSimklId(it) } }
     }
+
+    private fun streamHeaders(refererUrl: String): Map<String, String> = mapOf(
+        "User-Agent" to headers["User-Agent"].orEmpty(),
+        "Accept" to "*/*",
+        "Referer" to refererUrl,
+        "Origin" to refererUrl.substringBefore("://").plus("://").plus(refererUrl.substringAfter("://").substringBefore("/")),
+    )
 
     private fun Document.titleFromPage(): String =
         selectFirst("h1")?.text()?.trim()?.cleanCardTitle()?.takeIf { it.isNotBlank() }
