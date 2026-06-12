@@ -678,7 +678,7 @@ class NowHDTime : MainAPI() {
         String(cipher.doFinal(combined), Charsets.UTF_8)
     }.getOrNull()
 
-    private fun emitSubtitles(
+    private suspend fun emitSubtitles(
         subtitles: List<NhdSubtitle>,
         seen: MutableSet<String>,
         callback: (SubtitleFile) -> Unit
