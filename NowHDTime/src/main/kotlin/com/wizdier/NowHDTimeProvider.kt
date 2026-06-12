@@ -661,8 +661,6 @@ class NowHDTime : MainAPI() {
         val stream = root.optJSONObject("stream")?.optStringOrNull("hls_streaming")
             ?: root.optJSONObject("stream")?.optStringOrNull("url")
             ?: return@runCatching null
-        val refererForStream = "https://player.nhdapi.com/embed/$type/$id"
-        if (!isReachableM3u8(stream, refererForStream)) return@runCatching null
 
         val subEndpoint = buildString {
             append("https://player.nhdapi.com/api/subtitles?id=").append(secureId)
@@ -758,9 +756,7 @@ class NowHDTime : MainAPI() {
                     if (url.isPlayableUrl()) {
                         val referer = "https://player.videasy.net/"
                         val qualityInt = (src.optStringOrNull("quality") ?: qualityLabelFromUrl(url) ?: "").toQualityInt()
-                        if (isReachableM3u8(url, referer)) {
-                            out += ResolvedSource(url, "Server2", referer, ExtractorLinkType.M3U8, qualityInt)
-                        }
+                        out += ResolvedSource(url, "Server2 ${server.uppercase()}", referer, ExtractorLinkType.M3U8, qualityInt)
                     }
                 }
             }
@@ -810,7 +806,7 @@ class NowHDTime : MainAPI() {
         return out.distinctBy { it.url }
             .filter { source ->
                 when (source.type) {
-                    ExtractorLinkType.M3U8 -> isReachableM3u8(source.url, source.referer)
+                    ExtractorLinkType.M3U8 -> source.url.startsWith("http")
                     ExtractorLinkType.VIDEO -> source.url.isDirectVideo()
                     else -> false
                 }
@@ -843,7 +839,7 @@ class NowHDTime : MainAPI() {
                                         ?: qualityLabelFromUrl(child)
                                         ?: ""
                                     val qualityInt = value.optIntOrNull("resolution") ?: qualityText.toQualityInt()
-                                    out += ResolvedSource(child, "Server1", referer, linkType, qualityInt)
+                                    out += ResolvedSource(child, "Server1 $label", referer, linkType, qualityInt)
                                 }
                             }
                         }
@@ -900,14 +896,24 @@ class NowHDTime : MainAPI() {
         label: String,
         streamUrl: String,
         refererUrl: String,
-        callback: (ExtractorLink) -> Unit
+        callback: (ExtractorLink) -> Unit,
+        qualityValue: Int? = null
     ) {
-        M3u8Helper.generateM3u8(
-            source = "$name - $label",
-            streamUrl = streamUrl,
-            referer = refererUrl,
-            headers = streamHeaders(refererUrl)
-        ).forEach(callback)
+        // Emit the master URL directly. This is more reliable for these CDNs
+        // than pre-expanding variants: some signed segment URLs expire or fail
+        // when the helper probes them too early.
+        callback(
+            newExtractorLink(
+                source = name,
+                name = "$name - $label",
+                url = streamUrl,
+                type = ExtractorLinkType.M3U8,
+            ) {
+                referer = refererUrl
+                quality = qualityValue ?: getQualityFromName(streamUrl)
+                headers = streamHeaders(refererUrl)
+            }
+        )
     }
 
     private suspend fun emitResolvedSource(source: ResolvedSource, callback: (ExtractorLink) -> Unit) {
@@ -918,7 +924,7 @@ class NowHDTime : MainAPI() {
             else -> INFER_TYPE
         }
         if (type == ExtractorLinkType.M3U8) {
-            emitM3u8Link(source.label, clean, source.referer, callback)
+            emitM3u8Link(source.label, clean, source.referer, callback, source.quality)
         } else {
             callback(newExtractorLink(name, "$name - ${source.label}", clean, type) {
                 referer = source.referer
