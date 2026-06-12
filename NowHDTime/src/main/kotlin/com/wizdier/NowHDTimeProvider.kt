@@ -115,14 +115,20 @@ class NowHDTime : MainAPI() {
         val sources = linkedSetOf<String>()
 
         payload?.optJSONArray("players")?.let { arr ->
-            for (i in 0 until arr.length()) arr.optString(i).takeIf { it.isNotBlank() }?.let(sources::add)
+            for (i in 0 until arr.length()) arr.optString(i)
+                .takeIf { it.isNotBlank() && !it.startsWith("magnet:", ignoreCase = true) }
+                ?.let(sources::add)
         }
-        payload?.optStringOrNull("direct")?.let(sources::add)
+        payload?.optStringOrNull("direct")
+            ?.takeIf { !it.startsWith("magnet:", ignoreCase = true) }
+            ?.let(sources::add)
 
         if (!pageUrl.isNullOrBlank()) {
             val fresh = runCatching { app.get(pageUrl, headers = headers).text }.getOrNull()
-            if (fresh != null) sources += extractPlayers(fresh).mapNotNull { it.url }
-            if (fresh != null) sources += extractIframeSources(fresh)
+            if (fresh != null) sources += extractPlayers(fresh)
+                .filterNot { it.type.equals("torrent", true) || it.url?.startsWith("magnet:", true) == true }
+                .mapNotNull { it.url }
+            if (fresh != null) sources += extractIframeSources(fresh, pageUrl)
         }
 
         val tmdbId = payload?.optStringOrNull("tmdbId")
@@ -137,20 +143,21 @@ class NowHDTime : MainAPI() {
             }
         }
 
+        // Some servers wrap the real player inside a first iframe. Add those
+        // nested player URLs, but still let extractors resolve them properly.
+        sources.toList().forEach { src ->
+            if (src.startsWith("http") && !src.isDirectVideo() && !src.contains(".m3u8", true)) {
+                runCatching { app.get(src, headers = headers, timeout = 8000).text }
+                    .getOrNull()
+                    ?.let { sources += extractIframeSources(it, src) }
+            }
+        }
+
         var found = false
         sources.distinct().forEach { raw ->
             val source = raw.htmlDecode().trim()
             if (source.isBlank()) return@forEach
-            if (source.startsWith("magnet:", ignoreCase = true)) {
-                callback(
-                    newExtractorLink(name, "${name} - Torrent ${qualityLabelFromUrl(source).orEmpty()}".trim(), source, INFER_TYPE) {
-                        referer = pageUrl ?: mainUrl
-                        quality = getQualityFromName(source)
-                    }
-                )
-                found = true
-                return@forEach
-            }
+            if (source.startsWith("magnet:", ignoreCase = true)) return@forEach
             if (source.contains(".m3u8", ignoreCase = true)) {
                 M3u8Helper.generateM3u8(
                     source = name,
@@ -161,21 +168,22 @@ class NowHDTime : MainAPI() {
                 found = true
                 return@forEach
             }
-            var emittedForSource = false
-            runCatching {
-                loadExtractor(source, pageUrl ?: mainUrl, subtitleCallback) {
-                    callback(it)
-                    emittedForSource = true
-                    found = true
-                }
-            }
-            if (!emittedForSource && source.startsWith("http")) {
-                callback(newExtractorLink(name, source.hostName(), source, INFER_TYPE) {
+            if (source.isDirectVideo()) {
+                callback(newExtractorLink(name, "${name} - ${source.hostName()}", source, ExtractorLinkType.VIDEO) {
                     referer = pageUrl ?: mainUrl
                     quality = getQualityFromName(source)
                 })
                 found = true
+                return@forEach
             }
+            runCatching {
+                loadExtractor(source, pageUrl ?: mainUrl, subtitleCallback) {
+                    callback(it)
+                    found = true
+                }
+            }
+            // Never expose raw embed HTML pages as playable video links; that
+            // is what produced HTTP 200/403-style playback errors in the app.
         }
         return found
     }
@@ -194,7 +202,7 @@ class NowHDTime : MainAPI() {
             .put("url", url)
             .put("mediaType", "movie")
             .put("tmdbId", meta.tmdbId?.toString() ?: tmdbId.orEmpty())
-            .put("players", JSONArray(players.mapNotNull { it.url }))
+            .put("players", JSONArray(players.filterNot { it.type.equals("torrent", true) || it.url?.startsWith("magnet:", true) == true }.mapNotNull { it.url }))
             .toString()
 
         return newMovieLoadResponse(siteTitle, url, TvType.Movie, data) {
@@ -217,10 +225,10 @@ class NowHDTime : MainAPI() {
         val sitePoster = doc.posterFromPage()
         val sitePlot = doc.plotFromPage()
         val siteYear = doc.yearFromPage()
-        // data-tv-show-id on NowHDTime is an internal database id, not TMDB.
-        // Use TMDB search by title/year to avoid wrong embeds like /tv/1/...
-        val meta = fetchTmdbMeta(null, "tv", siteTitle, siteYear)
-        val tmdbId = meta.tmdbId?.toString().orEmpty()
+        val tvId = doc.selectFirst("[data-tv-show-id]")?.attr("data-tv-show-id")
+            ?: Regex("openReportModal\\('tv_show',\\s*(\\d+)").find(doc.html())?.groupValues?.getOrNull(1)
+        val meta = fetchTmdbMeta(tvId, "tv", siteTitle, siteYear)
+        val tmdbId = meta.tmdbId?.toString() ?: tvId.orEmpty()
         val episodes = parseTvEpisodes(doc, tmdbId)
 
         return newTvSeriesLoadResponse(siteTitle, url, TvType.TvSeries, episodes) {
@@ -281,7 +289,7 @@ class NowHDTime : MainAPI() {
 
     private suspend fun loadAnimeEpisodeAsMovie(url: String, doc: Document): LoadResponse {
         val title = doc.titleFromPage()
-        val iframe = extractIframeSources(doc.html()).firstOrNull()
+        val iframe = extractIframeSources(doc.html(), url).firstOrNull()
         val data = JSONObject().put("url", url).put("direct", iframe ?: url).toString()
         return newMovieLoadResponse(title, url, TvType.AnimeMovie, data) {
             posterUrl = doc.posterFromPage()
@@ -376,50 +384,45 @@ class NowHDTime : MainAPI() {
     // ───────────────────────────── Parsers ─────────────────────────────
 
     private fun parseCards(doc: Document, expected: String): List<SearchResponse> {
-        val cardSelector = if (expected == "/anime/") {
-            "div.group:has(a[href*='/anime/']), div[class*='movie-card']:has(a[href*='/anime/'])"
-        } else {
-            "div.group:has(a[href*='$expected']), div[class*='movie-card']:has(a[href*='$expected'])"
+        val selector = when {
+            expected.contains("tv-show") -> ".movie-card:has(a[href*='/tv-show/watch-']), div.group:has(a[href*='/tv-show/watch-'])"
+            expected == "/anime/" -> ".movie-card:has(a[href^='https://nowhdtime.com.bd/anime/']), div.group:has(a[href^='https://nowhdtime.com.bd/anime/'])"
+            else -> ".movie-card:has(a[href*='/movie/watch-']), div.group:has(a[href*='/movie/watch-'])"
         }
-        val cards = doc.select(cardSelector)
-            .mapNotNull { it.toSearchResult(expected) }
-            .distinctBy { it.url }
-        if (cards.isNotEmpty()) return cards
-
-        // Safe fallback for layout changes, but ignore hero/watch buttons.
-        return doc.select("a[href*='$expected']")
+        return doc.select(selector)
             .mapNotNull { it.toSearchResult(expected) }
             .distinctBy { it.url }
     }
 
     private fun Element.toSearchResult(expected: String): SearchResponse? {
-        val linkSelector = if (expected == "/anime/") "a[href*='/anime/']:not([href*='/watch/'])" else "a[href*='$expected']"
-        val a = if (tagName() == "a") this else selectFirst(linkSelector) ?: selectFirst("a[href*='$expected']") ?: return null
+        val a = when {
+            expected.contains("tv-show") -> selectFirst("a[href*='/tv-show/watch-']")
+            expected == "/anime/" -> selectFirst("a[href^='https://nowhdtime.com.bd/anime/']:not([href*='/watch/']), a[href^='/anime/']:not([href*='/watch/'])")
+            else -> selectFirst("a[href*='/movie/watch-']")
+        } ?: return null
         val href = a.absUrl("href").ifBlank { a.attr("href").toAbsoluteUrl() }
         if (href.isBlank() || !href.contains(expected)) return null
         if (expected == "/anime/" && href.contains("/watch/")) return null
 
-        val img = selectFirst("img[src*='/w500/'], img[src*='anilist'], img")
-        val rawTitle = img?.attr("alt")?.trim()?.takeIf { it.isNotBlank() }
-            ?: selectFirst("h4, h3, h2, .title")?.text()?.trim()?.takeIf { it.isNotBlank() }
+        val img = selectFirst("img[src*='/w500/'], img[src*='anilistcdn'], img")
+        val title = img?.attr("alt")?.trim()?.takeIf { it.isNotBlank() }
+            ?: selectFirst("h3, h2, h4, .title")?.text()?.trim()
             ?: a.attr("title").trim().takeIf { it.isNotBlank() }
-            ?: a.text().trim().takeIf { it.isNotBlank() }
             ?: return null
-        val title = rawTitle.cleanCardTitle()
-        if (title.isBlank() || title.equals("Watch", true) || title.equals("Watch Now", true) || title.equals("More", true) || title.equals("Info", true)) return null
+        if (title.equals("Watch", true) || title.equals("More", true) || title.equals("Info", true)) return null
 
         val poster = img?.imgUrl()
         val year = Regex("(?<!\\d)(?:19|20)\\d{2}(?!\\d)").find(text())?.value?.toIntOrNull()
         return when {
-            expected.contains("tv-show") -> newTvSeriesSearchResponse(title, href, TvType.TvSeries) {
+            expected.contains("tv-show") -> newTvSeriesSearchResponse(title.cleanCardTitle(), href, TvType.TvSeries) {
                 posterUrl = poster
                 this.year = year
             }
-            expected == "/anime/" -> newAnimeSearchResponse(title, href, TvType.Anime) {
+            expected == "/anime/" -> newAnimeSearchResponse(title.cleanCardTitle(), href, TvType.Anime) {
                 posterUrl = poster
                 this.year = year
             }
-            else -> newMovieSearchResponse(title, href, TvType.Movie) {
+            else -> newMovieSearchResponse(title.cleanCardTitle(), href, TvType.Movie) {
                 posterUrl = poster
                 this.year = year
             }
@@ -492,9 +495,9 @@ class NowHDTime : MainAPI() {
         return out
     }
 
-    private fun extractIframeSources(html: String): List<String> =
+    private fun extractIframeSources(html: String, baseUrl: String = mainUrl): List<String> =
         Regex("""(?i)<iframe[^>]+src=["']([^"']+)["']""").findAll(html)
-            .map { it.groupValues[1].htmlDecode().toAbsoluteUrl() }
+            .map { it.groupValues[1].htmlDecode().toAbsoluteUrl(baseUrl) }
             .filter { it.startsWith("http") }
             .toList()
 
@@ -595,14 +598,20 @@ class NowHDTime : MainAPI() {
 
     private fun String.hostName(): String = substringAfter("://").substringBefore("/").ifBlank { this }
 
+    private fun String.isDirectVideo(): Boolean {
+        val clean = substringBefore("?").lowercase()
+        return clean.endsWith(".mp4") || clean.endsWith(".mkv") || clean.endsWith(".webm") ||
+                clean.endsWith(".avi") || clean.endsWith(".mov") || clean.endsWith(".m4v")
+    }
+
     private fun qualityLabelFromUrl(url: String): String? =
         Regex("(?i)(2160p|1440p|1080p|720p|480p|360p|4k)").find(url)?.value
 
-    private fun String.toAbsoluteUrl(): String = when {
+    private fun String.toAbsoluteUrl(baseUrl: String = mainUrl): String = when {
         startsWith("//") -> "https:$this"
         startsWith("http") || startsWith("magnet:") -> this
-        startsWith("/") -> mainUrl + this
-        else -> "$mainUrl/$this"
+        startsWith("/") -> baseUrl.substringBefore("://").plus("://").plus(baseUrl.substringAfter("://").substringBefore("/")).plus(this)
+        else -> baseUrl.trimEnd('/') + "/" + this
     }
 
     private fun String.encodeUrl(): String = URLEncoder.encode(this, "UTF-8")
