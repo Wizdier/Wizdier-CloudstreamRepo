@@ -189,9 +189,21 @@ class NowHDTime : MainAPI() {
             }
 
             if (source.contains("videasy", ignoreCase = true)) {
-                // Videasy currently returns signed streams that frequently fail
-                // inside Cloudstream with HTTP 2004. Do not emit broken links
-                // or raw HTML embed pages.
+                val resolved = resolveVideasySources(
+                    siteTitle = payload?.optStringOrNull("title"),
+                    mediaType = mediaType,
+                    tmdbId = tmdbId,
+                    season = season,
+                    episode = episode,
+                    year = payload?.optIntOrNull("year"),
+                    subtitleCallback = subtitleCallback,
+                    emittedSubtitles = emittedSubtitles
+                )
+                if (resolved.isNotEmpty()) {
+                    resolved.forEach { emitResolvedSource(it, callback) }
+                    found = true
+                }
+                // Do not fall through to the raw Videasy HTML page.
                 return@forEach
             }
 
@@ -207,7 +219,7 @@ class NowHDTime : MainAPI() {
 
             if (source.contains(".m3u8", ignoreCase = true)) {
                 M3u8Helper.generateM3u8(
-                    source = "$name - $displayName",
+                    source = displayName,
                     streamUrl = source,
                     referer = pageUrl ?: mainUrl,
                     headers = streamHeaders(pageUrl ?: mainUrl)
@@ -776,13 +788,17 @@ class NowHDTime : MainAPI() {
         val out = mutableListOf<ResolvedSource>()
         val endpoints = if (mediaType == "tv" && season != null && episode != null) {
             listOf(
+                "movies4f/tv/$tmdbId/$season/$episode" to "Catflix",
                 "allmovies/tv/$tmdbId/$season/$episode" to "Lamda",
-                "klikxxi/tv/$tmdbId/$season/$episode" to "Ophim"
+                "klikxxi/tv/$tmdbId/$season/$episode" to "Ophim",
+                "hollymoviehd/tv/$tmdbId/$season/$episode" to "Sigma"
             )
         } else {
             listOf(
+                "movies4f/movie/$tmdbId" to "Catflix",
                 "allmovies/movie/$tmdbId" to "Lamda",
-                "klikxxi/movie/$tmdbId" to "Ophim"
+                "klikxxi/movie/$tmdbId" to "Ophim",
+                "hollymoviehd/movie/$tmdbId" to "Sigma"
             )
         }
         for ((endpoint, label) in endpoints) {
@@ -900,7 +916,7 @@ class NowHDTime : MainAPI() {
         // when the helper probes them too early.
         callback(
             newExtractorLink(
-                source = name,
+                source = label,
                 name = "$name - $label",
                 url = streamUrl,
                 type = ExtractorLinkType.M3U8,
@@ -922,7 +938,7 @@ class NowHDTime : MainAPI() {
         if (type == ExtractorLinkType.M3U8) {
             emitM3u8Link(source.label, clean, source.referer, callback, source.quality)
         } else {
-            callback(newExtractorLink(name, "$name - ${source.label}", clean, type) {
+            callback(newExtractorLink(source.label, "$name - ${source.label}", clean, type) {
                 referer = source.referer
                 quality = source.quality ?: getQualityFromName(clean)
                 headers = streamHeaders(source.referer)
@@ -943,11 +959,13 @@ class NowHDTime : MainAPI() {
     private fun fallbackMovieEmbeds(id: String): List<Pair<String, String>> = listOf(
         "Local" to "https://nhdapi.com/embed/movie/$id",
         "Server1" to "https://vidnest.fun/movie/$id",
+        "Server2" to "https://player.videasy.net/movie/$id",
     )
 
     private fun fallbackTvEmbeds(id: String, season: Int, episode: Int): List<Pair<String, String>> = listOf(
         "Local" to "https://nhdapi.com/embed/tv/$id/$season/$episode",
         "Server1" to "https://vidnest.fun/tv/$id/$season/$episode",
+        "Server2" to "https://player.videasy.net/tv/$id/$season/$episode",
     )
 
     // ───────────────────────────── Helpers ─────────────────────────────
