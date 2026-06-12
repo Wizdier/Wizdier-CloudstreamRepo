@@ -22,7 +22,7 @@ import javax.crypto.spec.SecretKeySpec
 class NowHDTime : MainAPI() {
     override var mainUrl = "https://nowhdtime.com.bd"
     override var name = "NowHDTime"
-    override var lang = "bn"
+    override var lang = "en"
     override val hasMainPage = true
     override val hasDownloadSupport = true
     override val hasQuickSearch = true
@@ -218,23 +218,23 @@ class NowHDTime : MainAPI() {
             }
 
             if (source.contains(".m3u8", ignoreCase = true)) {
-                M3u8Helper.generateM3u8(
-                    source = displayName,
-                    streamUrl = source,
-                    referer = pageUrl ?: mainUrl,
-                    headers = streamHeaders(pageUrl ?: mainUrl)
-                ).forEach(callback)
-                found = true
+                val refererUrl = pageUrl ?: mainUrl
+                if (isPlayableHlsDeep(source, refererUrl)) {
+                    emitM3u8Link(displayName, source, refererUrl, callback)
+                    found = true
+                }
                 return@forEach
             }
             if (source.isDirectVideo()) {
                 val refererUrl = pageUrl ?: mainUrl
-                callback(newExtractorLink(name, "${name} - ${source.hostName()}", source, ExtractorLinkType.VIDEO) {
-                    referer = refererUrl
-                    quality = getQualityFromName(source)
-                    headers = streamHeaders(refererUrl)
-                })
-                found = true
+                if (isReachableVideo(source, refererUrl)) {
+                    callback(newExtractorLink(displayName, "${name} - ${source.hostName()}", source, ExtractorLinkType.VIDEO) {
+                        referer = refererUrl
+                        quality = getQualityFromName(source)
+                        headers = streamHeaders(refererUrl)
+                    })
+                    found = true
+                }
                 return@forEach
             }
             var emittedByExtractor = false
@@ -673,6 +673,8 @@ class NowHDTime : MainAPI() {
         val stream = root.optJSONObject("stream")?.optStringOrNull("hls_streaming")
             ?: root.optJSONObject("stream")?.optStringOrNull("url")
             ?: return@runCatching null
+        val streamReferer = "https://player.nhdapi.com/embed/$type/$id"
+        if (!isPlayableHlsDeep(stream, streamReferer)) return@runCatching null
 
         val subEndpoint = buildString {
             append("https://player.nhdapi.com/api/subtitles?id=").append(secureId)
@@ -705,9 +707,61 @@ class NowHDTime : MainAPI() {
         NhdResolved(stream, subtitles)
     }.getOrNull()
 
-    private suspend fun isReachableM3u8(url: String, refererUrl: String): Boolean = runCatching {
-        val res = app.get(url, headers = streamHeaders(refererUrl), timeout = 8000)
-        res.code in 200..299 && res.text.trimStart().startsWith("#EXTM3U")
+    private suspend fun isPlayableHlsDeep(url: String, refererUrl: String): Boolean = runCatching {
+        val masterRes = app.get(url, headers = streamHeaders(refererUrl), timeout = 8000)
+        if (masterRes.code !in 200..299) return@runCatching false
+        val master = masterRes.text.trim()
+        if (!master.startsWith("#EXTM3U")) return@runCatching false
+
+        val mediaPlaylistUrl = firstVariantPlaylist(master, url) ?: url
+        val media = if (mediaPlaylistUrl == url && master.contains("#EXTINF")) {
+            master
+        } else {
+            val mediaRes = app.get(mediaPlaylistUrl, headers = streamHeaders(refererUrl), timeout = 8000)
+            if (mediaRes.code !in 200..299) return@runCatching false
+            mediaRes.text.trim()
+        }
+        if (!media.startsWith("#EXTM3U")) return@runCatching false
+
+        val segmentUrl = firstSegment(media, mediaPlaylistUrl)
+        if (segmentUrl.isNullOrBlank()) return@runCatching true
+        val segmentRes = app.get(
+            segmentUrl,
+            headers = streamHeaders(refererUrl) + mapOf("Range" to "bytes=0-1"),
+            timeout = 8000
+        )
+        segmentRes.code in 200..299 || segmentRes.code == 206
+    }.getOrDefault(false)
+
+    private fun firstVariantPlaylist(master: String, baseUrl: String): String? {
+        val lines = master.lineSequence().map { it.trim() }.filter { it.isNotBlank() }.toList()
+        for (i in lines.indices) {
+            if (lines[i].startsWith("#EXT-X-STREAM-INF", true)) {
+                val next = lines.drop(i + 1).firstOrNull { !it.startsWith("#") }
+                if (!next.isNullOrBlank()) return next.resolveAgainst(baseUrl)
+            }
+        }
+        return null
+    }
+
+    private fun firstSegment(media: String, baseUrl: String): String? {
+        val lines = media.lineSequence().map { it.trim() }.filter { it.isNotBlank() }.toList()
+        for (i in lines.indices) {
+            if (lines[i].startsWith("#EXTINF", true)) {
+                val next = lines.drop(i + 1).firstOrNull { !it.startsWith("#") }
+                if (!next.isNullOrBlank()) return next.resolveAgainst(baseUrl)
+            }
+        }
+        return lines.firstOrNull { !it.startsWith("#") }?.resolveAgainst(baseUrl)
+    }
+
+    private suspend fun isReachableVideo(url: String, refererUrl: String): Boolean = runCatching {
+        val res = app.get(
+            url,
+            headers = streamHeaders(refererUrl) + mapOf("Range" to "bytes=0-1"),
+            timeout = 8000
+        )
+        res.code in 200..299 || res.code == 206
     }.getOrDefault(false)
 
     private fun decryptNhdApiPayload(obj: JSONObject): String? = runCatching {
@@ -768,7 +822,9 @@ class NowHDTime : MainAPI() {
                     if (url.isPlayableUrl()) {
                         val referer = "https://player.videasy.net/"
                         val qualityInt = (src.optStringOrNull("quality") ?: qualityLabelFromUrl(url) ?: "").toQualityInt()
-                        out += ResolvedSource(url, "Server2 ${server.uppercase()}", referer, ExtractorLinkType.M3U8, qualityInt)
+                        if (isPlayableHlsDeep(url, referer)) {
+                            out += ResolvedSource(url, "Server2 ${server.uppercase()}", referer, ExtractorLinkType.M3U8, qualityInt)
+                        }
                     }
                 }
             }
@@ -815,15 +871,15 @@ class NowHDTime : MainAPI() {
             emitVidNestSubtitles(root, subtitleCallback, emittedSubtitles)
             out += collectVidNestMedia(root, label)
         }
-        return out.distinctBy { it.url }
-            .filter { source ->
-                when (source.type) {
-                    ExtractorLinkType.M3U8 -> source.url.startsWith("http")
-                    ExtractorLinkType.VIDEO -> source.url.isDirectVideo()
-                    else -> false
-                }
+        val checked = mutableListOf<ResolvedSource>()
+        out.distinctBy { it.url }.forEach { source ->
+            when (source.type) {
+                ExtractorLinkType.M3U8 -> if (isPlayableHlsDeep(source.url, source.referer)) checked += source
+                ExtractorLinkType.VIDEO -> if (isReachableVideo(source.url, source.referer)) checked += source
+                else -> Unit
             }
-            .take(20)
+        }
+        return checked.take(20)
     }
 
     private fun collectVidNestMedia(node: Any?, label: String): List<ResolvedSource> {
@@ -1108,6 +1164,13 @@ class NowHDTime : MainAPI() {
         startsWith("http") || startsWith("magnet:") -> this
         startsWith("/") -> baseUrl.substringBefore("://").plus("://").plus(baseUrl.substringAfter("://").substringBefore("/")).plus(this)
         else -> baseUrl.trimEnd('/') + "/" + this
+    }
+
+    private fun String.resolveAgainst(baseUrl: String): String = when {
+        startsWith("//") -> "https:$this"
+        startsWith("http") -> this
+        startsWith("/") -> baseUrl.substringBefore("://").plus("://").plus(baseUrl.substringAfter("://").substringBefore("/")).plus(this)
+        else -> baseUrl.substringBeforeLast('/', baseUrl) + "/" + this
     }
 
     private fun String.encodeUrl(): String = URLEncoder.encode(this, "UTF-8")
