@@ -219,10 +219,8 @@ class NowHDTime : MainAPI() {
 
             if (source.contains(".m3u8", ignoreCase = true)) {
                 val refererUrl = pageUrl ?: mainUrl
-                if (isPlayableHlsDeep(source, refererUrl)) {
-                    emitM3u8Link(displayName, source, refererUrl, callback)
-                    found = true
-                }
+                emitM3u8Link(displayName, source, refererUrl, callback)
+                found = true
                 return@forEach
             }
             if (source.isDirectVideo()) {
@@ -673,8 +671,6 @@ class NowHDTime : MainAPI() {
         val stream = root.optJSONObject("stream")?.optStringOrNull("hls_streaming")
             ?: root.optJSONObject("stream")?.optStringOrNull("url")
             ?: return@runCatching null
-        val streamReferer = "https://player.nhdapi.com/embed/$type/$id"
-        if (!isPlayableHlsDeep(stream, streamReferer)) return@runCatching null
 
         val subEndpoint = buildString {
             append("https://player.nhdapi.com/api/subtitles?id=").append(secureId)
@@ -822,9 +818,7 @@ class NowHDTime : MainAPI() {
                     if (url.isPlayableUrl()) {
                         val referer = "https://player.videasy.net/"
                         val qualityInt = (src.optStringOrNull("quality") ?: qualityLabelFromUrl(url) ?: "").toQualityInt()
-                        if (isPlayableHlsDeep(url, referer)) {
-                            out += ResolvedSource(url, "Server2 ${server.uppercase()}", referer, ExtractorLinkType.M3U8, qualityInt)
-                        }
+                        out += ResolvedSource(url, "Server2 ${server.uppercase()}", referer, ExtractorLinkType.M3U8, qualityInt)
                     }
                 }
             }
@@ -871,15 +865,15 @@ class NowHDTime : MainAPI() {
             emitVidNestSubtitles(root, subtitleCallback, emittedSubtitles)
             out += collectVidNestMedia(root, label)
         }
-        val checked = mutableListOf<ResolvedSource>()
-        out.distinctBy { it.url }.forEach { source ->
-            when (source.type) {
-                ExtractorLinkType.M3U8 -> if (isPlayableHlsDeep(source.url, source.referer)) checked += source
-                ExtractorLinkType.VIDEO -> if (isReachableVideo(source.url, source.referer)) checked += source
-                else -> Unit
+        return out.distinctBy { it.url }
+            .filter { source ->
+                when (source.type) {
+                    ExtractorLinkType.M3U8 -> source.url.startsWith("http")
+                    ExtractorLinkType.VIDEO -> source.url.isDirectVideo()
+                    else -> false
+                }
             }
-        }
-        return checked.take(20)
+            .take(20)
     }
 
     private fun collectVidNestMedia(node: Any?, label: String): List<ResolvedSource> {
