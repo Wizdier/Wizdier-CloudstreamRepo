@@ -181,12 +181,7 @@ class NowHDTime : MainAPI() {
             val nhdResolved = resolveNhdApiSource(source)
             if (nhdResolved?.streamUrl?.isNotBlank() == true) {
                 emitSubtitles(nhdResolved.subtitles, emittedSubtitles, subtitleCallback)
-                M3u8Helper.generateM3u8(
-                    source = "$name - $displayName",
-                    streamUrl = nhdResolved.streamUrl,
-                    referer = source,
-                    headers = headers
-                ).forEach(callback)
+                emitM3u8Link(displayName, nhdResolved.streamUrl, source, callback)
                 found = true
                 return@forEach
             }
@@ -194,12 +189,7 @@ class NowHDTime : MainAPI() {
             val mirroredResolved = resolveMirrorWithNhdApi(source, mediaType, tmdbId, season, episode)
             if (mirroredResolved?.streamUrl?.isNotBlank() == true) {
                 emitSubtitles(mirroredResolved.subtitles, emittedSubtitles, subtitleCallback)
-                M3u8Helper.generateM3u8(
-                    source = "$name - $displayName",
-                    streamUrl = mirroredResolved.streamUrl,
-                    referer = source,
-                    headers = headers
-                ).forEach(callback)
+                emitM3u8Link(displayName, mirroredResolved.streamUrl, source, callback)
                 found = true
                 return@forEach
             }
@@ -678,6 +668,25 @@ class NowHDTime : MainAPI() {
         String(cipher.doFinal(combined), Charsets.UTF_8)
     }.getOrNull()
 
+    private fun emitM3u8Link(
+        label: String,
+        streamUrl: String,
+        refererUrl: String,
+        callback: (ExtractorLink) -> Unit
+    ) {
+        callback(
+            newExtractorLink(
+                source = name,
+                name = "$name - $label",
+                url = streamUrl.withSourceFragment(label),
+                type = ExtractorLinkType.M3U8,
+            ) {
+                referer = refererUrl
+                quality = getQualityFromName(streamUrl)
+            }
+        )
+    }
+
     private suspend fun emitSubtitles(
         subtitles: List<NhdSubtitle>,
         seen: MutableSet<String>,
@@ -790,6 +799,11 @@ class NowHDTime : MainAPI() {
         url.contains("vidnest.fun", true) -> "Server1"
         url.contains("videasy", true) -> "Server2"
         else -> url.hostName()
+    }
+
+    private fun String.withSourceFragment(label: String): String {
+        val clean = substringBefore("#")
+        return clean + "#" + label.encodeUrl()
     }
 
     private fun String.isDirectVideo(): Boolean {
