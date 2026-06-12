@@ -186,14 +186,6 @@ class NowHDTime : MainAPI() {
                 return@forEach
             }
 
-            val mirroredResolved = resolveMirrorWithNhdApi(source, mediaType, tmdbId, season, episode)
-            if (mirroredResolved?.streamUrl?.isNotBlank() == true) {
-                emitSubtitles(mirroredResolved.subtitles, emittedSubtitles, subtitleCallback)
-                emitM3u8Link(displayName, mirroredResolved.streamUrl, source, callback)
-                found = true
-                return@forEach
-            }
-
             if (source.contains(".m3u8", ignoreCase = true)) {
                 M3u8Helper.generateM3u8(
                     source = name,
