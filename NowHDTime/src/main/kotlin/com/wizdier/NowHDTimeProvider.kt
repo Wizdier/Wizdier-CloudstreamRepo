@@ -13,6 +13,11 @@ import org.json.JSONObject
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import java.net.URLEncoder
+import java.security.MessageDigest
+import java.util.Base64
+import javax.crypto.Cipher
+import javax.crypto.spec.GCMParameterSpec
+import javax.crypto.spec.SecretKeySpec
 
 class NowHDTime : MainAPI() {
     override var mainUrl = "https://nowhdtime.com.bd"
@@ -158,6 +163,21 @@ class NowHDTime : MainAPI() {
             val source = raw.htmlDecode().trim()
             if (source.isBlank()) return@forEach
             if (source.startsWith("magnet:", ignoreCase = true)) return@forEach
+
+            // NHDAPI is the site's primary/local server. Resolve it directly
+            // instead of returning an HTML embed page to Cloudstream.
+            val nhdDirect = resolveNhdApiSource(source)
+            if (!nhdDirect.isNullOrBlank()) {
+                M3u8Helper.generateM3u8(
+                    source = "$name - Local",
+                    streamUrl = nhdDirect,
+                    referer = source,
+                    headers = headers
+                ).forEach(callback)
+                found = true
+                return@forEach
+            }
+
             if (source.contains(".m3u8", ignoreCase = true)) {
                 M3u8Helper.generateM3u8(
                     source = name,
@@ -227,7 +247,9 @@ class NowHDTime : MainAPI() {
         val siteYear = doc.yearFromPage()
         val tvId = doc.selectFirst("[data-tv-show-id]")?.attr("data-tv-show-id")
             ?: Regex("openReportModal\\('tv_show',\\s*(\\d+)").find(doc.html())?.groupValues?.getOrNull(1)
-        val meta = fetchTmdbMeta(tvId, "tv", siteTitle, siteYear)
+        // data-tv-show-id is NowHDTime's local id, not TMDB. Search TMDB by
+        // clean title/year to avoid bad embeds like tv/1/...
+        val meta = fetchTmdbMeta(null, "tv", siteTitle, siteYear)
         val tmdbId = meta.tmdbId?.toString() ?: tvId.orEmpty()
         val episodes = parseTvEpisodes(doc, tmdbId)
 
@@ -500,6 +522,75 @@ class NowHDTime : MainAPI() {
             .map { it.groupValues[1].htmlDecode().toAbsoluteUrl(baseUrl) }
             .filter { it.startsWith("http") }
             .toList()
+
+    private suspend fun resolveNhdApiSource(url: String): String? {
+        val movieId = Regex("(?i)(?:nhdapi\\.com|player\\.nhdapi\\.com)/embed/movie/(\\d+)").find(url)
+            ?.groupValues?.getOrNull(1)
+        if (!movieId.isNullOrBlank()) return fetchNhdApiStream("movie", movieId, null, null)
+
+        val tv = Regex("(?i)(?:nhdapi\\.com|player\\.nhdapi\\.com)/embed/tv/(\\d+)/(\\d+)/(\\d+)").find(url)
+        if (tv != null) {
+            return fetchNhdApiStream(
+                type = "tv",
+                id = tv.groupValues[1],
+                season = tv.groupValues[2].toIntOrNull(),
+                episode = tv.groupValues[3].toIntOrNull()
+            )
+        }
+        return null
+    }
+
+    private suspend fun fetchNhdApiStream(type: String, id: String, season: Int?, episode: Int?): String? = runCatching {
+        val tokenRes = app.post(
+            "https://player.nhdapi.com/api/token",
+            headers = mapOf(
+                "User-Agent" to headers["User-Agent"].orEmpty(),
+                "Origin" to "https://player.nhdapi.com",
+                "Referer" to "https://player.nhdapi.com/embed/$type/$id",
+                "X-Content-Id" to id,
+                "Content-Type" to "application/json",
+            ),
+            json = mapOf("ipv4" to "")
+        )
+        if (tokenRes.code !in 200..299) return@runCatching null
+        val tokenJson = JSONObject(tokenRes.text)
+        val token = tokenJson.optStringOrNull("token") ?: return@runCatching null
+        val secureId = tokenJson.optStringOrNull("secureId") ?: id
+        val endpoint = if (type == "tv" && season != null && episode != null) {
+            "https://player.nhdapi.com/api/tv?id=$secureId&season=$season&episode=$episode"
+        } else {
+            "https://player.nhdapi.com/api/movie?id=$secureId"
+        }
+        val sourceRes = app.get(
+            endpoint,
+            headers = mapOf(
+                "User-Agent" to headers["User-Agent"].orEmpty(),
+                "Referer" to "https://player.nhdapi.com/embed/$type/$id",
+                "X-API-Token" to token,
+                "X-Client-IPv4" to "",
+            )
+        )
+        if (sourceRes.code !in 200..299) return@runCatching null
+        val encrypted = JSONObject(sourceRes.text)
+        val decrypted = decryptNhdApiPayload(encrypted) ?: return@runCatching null
+        val root = JSONObject(decrypted)
+        if (root.optString("status") != "success") return@runCatching null
+        root.optJSONObject("stream")?.optStringOrNull("hls_streaming")
+            ?: root.optJSONObject("stream")?.optStringOrNull("url")
+    }.getOrNull()
+
+    private fun decryptNhdApiPayload(obj: JSONObject): String? = runCatching {
+        val iv = Base64.getDecoder().decode(obj.optStringOrNull("iv") ?: return@runCatching null)
+        val tag = Base64.getDecoder().decode(obj.optStringOrNull("tag") ?: return@runCatching null)
+        val data = Base64.getDecoder().decode(obj.optStringOrNull("data") ?: return@runCatching null)
+        val combined = ByteArray(data.size + tag.size)
+        System.arraycopy(data, 0, combined, 0, data.size)
+        System.arraycopy(tag, 0, combined, data.size, tag.size)
+        val key = MessageDigest.getInstance("SHA-256").digest("Z9#rL!v2K*5qP&7mXw".toByteArray())
+        val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+        cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"), GCMParameterSpec(128, iv))
+        String(cipher.doFinal(combined), Charsets.UTF_8)
+    }.getOrNull()
 
     private fun fallbackMovieEmbeds(id: String): List<String> = listOf(
         "https://nhdapi.com/embed/movie/$id",
