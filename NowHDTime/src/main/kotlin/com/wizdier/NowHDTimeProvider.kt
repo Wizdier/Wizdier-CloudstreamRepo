@@ -175,9 +175,28 @@ class NowHDTime : MainAPI() {
             if (source.isBlank()) return@forEach
             if (source.startsWith("magnet:", ignoreCase = true)) return@forEach
 
+            val displayName = sourceNames[source] ?: source.hostName()
+
+            if (source.contains("vidnest.fun", ignoreCase = true)) {
+                val resolved = resolveVidNestSources(mediaType, tmdbId, season, episode, subtitleCallback, emittedSubtitles)
+                if (resolved.isNotEmpty()) {
+                    resolved.forEach { emitResolvedSource(it, callback) }
+                    found = true
+                    return@forEach
+                }
+            }
+
+            if (source.contains("videasy", ignoreCase = true)) {
+                val resolved = resolveVideasySources(siteTitle = payload?.optStringOrNull("title"), mediaType = mediaType, tmdbId = tmdbId, season = season, episode = episode, year = payload?.optIntOrNull("year"), subtitleCallback = subtitleCallback, emittedSubtitles = emittedSubtitles)
+                if (resolved.isNotEmpty()) {
+                    resolved.forEach { emitResolvedSource(it, callback) }
+                    found = true
+                    return@forEach
+                }
+            }
+
             // NHDAPI is the site's primary/local server. Resolve it directly
             // instead of returning an HTML embed page to Cloudstream.
-            val displayName = sourceNames[source] ?: source.hostName()
             val nhdResolved = resolveNhdApiSource(source)
             if (nhdResolved?.streamUrl?.isNotBlank() == true) {
                 emitSubtitles(nhdResolved.subtitles, emittedSubtitles, subtitleCallback)
@@ -243,6 +262,8 @@ class NowHDTime : MainAPI() {
         val data = JSONObject()
             .put("url", url)
             .put("mediaType", "movie")
+            .put("title", siteTitle)
+            .put("year", siteYear ?: meta.year)
             .put("tmdbId", meta.tmdbId?.toString() ?: tmdbId.orEmpty())
             .put("players", JSONArray(players.filterNot { it.type.equals("torrent", true) || it.url?.startsWith("magnet:", true) == true }.mapNotNull { it.url }))
             .toString()
@@ -502,6 +523,8 @@ class NowHDTime : MainAPI() {
             val data = JSONObject()
                 .put("mediaType", "tv")
                 .put("tmdbId", tmdbId)
+                .put("title", doc.titleFromPage())
+                .put("year", doc.yearFromPage())
                 .put("season", season)
                 .put("episode", episode)
                 .put("players", JSONArray(fallbackTvEmbeds(tmdbId, season, episode).map { it.second }))
@@ -556,6 +579,7 @@ class NowHDTime : MainAPI() {
 
     private data class NhdSubtitle(val label: String, val url: String)
     private data class NhdResolved(val streamUrl: String, val subtitles: List<NhdSubtitle> = emptyList())
+    private data class ResolvedSource(val url: String, val label: String, val referer: String)
 
     private suspend fun resolveNhdApiSource(url: String): NhdResolved? {
         val movieId = Regex("(?i)(?:nhdapi\\.com|player\\.nhdapi\\.com)/embed/movie/(\\d+)").find(url)
@@ -674,21 +698,185 @@ class NowHDTime : MainAPI() {
         String(cipher.doFinal(combined), Charsets.UTF_8)
     }.getOrNull()
 
-    private fun emitM3u8Link(
+    private suspend fun resolveVideasySources(
+        siteTitle: String?,
+        mediaType: String?,
+        tmdbId: String?,
+        season: Int?,
+        episode: Int?,
+        year: Int?,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        emittedSubtitles: MutableSet<String>
+    ): List<ResolvedSource> {
+        if (tmdbId.isNullOrBlank() || mediaType.isNullOrBlank()) return emptyList()
+        val title = siteTitle?.cleanMediaTitle()?.takeIf { it.isNotBlank() } ?: return emptyList()
+        val encodedTitle = title.encodeUrl().replace("+", "%20").encodeUrl().replace("+", "%20")
+        val serverIds = listOf("mb-flix", "cdn", "1movies", "moviebox", "primewire", "m4uhd", "hdmovie")
+        val out = mutableListOf<ResolvedSource>()
+        for (server in serverIds) {
+            if (out.size >= 12) break
+            val apiUrl = if (mediaType == "tv" && season != null && episode != null) {
+                "https://api.videasy.to/$server/sources-with-title?title=$encodedTitle&mediaType=tv&year=${year ?: ""}&tmdbId=$tmdbId&episodeId=$episode&seasonId=$season&imdbId="
+            } else {
+                "https://api.videasy.to/$server/sources-with-title?title=$encodedTitle&mediaType=movie&year=${year ?: ""}&tmdbId=$tmdbId&imdbId="
+            }
+            val encrypted = runCatching {
+                app.get(apiUrl, headers = headers + mapOf("Origin" to "https://www.cineby.sc"), timeout = 10000).text
+            }.getOrNull() ?: continue
+            if (encrypted.startsWith("<!", true) || encrypted.length < 80) continue
+            val decoded = runCatching {
+                app.post("https://enc-dec.app/api/dec-videasy", json = mapOf("text" to encrypted, "id" to tmdbId.toIntOrNull())).text
+            }.getOrNull() ?: continue
+            val result = runCatching { JSONObject(decoded).optJSONObject("result") }.getOrNull() ?: continue
+            result.optJSONArray("subtitles")?.let { subs ->
+                for (i in 0 until subs.length()) {
+                    val sub = subs.optJSONObject(i) ?: continue
+                    val url = sub.optStringOrNull("url") ?: continue
+                    val lang = sub.optStringOrNull("language") ?: sub.optStringOrNull("lang") ?: "Subtitle"
+                    if (emittedSubtitles.add(url)) subtitleCallback(newSubtitleFile(lang, url))
+                }
+            }
+            result.optJSONArray("sources")?.let { sources ->
+                for (i in 0 until sources.length()) {
+                    val src = sources.optJSONObject(i) ?: continue
+                    val url = src.optStringOrNull("url") ?: continue
+                    if (url.isPlayableUrl()) {
+                        val quality = src.optStringOrNull("quality") ?: qualityLabelFromUrl(url) ?: "auto"
+                        out += ResolvedSource(url, "Server2 ${server.uppercase()} $quality", "https://player.videasy.net/")
+                    }
+                }
+            }
+        }
+        return out.distinctBy { it.url }
+    }
+
+    private suspend fun resolveVidNestSources(
+        mediaType: String?,
+        tmdbId: String?,
+        season: Int?,
+        episode: Int?,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        emittedSubtitles: MutableSet<String>
+    ): List<ResolvedSource> {
+        if (tmdbId.isNullOrBlank()) return emptyList()
+        val out = mutableListOf<ResolvedSource>()
+        val endpoints = if (mediaType == "tv" && season != null && episode != null) {
+            // The public VidNest frontend primarily documents movie endpoints;
+            // keep TV support conservative and let Cloudstream extractors try
+            // the raw tv embed if these endpoints change.
+            emptyList()
+        } else {
+            listOf(
+                "movies4f/movie" to "Catflix",
+                "allmovies/movie" to "Lamda",
+                "klikxxi/movie" to "Ophim",
+                "hollymoviehd/movie" to "Sigma"
+            )
+        }
+        for ((endpoint, label) in endpoints) {
+            val raw = runCatching {
+                app.get("https://new.vidnest.fun/$endpoint/$tmdbId", headers = headers + mapOf("Referer" to "https://vidnest.fun/"), timeout = 10000).text
+            }.getOrNull() ?: continue
+            val json = runCatching { JSONObject(raw) }.getOrNull() ?: continue
+            val decodedText = if (json.optBoolean("encrypted", json.has("data"))) {
+                decodeVidNestData(json.optStringOrNull("data") ?: continue) ?: continue
+            } else raw
+            val root = runCatching { JSONObject(decodedText) }.getOrNull() ?: continue
+            emitVidNestSubtitles(root, subtitleCallback, emittedSubtitles)
+            out += collectVidNestMedia(root, label)
+        }
+        return out.distinctBy { it.url }.take(20)
+    }
+
+    private fun collectVidNestMedia(node: Any?, label: String): List<ResolvedSource> {
+        val out = mutableListOf<ResolvedSource>()
+        fun walk(value: Any?) {
+            when (value) {
+                is JSONObject -> {
+                    val keys = value.keys()
+                    while (keys.hasNext()) {
+                        val key = keys.next()
+                        val child = value.opt(key)
+                        if (child is String && key in listOf("url", "file", "playlist", "hls", "src")) {
+                            if (child.isPlayableUrl()) {
+                                val quality = value.optStringOrNull("quality") ?: value.optStringOrNull("label") ?: qualityLabelFromUrl(child) ?: "auto"
+                                val referer = value.optJSONObject("headers")?.optStringOrNull("Referer") ?: "https://vidnest.fun/"
+                                out += ResolvedSource(child, "Server1 $label $quality", referer)
+                            }
+                        }
+                        walk(child)
+                    }
+                }
+                is JSONArray -> for (i in 0 until value.length()) walk(value.opt(i))
+            }
+        }
+        walk(node)
+        return out
+    }
+
+    private suspend fun emitVidNestSubtitles(
+        node: Any?,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        emittedSubtitles: MutableSet<String>
+    ) {
+        suspend fun walk(value: Any?) {
+            when (value) {
+                is JSONObject -> {
+                    val url = value.optStringOrNull("url")
+                    if (!url.isNullOrBlank() && url.isSubtitleUrl() && emittedSubtitles.add(url)) {
+                        val label = value.optStringOrNull("lanName")
+                            ?: value.optStringOrNull("language")
+                            ?: value.optStringOrNull("lang")
+                            ?: value.optStringOrNull("lan")
+                            ?: "Subtitle"
+                        subtitleCallback(newSubtitleFile(label, url))
+                    }
+                    val keys = value.keys()
+                    while (keys.hasNext()) walk(value.opt(keys.next()))
+                }
+                is JSONArray -> for (i in 0 until value.length()) walk(value.opt(i))
+            }
+        }
+        walk(node)
+    }
+
+    private fun decodeVidNestData(data: String): String? = runCatching {
+        val alphabet = "RB0fpH8ZEyVLkv7c2i6MAJ5u3IKFDxlS1NTsnGaqmXYdUrtzjwObCgQP94hoeW+/="
+        val standard = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/="
+        val translated = buildString {
+            data.forEach { ch ->
+                val idx = alphabet.indexOf(ch)
+                append(if (idx >= 0) standard[idx] else ch)
+            }
+        }
+        val padded = translated + "=".repeat((4 - translated.length % 4) % 4)
+        String(Base64.getDecoder().decode(padded), Charsets.UTF_8)
+    }.getOrNull()
+
+    private suspend fun emitM3u8Link(
         label: String,
         streamUrl: String,
         refererUrl: String,
         callback: (ExtractorLink) -> Unit
     ) {
-        // Do not append fragments or fake suffixes to the HLS url. Some HLS
-        // engines treat fragments as part of segment resolution and fail
-        // intermittently. Let M3u8Helper build clean quality links instead.
         M3u8Helper.generateM3u8(
             source = "$name - $label",
             streamUrl = streamUrl,
             referer = refererUrl,
             headers = headers
         ).forEach(callback)
+    }
+
+    private suspend fun emitResolvedSource(source: ResolvedSource, callback: (ExtractorLink) -> Unit) {
+        val clean = source.url
+        if (clean.contains(".m3u8", true) || clean.contains("/hls/", true) || clean.contains("master", true) || clean.endsWith(".txt", true)) {
+            emitM3u8Link(source.label, clean, source.referer, callback)
+        } else {
+            callback(newExtractorLink(name, "$name - ${source.label}", clean, ExtractorLinkType.VIDEO) {
+                referer = source.referer
+                quality = getQualityFromName(clean)
+            })
+        }
     }
 
     private suspend fun emitSubtitles(
@@ -814,6 +1002,17 @@ class NowHDTime : MainAPI() {
         val clean = substringBefore("?").lowercase()
         return clean.endsWith(".mp4") || clean.endsWith(".mkv") || clean.endsWith(".webm") ||
                 clean.endsWith(".avi") || clean.endsWith(".mov") || clean.endsWith(".m4v")
+    }
+
+    private fun String.isPlayableUrl(): Boolean {
+        val lower = lowercase()
+        return lower.contains(".m3u8") || lower.contains("/hls/") || lower.contains("master") ||
+                lower.endsWith(".txt") || isDirectVideo()
+    }
+
+    private fun String.isSubtitleUrl(): Boolean {
+        val lower = substringBefore("?").lowercase()
+        return lower.endsWith(".srt") || lower.endsWith(".vtt") || contains("subtitle", ignoreCase = true)
     }
 
     private fun qualityLabelFromUrl(url: String): String? =
