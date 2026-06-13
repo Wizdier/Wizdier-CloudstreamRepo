@@ -15,6 +15,7 @@ import com.lagradost.cloudstream3.utils.*
 import org.json.JSONArray
 import org.json.JSONObject
 import java.net.URLEncoder
+import java.util.Base64
 
 class CTGMovies(private val prefs: SharedPreferences? = null) : MainAPI() {
     override var mainUrl = "https://ctgmovies.com"
@@ -65,6 +66,35 @@ class CTGMovies(private val prefs: SharedPreferences? = null) : MainAPI() {
         "anime" to "Latest Anime",
     )
 
+    private data class CtgSearchItem(
+        val title: String,
+        val url: String,
+        val kind: String,
+        val id: String,
+        val type: TvType,
+        val poster: String?,
+        val year: Int?,
+        val sourceLabel: String?,
+    )
+
+    private data class GroupedCtgItem(
+        val kind: String,
+        val id: String,
+        val label: String?,
+    )
+
+    private data class ObjWithLabel(
+        val obj: JSONObject,
+        val label: String?,
+    )
+
+    private data class TmdbEpisodeMeta(
+        val name: String? = null,
+        val overview: String? = null,
+        val stillUrl: String? = null,
+        val rating: Double? = null,
+    )
+
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val path = when (request.data) {
             "tv" -> "/tv"
@@ -80,15 +110,15 @@ class CTGMovies(private val prefs: SharedPreferences? = null) : MainAPI() {
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
-        val out = mutableListOf<SearchResponse>()
         val q = query.trim()
         if (q.isBlank()) return emptyList()
 
-        runCatching { out += parseList(apiGet("/movies", mapOf("search" to q)), "movies") }
-        runCatching { out += parseList(apiGet("/tv", mapOf("search" to q)), "tv") }
-        runCatching { out += parseList(apiGet("/anime", mapOf("search" to q)), "anime") }
+        val items = mutableListOf<CtgSearchItem>()
+        runCatching { items += parseSearchItems(apiGet("/movies", mapOf("search" to q)), "movies") }
+        runCatching { items += parseSearchItems(apiGet("/tv", mapOf("search" to q)), "tv") }
+        runCatching { items += parseSearchItems(apiGet("/anime", mapOf("search" to q)), "anime") }
 
-        return out.distinctBy { it.url }
+        return groupSearchItems(items)
     }
 
     override suspend fun getLoadUrl(name: SyncIdName, id: String): String? {
@@ -113,6 +143,10 @@ class CTGMovies(private val prefs: SharedPreferences? = null) : MainAPI() {
     }
 
     override suspend fun load(url: String): LoadResponse? {
+        decodeGroupedCtgItems(url)?.let { grouped ->
+            return loadGrouped(url, grouped)
+        }
+
         val cleanUrl = url.substringBefore("?")
         val (kind, idOrSlug) = when {
             cleanUrl.contains("/anime/") -> "anime" to cleanUrl.substringAfterLast("/")
@@ -132,6 +166,22 @@ class CTGMovies(private val prefs: SharedPreferences? = null) : MainAPI() {
         }
     }
 
+    private suspend fun loadGrouped(url: String, items: List<GroupedCtgItem>): LoadResponse? {
+        val loaded = items.distinctBy { it.kind to it.id }.mapNotNull { item ->
+            val obj = runCatching { JSONObject(apiGet("/${item.kind}/${item.id.encodeUrl()}")) }.getOrNull()
+            obj?.let { ObjWithLabel(it, item.label) }
+        }
+        if (loaded.isEmpty()) return null
+
+        val primaryKind = items.first().kind
+        val primaryUrl = ctgUrlFor(loaded.first().obj, primaryKind) ?: url
+        return when (primaryKind) {
+            "movies" -> loadMovie(primaryUrl, mergeMovieObjects(loaded))
+            "anime" -> loadAnime(primaryUrl, mergeAnimeObjects(loaded))
+            else -> loadTv(primaryUrl, mergeSeriesObjects(loaded))
+        }
+    }
+
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
@@ -148,36 +198,30 @@ class CTGMovies(private val prefs: SharedPreferences? = null) : MainAPI() {
         var found = false
         val seenLinks = linkedSetOf<String>()
         val seenSubs = linkedSetOf<String>()
+        val seenSourceNames = mutableMapOf<String, Int>()
 
         for (i in 0 until links.length()) {
             val link = links.optJSONObject(i) ?: continue
             if (link.optBoolean("broken", false)) continue
 
-            val rawUrl = link.optStringOrNull("url") ?: continue
+            val rawUrl = link.optStringOrNull("url")
+                ?: link.optStringOrNull("file")
+                ?: link.optStringOrNull("src")
+                ?: link.optStringOrNull("link")
+                ?: continue
             val finalUrl = resolveMediaUrl(rawUrl)
             if (finalUrl.isBlank() || !seenLinks.add(finalUrl)) continue
 
-            link.optJSONArray("subtitle_tracks")?.let { subs ->
-                for (s in 0 until subs.length()) {
-                    val sub = subs.optJSONObject(s) ?: continue
-                    val subUrl = resolveSubtitleUrl(sub.optStringOrNull("url") ?: continue)
-                    if (subUrl.isBlank() || !seenSubs.add(subUrl)) continue
-                    val label = sub.optStringOrNull("label")
-                        ?: sub.optStringOrNull("language")
-                        ?: "Subtitle"
-                    subtitleCallback(newSubtitleFile(label, subUrl))
-                }
-            }
+            collectSubtitleTracks(link, finalUrl, seenSubs, subtitleCallback)
 
-            val qualityName = link.optStringOrNull("quality") ?: qualityFromUrl(finalUrl)
-            val sourceName = buildString {
-                append(name)
-                link.optStringOrNull("source_display")?.let { append(" - ").append(it.cleanSourceName()) }
-                    ?: link.optStringOrNull("source")?.let { append(" - ").append(it.cleanSourceName()) }
-                qualityName?.let { append(" [$it]") }
-            }
+            val baseSourceName = buildShortSourceName(link, finalUrl, i + 1)
+            val sourceCount = (seenSourceNames[baseSourceName] ?: 0) + 1
+            seenSourceNames[baseSourceName] = sourceCount
+            val sourceName = if (sourceCount > 1) "$baseSourceName #$sourceCount" else baseSourceName
+            val qualityHint = link.optStringOrNull("quality") ?: sourceName
 
             if (finalUrl.contains(".m3u8", ignoreCase = true)) {
+                collectM3u8Subtitles(finalUrl, mainUrl, seenSubs, subtitleCallback)
                 M3u8Helper.generateM3u8(
                     source = sourceName,
                     streamUrl = finalUrl,
@@ -188,18 +232,17 @@ class CTGMovies(private val prefs: SharedPreferences? = null) : MainAPI() {
             } else if (isDirectVideo(finalUrl)) {
                 callback(
                     newExtractorLink(
-                        source = name,
-                        name = sourceName,
+                        source = sourceName,
+                        name = "$sourceName - Direct",
                         url = finalUrl,
                         type = ExtractorLinkType.VIDEO,
                     ) {
                         referer = mainUrl
-                        quality = getQualityFromName(qualityName ?: finalUrl)
+                        quality = getQualityFromName(qualityHint)
                     }
                 )
                 found = true
             } else {
-                // Some future CTG sources may be embeds instead of direct files.
                 val before = found
                 runCatching {
                     loadExtractor(finalUrl, mainUrl, subtitleCallback) { extractorLink ->
@@ -208,17 +251,15 @@ class CTGMovies(private val prefs: SharedPreferences? = null) : MainAPI() {
                     }
                 }
                 if (!found && !before && finalUrl.startsWith("http")) {
-                    // Last-resort download/folder link. Cloudstream may not play folders,
-                    // but exposing it is still useful for clients with external handling.
                     callback(
                         newExtractorLink(
-                            source = name,
-                            name = sourceName,
+                            source = sourceName,
+                            name = "$sourceName - Link",
                             url = finalUrl,
                             type = INFER_TYPE,
                         ) {
                             referer = mainUrl
-                            quality = getQualityFromName(qualityName ?: finalUrl)
+                            quality = getQualityFromName(qualityHint)
                         }
                     )
                     found = true
@@ -245,9 +286,16 @@ class CTGMovies(private val prefs: SharedPreferences? = null) : MainAPI() {
         val imdbId: String? = null,
         val simklId: Int? = null,
         val actors: List<ActorData>? = null,
+        val episodes: List<TmdbEpisodeMeta> = emptyList(),
+        val episodesBySeason: Map<Int, List<TmdbEpisodeMeta>> = emptyMap(),
     )
 
-    private suspend fun fetchTmdbMeta(obj: JSONObject, mediaType: String, fallbackTitle: String?): TmdbMeta {
+    private suspend fun fetchTmdbMeta(
+        obj: JSONObject,
+        mediaType: String,
+        fallbackTitle: String?,
+        seasonHints: Set<Int> = emptySet(),
+    ): TmdbMeta {
         val tmdbId = obj.optIntOrNull("tmdb_id") ?: findTmdbId(mediaType, fallbackTitle, obj)
         if (tmdbId == null) return TmdbMeta(
             imdbId = obj.optStringOrNull("imdb_id"),
@@ -289,6 +337,15 @@ class CTGMovies(private val prefs: SharedPreferences? = null) : MainAPI() {
             ?: detail.optStringOrNull("imdb_id")
             ?: obj.optStringOrNull("imdb_id")
         val simklId = fetchSimklId(imdbId, mediaType)
+        val targetSeasons = seasonHints.takeIf { it.isNotEmpty() } ?: setOf(1)
+        val episodesBySeason = if (mediaType == "tv") {
+            val map = linkedMapOf<Int, List<TmdbEpisodeMeta>>()
+            for (season in targetSeasons) {
+                map[season] = fetchTmdbSeasonEpisodes(tmdbId, season)
+            }
+            map
+        } else emptyMap()
+        val episodes = episodesBySeason[targetSeasons.firstOrNull() ?: 1] ?: emptyList()
 
         return TmdbMeta(
             title = title,
@@ -304,7 +361,23 @@ class CTGMovies(private val prefs: SharedPreferences? = null) : MainAPI() {
             imdbId = imdbId,
             simklId = simklId,
             actors = actors,
+            episodes = episodes,
+            episodesBySeason = episodesBySeason,
         )
+    }
+
+    private suspend fun fetchTmdbSeasonEpisodes(tmdbId: Int, season: Int): List<TmdbEpisodeMeta> {
+        val root = tmdbJson("/tv/$tmdbId/season/$season") ?: return emptyList()
+        val arr = root.optJSONArray("episodes") ?: return emptyList()
+        return (0 until arr.length()).mapNotNull { i ->
+            val ep = arr.optJSONObject(i) ?: return@mapNotNull null
+            TmdbEpisodeMeta(
+                name = ep.optStringOrNull("name"),
+                overview = ep.optStringOrNull("overview"),
+                stillUrl = ep.optStringOrNull("still_path")?.let { tmdbImg("w300", it) },
+                rating = ep.optDoubleOrNull("vote_average"),
+            )
+        }
     }
 
     private suspend fun findTmdbId(mediaType: String, title: String?, obj: JSONObject): Int? {
@@ -418,9 +491,11 @@ class CTGMovies(private val prefs: SharedPreferences? = null) : MainAPI() {
 
     private suspend fun loadTv(pageUrl: String, obj: JSONObject): LoadResponse {
         val baseTitle = obj.optStringOrNull("name") ?: obj.optStringOrNull("title") ?: "Untitled"
-        val meta = fetchTmdbMeta(obj, "tv", baseTitle)
+        val rawEpisodes = obj.optJSONArray("episodes")
+        val seasonSet = seasonHints(rawEpisodes)
+        val meta = fetchTmdbMeta(obj, "tv", baseTitle, seasonSet)
         val title = baseTitle
-        val episodes = parseEpisodes(obj.optJSONArray("episodes"), anime = false)
+        val episodes = parseEpisodes(rawEpisodes, anime = false, tmdbEpisodesBySeason = meta.episodesBySeason)
         return newTvSeriesLoadResponse(title, pageUrl, TvType.TvSeries, episodes) {
             posterUrl = obj.optStringOrNull("poster_url") ?: obj.optStringOrNull("cover_url")
             backgroundPosterUrl = meta.backdropUrl ?: obj.optStringOrNull("backdrop_url") ?: obj.optStringOrNull("banner_url")
@@ -440,9 +515,11 @@ class CTGMovies(private val prefs: SharedPreferences? = null) : MainAPI() {
             ?: obj.optStringOrNull("name")
             ?: obj.optStringOrNull("english_title")
             ?: "Untitled"
-        val episodes = parseEpisodes(obj.optJSONArray("episodes"), anime = true)
-        val tvType = if (episodes.isEmpty()) TvType.AnimeMovie else TvType.Anime
-        val meta = fetchTmdbMeta(obj, if (tvType == TvType.AnimeMovie) "movie" else "tv", baseTitle)
+        val rawEpisodes = obj.optJSONArray("episodes")
+        val seasonSet = seasonHints(rawEpisodes)
+        val tvType = if (rawEpisodes == null || rawEpisodes.length() == 0) TvType.AnimeMovie else TvType.Anime
+        val meta = fetchTmdbMeta(obj, if (tvType == TvType.AnimeMovie) "movie" else "tv", baseTitle, seasonSet)
+        val episodes = parseEpisodes(rawEpisodes, anime = true, tmdbEpisodesBySeason = meta.episodesBySeason)
         val title = baseTitle
 
         return if (tvType == TvType.AnimeMovie) {
@@ -481,14 +558,30 @@ class CTGMovies(private val prefs: SharedPreferences? = null) : MainAPI() {
         }
     }
 
-    private fun parseEpisodes(array: JSONArray?, anime: Boolean): List<Episode> {
+    private fun parseEpisodes(
+        array: JSONArray?,
+        anime: Boolean,
+        tmdbEpisodesBySeason: Map<Int, List<TmdbEpisodeMeta>> = emptyMap(),
+    ): List<Episode> {
         if (array == null) return emptyList()
-        val out = mutableListOf<Episode>()
+        val grouped = linkedMapOf<Pair<Int, Int>, JSONObject>()
+
         for (i in 0 until array.length()) {
             val ep = array.optJSONObject(i) ?: continue
             val epNum = ep.optIntOrNull("episode_number") ?: ep.optIntOrNull("absolute_number") ?: (i + 1)
             val seasonNum = ep.optIntOrNull("season_number") ?: 1
-            val epTitle = ep.optStringOrNull("name")
+            val key = seasonNum to epNum
+            val target = grouped.getOrPut(key) { JSONObject(ep.toString()).put("links", JSONArray()) }
+            appendJsonArray(target.optJSONArray("links") ?: JSONArray().also { target.put("links", it) }, ep.optJSONArray("links"))
+        }
+
+        val out = mutableListOf<Episode>()
+        grouped.forEach { (key, ep) ->
+            val seasonNum = key.first
+            val epNum = key.second
+            val tmdbEp = tmdbEpisodesBySeason[seasonNum]?.getOrNull(epNum - 1)
+            val epTitle = tmdbEp?.name?.takeIf { it.isNotBlank() }
+                ?: ep.optStringOrNull("name")
                 ?: ep.optStringOrNull("title")
                 ?: "Episode $epNum"
             val epData = JSONObject()
@@ -504,33 +597,67 @@ class CTGMovies(private val prefs: SharedPreferences? = null) : MainAPI() {
                 name = epTitle
                 season = seasonNum
                 episode = epNum
-                posterUrl = ep.optStringOrNull("still_url") ?: ep.optStringOrNull("thumbnail_url")
-                description = ep.optStringOrNull("overview") ?: ep.optStringOrNull("description")
+                posterUrl = tmdbEp?.stillUrl ?: ep.optStringOrNull("still_url") ?: ep.optStringOrNull("thumbnail_url")
+                description = tmdbEp?.overview?.takeIf { it.isNotBlank() }
+                    ?: ep.optStringOrNull("overview")
+                    ?: ep.optStringOrNull("description")
                 runTime = ep.optIntOrNull("runtime")
+                runCatching { tmdbEp?.rating?.let { score = Score.from10(it) } }
             }
         }
-        return out.distinctBy { (it.season ?: 1) to (it.episode ?: 0) to it.data }
-            .sortedWith(compareBy({ it.season ?: 1 }, { it.episode ?: 0 }))
+        return out.sortedWith(compareBy({ it.season ?: 1 }, { it.episode ?: 0 }))
     }
 
     // ───────────────────────────── Search/listing ────────────────────────────
 
-    private fun parseList(raw: String, kind: String): List<SearchResponse> {
+    private fun parseList(raw: String, kind: String): List<SearchResponse> =
+        groupSearchItems(parseSearchItems(raw, kind))
+
+    private fun parseSearchItems(raw: String, kind: String): List<CtgSearchItem> {
         val trimmed = raw.trim()
         val array = when {
             trimmed.startsWith("[") -> JSONArray(trimmed)
-            else -> JSONObject(trimmed).optJSONArray("movies") ?: JSONArray()
+            else -> JSONObject(trimmed).optJSONArray("movies")
+                ?: JSONObject(trimmed).optJSONArray("results")
+                ?: JSONObject(trimmed).optJSONArray("data")
+                ?: JSONArray()
         }
 
-        val out = mutableListOf<SearchResponse>()
+        val out = mutableListOf<CtgSearchItem>()
         for (i in 0 until array.length()) {
             val obj = array.optJSONObject(i) ?: continue
-            toSearchResponse(obj, kind)?.let(out::add)
+            toSearchItem(obj, kind)?.let(out::add)
         }
-        return out.distinctBy { it.url }
+        return out.distinctBy { it.kind to it.id }
     }
 
-    private fun toSearchResponse(obj: JSONObject, kind: String): SearchResponse? {
+    private fun groupSearchItems(items: List<CtgSearchItem>): List<SearchResponse> =
+        items.groupBy { item ->
+            val titleKey = item.title.cleanDisplayTitle().normalizedTitle()
+            val year = item.year
+            // Same rule as Cineplex: only merge when BOTH normalized name and
+            // year are common. Missing year keeps the item separate.
+            if (year != null) "$titleKey|$year|${item.type}" else "$titleKey|${item.kind}|${item.id}|${item.type}"
+        }.values.mapNotNull { group ->
+            val first = group.firstOrNull() ?: return@mapNotNull null
+            val groupUrl = if (group.size > 1) encodeGroupedCtgItems(group) else first.url
+            when (first.type) {
+                TvType.Movie -> newMovieSearchResponse(first.title, groupUrl, TvType.Movie) {
+                    posterUrl = first.poster
+                    year = first.year
+                }
+                TvType.Anime, TvType.AnimeMovie -> newAnimeSearchResponse(first.title, groupUrl, TvType.Anime) {
+                    posterUrl = first.poster
+                    year = first.year
+                }
+                else -> newTvSeriesSearchResponse(first.title, groupUrl, TvType.TvSeries) {
+                    posterUrl = first.poster
+                    year = first.year
+                }
+            }
+        }
+
+    private fun toSearchItem(obj: JSONObject, kind: String): CtgSearchItem? {
         val isMovie = kind == "movies"
         val isAnime = kind == "anime" || obj.optBoolean("is_anime", false) && kind != "tv"
         val title = obj.optStringOrNull("title")
@@ -543,21 +670,109 @@ class CTGMovies(private val prefs: SharedPreferences? = null) : MainAPI() {
         val year = obj.optIntOrNull("year")
             ?: yearFromDate(obj.optStringOrNull("release_date"))
             ?: yearFromDate(obj.optStringOrNull("first_air_date"))
+        val type = when {
+            isMovie -> TvType.Movie
+            isAnime -> TvType.Anime
+            else -> TvType.TvSeries
+        }
+        val url = when {
+            isMovie -> "$mainUrl/movies/$id"
+            isAnime -> "$mainUrl/anime/$id"
+            else -> "$mainUrl/tv/$id"
+        }
+        return CtgSearchItem(
+            title = title.cleanDisplayTitle(),
+            url = url,
+            kind = kind,
+            id = id,
+            type = type,
+            poster = poster,
+            year = year,
+            sourceLabel = buildQualityInitials(
+                obj.optStringOrNull("quality"),
+                obj.optStringOrNull("source"),
+                obj.optStringOrNull("source_display"),
+                title,
+            ),
+        )
+    }
 
-        return when {
-            isMovie -> newMovieSearchResponse(title, "$mainUrl/movies/$id", TvType.Movie) {
-                posterUrl = poster
-                this.year = year
+    private fun encodeGroupedCtgItems(items: List<CtgSearchItem>): String {
+        val arr = JSONArray()
+        val seenLabels = mutableMapOf<String, Int>()
+        items.distinctBy { it.kind to it.id }.forEachIndexed { index, item ->
+            val baseLabel = item.sourceLabel ?: "Source ${index + 1}"
+            val count = (seenLabels[baseLabel] ?: 0) + 1
+            seenLabels[baseLabel] = count
+            val label = if (count > 1) "$baseLabel #$count" else baseLabel
+            arr.put(JSONObject().apply {
+                put("kind", item.kind)
+                put("id", item.id)
+                put("label", label)
+            })
+        }
+        val encoded = Base64.getUrlEncoder().withoutPadding().encodeToString(arr.toString().toByteArray())
+        return "load?data=$encoded"
+    }
+
+    private fun decodeGroupedCtgItems(url: String): List<GroupedCtgItem>? = runCatching {
+        if (!url.contains("load?data=")) return@runCatching null
+        val encoded = url.substringAfter("load?data=").substringBefore("&")
+        val arr = JSONArray(String(Base64.getUrlDecoder().decode(encoded)))
+        (0 until arr.length()).mapNotNull { i ->
+            val obj = arr.optJSONObject(i) ?: return@mapNotNull null
+            val kind = obj.optStringOrNull("kind") ?: return@mapNotNull null
+            val id = obj.optStringOrNull("id") ?: return@mapNotNull null
+            GroupedCtgItem(kind, id, obj.optStringOrNull("label"))
+        }.takeIf { it.isNotEmpty() }
+    }.getOrNull()
+
+    private fun mergeMovieObjects(items: List<ObjWithLabel>): JSONObject {
+        val merged = JSONObject(items.first().obj.toString())
+        val links = JSONArray()
+        items.forEach { item ->
+            appendJsonArray(links, item.obj.optJSONArray("links"), item.label)
+        }
+        merged.put("links", links)
+        return merged
+    }
+
+    private fun mergeAnimeObjects(items: List<ObjWithLabel>): JSONObject {
+        val merged = JSONObject(items.first().obj.toString())
+        val links = JSONArray()
+        val episodes = JSONArray()
+        items.forEach { item ->
+            appendJsonArray(links, item.obj.optJSONArray("links"), item.label)
+            appendJsonArray(episodes, item.obj.optJSONArray("episodes"), item.label)
+        }
+        if (links.length() > 0) merged.put("links", links)
+        if (episodes.length() > 0) merged.put("episodes", episodes)
+        return merged
+    }
+
+    private fun mergeSeriesObjects(items: List<ObjWithLabel>): JSONObject {
+        val merged = JSONObject(items.first().obj.toString())
+        val episodes = JSONArray()
+        items.forEach { item -> appendJsonArray(episodes, item.obj.optJSONArray("episodes"), item.label) }
+        merged.put("episodes", episodes)
+        return merged
+    }
+
+    private fun appendJsonArray(target: JSONArray, source: JSONArray?, label: String? = null) {
+        if (source == null) return
+        for (i in 0 until source.length()) {
+            val raw = source.opt(i)
+            if (raw !is JSONObject) continue
+            val obj = JSONObject(raw.toString())
+            label?.takeIf { it.isNotBlank() }?.let { sourceLabel ->
+                obj.put("group_source", sourceLabel)
+                obj.optJSONArray("links")?.let { links ->
+                    for (j in 0 until links.length()) {
+                        links.optJSONObject(j)?.put("group_source", sourceLabel)
+                    }
+                }
             }
-            isAnime -> newAnimeSearchResponse(title, "$mainUrl/anime/$id", TvType.Anime) {
-                posterUrl = poster
-                this.year = year
-                runCatching { obj.optDoubleOrNull("rating")?.let { score = Score.from10(it) } }
-            }
-            else -> newTvSeriesSearchResponse(title, "$mainUrl/tv/$id", TvType.TvSeries) {
-                posterUrl = poster
-                this.year = year
-            }
+            target.put(obj)
         }
     }
 
@@ -672,6 +887,150 @@ class CTGMovies(private val prefs: SharedPreferences? = null) : MainAPI() {
     )
 
     // ───────────────────────────── Helpers ───────────────────────────────────
+
+    private suspend fun collectSubtitleTracks(
+        link: JSONObject,
+        finalUrl: String,
+        seenSubs: MutableSet<String>,
+        subtitleCallback: (SubtitleFile) -> Unit,
+    ) {
+        listOf("subtitle_tracks", "subtitles", "captions", "tracks").forEach { key ->
+            val subs = link.optJSONArray(key) ?: return@forEach
+            for (s in 0 until subs.length()) {
+                val sub = subs.optJSONObject(s) ?: continue
+                val rawSubUrl = sub.optStringOrNull("url")
+                    ?: sub.optStringOrNull("file")
+                    ?: sub.optStringOrNull("src")
+                    ?: continue
+                val subUrl = resolveSubtitleUrl(rawSubUrl)
+                if (subUrl.isBlank() || !seenSubs.add(subUrl)) continue
+                val label = sub.optStringOrNull("label")
+                    ?: sub.optStringOrNull("language")
+                    ?: subtitleLabelFromUrl(subUrl)
+                subtitleCallback(newSubtitleFile(label, subUrl))
+            }
+        }
+
+        if (finalUrl.contains(".vtt", true) || finalUrl.contains(".srt", true) || finalUrl.contains(".ass", true)) {
+            val subUrl = resolveSubtitleUrl(finalUrl)
+            if (subUrl.isNotBlank() && seenSubs.add(subUrl)) {
+                subtitleCallback(newSubtitleFile(subtitleLabelFromUrl(subUrl), subUrl))
+            }
+        }
+    }
+
+    private suspend fun collectM3u8Subtitles(
+        manifestUrl: String,
+        referer: String,
+        seenSubs: MutableSet<String>,
+        subtitleCallback: (SubtitleFile) -> Unit,
+    ) {
+        val manifestHeaders = directHeaders(manifestUrl) + ("Referer" to referer)
+        val manifest = runCatching { app.get(manifestUrl, headers = manifestHeaders).text }.getOrNull() ?: return
+        Regex("""#EXT-X-MEDIA:([^\r\n]+)""", RegexOption.IGNORE_CASE)
+            .findAll(manifest)
+            .forEach { match ->
+                val attrs = match.groupValues[1]
+                if (!attrs.contains("TYPE=SUBTITLES", ignoreCase = true)) return@forEach
+                val rawUri = parseM3u8Attribute(attrs, "URI") ?: return@forEach
+                val subUrl = resolveRelativeUrl(rawUri, manifestUrl)
+                if (subUrl.isBlank() || !seenSubs.add(subUrl)) return@forEach
+                val label = parseM3u8Attribute(attrs, "NAME")
+                    ?: parseM3u8Attribute(attrs, "LANGUAGE")
+                    ?: subtitleLabelFromUrl(subUrl)
+                subtitleCallback(newSubtitleFile(label, subUrl))
+            }
+    }
+
+    private fun parseM3u8Attribute(attrs: String, key: String): String? =
+        Regex("""$key=(?:"([^"]*)"|([^,]*))""", RegexOption.IGNORE_CASE)
+            .find(attrs)
+            ?.let { match ->
+                match.groupValues.getOrNull(1)?.takeIf { it.isNotBlank() }
+                    ?: match.groupValues.getOrNull(2)
+            }
+            ?.trim()
+            ?.takeIf { it.isNotBlank() }
+
+    private fun buildShortSourceName(link: JSONObject, finalUrl: String, index: Int): String {
+        val actualQuality = buildQualityInitials(
+            link.optStringOrNull("quality"),
+            link.optStringOrNull("source_display"),
+            link.optStringOrNull("source"),
+            finalUrl,
+        )
+        val groupLabel = link.optStringOrNull("group_source")?.takeUnless { it.startsWith("Source ", true) }
+        val label = actualQuality
+            ?: groupLabel
+            ?: link.optStringOrNull("source_display")?.cleanSourceName()?.take(18)
+            ?: link.optStringOrNull("source")?.cleanSourceName()?.take(18)
+            ?: "Source $index"
+        return "$name • ${label.cleanSourceName()}"
+    }
+
+    private fun buildQualityInitials(vararg hints: String?): String? {
+        val raw = hints.filterNotNull().joinToString(" ")
+            .replace("%20", " ")
+            .replace("_", " ")
+            .replace("-", " ")
+        if (raw.isBlank()) return null
+        fun has(pattern: String): Boolean = Regex(pattern, RegexOption.IGNORE_CASE).containsMatchIn(raw)
+        val parts = linkedSetOf<String>()
+        if (has("\\b3d\\b")) parts += "3D"
+        if (has("\\b(?:4k|2160p|uhd)\\b")) {
+            parts += "4K"
+        } else {
+            Regex("(?i)\\b(1080|720|576|540|480|360)p\\b")
+                .findAll(raw)
+                .mapNotNull { it.groupValues[1].toIntOrNull() }
+                .maxOrNull()
+                ?.let { parts += "${it}p" }
+        }
+        if (parts.isEmpty() && has("\\bHD\\b")) parts += "HD"
+        if (parts.isEmpty()) {
+            listOf(
+                "WEB-DL" to "(?i)\\bweb[- ]?dl\\b",
+                "WEBRip" to "(?i)\\bwebrip\\b",
+                "BluRay" to "(?i)\\b(?:bluray|blu ray|brrip)\\b",
+                "HDRip" to "(?i)\\bhdrip\\b",
+                "HEVC" to "(?i)\\b(?:hevc|x265|h265)\\b",
+                "10bit" to "(?i)\\b10[- ]?bit\\b",
+            ).firstOrNull { (_, pattern) -> has(pattern) }?.let { (short, _) -> parts += short }
+        }
+        return parts.joinToString(" ").takeIf { it.isNotBlank() }
+    }
+
+    private fun seasonHints(episodes: JSONArray?): Set<Int> {
+        if (episodes == null) return emptySet()
+        val out = linkedSetOf<Int>()
+        for (i in 0 until episodes.length()) {
+            episodes.optJSONObject(i)?.optIntOrNull("season_number")?.let { if (it > 0) out += it }
+        }
+        return out
+    }
+
+    private fun subtitleLabelFromUrl(url: String): String {
+        val file = url.substringBefore("?").substringAfterLast('/').replace("%20", " ")
+        return when {
+            file.contains("bangla", true) || file.contains("bengali", true) || file.contains("ben", true) -> "Bangla"
+            file.contains("english", true) || file.contains("eng", true) -> "English"
+            file.contains("hindi", true) || file.contains("hin", true) -> "Hindi"
+            else -> "Subtitle"
+        }
+    }
+
+    private fun resolveRelativeUrl(url: String, baseUrl: String): String = when {
+        url.startsWith("//") -> baseUrl.substringBefore("://", "https") + ":$url"
+        url.startsWith("http", true) -> url
+        url.startsWith("/") -> apiOrigin() + url
+        else -> baseUrl.substringBeforeLast("/", apiOrigin()).trimEnd('/') + "/${url.trimStart('/')}"
+    }
+
+    private fun String.cleanDisplayTitle(): String =
+        replace(Regex("(?i)\\b(1080p|720p|480p|2160p|4k|web[- ]?dl|webrip|bluray|hdrip|x264|x265|hevc|10bit|dual[- ]?audio|hindi[- ]?dubbed|dubbed|esub)\\b"), " ")
+            .replace(Regex("\\[[^]]+]"), " ")
+            .replace(Regex("\\s+"), " ")
+            .trim()
 
     private fun LoadResponse.addSyncIds(obj: JSONObject, meta: TmdbMeta) {
         // Simkl matches through IMDb. CTG/TMDB normally provides this id for
