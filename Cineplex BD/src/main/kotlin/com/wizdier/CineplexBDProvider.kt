@@ -1,5 +1,6 @@
 package com.wizdier
 
+import android.util.Base64
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.LoadResponse.Companion.addAniListId
 import com.lagradost.cloudstream3.LoadResponse.Companion.addImdbId
@@ -14,7 +15,6 @@ import org.json.JSONArray
 import org.json.JSONObject
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
-import java.util.Base64
 
 class CineplexBD : MainAPI() {
     override var mainUrl = "http://cineplexbd.net"
@@ -99,9 +99,10 @@ class CineplexBD : MainAPI() {
     // ----------------------------- Load ----------------------------------
 
     override suspend fun load(url: String): LoadResponse? {
-        val groupedUrls = decodeGroupedUrls(url)
-        val primaryUrl = groupedUrls?.firstOrNull() ?: url
-        val allLoadUrls = groupedUrls ?: listOf(primaryUrl)
+        val groupedItems = decodeGroupedItems(url)
+        val primaryItem = groupedItems?.firstOrNull() ?: GroupedLoadItem(url = url, label = null)
+        val allLoadItems = groupedItems ?: listOf(primaryItem)
+        val primaryUrl = primaryItem.url
         val absUrl = if (primaryUrl.startsWith("http")) primaryUrl else mainUrl + primaryUrl
         val doc = app.get(absUrl, headers = cfHeaders).document
 
@@ -172,13 +173,17 @@ class CineplexBD : MainAPI() {
         val seriesType = if (looksLikeAnime || meta.isAnimeHint) TvType.Anime else TvType.TvSeries
 
         return if (!isSeries) {
-            val playerLinks = allLoadUrls.mapNotNull { itemUrl ->
-                val absolute = if (itemUrl.startsWith("http")) itemUrl else mainUrl + itemUrl
+            val playerLinks = allLoadItems.mapNotNull { item ->
+                val absolute = if (item.url.startsWith("http")) item.url else mainUrl + item.url
                 val id = absolute.substringAfter("id=", "").substringBefore("&")
                     .takeIf { it.isNotBlank() && it != absolute }
-                id?.let { "/player.php?id=$it" }
-            }.distinct()
-            val dataUrl = if (playerLinks.size > 1) encodeLinkGroup(playerLinks) else playerLinks.firstOrNull() ?: absUrl
+                id?.let { LinkItem(url = "/player.php?id=$it", label = item.label) }
+            }.distinctBy { it.url }
+            val dataUrl = if (playerLinks.size > 1) {
+                encodeLinkGroupItems(playerLinks)
+            } else {
+                playerLinks.firstOrNull()?.url ?: absUrl
+            }
             newMovieLoadResponse(finalTitle, absUrl, movieType, dataUrl) {
                 this.posterUrl = finalPoster
                 this.backgroundPosterUrl = finalBackdrop
@@ -198,7 +203,7 @@ class CineplexBD : MainAPI() {
                 runCatching { meta.kitsuId?.let { addKitsuId(it) } }
             }
         } else {
-            val episodes = collectEpisodesForGroup(allLoadUrls, absUrl, doc, meta)
+            val episodes = collectEpisodesForGroup(allLoadItems, absUrl, doc, meta)
 
             newTvSeriesLoadResponse(finalTitle, absUrl, seriesType, episodes) {
                 this.posterUrl = finalPoster
@@ -239,19 +244,26 @@ class CineplexBD : MainAPI() {
     //  (5) If literally everything fails, emit a single placeholder episode
     //      that points at the watch URL itself, so the user gets a working
     //      play button instead of the "coming soon" empty state.
+    private data class EpisodeWithLabel(
+        val episode: Episode,
+        val label: String?,
+    )
+
     private suspend fun collectEpisodesForGroup(
-        urls: List<String>,
+        items: List<GroupedLoadItem>,
         primaryAbsUrl: String,
         primaryDoc: Document,
         meta: MetadataEnricher.MetaInfo,
     ): List<Episode> {
-        val all = mutableListOf<Episode>()
-        urls.distinct().forEachIndexed { index, raw ->
-            val abs = if (raw.startsWith("http")) raw else mainUrl + raw
+        val all = mutableListOf<EpisodeWithLabel>()
+        items.distinctBy { it.url }.forEachIndexed { index, item ->
+            val abs = if (item.url.startsWith("http")) item.url else mainUrl + item.url
             val doc = if (index == 0 && abs == primaryAbsUrl) primaryDoc
             else runCatching { app.get(abs, headers = cfHeaders).document }.getOrNull() ?: return@forEachIndexed
             val seriesId = parseSeriesId(abs)
-            all += collectEpisodes(seriesId, abs, doc, meta)
+            collectEpisodes(seriesId, abs, doc, meta).forEach { ep ->
+                all += EpisodeWithLabel(ep, item.label)
+            }
         }
         if (all.isEmpty()) return listOf(
             newEpisode(primaryAbsUrl) {
@@ -261,17 +273,18 @@ class CineplexBD : MainAPI() {
             }
         )
 
-        return all.groupBy { (it.season ?: 1) to (it.episode ?: 1) }
+        return all.groupBy { (it.episode.season ?: 1) to (it.episode.episode ?: 1) }
             .map { (key, eps) ->
-                val first = eps.first()
-                val data = if (eps.size > 1) encodeLinkGroup(eps.map { it.data }) else first.data
+                val first = eps.first().episode
+                val linkItems = eps.map { LinkItem(url = it.episode.data, label = it.label) }
+                    .distinctBy { it.url }
+                val data = if (linkItems.size > 1) encodeLinkGroupItems(linkItems) else first.data
                 newEpisode(data) {
                     name = first.name
                     season = key.first
                     episode = key.second
                     posterUrl = first.posterUrl
                     description = first.description
-
                 }
             }
             .sortedWith(compareBy({ it.season ?: 1 }, { it.episode ?: 1 }))
@@ -454,11 +467,20 @@ class CineplexBD : MainAPI() {
         isCasting: Boolean,
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
+    ): Boolean = loadLinksWithLabel(data, null, isCasting, subtitleCallback, callback)
+
+    private suspend fun loadLinksWithLabel(
+        data: String,
+        label: String?,
+        isCasting: Boolean,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit
     ): Boolean {
         decodeLinkGroup(data)?.let { links ->
             var any = false
-            links.distinct().forEach { link ->
-                if (loadLinks(link, isCasting, subtitleCallback, callback)) any = true
+            links.distinctBy { it.url }.forEach { link ->
+                val mergedLabel = link.label ?: label
+                if (loadLinksWithLabel(link.url, mergedLabel, isCasting, subtitleCallback, callback)) any = true
             }
             return any
         }
@@ -469,16 +491,26 @@ class CineplexBD : MainAPI() {
             else -> "$mainUrl/$data"
         }
 
-        if (url.contains(".m3u8", true) || url.endsWith(".mp4", true) || url.endsWith(".mkv", true) || url.contains("/Data/")) {
+        val explicitSourceName = buildStreamSourceName(label, url)
+        if (url.contains(".m3u8", true)) {
+            M3u8Helper.generateM3u8(
+                source = explicitSourceName,
+                streamUrl = url,
+                referer = "$mainUrl/",
+                headers = cfHeaders
+            ).forEach(callback)
+            return true
+        }
+        if (url.endsWith(".mp4", true) || url.endsWith(".mkv", true) || url.contains("/Data/")) {
             callback.invoke(
                 newExtractorLink(
-                    source = name,
-                    name = "Direct",
+                    source = explicitSourceName,
+                    name = "$explicitSourceName - Direct",
                     url = url,
-                    type = if (url.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO,
+                    type = ExtractorLinkType.VIDEO,
                 ) {
                     this.referer = "$mainUrl/"
-                    this.quality = Qualities.Unknown.value
+                    this.quality = getQualityFromName(url)
                 }
             )
             return true
@@ -506,10 +538,11 @@ class CineplexBD : MainAPI() {
             .filter { it.isNotBlank() }
             .distinct()
             .forEach { finalUrl ->
+                val sourceName = buildStreamSourceName(label, finalUrl, html, url)
                 when {
                     finalUrl.contains(".m3u8", ignoreCase = true) -> {
                         M3u8Helper.generateM3u8(
-                            source = name,
+                            source = sourceName,
                             streamUrl = finalUrl,
                             referer = url,
                             headers = cfHeaders
@@ -519,8 +552,8 @@ class CineplexBD : MainAPI() {
                     finalUrl.isDirectVideoUrl() || finalUrl.contains("/Data/", ignoreCase = true) -> {
                         callback.invoke(
                             newExtractorLink(
-                                source = name,
-                                name = "$name - Direct",
+                                source = sourceName,
+                                name = "$sourceName - Direct",
                                 url = finalUrl,
                                 type = ExtractorLinkType.VIDEO,
                             ) {
@@ -583,6 +616,17 @@ class CineplexBD : MainAPI() {
         val type: TvType,
         val poster: String?,
         val year: Int?,
+        val sourceLabel: String?,
+    )
+
+    private data class GroupedLoadItem(
+        val url: String,
+        val label: String?,
+    )
+
+    private data class LinkItem(
+        val url: String,
+        val label: String? = null,
     )
 
     private fun parseAndGroupSearchItems(doc: Document): List<SearchResponse> {
@@ -600,7 +644,7 @@ class CineplexBD : MainAPI() {
             if (year != null) "$normalized|$year|${item.type}" else "$normalized|${item.url}|${item.type}"
         }.values.mapNotNull { group ->
             val first = group.firstOrNull() ?: return@mapNotNull null
-            val groupUrl = if (group.size > 1) encodeGroupedUrls(group.map { it.url }) else first.url
+            val groupUrl = if (group.size > 1) encodeGroupedItems(group) else first.url
             if (first.type == TvType.TvSeries) {
                 newTvSeriesSearchResponse(first.title, groupUrl, TvType.TvSeries) {
                     posterUrl = first.poster
@@ -658,8 +702,10 @@ class CineplexBD : MainAPI() {
             else -> TvType.Movie
         }
 
+        val cardText = text() + " " + title + " " + href
         val year = Regex("(?<!\\d)(?:19|20)\\d{2}(?!\\d)")
-            .find(text() + " " + href)?.value?.toIntOrNull()
+            .find(cardText)?.value?.toIntOrNull()
+        val sourceLabel = buildSourceLabel(cardText)
 
         return SearchItem(
             title = title.cleanDisplayTitle(),
@@ -667,36 +713,145 @@ class CineplexBD : MainAPI() {
             type = type,
             poster = poster,
             year = year,
+            sourceLabel = sourceLabel,
         )
     }
 
-    private fun encodeGroupedUrls(urls: List<String>): String {
+    private fun encodeGroupedItems(items: List<SearchItem>): String {
         val arr = JSONArray()
-        urls.distinct().forEach(arr::put)
-        val encoded = Base64.getUrlEncoder().encodeToString(arr.toString().toByteArray())
-        return "cineplexbd://group?data=$encoded"
+        val seenLabels = mutableMapOf<String, Int>()
+        items.distinctBy { it.url }.forEachIndexed { index, item ->
+            val baseLabel = item.sourceLabel ?: buildSourceLabel(item.url) ?: "Source ${index + 1}"
+            val seen = (seenLabels[baseLabel] ?: 0) + 1
+            seenLabels[baseLabel] = seen
+            val label = if (seen > 1) "$baseLabel #$seen" else baseLabel
+            arr.put(JSONObject().apply {
+                put("url", item.url)
+                put("label", label)
+            })
+        }
+        val encoded = Base64.encodeToString(arr.toString().toByteArray(), Base64.URL_SAFE or Base64.NO_WRAP)
+        return "load?data=$encoded"
     }
 
-    private fun decodeGroupedUrls(url: String): List<String>? = runCatching {
-        if (!url.startsWith("cineplexbd://group?data=")) return@runCatching null
-        val data = url.substringAfter("cineplexbd://group?data=")
-        val arr = JSONArray(String(Base64.getUrlDecoder().decode(data)))
-        (0 until arr.length()).mapNotNull { arr.optString(it).takeIf { s -> s.isNotBlank() } }
+    private fun decodeGroupedItems(url: String): List<GroupedLoadItem>? = runCatching {
+        if (!url.contains("load?data=")) return@runCatching null
+        val data = url.substringAfter("load?data=").substringBefore("&")
+        val arr = JSONArray(String(Base64.decode(data, Base64.URL_SAFE)))
+        (0 until arr.length()).mapNotNull { i ->
+            val raw = arr.opt(i)
+            when (raw) {
+                is JSONObject -> raw.optStringOrNull("url")?.let { GroupedLoadItem(it, raw.optStringOrNull("label")) }
+                is String -> raw.takeIf { it.isNotBlank() }?.let { GroupedLoadItem(it, null) }
+                else -> null
+            }
+        }.takeIf { it.isNotEmpty() }
     }.getOrNull()
 
-    private fun encodeLinkGroup(links: List<String>): String {
+    private fun encodeLinkGroupItems(links: List<LinkItem>): String {
         val arr = JSONArray()
-        links.distinct().forEach(arr::put)
-        val encoded = Base64.getUrlEncoder().encodeToString(arr.toString().toByteArray())
+        val seenLabels = mutableMapOf<String, Int>()
+        links.distinctBy { it.url }.forEachIndexed { index, link ->
+            val baseLabel = link.label ?: buildSourceLabel(link.url) ?: "Source ${index + 1}"
+            val seen = (seenLabels[baseLabel] ?: 0) + 1
+            seenLabels[baseLabel] = seen
+            val label = if (seen > 1) "$baseLabel #$seen" else baseLabel
+            arr.put(JSONObject().apply {
+                put("url", link.url)
+                put("label", label)
+            })
+        }
+        val encoded = Base64.encodeToString(arr.toString().toByteArray(), Base64.URL_SAFE or Base64.NO_WRAP)
         return "cineplexbd://links?data=$encoded"
     }
 
-    private fun decodeLinkGroup(data: String): List<String>? = runCatching {
+    private fun decodeLinkGroup(data: String): List<LinkItem>? = runCatching {
         if (!data.startsWith("cineplexbd://links?data=")) return@runCatching null
         val encoded = data.substringAfter("cineplexbd://links?data=")
-        val arr = JSONArray(String(Base64.getUrlDecoder().decode(encoded)))
-        (0 until arr.length()).mapNotNull { arr.optString(it).takeIf { s -> s.isNotBlank() } }
+        val arr = JSONArray(String(Base64.decode(encoded, Base64.URL_SAFE)))
+        (0 until arr.length()).mapNotNull { i ->
+            val raw = arr.opt(i)
+            when (raw) {
+                is JSONObject -> raw.optStringOrNull("url")?.let { LinkItem(it, raw.optStringOrNull("label")) }
+                is String -> raw.takeIf { it.isNotBlank() }?.let { LinkItem(it, null) }
+                else -> null
+            }
+        }.takeIf { it.isNotEmpty() }
     }.getOrNull()
+
+    private fun buildStreamSourceName(label: String?, vararg hints: String?): String {
+        val cleanLabel = label?.cleanSourceLabel()?.takeIf { it.isNotBlank() }
+        val derivedLabel = buildSourceLabel(hints.filterNotNull().joinToString(" "))
+        val finalLabel = when {
+            cleanLabel == null -> derivedLabel
+            derivedLabel == null -> cleanLabel
+            cleanLabel.contains(derivedLabel, ignoreCase = true) -> cleanLabel
+            derivedLabel.contains(cleanLabel, ignoreCase = true) -> derivedLabel
+            else -> "$derivedLabel $cleanLabel".cleanSourceLabel()
+        }
+        return finalLabel?.let { "$name • $it" } ?: name
+    }
+
+    private fun buildSourceLabel(vararg hints: String?): String? {
+        val raw = hints.filterNotNull().joinToString(" ")
+            .replace("%20", " ")
+            .replace("_", " ")
+            .replace("-", " ")
+        if (raw.isBlank()) return null
+
+        val parts = linkedSetOf<String>()
+        fun has(pattern: String): Boolean = Regex(pattern, RegexOption.IGNORE_CASE).containsMatchIn(raw)
+
+        if (has("\\b(?:4k|2160p|uhd)\\b")) parts += "4K"
+        if (has("\\b3d\\b")) parts += "3D"
+        Regex("(?i)\\b(1080|720|576|540|480|360)p\\b")
+            .findAll(raw)
+            .map { "${it.groupValues[1]}p" }
+            .forEach(parts::add)
+        if (parts.isEmpty() && has("\\bHD\\b")) parts += "HD"
+
+        val tech = linkedSetOf<String>()
+        listOf(
+            "WEB-DL" to "(?i)\\bweb[- ]?dl\\b",
+            "WEBRip" to "(?i)\\bwebrip\\b",
+            "BluRay" to "(?i)\\b(?:bluray|blu ray|brrip)\\b",
+            "HDRip" to "(?i)\\bhdrip\\b",
+            "HEVC" to "(?i)\\b(?:hevc|x265|h265)\\b",
+            "10bit" to "(?i)\\b10[- ]?bit\\b",
+        ).forEach { (label, pattern) -> if (has(pattern)) tech += label }
+        if (tech.isNotEmpty()) parts += tech.joinToString("/")
+
+        val langs = linkedSetOf<String>()
+        listOf(
+            "Hindi Dubbed" to "(?i)\\bhindi[- /]?dubbed\\b",
+            "Bangla Dubbed" to "(?i)\\b(?:bangla|bengali)[- /]?dubbed\\b",
+            "Dual Audio" to "(?i)\\bdual[- /]?audio\\b",
+            "English" to "(?i)\\benglish\\b",
+            "Hindi" to "(?i)\\bhindi\\b",
+            "Bangla" to "(?i)\\b(?:bangla|bengali)\\b",
+            "Korean" to "(?i)\\bkorean\\b",
+            "Japanese" to "(?i)\\bjapanese\\b",
+            "Chinese" to "(?i)\\bchinese\\b",
+            "Tamil" to "(?i)\\btamil\\b",
+            "Telugu" to "(?i)\\btelugu\\b",
+            "Malayalam" to "(?i)\\bmalayalam\\b",
+            "Kannada" to "(?i)\\bkannada\\b",
+        ).forEach { (lang, pattern) ->
+            if (has(pattern) && !(lang == "Hindi" && langs.contains("Hindi Dubbed")) &&
+                !(lang == "Bangla" && langs.contains("Bangla Dubbed"))) {
+                langs += lang
+            }
+        }
+        if (langs.isNotEmpty()) parts += langs.joinToString("/")
+
+        return parts.joinToString(" ").cleanSourceLabel().takeIf { it.isNotBlank() }
+    }
+
+    private fun String.cleanSourceLabel(): String =
+        replace(Regex("(?i)\\b(?:web series|movies?|series|tv)\\b"), " ")
+            .replace(Regex("\\s*/\\s*"), "/")
+            .replace(Regex("\\s+"), " ")
+            .trim(' ', '/', '-', '•')
 
     private fun String.normalizedTitleKey(): String = cleanDisplayTitle()
         .lowercase()
