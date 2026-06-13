@@ -5,6 +5,7 @@ import android.content.Context
 import android.content.SharedPreferences
 import android.graphics.Color
 import android.graphics.Typeface
+import android.graphics.drawable.ColorDrawable
 import android.graphics.drawable.GradientDrawable
 import android.graphics.drawable.StateListDrawable
 import android.text.InputType
@@ -13,6 +14,8 @@ import android.text.method.PasswordTransformationMethod
 import android.util.TypedValue
 import android.view.Gravity
 import android.view.View
+import android.view.WindowManager
+import android.view.animation.DecelerateInterpolator
 import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ScrollView
@@ -26,189 +29,296 @@ class CTGMoviesPlugin : Plugin() {
     override fun load(context: Context) {
         val prefs = context.getSharedPreferences(CTGMovies.PREF_FILE, Context.MODE_PRIVATE)
         registerMainAPI(CTGMovies(prefs))
-
-        openSettings = { ctx ->
-            CTGSettingsUI.show(ctx, prefs)
-        }
+        openSettings = { ctx -> CTGSettingsUI.show(ctx, prefs) }
     }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  CTGSettingsUI
+//  CTGSettingsUI — CineStream-inspired card-based settings dialog
 //
-//  Renders an elegant dark-themed settings/login dialog using a standard
-//  AlertDialog (no androidx.fragment dependency required — only the Android
-//  framework APIs that are guaranteed on Cloudstream's compile classpath).
-//  All views are built programmatically, no XML resources needed.
+//  Design language borrowed from SaurabhKaperwan/CSX CineStream:
+//    • Hero banner with subtle gradient + accent bar
+//    • Collapsible card sections with accent strips & chevrons
+//    • State-aware row backgrounds (pressed feedback)
+//    • Pill-style buttons with scale animation
+//    • Compact typography, fade-in entrance
+//
+//  Built entirely from framework widgets (no androidx dependency).
 // ═══════════════════════════════════════════════════════════════════════════
 
 object CTGSettingsUI {
 
-    // ── Palette (dark charcoal-grey) ─────────────────────────────────────────
-    private const val C_BG      = 0xFF1A1A1E.toInt()
-    private const val C_CARD    = 0xFF242429.toInt()
-    private const val C_BORDER  = 0xFF383840.toInt()
-    private const val C_ACCENT  = 0xFF3A3A44.toInt()
-    private const val C_ACCENT2 = 0xFF4A4A55.toInt()
-    private const val C_TEXT    = 0xFFD8D8DF.toInt()
-    private const val C_SUB     = 0xFF7A7A85.toInt()
-    private const val C_HINT    = 0xFF4E4E58.toInt()
-    private const val C_RED     = 0xFFE07070.toInt()
+    // ── Palette (deep charcoal with indigo accents) ──────────────────────────
+    private val BG_DARK    = Color.parseColor("#0E1014")
+    private val BG_CARD    = Color.parseColor("#14171E")
+    private val BG_INPUT   = Color.parseColor("#0C0E12")
+    private val BORDER     = Color.parseColor("#252836")
+    private val BORDER_FOC = Color.parseColor("#3A3D5C")
+    private val ACCENT_A   = Color.parseColor("#6C63FF")
+    private val ACCENT_B   = Color.parseColor("#A855F7")
+    private val TEXT_PRI   = Color.parseColor("#EDEFF8")
+    private val TEXT_SEC   = Color.parseColor("#7B82A0")
+    private val DIVIDER    = Color.parseColor("#1C1F2E")
+    private val DANGER     = Color.parseColor("#FF4E6A")
+    private val GREEN      = Color.parseColor("#3DD68C")
 
-    // ── Density helpers ──────────────────────────────────────────────────────
+    // ── dp / sp ──────────────────────────────────────────────────────────────
     private fun dp(ctx: Context, v: Int): Int =
         TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_DIP, v.toFloat(), ctx.resources.displayMetrics).toInt()
 
-    private fun sp(ctx: Context, v: Float): Float =
-        TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_SP, v, ctx.resources.displayMetrics)
-
     // ── Drawables ────────────────────────────────────────────────────────────
-    private fun fill(color: Int, r: Float, stroke: Int? = null, sw: Int = 0) =
+    private fun roundRect(color: Int, radius: Float, stroke: Int? = null, sw: Int = 0) =
         GradientDrawable().apply {
-            shape = GradientDrawable.RECTANGLE
-            setColor(color)
-            cornerRadius = r
+            cornerRadius = radius; setColor(color)
             if (stroke != null) setStroke(sw, stroke)
         }
 
-    private fun gradient(r: Float) =
-        GradientDrawable(
-            GradientDrawable.Orientation.TL_BR,
-            intArrayOf(C_ACCENT, C_ACCENT2)
-        ).apply { cornerRadius = r }
+    private fun accentBar(top: Int, bottom: Int) =
+        GradientDrawable(GradientDrawable.Orientation.TOP_BOTTOM, intArrayOf(top, bottom))
+            .apply { cornerRadius = 99f }
 
-    private fun pressable(normal: GradientDrawable, pressed: GradientDrawable) =
-        StateListDrawable().apply {
-            addState(intArrayOf(android.R.attr.state_pressed), pressed)
-            addState(intArrayOf(), normal)
+    private fun stateBg(): StateListDrawable = StateListDrawable().apply {
+        addState(intArrayOf(android.R.attr.state_pressed), roundRect(Color.parseColor("#1E2130"), 0f))
+        addState(intArrayOf(), ColorDrawable(Color.TRANSPARENT))
+    }
+
+    // ── Animations ───────────────────────────────────────────────────────────
+    private fun fadeInSlide(v: View) {
+        v.alpha = 0f; v.translationY = 16f
+        v.animate().alpha(1f).translationY(0f)
+            .setDuration(280).setInterpolator(DecelerateInterpolator()).start()
+    }
+
+    private fun animateExpand(v: View, expand: Boolean) {
+        if (expand) {
+            v.visibility = View.VISIBLE; v.alpha = 0f
+            v.animate().alpha(1f).setDuration(200).start()
+        } else {
+            v.animate().alpha(0f).setDuration(140)
+                .withEndAction { v.visibility = View.GONE; v.alpha = 1f }.start()
         }
+    }
 
-    // ═════════════════════════════════════════════════════════════════════════
-    //  View factories
-    // ═════════════════════════════════════════════════════════════════════════
-
-    private fun makeHeader(ctx: Context): View {
-        val d3 = dp(ctx, 3); val d4 = dp(ctx, 4); val d14 = dp(ctx, 14)
+    // ── Hero banner ──────────────────────────────────────────────────────────
+    private fun buildHero(ctx: Context): View {
+        val d6 = dp(ctx, 6); val d16 = dp(ctx, 16); val d24 = dp(ctx, 24)
 
         return LinearLayout(ctx).apply {
             orientation = LinearLayout.VERTICAL
-            background = gradient(d14.toFloat())
-            setPadding(d14, dp(ctx, 14), d14, dp(ctx, 13))
-            gravity = Gravity.CENTER
+            setPadding(d24, dp(ctx, 28), d24, dp(ctx, 22))
+            background = GradientDrawable(
+                GradientDrawable.Orientation.TL_BR,
+                intArrayOf(Color.parseColor("#16142B"), BG_DARK)
+            )
 
-            addView(TextView(ctx).apply {
-                text = "🎬"
-                textSize = 20f
-                gravity = Gravity.CENTER
+            // Accent bar
+            addView(View(ctx).apply {
+                layoutParams = LinearLayout.LayoutParams(dp(ctx, 44), dp(ctx, 4)).apply {
+                    bottomMargin = d16
+                }
+                background = GradientDrawable(
+                    GradientDrawable.Orientation.LEFT_RIGHT,
+                    intArrayOf(ACCENT_A, ACCENT_B)
+                ).apply { cornerRadius = 99f }
             })
+            // Title
             addView(TextView(ctx).apply {
-                text = "CTGMovies"
-                setTextColor(Color.WHITE)
-                textSize = sp(ctx, 16f)
-                typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
-                gravity = Gravity.CENTER
-                setPadding(0, d3, 0, 0)
+                text = "CTGMovies"; textSize = 20f
+                setTypeface(null, Typeface.BOLD); setTextColor(TEXT_PRI)
+                letterSpacing = -0.02f
             })
+            // Subtitle
             addView(TextView(ctx).apply {
-                text = "Sign in to unlock protected content"
-                setTextColor(0xFF9A9AA5.toInt())
-                textSize = sp(ctx, 9.5f)
-                gravity = Gravity.CENTER
-                setPadding(0, d3, 0, 0)
+                text = "Configure login credentials & API access"
+                textSize = 12f; setTextColor(TEXT_SEC)
+                setPadding(0, d6, 0, 0)
             })
         }
     }
 
-    private fun makeSection(ctx: Context, label: String): TextView {
-        val d3 = dp(ctx, 3); val d12 = dp(ctx, 12)
-        return TextView(ctx).apply {
-            text = label
-            setTextColor(0xFF9A9AA5.toInt())
-            textSize = sp(ctx, 9.5f)
-            typeface = Typeface.create("sans-serif-medium", Typeface.BOLD)
-            setPadding(d3, d12, d3, d3)
-        }
+    // ── Divider ──────────────────────────────────────────────────────────────
+    private fun divider(ctx: Context) = View(ctx).apply {
+        layoutParams = LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, 1
+        ).apply { setMargins(dp(ctx, 20), 0, dp(ctx, 20), 0) }
+        setBackgroundColor(DIVIDER)
     }
 
-    private fun makeLabel(ctx: Context, label: String): TextView {
-        val d3 = dp(ctx, 3)
-        return TextView(ctx).apply {
-            text = label
-            setTextColor(C_SUB)
-            textSize = sp(ctx, 9.5f)
-            setPadding(d3, 0, d3, d3)
-        }
+    // ── Card container ───────────────────────────────────────────────────────
+    private fun cardContainer(ctx: Context) = LinearLayout(ctx).apply {
+        orientation = LinearLayout.VERTICAL
+        val m = dp(ctx, 16)
+        layoutParams = LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
+        ).apply { setMargins(m, 0, m, dp(ctx, 12)) }
+        background = roundRect(BG_CARD, dp(ctx, 16).toFloat())
     }
 
-    private fun makeInput(
+    // ── Collapsible card ─────────────────────────────────────────────────────
+    private fun buildCard(
         ctx: Context,
-        value: String?,
-        hint: String,
-        isPassword: Boolean = false,
-        isMultiLine: Boolean = false,
-    ): EditText {
-        val d8 = dp(ctx, 8); val d10 = dp(ctx, 10)
-        return EditText(ctx).apply {
-            setText(value.orEmpty())
-            this.hint = hint
-            setHintTextColor(C_HINT)
-            setTextColor(C_TEXT)
-            textSize = sp(ctx, 11.5f)
-            background = fill(C_CARD, dp(ctx, 12).toFloat(), C_BORDER, dp(ctx, 1))
-            setPadding(d10, d8, d10, d8)
-            inputType = when {
-                isPassword -> InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
-                isMultiLine -> InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE
-                else -> InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI
-            }
-            if (isMultiLine) {
-                minLines = 2; maxLines = 5; isSingleLine = false
-            } else {
-                setSingleLine(true)
-            }
-        }
-    }
-
-    private class FieldRow(val container: View, val edit: EditText)
-
-    private fun makeField(
-        ctx: Context,
-        label: String,
-        value: String?,
-        hint: String,
-        isPassword: Boolean = false,
-        isMultiLine: Boolean = false,
-    ): FieldRow {
-        val edit = makeInput(ctx, value, hint, isPassword, isMultiLine)
-        val container = LinearLayout(ctx).apply {
+        title: String,
+        accentA: Int,
+        accentB: Int,
+        startOpen: Boolean = false,
+        buildContent: LinearLayout.() -> Unit,
+    ): View {
+        val card = cardContainer(ctx)
+        var expanded = startOpen
+        val content = LinearLayout(ctx).apply {
             orientation = LinearLayout.VERTICAL
-            addView(makeLabel(ctx, label))
-            if (isPassword) {
-                val row = LinearLayout(ctx).apply { orientation = LinearLayout.HORIZONTAL }
-                row.addView(edit, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
-                val toggle = TextView(ctx).apply {
-                    text = "👁"
-                    textSize = 13f
-                    gravity = Gravity.CENTER
-                    val p = dp(ctx, 8)
-                    setPadding(p, p, p, p)
-                }
-                toggle.setOnClickListener {
-                    val hidden = edit.transformationMethod is PasswordTransformationMethod
-                    edit.transformationMethod = if (hidden)
-                        HideReturnsTransformationMethod.getInstance()
-                    else
-                        PasswordTransformationMethod.getInstance()
-                    toggle.text = if (hidden) "🙈" else "👁"
-                    edit.setSelection(edit.text?.length ?: 0)
-                }
-                row.addView(toggle)
-                addView(row)
-            } else {
-                addView(edit)
-            }
+            setPadding(0, 0, 0, dp(ctx, 8))
+            visibility = if (expanded) View.VISIBLE else View.GONE
         }
-        return FieldRow(container, edit)
+        content.buildContent()
+
+        val chevron = TextView(ctx).apply {
+            text = if (expanded) "▲" else "▼"; textSize = 10f; setTextColor(TEXT_SEC)
+        }
+
+        card.addView(LinearLayout(ctx).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(dp(ctx, 20), dp(ctx, 16), dp(ctx, 16), dp(ctx, 16))
+            gravity = Gravity.CENTER_VERTICAL
+            isClickable = true; isFocusable = true
+            background = stateBg()
+
+            addView(View(ctx).apply {
+                layoutParams = LinearLayout.LayoutParams(dp(ctx, 3), dp(ctx, 18)).apply {
+                    marginEnd = dp(ctx, 12)
+                }
+                background = accentBar(accentA, accentB)
+            })
+            addView(TextView(ctx).apply {
+                this.text = title; textSize = 12f
+                setTypeface(null, Typeface.BOLD); setTextColor(TEXT_SEC)
+                letterSpacing = 0.08f
+                layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+            })
+            addView(chevron)
+
+            setOnClickListener {
+                expanded = !expanded
+                chevron.text = if (expanded) "▲" else "▼"
+                animateExpand(content, expanded)
+            }
+        })
+        card.addView(content)
+        fadeInSlide(card)
+        return card
+    }
+
+    // ── Label ────────────────────────────────────────────────────────────────
+    private fun label(ctx: Context, text: String) = TextView(ctx).apply {
+        this.text = text; textSize = 11f; setTextColor(TEXT_SEC)
+        setPadding(dp(ctx, 20), 0, dp(ctx, 20), dp(ctx, 4))
+    }
+
+    // ── Styled input ─────────────────────────────────────────────────────────
+    private fun input(
+        ctx: Context, value: String?, hint: String,
+        isPassword: Boolean = false, isMultiLine: Boolean = false,
+    ): EditText = EditText(ctx).apply {
+        setText(value.orEmpty())
+        this.hint = hint
+        setHintTextColor(Color.parseColor("#3E4255"))
+        setTextColor(TEXT_PRI)
+        textSize = 13f
+        background = roundRect(BG_INPUT, dp(ctx, 10).toFloat(), BORDER, 1)
+        setPadding(dp(ctx, 14), dp(ctx, 11), dp(ctx, 14), dp(ctx, 11))
+        layoutParams = LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
+        ).apply { setMargins(dp(ctx, 20), 0, dp(ctx, 20), dp(ctx, 12)) }
+        inputType = when {
+            isPassword -> InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
+            isMultiLine -> InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE
+            else -> InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI
+        }
+        if (isMultiLine) { minLines = 2; maxLines = 4; isSingleLine = false }
+        else setSingleLine(true)
+    }
+
+    // ── Field row (label + input, optional password toggle) ──────────────────
+    private class Field(val edit: EditText, val view: View)
+
+    private fun field(
+        ctx: Context, labelText: String, value: String?, hint: String,
+        isPassword: Boolean = false, isMultiLine: Boolean = false,
+    ): Field {
+        val edit = input(ctx, value, hint, isPassword, isMultiLine)
+        if (isPassword) {
+            val toggle = TextView(ctx).apply {
+                text = "👁"; textSize = 14f
+                setPadding(0, 0, dp(ctx, 16), 0)
+                gravity = Gravity.CENTER
+            }
+            toggle.setOnClickListener {
+                val hidden = edit.transformationMethod is PasswordTransformationMethod
+                edit.transformationMethod = if (hidden)
+                    HideReturnsTransformationMethod.getInstance()
+                else PasswordTransformationMethod.getInstance()
+                toggle.text = if (hidden) "🙈" else "👁"
+                edit.setSelection(edit.text?.length ?: 0)
+            }
+            // Replace edit's own margins with a wrapper row
+            edit.layoutParams = LinearLayout.LayoutParams(
+                0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f
+            )
+            val row = LinearLayout(ctx).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                layoutParams = LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
+                ).apply { setMargins(dp(ctx, 20), 0, dp(ctx, 20), dp(ctx, 12)) }
+                addView(edit)
+                addView(toggle)
+            }
+            return Field(edit, row)
+        }
+        return Field(edit, edit)
+    }
+
+    // ── Pill button ──────────────────────────────────────────────────────────
+    private fun pillBtn(
+        ctx: Context, text: String, textColor: Int, bgColor: Int, borderColor: Int,
+        onClick: () -> Unit,
+    ) = TextView(ctx).apply {
+        this.text = text; textSize = 11f
+        setTypeface(null, Typeface.BOLD); setTextColor(textColor)
+        setPadding(dp(ctx, 18), dp(ctx, 10), dp(ctx, 18), dp(ctx, 10))
+        background = roundRect(bgColor, 99f, borderColor, 1)
+        isClickable = true; isFocusable = true
+        setOnClickListener {
+            animate().scaleX(0.88f).scaleY(0.88f).setDuration(60).withEndAction {
+                animate().scaleX(1f).scaleY(1f).setDuration(90).start()
+            }.start()
+            onClick()
+        }
+    }
+
+    // ── Info card ────────────────────────────────────────────────────────────
+    private fun infoCard(ctx: Context): View {
+        return LinearLayout(ctx).apply {
+            orientation = LinearLayout.HORIZONTAL
+            val m = dp(ctx, 16)
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply { setMargins(m, 0, m, dp(ctx, 16)) }
+            background = roundRect(Color.parseColor("#0C1018"), dp(ctx, 12).toFloat(), Color.parseColor("#1A2040"), 1)
+            setPadding(dp(ctx, 16), dp(ctx, 14), dp(ctx, 16), dp(ctx, 14))
+            gravity = Gravity.TOP
+
+            addView(TextView(ctx).apply {
+                text = "💡"; textSize = 13f
+                setPadding(0, 0, dp(ctx, 10), 0)
+            })
+            addView(TextView(ctx).apply {
+                this.text = "Enter email/password for auto-login, paste a ctg.token / Bearer token, or a raw Cookie header. Everything is saved locally only."
+                textSize = 10.5f; setTextColor(TEXT_SEC)
+                setLineSpacing(dp(ctx, 2).toFloat(), 1f)
+                layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+            })
+        }
     }
 
     // ═════════════════════════════════════════════════════════════════════════
@@ -216,74 +326,82 @@ object CTGSettingsUI {
     // ═════════════════════════════════════════════════════════════════════════
 
     fun show(ctx: Context, prefs: SharedPreferences) {
-        val d4 = dp(ctx, 4); val d6 = dp(ctx, 6); val d12 = dp(ctx, 12)
-        val d14 = dp(ctx, 14); val d16 = dp(ctx, 16)
+        val root = LinearLayout(ctx).apply {
+            orientation = LinearLayout.VERTICAL
+            background = ColorDrawable(BG_DARK)
+        }
+
+        // ── Hero ─────────────────────────────────────────────────────────────
+        root.addView(buildHero(ctx))
+        root.addView(View(ctx).apply {
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, dp(ctx, 8)
+            )
+        })
 
         // ── Fields ───────────────────────────────────────────────────────────
-        val fEmail  = makeField(ctx, "Email",    prefs.getString(CTGMovies.PREF_EMAIL, ""), "name@example.com")
-        val fPass   = makeField(ctx, "Password", prefs.getString(CTGMovies.PREF_PASSWORD, ""), "Account password", isPassword = true)
-        val fToken  = makeField(ctx, "Token",    prefs.getString(CTGMovies.PREF_TOKEN, ""), "Bearer token / ctg.token", isMultiLine = true)
-        val fCookie = makeField(ctx, "Cookie",   prefs.getString(CTGMovies.PREF_COOKIE, ""), "Optional raw Cookie header", isMultiLine = true)
-        val fApi    = makeField(ctx, "API Base", prefs.getString(CTGMovies.PREF_API_BASE, CTGMovies.DEFAULT_API_BASE), CTGMovies.DEFAULT_API_BASE)
+        val fEmail  = field(ctx, "Email",    prefs.getString(CTGMovies.PREF_EMAIL, ""), "name@example.com")
+        val fPass   = field(ctx, "Password", prefs.getString(CTGMovies.PREF_PASSWORD, ""), "Account password", isPassword = true)
+        val fToken  = field(ctx, "Token",    prefs.getString(CTGMovies.PREF_TOKEN, ""), "Bearer token / ctg.token", isMultiLine = true)
+        val fCookie = field(ctx, "Cookie",   prefs.getString(CTGMovies.PREF_COOKIE, ""), "Optional raw Cookie header", isMultiLine = true)
+        val fApi    = field(ctx, "API Base", prefs.getString(CTGMovies.PREF_API_BASE, CTGMovies.DEFAULT_API_BASE), CTGMovies.DEFAULT_API_BASE)
 
-        // ── Info note ────────────────────────────────────────────────────────
-        val note = TextView(ctx).apply {
-            text = "💡  Enter email/password for auto-login, paste a ctg.token / Bearer token, or a raw Cookie header. Everything is saved locally in Cloudstream's extension settings only."
-            setTextColor(0xFF6A6A75.toInt())
-            textSize = sp(ctx, 9f)
-            background = fill(0xFF202024.toInt(), dp(ctx, 12).toFloat(), 0xFF333338.toInt(), dp(ctx, 1))
-            setPadding(dp(ctx, 10), dp(ctx, 8), dp(ctx, 10), dp(ctx, 8))
-        }
+        // ── Card: Account Login ──────────────────────────────────────────────
+        root.addView(buildCard(ctx, "🔐  ACCOUNT LOGIN",
+            accentA = Color.parseColor("#6C63FF"), accentB = Color.parseColor("#8B5CF6"),
+            startOpen = true,
+        ) {
+            addView(label(ctx, "Email"))
+            addView(fEmail.view)
+            addView(divider(ctx))
+            addView(label(ctx, "Password"))
+            addView(fPass.view)
+        })
 
-        // ── Build the scrollable form body ───────────────────────────────────
-        val form = LinearLayout(ctx).apply {
-            orientation = LinearLayout.VERTICAL
-            setBackgroundColor(C_BG)
+        // ── Card: Quick Access ───────────────────────────────────────────────
+        root.addView(buildCard(ctx, "🔑  QUICK ACCESS",
+            accentA = Color.parseColor("#A855F7"), accentB = Color.parseColor("#C084FC"),
+        ) {
+            addView(label(ctx, "Token"))
+            addView(fToken.view)
+            addView(divider(ctx))
+            addView(label(ctx, "Cookie"))
+            addView(fCookie.view)
+        })
 
-            addView(makeHeader(ctx), LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
-            ))
+        // ── Card: Advanced ───────────────────────────────────────────────────
+        root.addView(buildCard(ctx, "⚙️  ADVANCED",
+            accentA = Color.parseColor("#38BDF8"), accentB = Color.parseColor("#0EA5E9"),
+        ) {
+            addView(label(ctx, "API Base"))
+            addView(fApi.view)
+        })
 
-            val inner = LinearLayout(ctx).apply {
-                orientation = LinearLayout.VERTICAL
-                setPadding(d14, dp(ctx, 8), d14, dp(ctx, 8))
-
-                addView(makeSection(ctx, "🔐  ACCOUNT"))
-                addView(fEmail.container)
-                addView(fPass.container)
-
-                addView(makeSection(ctx, "🔑  QUICK ACCESS"))
-                addView(fToken.container)
-                addView(fCookie.container)
-
-                addView(makeSection(ctx, "⚙️  ADVANCED"))
-                addView(fApi.container)
-
-                addView(note, LinearLayout.LayoutParams(
-                    LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
-                ).apply { topMargin = d12 })
-            }
-            addView(inner)
-        }
+        // ── Info ─────────────────────────────────────────────────────────────
+        root.addView(infoCard(ctx))
+        root.addView(View(ctx).apply {
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, dp(ctx, 8)
+            )
+        })
 
         val scroll = ScrollView(ctx).apply {
-            setBackgroundColor(C_BG)
-            addView(form)
+            background = ColorDrawable(BG_DARK)
+            addView(root)
         }
 
-        // ── Build the AlertDialog ────────────────────────────────────────────
+        // ── Dialog ───────────────────────────────────────────────────────────
         val dialog = AlertDialog.Builder(ctx)
             .setView(scroll)
-            .setPositiveButton("Save", null)   // null → we intercept below to prevent auto-dismiss on validation
+            .setPositiveButton("Save", null)
             .setNegativeButton("Cancel", null)
             .setNeutralButton("Clear", null)
             .create()
 
         dialog.setOnShowListener {
-            // Style the built-in buttons with our accent colors
             dialog.getButton(AlertDialog.BUTTON_POSITIVE)?.apply {
-                setTextColor(0xFFB0B0C0.toInt())
-                typeface = Typeface.create("sans-serif-medium", Typeface.BOLD)
+                setTextColor(ACCENT_A); isAllCaps = false
+                setTypeface(null, Typeface.BOLD)
                 setOnClickListener {
                     prefs.edit()
                         .putString(CTGMovies.PREF_EMAIL,    fEmail.edit.text?.toString()?.trim().orEmpty())
@@ -296,44 +414,38 @@ object CTGSettingsUI {
                                 ?: CTGMovies.DEFAULT_API_BASE
                         )
                         .apply()
-                    Toast.makeText(ctx, "✓ Settings saved", Toast.LENGTH_SHORT).show()
+                    Toast.makeText(ctx, "✓ Saved", Toast.LENGTH_SHORT).show()
                     dialog.dismiss()
                 }
             }
             dialog.getButton(AlertDialog.BUTTON_NEGATIVE)?.apply {
-                setTextColor(C_SUB)
+                setTextColor(TEXT_SEC); isAllCaps = false
             }
             dialog.getButton(AlertDialog.BUTTON_NEUTRAL)?.apply {
-                setTextColor(C_RED)
+                setTextColor(DANGER); isAllCaps = false
                 setOnClickListener {
                     prefs.edit()
-                        .remove(CTGMovies.PREF_EMAIL)
-                        .remove(CTGMovies.PREF_PASSWORD)
-                        .remove(CTGMovies.PREF_TOKEN)
-                        .remove(CTGMovies.PREF_COOKIE)
+                        .remove(CTGMovies.PREF_EMAIL).remove(CTGMovies.PREF_PASSWORD)
+                        .remove(CTGMovies.PREF_TOKEN).remove(CTGMovies.PREF_COOKIE)
                         .putString(CTGMovies.PREF_API_BASE, CTGMovies.DEFAULT_API_BASE)
                         .apply()
-                    fEmail.edit.setText("")
-                    fPass.edit.setText("")
-                    fToken.edit.setText("")
-                    fCookie.edit.setText("")
+                    fEmail.edit.setText(""); fPass.edit.setText("")
+                    fToken.edit.setText(""); fCookie.edit.setText("")
                     fApi.edit.setText(CTGMovies.DEFAULT_API_BASE)
-                    Toast.makeText(ctx, "Settings cleared", Toast.LENGTH_SHORT).show()
+                    Toast.makeText(ctx, "Cleared", Toast.LENGTH_SHORT).show()
                 }
             }
         }
 
         dialog.show()
-
-        // Apply our dark rounded background to the dialog window
         dialog.window?.apply {
-            setBackgroundDrawable(fill(C_BG, dp(ctx, 24).toFloat()))
-            // Cap the height to 85% of screen so it scrolls cleanly on small devices
-            val dm = ctx.resources.displayMetrics
-            val maxH = (dm.heightPixels * 0.85f).toInt()
-            attributes = attributes.apply {
-                if (height > maxH) height = maxH
-            }
+            setBackgroundDrawable(roundRect(BG_DARK, dp(ctx, 20).toFloat()))
+            setLayout(
+                (ctx.resources.displayMetrics.widthPixels * 0.94).toInt(),
+                WindowManager.LayoutParams.WRAP_CONTENT
+            )
+            val maxH = (ctx.resources.displayMetrics.heightPixels * 0.85f).toInt()
+            attributes = attributes.apply { if (height > maxH) height = maxH }
         }
     }
 }
