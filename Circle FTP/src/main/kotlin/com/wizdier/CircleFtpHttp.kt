@@ -21,8 +21,8 @@ import kotlinx.coroutines.delay
 internal object CircleFtpHttp {
 
     private const val TAG = "CircleFtpHttp"
-    private const val DEFAULT_TIMEOUT = 12_000  // ms
-    private const val DEFAULT_CACHE = 60        // s
+    private const val DEFAULT_TIMEOUT = 12_000L  // ms (Long — app.get() expects Long)
+    private const val DEFAULT_CACHE = 60         // s
 
     /**
      * Fetch [path] from [primary], falling back to [fallback] on any error.
