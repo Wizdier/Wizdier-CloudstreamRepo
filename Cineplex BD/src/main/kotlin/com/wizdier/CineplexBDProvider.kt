@@ -828,7 +828,7 @@ class CineplexBD : MainAPI() {
             ?.trim()
             ?.takeIf { it.isNotBlank() }
 
-    private fun collectSubtitles(
+    private suspend fun collectSubtitles(
         parsed: Document,
         html: String,
         baseUrl: String,
