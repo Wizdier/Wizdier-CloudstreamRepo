@@ -52,6 +52,12 @@ internal object MetadataEnricher {
         val year: Int?,
     )
 
+    data class ActorMeta(
+        val name: String,
+        val role: String? = null,
+        val imageUrl: String? = null,
+    )
+
     data class MetaInfo(
         val title: String? = null,
         val originalTitle: String? = null,
@@ -75,6 +81,7 @@ internal object MetadataEnricher {
         // Empty list if season fetch failed or media is a movie.
         val episodes: List<EpisodeMeta> = emptyList(),
         val recommendations: List<RecommendationItem> = emptyList(),
+        val actors: List<ActorMeta> = emptyList(),
     )
 
     // Strip junk that breaks remote searches.
@@ -123,7 +130,7 @@ internal object MetadataEnricher {
 
         val details = safeJson(
             "$TMDB_API/$mediaType/$tmdbId?api_key=$TMDB_KEY" +
-                    "&append_to_response=external_ids,videos,images,recommendations,alternative_titles"
+                    "&append_to_response=external_ids,videos,images,recommendations,alternative_titles,credits"
         ) ?: return MetaInfo(tmdbId = tmdbId, mediaType = mediaType)
 
         val titleKey = if (mediaType == "movie") "title" else "name"
@@ -164,6 +171,7 @@ internal object MetadataEnricher {
         )
 
         val simklId = fetchSimklId(imdbId, mediaType)
+        val actors = parseActors(details.optJSONObject("credits")?.optJSONArray("cast"))
 
         return MetaInfo(
             title = titleFromTmdb,
@@ -183,6 +191,7 @@ internal object MetadataEnricher {
             isAnimeHint = isAnimeHint,
             episodes = episodes,
             recommendations = recs,
+            actors = actors,
         )
     }
 
@@ -351,6 +360,20 @@ internal object MetadataEnricher {
             if (!res.startsWith("{")) return@runCatching null
             JSONObject(res).optJSONObject("ids")?.optInt("simkl")?.takeIf { it != 0 }
         }.getOrNull()
+    }
+
+    private fun parseActors(arr: JSONArray?): List<ActorMeta> {
+        if (arr == null || arr.length() == 0) return emptyList()
+        val out = mutableListOf<ActorMeta>()
+        for (i in 0 until arr.length()) {
+            val a = arr.optJSONObject(i) ?: continue
+            val name = a.optStringOrNull("name") ?: a.optStringOrNull("original_name") ?: continue
+            val role = a.optStringOrNull("character")
+            val image = a.optString("profile_path", "").toTmdbImg("w185")
+            out += ActorMeta(name = name, role = role, imageUrl = image)
+            if (out.size >= 20) break
+        }
+        return out
     }
 
     private fun parseRecommendations(arr: JSONArray?): List<RecommendationItem> {

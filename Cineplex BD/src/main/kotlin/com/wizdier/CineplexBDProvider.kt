@@ -14,6 +14,7 @@ import org.json.JSONArray
 import org.json.JSONObject
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
+import java.util.Base64
 
 class CineplexBD : MainAPI() {
     override var mainUrl = "http://cineplexbd.net"
@@ -67,11 +68,7 @@ class CineplexBD : MainAPI() {
         val url = request.data + page
         val doc = app.get(url, headers = cfHeaders).document
 
-        val items = doc.select(
-            "a[href*='view.php'], a[href*='watch.php'], a[href*='tview.php'], " +
-                    ".movie-card a, a:has(.poster), a:has(img[src*='uploads'])"
-        ).mapNotNull { it.toSearchResult() }
-            .distinctBy { it.url }
+        val items = parseAndGroupSearchItems(doc)
             .let { list ->
                 if (request.name.startsWith("Latest")) {
                     list.filterNot {
@@ -96,17 +93,16 @@ class CineplexBD : MainAPI() {
     override suspend fun search(query: String): List<SearchResponse> {
         val url = "$mainUrl/search.php?q=${query.encodeUrl()}&page=1"
         val doc = app.get(url, headers = cfHeaders).document
-        return doc.select(
-            "a[href*='view.php'], a[href*='watch.php'], a[href*='tview.php'], " +
-                    ".movie-card a, a:has(.poster), a:has(img[src*='uploads'])"
-        ).mapNotNull { it.toSearchResult() }
-            .distinctBy { it.url }
+        return parseAndGroupSearchItems(doc)
     }
 
     // ----------------------------- Load ----------------------------------
 
     override suspend fun load(url: String): LoadResponse? {
-        val absUrl = if (url.startsWith("http")) url else mainUrl + url
+        val groupedUrls = decodeGroupedUrls(url)
+        val primaryUrl = groupedUrls?.firstOrNull() ?: url
+        val allLoadUrls = groupedUrls ?: listOf(primaryUrl)
+        val absUrl = if (primaryUrl.startsWith("http")) primaryUrl else mainUrl + primaryUrl
         val doc = app.get(absUrl, headers = cfHeaders).document
 
         // ─── Scrape what the source gives us ───────────────────────────────
@@ -165,13 +161,24 @@ class CineplexBD : MainAPI() {
         val finalLogo = meta.logoUrl
         val finalTrailer = meta.trailerUrl
         val recommendations = meta.recommendations.toSearchResponses()
+        val actorsList = buildList {
+            if (director.isNotBlank()) add(ActorData(Actor(director, null), roleString = "Director"))
+            meta.actors.forEach { actor ->
+                add(ActorData(Actor(actor.name, actor.imageUrl), roleString = actor.role ?: ""))
+            }
+        }.distinctBy { it.actor.name }
 
         val movieType = if (looksLikeAnime || meta.isAnimeHint) TvType.AnimeMovie else TvType.Movie
         val seriesType = if (looksLikeAnime || meta.isAnimeHint) TvType.Anime else TvType.TvSeries
 
         return if (!isSeries) {
-            val id = absUrl.substringAfter("id=").substringBefore("&")
-            val dataUrl = "/player.php?id=$id"
+            val playerLinks = allLoadUrls.mapNotNull { itemUrl ->
+                val absolute = if (itemUrl.startsWith("http")) itemUrl else mainUrl + itemUrl
+                val id = absolute.substringAfter("id=", "").substringBefore("&")
+                    .takeIf { it.isNotBlank() && it != absolute }
+                id?.let { "/player.php?id=$it" }
+            }.distinct()
+            val dataUrl = if (playerLinks.size > 1) encodeLinkGroup(playerLinks) else playerLinks.firstOrNull() ?: absUrl
             newMovieLoadResponse(finalTitle, absUrl, movieType, dataUrl) {
                 this.posterUrl = finalPoster
                 this.backgroundPosterUrl = finalBackdrop
@@ -180,11 +187,7 @@ class CineplexBD : MainAPI() {
                 this.duration = scrapedDuration
                 this.tags = finalTags
                 runCatching { finalRating?.let { this.score = Score.from10(it) } }
-                if (director.isNotBlank()) {
-                    this.actors = listOf(
-                        ActorData(Actor(director, null), roleString = "Director")
-                    )
-                }
+                if (actorsList.isNotEmpty()) this.actors = actorsList
                 runCatching { if (recommendations.isNotEmpty()) this.recommendations = recommendations }
                 runCatching { finalLogo?.let { this.logoUrl = it } }
                 runCatching { finalTrailer?.let { addTrailer(it) } }
@@ -195,8 +198,7 @@ class CineplexBD : MainAPI() {
                 runCatching { meta.kitsuId?.let { addKitsuId(it) } }
             }
         } else {
-            val seriesId = parseSeriesId(absUrl)
-            val episodes = collectEpisodes(seriesId, absUrl, doc, meta)
+            val episodes = collectEpisodesForGroup(allLoadUrls, absUrl, doc, meta)
 
             newTvSeriesLoadResponse(finalTitle, absUrl, seriesType, episodes) {
                 this.posterUrl = finalPoster
@@ -205,11 +207,7 @@ class CineplexBD : MainAPI() {
                 this.year = finalYear
                 this.tags = finalTags
                 runCatching { finalRating?.let { this.score = Score.from10(it) } }
-                if (director.isNotBlank()) {
-                    this.actors = listOf(
-                        ActorData(Actor(director, null), roleString = "Director")
-                    )
-                }
+                if (actorsList.isNotEmpty()) this.actors = actorsList
                 runCatching { if (recommendations.isNotEmpty()) this.recommendations = recommendations }
                 runCatching { finalLogo?.let { this.logoUrl = it } }
                 runCatching { finalTrailer?.let { addTrailer(it) } }
@@ -241,6 +239,44 @@ class CineplexBD : MainAPI() {
     //  (5) If literally everything fails, emit a single placeholder episode
     //      that points at the watch URL itself, so the user gets a working
     //      play button instead of the "coming soon" empty state.
+    private suspend fun collectEpisodesForGroup(
+        urls: List<String>,
+        primaryAbsUrl: String,
+        primaryDoc: Document,
+        meta: MetadataEnricher.MetaInfo,
+    ): List<Episode> {
+        val all = mutableListOf<Episode>()
+        urls.distinct().forEachIndexed { index, raw ->
+            val abs = if (raw.startsWith("http")) raw else mainUrl + raw
+            val doc = if (index == 0 && abs == primaryAbsUrl) primaryDoc
+            else runCatching { app.get(abs, headers = cfHeaders).document }.getOrNull() ?: return@forEachIndexed
+            val seriesId = parseSeriesId(abs)
+            all += collectEpisodes(seriesId, abs, doc, meta)
+        }
+        if (all.isEmpty()) return listOf(
+            newEpisode(primaryAbsUrl) {
+                name = "Watch"
+                season = 1
+                episode = 1
+            }
+        )
+
+        return all.groupBy { (it.season ?: 1) to (it.episode ?: 1) }
+            .map { (key, eps) ->
+                val first = eps.first()
+                val data = if (eps.size > 1) encodeLinkGroup(eps.map { it.data }) else first.data
+                newEpisode(data) {
+                    name = first.name
+                    season = key.first
+                    episode = key.second
+                    posterUrl = first.posterUrl
+                    description = first.description
+
+                }
+            }
+            .sortedWith(compareBy({ it.season ?: 1 }, { it.episode ?: 1 }))
+    }
+
     private suspend fun collectEpisodes(
         seriesId: String,
         watchUrl: String,
@@ -419,13 +455,21 @@ class CineplexBD : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
+        decodeLinkGroup(data)?.let { links ->
+            var any = false
+            links.distinct().forEach { link ->
+                if (loadLinks(link, isCasting, subtitleCallback, callback)) any = true
+            }
+            return any
+        }
+
         val url = when {
             data.startsWith("http") -> data
             data.startsWith("/") -> mainUrl + data
             else -> "$mainUrl/$data"
         }
 
-        if (url.endsWith(".mp4") || url.endsWith(".mkv") || url.contains("/Data/")) {
+        if (url.contains(".m3u8", true) || url.endsWith(".mp4", true) || url.endsWith(".mkv", true) || url.contains("/Data/")) {
             callback.invoke(
                 newExtractorLink(
                     source = name,
@@ -441,58 +485,60 @@ class CineplexBD : MainAPI() {
         }
 
         val html = app.get(url, headers = cfHeaders).text
-        val videoUrl = Regex("""const\s+videoSrc\s*=\s*["'](.*?)["']""")
-            .find(html)?.groupValues?.get(1)
+        val sources = linkedSetOf<String>()
+
+        Regex("""const\s+videoSrc\s*=\s*["'](.*?)["']""")
+            .find(html)?.groupValues?.getOrNull(1)?.let(sources::add)
+
+        val parsed = org.jsoup.Jsoup.parse(html, url)
+        parsed.select("video[src], source[src], a[href*='.m3u8'], a[href*='.mp4'], a[href*='.mkv']")
+            .forEach { el ->
+                val src = el.attr("src").ifBlank { el.attr("href") }
+                if (src.isNotBlank()) sources += src
+            }
+
+        Regex("""https?://[^\s"'<>]+(?:\.m3u8|\.mp4|\.mkv|\.webm|\.avi|\.m4v)(?:/index\.m3u8|\?[^\s"'<>]*)?""", RegexOption.IGNORE_CASE)
+            .findAll(html)
+            .mapTo(sources) { it.value.replace("&amp;", "&") }
 
         var found = false
-
-        if (!videoUrl.isNullOrBlank()) {
-            val finalUrl = if (videoUrl.startsWith("http")) videoUrl
-            else "$mainUrl/${videoUrl.trimStart('/')}"
-
-            if (finalUrl.contains(".m3u8")) {
-                M3u8Helper.generateM3u8(
-                    source = name,
-                    streamUrl = finalUrl,
-                    referer = "$mainUrl/",
-                ).forEach(callback)
-            } else {
-                callback.invoke(
-                    newExtractorLink(
-                        source = name,
-                        name = "$name - Original",
-                        url = finalUrl,
-                        type = ExtractorLinkType.VIDEO,
-                    ) {
-                        this.referer = "$mainUrl/"
-                        this.quality = Qualities.Unknown.value
+        sources.map { it.toAbsoluteMediaUrl() }
+            .filter { it.isNotBlank() }
+            .distinct()
+            .forEach { finalUrl ->
+                when {
+                    finalUrl.contains(".m3u8", ignoreCase = true) -> {
+                        M3u8Helper.generateM3u8(
+                            source = name,
+                            streamUrl = finalUrl,
+                            referer = url,
+                            headers = cfHeaders
+                        ).forEach(callback)
+                        found = true
                     }
-                )
-            }
-            found = true
-        }
-
-        org.jsoup.Jsoup.parse(html)
-            .select("source[src*='.mp4'], source[src*='.mkv'], source[src*='.m3u8'], source")
-            .forEach {
-                val src = it.attr("src")
-                if (src.isBlank() || src == videoUrl) return@forEach
-                val finalUrl = if (src.startsWith("http")) src
-                else "$mainUrl/${src.trimStart('/')}"
-                val type = if (finalUrl.contains(".m3u8")) ExtractorLinkType.M3U8
-                else ExtractorLinkType.VIDEO
-                callback.invoke(
-                    newExtractorLink(
-                        source = name,
-                        name = "$name - Fallback",
-                        url = finalUrl,
-                        type = type,
-                    ) {
-                        this.referer = "$mainUrl/"
-                        this.quality = Qualities.Unknown.value
+                    finalUrl.isDirectVideoUrl() || finalUrl.contains("/Data/", ignoreCase = true) -> {
+                        callback.invoke(
+                            newExtractorLink(
+                                source = name,
+                                name = "$name - Direct",
+                                url = finalUrl,
+                                type = ExtractorLinkType.VIDEO,
+                            ) {
+                                this.referer = url
+                                this.quality = getQualityFromName(finalUrl)
+                            }
+                        )
+                        found = true
                     }
-                )
-                found = true
+                    else -> {
+                        runCatching {
+                            loadExtractor(finalUrl, url, subtitleCallback) {
+                                callback(it)
+                                found = true
+                            }
+                        }
+                    }
+                }
             }
 
         return found
@@ -531,7 +577,45 @@ class CineplexBD : MainAPI() {
             }
         }
 
-    private fun Element.toSearchResult(): SearchResponse? {
+    private data class SearchItem(
+        val title: String,
+        val url: String,
+        val type: TvType,
+        val poster: String?,
+        val year: Int?,
+    )
+
+    private fun parseAndGroupSearchItems(doc: Document): List<SearchResponse> {
+        val items = doc.select(
+            "a[href*='view.php'], a[href*='watch.php'], a[href*='tview.php'], " +
+                    ".movie-card a, a:has(.poster), a:has(img[src*='uploads'])"
+        ).mapNotNull { it.toSearchItem() }
+            .distinctBy { it.url }
+
+        return items.groupBy { item ->
+            val normalized = item.title.normalizedTitleKey()
+            val year = item.year
+            // Only merge when BOTH normalized name and year are common. If the
+            // year is missing, keep the item separate to avoid false merges.
+            if (year != null) "$normalized|$year|${item.type}" else "$normalized|${item.url}|${item.type}"
+        }.values.mapNotNull { group ->
+            val first = group.firstOrNull() ?: return@mapNotNull null
+            val groupUrl = if (group.size > 1) encodeGroupedUrls(group.map { it.url }) else first.url
+            if (first.type == TvType.TvSeries) {
+                newTvSeriesSearchResponse(first.title, groupUrl, TvType.TvSeries) {
+                    posterUrl = first.poster
+                    year = first.year
+                }
+            } else {
+                newMovieSearchResponse(first.title, groupUrl, first.type) {
+                    posterUrl = first.poster
+                    year = first.year
+                }
+            }
+        }
+    }
+
+    private fun Element.toSearchItem(): SearchItem? {
         val rawUrl = attr("href").ifBlank { return null }
 
         val id = if (rawUrl.contains("series_id=")) {
@@ -574,15 +658,69 @@ class CineplexBD : MainAPI() {
             else -> TvType.Movie
         }
 
-        return if (type == TvType.TvSeries) {
-            newTvSeriesSearchResponse(title, href, TvType.TvSeries) {
-                this.posterUrl = poster
-            }
-        } else {
-            newMovieSearchResponse(title, href, TvType.Movie) {
-                this.posterUrl = poster
-            }
-        }
+        val year = Regex("(?<!\\d)(?:19|20)\\d{2}(?!\\d)")
+            .find(text() + " " + href)?.value?.toIntOrNull()
+
+        return SearchItem(
+            title = title.cleanDisplayTitle(),
+            url = href,
+            type = type,
+            poster = poster,
+            year = year,
+        )
+    }
+
+    private fun encodeGroupedUrls(urls: List<String>): String {
+        val arr = JSONArray()
+        urls.distinct().forEach(arr::put)
+        val encoded = Base64.getUrlEncoder().encodeToString(arr.toString().toByteArray())
+        return "cineplexbd://group?data=$encoded"
+    }
+
+    private fun decodeGroupedUrls(url: String): List<String>? = runCatching {
+        if (!url.startsWith("cineplexbd://group?data=")) return@runCatching null
+        val data = url.substringAfter("cineplexbd://group?data=")
+        val arr = JSONArray(String(Base64.getUrlDecoder().decode(data)))
+        (0 until arr.length()).mapNotNull { arr.optString(it).takeIf { s -> s.isNotBlank() } }
+    }.getOrNull()
+
+    private fun encodeLinkGroup(links: List<String>): String {
+        val arr = JSONArray()
+        links.distinct().forEach(arr::put)
+        val encoded = Base64.getUrlEncoder().encodeToString(arr.toString().toByteArray())
+        return "cineplexbd://links?data=$encoded"
+    }
+
+    private fun decodeLinkGroup(data: String): List<String>? = runCatching {
+        if (!data.startsWith("cineplexbd://links?data=")) return@runCatching null
+        val encoded = data.substringAfter("cineplexbd://links?data=")
+        val arr = JSONArray(String(Base64.getUrlDecoder().decode(encoded)))
+        (0 until arr.length()).mapNotNull { arr.optString(it).takeIf { s -> s.isNotBlank() } }
+    }.getOrNull()
+
+    private fun String.normalizedTitleKey(): String = cleanDisplayTitle()
+        .lowercase()
+        .replace(Regex("[^a-z0-9]+"), " ")
+        .trim()
+        .replace(Regex("\\s+"), " ")
+
+    private fun String.cleanDisplayTitle(): String =
+        replace(Regex("(?i)\\b(1080p|720p|480p|2160p|4k|web[- ]?dl|webrip|bluray|hdrip|x264|x265|hevc|10bit|dual[- ]?audio|hindi[- ]?dubbed|dubbed|esub)\\b"), " ")
+            .replace(Regex("\\[[^]]+]"), " ")
+            .replace(Regex("\\s+"), " ")
+            .trim()
+
+    private fun String.toAbsoluteMediaUrl(): String = when {
+        startsWith("//") -> "https:$this"
+        startsWith("http", ignoreCase = true) -> this
+        startsWith("/") -> mainUrl + this
+        else -> "$mainUrl/${trimStart('/')}"
+    }
+
+    private fun String.isDirectVideoUrl(): Boolean {
+        val clean = substringBefore("?").lowercase()
+        return clean.endsWith(".mp4") || clean.endsWith(".mkv") || clean.endsWith(".webm") ||
+                clean.endsWith(".avi") || clean.endsWith(".m4v") || clean.endsWith(".mov")
     }
 
     private fun String.encodeUrl(): String =
