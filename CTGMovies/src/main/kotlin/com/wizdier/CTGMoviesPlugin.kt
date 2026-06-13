@@ -44,16 +44,16 @@ class CTGMoviesPlugin : Plugin() {
 
 object CTGSettingsUI {
 
-    // ── Palette ──────────────────────────────────────────────────────────────
-    private const val C_BG      = 0xFF13141F.toInt()
-    private const val C_CARD    = 0xFF1C1E2E.toInt()
-    private const val C_BORDER  = 0xFF333652.toInt()
-    private const val C_ACCENT  = 0xFF7C5CFC.toInt()
-    private const val C_ACCENT2 = 0xFF4F8BF5.toInt()
-    private const val C_TEXT    = 0xFFE8E8F0.toInt()
-    private const val C_SUB     = 0xFF8888A0.toInt()
-    private const val C_HINT    = 0xFF5A5A70.toInt()
-    private const val C_RED     = 0xFFFF6B6B.toInt()
+    // ── Palette (dark charcoal-grey) ─────────────────────────────────────────
+    private const val C_BG      = 0xFF1A1A1E.toInt()
+    private const val C_CARD    = 0xFF242429.toInt()
+    private const val C_BORDER  = 0xFF383840.toInt()
+    private const val C_ACCENT  = 0xFF3A3A44.toInt()
+    private const val C_ACCENT2 = 0xFF4A4A55.toInt()
+    private const val C_TEXT    = 0xFFD8D8DF.toInt()
+    private const val C_SUB     = 0xFF7A7A85.toInt()
+    private const val C_HINT    = 0xFF4E4E58.toInt()
+    private const val C_RED     = 0xFFE07070.toInt()
 
     // ── Density helpers ──────────────────────────────────────────────────────
     private fun dp(ctx: Context, v: Int): Int =
@@ -88,55 +88,55 @@ object CTGSettingsUI {
     // ═════════════════════════════════════════════════════════════════════════
 
     private fun makeHeader(ctx: Context): View {
-        val d4 = dp(ctx, 4); val d6 = dp(ctx, 6); val d16 = dp(ctx, 16); val d20 = dp(ctx, 20)
+        val d3 = dp(ctx, 3); val d4 = dp(ctx, 4); val d14 = dp(ctx, 14)
 
         return LinearLayout(ctx).apply {
             orientation = LinearLayout.VERTICAL
-            background = gradient(d20.toFloat())
-            setPadding(d16, d20, d16, d20)
+            background = gradient(d16.toFloat())
+            setPadding(d14, dp(ctx, 14), d14, dp(ctx, 13))
             gravity = Gravity.CENTER
 
             addView(TextView(ctx).apply {
                 text = "🎬"
-                textSize = 30f
+                textSize = 20f
                 gravity = Gravity.CENTER
             })
             addView(TextView(ctx).apply {
                 text = "CTGMovies"
                 setTextColor(Color.WHITE)
-                textSize = sp(ctx, 22f)
+                textSize = sp(ctx, 16f)
                 typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
                 gravity = Gravity.CENTER
-                setPadding(0, d6, 0, 0)
+                setPadding(0, d3, 0, 0)
             })
             addView(TextView(ctx).apply {
                 text = "Sign in to unlock protected content"
-                setTextColor(0xFFD6D6E8.toInt())
-                textSize = sp(ctx, 12.5f)
+                setTextColor(0xFF9A9AA5.toInt())
+                textSize = sp(ctx, 9.5f)
                 gravity = Gravity.CENTER
-                setPadding(0, d4, 0, 0)
+                setPadding(0, d3, 0, 0)
             })
         }
     }
 
     private fun makeSection(ctx: Context, label: String): TextView {
-        val d4 = dp(ctx, 4); val d6 = dp(ctx, 6); val d16 = dp(ctx, 16)
+        val d3 = dp(ctx, 3); val d12 = dp(ctx, 12)
         return TextView(ctx).apply {
             text = label
-            setTextColor(C_ACCENT)
-            textSize = sp(ctx, 12f)
+            setTextColor(0xFF9A9AA5.toInt())
+            textSize = sp(ctx, 9.5f)
             typeface = Typeface.create("sans-serif-medium", Typeface.BOLD)
-            setPadding(d4, d16, d4, d6)
+            setPadding(d3, d12, d3, d3)
         }
     }
 
     private fun makeLabel(ctx: Context, label: String): TextView {
-        val d4 = dp(ctx, 4)
+        val d3 = dp(ctx, 3)
         return TextView(ctx).apply {
             text = label
             setTextColor(C_SUB)
-            textSize = sp(ctx, 12f)
-            setPadding(d4, 0, d4, d4)
+            textSize = sp(ctx, 9.5f)
+            setPadding(d3, 0, d3, d3)
         }
     }
 
@@ -147,15 +147,15 @@ object CTGSettingsUI {
         isPassword: Boolean = false,
         isMultiLine: Boolean = false,
     ): EditText {
-        val d12 = dp(ctx, 12); val d14 = dp(ctx, 14)
+        val d8 = dp(ctx, 8); val d10 = dp(ctx, 10)
         return EditText(ctx).apply {
             setText(value.orEmpty())
             this.hint = hint
             setHintTextColor(C_HINT)
             setTextColor(C_TEXT)
-            textSize = sp(ctx, 14f)
-            background = fill(C_CARD, dp(ctx, 14).toFloat(), C_BORDER, dp(ctx, 2))
-            setPadding(d14, d12, d14, d12)
+            textSize = sp(ctx, 11.5f)
+            background = fill(C_CARD, dp(ctx, 12).toFloat(), C_BORDER, dp(ctx, 1))
+            setPadding(d10, d8, d10, d8)
             inputType = when {
                 isPassword -> InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
                 isMultiLine -> InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE
@@ -188,9 +188,9 @@ object CTGSettingsUI {
                 row.addView(edit, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
                 val toggle = TextView(ctx).apply {
                     text = "👁"
-                    textSize = 16f
+                    textSize = 13f
                     gravity = Gravity.CENTER
-                    val p = dp(ctx, 12)
+                    val p = dp(ctx, 8)
                     setPadding(p, p, p, p)
                 }
                 toggle.setOnClickListener {
@@ -229,10 +229,10 @@ object CTGSettingsUI {
         // ── Info note ────────────────────────────────────────────────────────
         val note = TextView(ctx).apply {
             text = "💡  Enter email/password for auto-login, paste a ctg.token / Bearer token, or a raw Cookie header. Everything is saved locally in Cloudstream's extension settings only."
-            setTextColor(0xFF9A9AB4.toInt())
-            textSize = sp(ctx, 11f)
-            background = fill(0xFF1A1C2A.toInt(), dp(ctx, 14).toFloat(), 0xFF3A2E5C.toInt(), dp(ctx, 1))
-            setPadding(d14, d12, d14, d12)
+            setTextColor(0xFF6A6A75.toInt())
+            textSize = sp(ctx, 9f)
+            background = fill(0xFF202024.toInt(), dp(ctx, 12).toFloat(), 0xFF333338.toInt(), dp(ctx, 1))
+            setPadding(dp(ctx, 10), dp(ctx, 8), dp(ctx, 10), dp(ctx, 8))
         }
 
         // ── Build the scrollable form body ───────────────────────────────────
@@ -246,7 +246,7 @@ object CTGSettingsUI {
 
             val inner = LinearLayout(ctx).apply {
                 orientation = LinearLayout.VERTICAL
-                setPadding(d16, d12, d16, d12)
+                setPadding(d14, dp(ctx, 8), d14, dp(ctx, 8))
 
                 addView(makeSection(ctx, "🔐  ACCOUNT"))
                 addView(fEmail.container)
@@ -282,7 +282,7 @@ object CTGSettingsUI {
         dialog.setOnShowListener {
             // Style the built-in buttons with our accent colors
             dialog.getButton(AlertDialog.BUTTON_POSITIVE)?.apply {
-                setTextColor(C_ACCENT)
+                setTextColor(0xFFB0B0C0.toInt())
                 typeface = Typeface.create("sans-serif-medium", Typeface.BOLD)
                 setOnClickListener {
                     prefs.edit()
