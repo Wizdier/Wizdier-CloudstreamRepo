@@ -92,7 +92,7 @@ object CTGSettingsUI {
 
         return LinearLayout(ctx).apply {
             orientation = LinearLayout.VERTICAL
-            background = gradient(d16.toFloat())
+            background = gradient(d14.toFloat())
             setPadding(d14, dp(ctx, 14), d14, dp(ctx, 13))
             gravity = Gravity.CENTER
 
