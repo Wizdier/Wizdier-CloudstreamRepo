@@ -12,10 +12,14 @@ import com.lagradost.cloudstream3.Score
 import com.lagradost.cloudstream3.newSubtitleFile
 import com.lagradost.cloudstream3.syncproviders.SyncIdName
 import com.lagradost.cloudstream3.utils.*
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import org.json.JSONArray
 import org.json.JSONObject
 import java.net.URLEncoder
 import java.util.Base64
+import java.util.concurrent.ConcurrentHashMap
 
 class CTGMovies(private val prefs: SharedPreferences? = null) : MainAPI() {
     override var mainUrl = "https://ctgmovies.com"
@@ -58,6 +62,10 @@ class CTGMovies(private val prefs: SharedPreferences? = null) : MainAPI() {
         private const val UA =
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
                     "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+
+        // TTL cache for TMDB metadata. Keyed by mediaType + tmdbId + seasons.
+        // Repeat loads of the same title within the window return instantly.
+        private val tmdbMetaCache = CTGConcurrent.TtlCache<String, TmdbMeta>(ttlMs = 10 * 60 * 1000L)
     }
 
     override val mainPage = mainPageOf(
@@ -113,10 +121,16 @@ class CTGMovies(private val prefs: SharedPreferences? = null) : MainAPI() {
         val q = query.trim()
         if (q.isBlank()) return emptyList()
 
-        val items = mutableListOf<CtgSearchItem>()
-        runCatching { items += parseSearchItems(apiGet("/movies", mapOf("search" to q)), "movies") }
-        runCatching { items += parseSearchItems(apiGet("/tv", mapOf("search" to q)), "tv") }
-        runCatching { items += parseSearchItems(apiGet("/anime", mapOf("search" to q)), "anime") }
+        // Fan out to all three content sections concurrently. The old code
+        // issued these sequentially, so search latency was 3× the per-request
+        // time. Now it's ~1×.
+        val params = mapOf("search" to q)
+        val items = coroutineScope {
+            val movies = async { runCatching { parseSearchItems(apiGet("/movies", params), "movies") }.getOrDefault(emptyList()) }
+            val tv = async { runCatching { parseSearchItems(apiGet("/tv", params), "tv") }.getOrDefault(emptyList()) }
+            val anime = async { runCatching { parseSearchItems(apiGet("/anime", params), "anime") }.getOrDefault(emptyList()) }
+            movies.await() + tv.await() + anime.await()
+        }
 
         return groupSearchItems(items)
     }
@@ -167,9 +181,10 @@ class CTGMovies(private val prefs: SharedPreferences? = null) : MainAPI() {
     }
 
     private suspend fun loadGrouped(url: String, items: List<GroupedCtgItem>): LoadResponse? {
-        val loaded = items.distinctBy { it.kind to it.id }.mapNotNull { item ->
-            val obj = runCatching { JSONObject(apiGet("/${item.kind}/${item.id.encodeUrl()}")) }.getOrNull()
-            obj?.let { ObjWithLabel(it, item.label) }
+        // Fetch every grouped item concurrently instead of sequentially.
+        val loaded = CTGConcurrent.parallelMapNotNull(items.distinctBy { it.kind to it.id }) { item ->
+            runCatching { JSONObject(apiGet("/${item.kind}/${item.id.encodeUrl()}")) }
+                .getOrNull()?.let { ObjWithLabel(it, item.label) }
         }
         if (loaded.isEmpty()) return null
 
@@ -302,6 +317,10 @@ class CTGMovies(private val prefs: SharedPreferences? = null) : MainAPI() {
             tags = obj.optStringOrNull("genres")?.splitCsv()
         )
 
+        // Cache hit → instant return, zero network I/O.
+        val cacheKey = "$mediaType|$tmdbId|${seasonHints.sorted()}"
+        tmdbMetaCache.get(cacheKey)?.let { return it }
+
         val detail = tmdbJson(
             "/$mediaType/$tmdbId",
             mapOf(
@@ -347,7 +366,7 @@ class CTGMovies(private val prefs: SharedPreferences? = null) : MainAPI() {
         } else emptyMap()
         val episodes = episodesBySeason[targetSeasons.firstOrNull() ?: 1] ?: emptyList()
 
-        return TmdbMeta(
+        val result = TmdbMeta(
             title = title,
             plot = detail.optStringOrNull("overview"),
             posterUrl = detail.optStringOrNull("poster_path")?.let { tmdbImg("w500", it) },
@@ -364,6 +383,8 @@ class CTGMovies(private val prefs: SharedPreferences? = null) : MainAPI() {
             episodes = episodes,
             episodesBySeason = episodesBySeason,
         )
+        tmdbMetaCache.put(cacheKey, result)
+        return result
     }
 
     private suspend fun fetchTmdbSeasonEpisodes(tmdbId: Int, season: Int): List<TmdbEpisodeMeta> {
@@ -781,18 +802,22 @@ class CTGMovies(private val prefs: SharedPreferences? = null) : MainAPI() {
     private suspend fun apiGet(path: String, query: Map<String, Any?> = emptyMap()): String {
         ensureToken(false)
         val url = buildApiUrl(path, query)
-        var response = app.get(url, headers = apiHeaders())
+        var response = app.get(url, headers = apiHeaders(), timeout = 10_000)
 
         if (response.code == 401 || response.code == 403) {
             ensureToken(true)
-            response = app.get(url, headers = apiHeaders())
+            response = app.get(url, headers = apiHeaders(), timeout = 10_000)
         }
 
         if (response.code !in 200..299) {
             // Same-origin fallback catches deployments where the public API is blocked
             // but Next.js proxy routes still work.
             val fallback = runCatching {
-                app.get(mainUrl + "/api/v1" + (if (path.startsWith("/")) path else "/$path") + queryString(query), headers = apiHeaders())
+                app.get(
+                    mainUrl + "/api/v1" + (if (path.startsWith("/")) path else "/$path") + queryString(query),
+                    headers = apiHeaders(),
+                    timeout = 10_000
+                )
             }.getOrNull()
             if (fallback != null && fallback.code in 200..299) return fallback.text
         }
@@ -811,7 +836,8 @@ class CTGMovies(private val prefs: SharedPreferences? = null) : MainAPI() {
             app.post(
                 "${apiBase()}/auth/login",
                 headers = webHeaders() + mapOf("Content-Type" to "application/json", "Accept" to "application/json"),
-                json = mapOf("email" to email, "password" to password)
+                json = mapOf("email" to email, "password" to password),
+                timeout = 10_000
             )
         }.getOrNull() ?: return current.ifBlank { null }
 

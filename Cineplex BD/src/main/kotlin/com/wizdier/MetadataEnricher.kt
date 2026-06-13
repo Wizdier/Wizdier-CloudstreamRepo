@@ -36,6 +36,9 @@ internal object MetadataEnricher {
     private const val TMDB_KEY = "98ae14df2b8d8f8f8136499daf79f0e0"
     private const val IMG_BASE = "https://image.tmdb.org/t/p"
 
+    // TTL cache so repeat loads of the same title return instantly.
+    private val metaCache = CineplexConcurrent.TtlCache<String, MetaInfo>(ttlMs = 10 * 60 * 1000L)
+
     data class EpisodeMeta(
         val name: String? = null,
         val overview: String? = null,
@@ -109,6 +112,10 @@ internal object MetadataEnricher {
         seasonHint: Int? = null,
     ): MetaInfo {
         val cleaned = cleanTitle(rawTitle).ifBlank { rawTitle }
+        // Cache hit → instant return, zero network I/O.
+        val cacheKey = "mtv|${cleaned.lowercase()}|$hintYear|$seasonHint"
+        metaCache.get(cacheKey)?.let { return it }
+
         val q = URLEncoder.encode(cleaned, "UTF-8")
         val yearParam = hintYear?.let { "&year=$it" } ?: ""
         val searchUrl = "$TMDB_API/search/multi?api_key=$TMDB_KEY&query=$q&include_adult=false$yearParam"
@@ -173,7 +180,7 @@ internal object MetadataEnricher {
         val simklId = fetchSimklId(imdbId, mediaType)
         val actors = parseActors(details.optJSONObject("credits")?.optJSONArray("cast"))
 
-        return MetaInfo(
+        val result = MetaInfo(
             title = titleFromTmdb,
             originalTitle = origTitle,
             plot = plot,
@@ -193,12 +200,17 @@ internal object MetadataEnricher {
             recommendations = recs,
             actors = actors,
         )
+        metaCache.put(cacheKey, result)
+        return result
     }
 
     // ─────────────────────────────── Anime ──────────────────────────────────
 
     suspend fun enrichAnime(rawTitle: String, seasonHint: Int? = null): MetaInfo {
         val cleaned = cleanTitle(rawTitle).ifBlank { rawTitle }
+        // Cache hit → instant return.
+        val cacheKey = "anime|${cleaned.lowercase()}|$seasonHint"
+        metaCache.get(cacheKey)?.let { return it }
 
         val anilistQuery = """
             query (${'$'}search: String) {
@@ -227,7 +239,8 @@ internal object MetadataEnricher {
             app.post(
                 "https://graphql.anilist.co",
                 headers = mapOf("Content-Type" to "application/json"),
-                requestBody = payload.toRequestBody("application/json".toMediaTypeOrNull())
+                requestBody = payload.toRequestBody("application/json".toMediaTypeOrNull()),
+                timeout = 8000
             ).text
         }.getOrNull()
             ?: return enrichMovieOrTv(rawTitle, null, seasonHint).copy(isAnimeHint = true)
@@ -270,7 +283,7 @@ internal object MetadataEnricher {
         if (aniId != null) {
             runCatching {
                 val mappings = JSONObject(
-                    app.get("https://api.ani.zip/mappings?anilist_id=$aniId").text
+                    app.get("https://api.ani.zip/mappings?anilist_id=$aniId", timeout = 8000).text
                 ).optJSONObject("mappings")
                 kitsuId = mappings?.optStringOrNull("kitsu_id")
                 tmdbId = mappings?.optStringOrNull("themoviedb_id")?.toIntOrNull()
@@ -288,7 +301,8 @@ internal object MetadataEnricher {
                 val tv = JSONObject(
                     app.get(
                         "$TMDB_API/tv/$tmdbId?api_key=$TMDB_KEY" +
-                                "&append_to_response=images,videos,external_ids,recommendations"
+                                "&append_to_response=images,videos,external_ids,recommendations",
+                        timeout = 8000
                     ).text
                 )
                 logo = pickLogo(tv.optJSONObject("images")?.optJSONArray("logos"))
@@ -306,7 +320,7 @@ internal object MetadataEnricher {
 
         val simklId = fetchSimklId(imdbId, "tv")
 
-        return MetaInfo(
+        val result = MetaInfo(
             title = eng ?: rom ?: nat ?: rawTitle,
             originalTitle = rom ?: nat,
             plot = plot,
@@ -328,6 +342,8 @@ internal object MetadataEnricher {
             episodes = episodes,
             recommendations = recs,
         )
+        metaCache.put(cacheKey, result)
+        return result
     }
 
     // ─────────────────────────────── helpers ────────────────────────────────
@@ -356,7 +372,7 @@ internal object MetadataEnricher {
         val type = if (mediaType == "movie") "movies" else "tv"
         return runCatching {
             val url = "https://api.simkl.com/$type/${URLEncoder.encode(imdbId, "UTF-8")}?client_id=%20&extended=full"
-            val res = app.get(url).text.trim()
+            val res = app.get(url, timeout = 8000).text.trim()
             if (!res.startsWith("{")) return@runCatching null
             JSONObject(res).optJSONObject("ids")?.optInt("simkl")?.takeIf { it != 0 }
         }.getOrNull()
@@ -417,7 +433,7 @@ internal object MetadataEnricher {
     }
 
     private suspend fun safeJson(url: String): JSONObject? = runCatching {
-        JSONObject(app.get(url).text)
+        JSONObject(app.get(url, timeout = 8000).text)
     }.getOrNull()
 
     private fun String.toTmdbImg(size: String): String? =

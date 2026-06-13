@@ -15,6 +15,9 @@ import org.json.JSONArray
 import org.json.JSONObject
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 
 class CineplexBD : MainAPI() {
     override var mainUrl = "http://cineplexbd.net"
@@ -66,7 +69,7 @@ class CineplexBD : MainAPI() {
         request: MainPageRequest
     ): HomePageResponse {
         val url = request.data + page
-        val doc = app.get(url, headers = cfHeaders).document
+        val doc = app.get(url, headers = cfHeaders, timeout = 10_000).document
 
         val items = parseAndGroupSearchItems(doc)
             .let { list ->
@@ -92,7 +95,7 @@ class CineplexBD : MainAPI() {
 
     override suspend fun search(query: String): List<SearchResponse> {
         val url = "$mainUrl/search.php?q=${query.encodeUrl()}&page=1"
-        val doc = app.get(url, headers = cfHeaders).document
+        val doc = app.get(url, headers = cfHeaders, timeout = 10_000).document
         return parseAndGroupSearchItems(doc)
     }
 
@@ -104,7 +107,7 @@ class CineplexBD : MainAPI() {
         val allLoadItems = groupedItems ?: listOf(primaryItem)
         val primaryUrl = primaryItem.url
         val absUrl = if (primaryUrl.startsWith("http")) primaryUrl else mainUrl + primaryUrl
-        val doc = app.get(absUrl, headers = cfHeaders).document
+        val doc = app.get(absUrl, headers = cfHeaders, timeout = 10_000).document
 
         // ─── Scrape what the source gives us ───────────────────────────────
         val rawTitle = doc.selectFirst("h1, .movie-title, title")
@@ -255,16 +258,19 @@ class CineplexBD : MainAPI() {
         primaryDoc: Document,
         meta: MetadataEnricher.MetaInfo,
     ): List<Episode> {
-        val all = mutableListOf<EpisodeWithLabel>()
-        items.distinctBy { it.url }.forEachIndexed { index, item ->
-            val abs = if (item.url.startsWith("http")) item.url else mainUrl + item.url
-            val doc = if (index == 0 && abs == primaryAbsUrl) primaryDoc
-            else runCatching { app.get(abs, headers = cfHeaders).document }.getOrNull() ?: return@forEachIndexed
-            val seriesId = parseSeriesId(abs)
-            collectEpisodes(seriesId, abs, doc, meta).forEach { ep ->
-                all += EpisodeWithLabel(ep, item.label)
-            }
-        }
+        // Fetch each source's page concurrently.
+        val all = coroutineScope {
+            items.distinctBy { it.url }.mapIndexed { index, item ->
+                async {
+                    val abs = if (item.url.startsWith("http")) item.url else mainUrl + item.url
+                    val doc = if (index == 0 && abs == primaryAbsUrl) primaryDoc
+                    else runCatching { app.get(abs, headers = cfHeaders, timeout = 10_000).document }.getOrNull()
+                    if (doc == null) return@async emptyList()
+                    val seriesId = parseSeriesId(abs)
+                    collectEpisodes(seriesId, abs, doc, meta).map { ep -> EpisodeWithLabel(ep, item.label) }
+                }
+            }.awaitAll().flatten()
+        }.toMutableList()
         if (all.isEmpty()) return listOf(
             newEpisode(primaryAbsUrl) {
                 name = "Watch"
@@ -321,7 +327,7 @@ class CineplexBD : MainAPI() {
         for (season in seasonHints) {
             val seasonInt = season.toIntOrNull() ?: continue
             val metaUrl = "$mainUrl/watch.php?$seriesIdKey=$seriesId&season=$season&meta=1"
-            val text = runCatching { app.get(metaUrl, headers = cfHeaders).text }.getOrNull()
+            val text = runCatching { app.get(metaUrl, headers = cfHeaders, timeout = 10_000).text }.getOrNull()
                 ?: continue
             episodes += parseEpisodesFromMetaJson(text, seasonInt, meta.episodes)
         }
@@ -334,7 +340,7 @@ class CineplexBD : MainAPI() {
         // ── (3-extra) numeric fallback when the page exposes no season UI ─
         for (s in 1..12) {
             val metaUrl = "$mainUrl/watch.php?$seriesIdKey=$seriesId&season=$s&meta=1"
-            val text = runCatching { app.get(metaUrl, headers = cfHeaders).text }.getOrNull()
+            val text = runCatching { app.get(metaUrl, headers = cfHeaders, timeout = 10_000).text }.getOrNull()
                 ?: continue
             val parsed = parseEpisodesFromMetaJson(text, s, meta.episodes)
             if (parsed.isNotEmpty()) episodes += parsed
@@ -517,7 +523,7 @@ class CineplexBD : MainAPI() {
             return true
         }
 
-        val html = app.get(url, headers = cfHeaders).text
+        val html = app.get(url, headers = cfHeaders, timeout = 15_000).text
         val sources = linkedSetOf<String>()
 
         Regex("""const\s+videoSrc\s*=\s*["'](.*?)["']""")
@@ -802,7 +808,7 @@ class CineplexBD : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
     ) {
         val manifestHeaders = cfHeaders + ("Referer" to referer)
-        val manifest = runCatching { app.get(manifestUrl, headers = manifestHeaders).text }.getOrNull()
+        val manifest = runCatching { app.get(manifestUrl, headers = manifestHeaders, timeout = 10_000).text }.getOrNull()
             ?: return
         Regex("""#EXT-X-MEDIA:([^\r\n]+)""", RegexOption.IGNORE_CASE)
             .findAll(manifest)

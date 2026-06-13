@@ -14,6 +14,10 @@ import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import java.net.URLEncoder
 import java.util.Base64
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
+import java.util.concurrent.ConcurrentHashMap
 
 class FTPBD : MainAPI() {
     override var mainUrl = "https://ftpbd.net"
@@ -38,6 +42,9 @@ class FTPBD : MainAPI() {
         private const val TMDB_API = "https://api.themoviedb.org/3"
         private const val TMDB_KEY = "98ae14df2b8d8f8f8136499daf79f0e0"
         private const val TMDB_IMG = "https://image.tmdb.org/t/p"
+
+        // TTL cache for TMDB metadata so repeat loads return instantly.
+        private val tmdbMetaCache = FTPBDConcurrent.TtlCache<String, TmdbMeta>(ttlMs = 10 * 60 * 1000L)
     }
 
     private val headers = mapOf(
@@ -90,7 +97,7 @@ class FTPBD : MainAPI() {
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val url = pageUrl(request.data, page)
-        val doc = app.get(url, headers = headers).document
+        val doc = app.get(url, headers = headers, timeout = 10_000).document
         val expected = if (request.data == "tv_shows") "/tv_shows/" else "/movie/"
         val items = parseCards(doc, expected)
         val hasNext = doc.select("a.next, .page-numbers.next, a[href*='/page/${page + 1}/']").isNotEmpty() || items.isNotEmpty()
@@ -101,14 +108,19 @@ class FTPBD : MainAPI() {
         val q = query.trim()
         if (q.isBlank()) return emptyList()
         val encoded = q.encodeUrl()
-        val items = mutableListOf<FtpSearchItem>()
-        runCatching {
-            val doc = app.get("$mainUrl/?s=$encoded&post_type=movies", headers = headers).document
-            items += parseCardItems(doc, "/movie/")
-        }
-        runCatching {
-            val doc = app.get("$mainUrl/?s=$encoded&post_type=tv_shows", headers = headers).document
-            items += parseCardItems(doc, "/tv_shows/")
+        // Search movies and TV concurrently — halves search latency.
+        val items = coroutineScope {
+            val movies = async {
+                runCatching {
+                    parseCardItems(app.get("$mainUrl/?s=$encoded&post_type=movies", headers = headers, timeout = 10_000).document, "/movie/")
+                }.getOrDefault(emptyList())
+            }
+            val tv = async {
+                runCatching {
+                    parseCardItems(app.get("$mainUrl/?s=$encoded&post_type=tv_shows", headers = headers, timeout = 10_000).document, "/tv_shows/")
+                }.getOrDefault(emptyList())
+            }
+            movies.await() + tv.await()
         }
         return groupSearchItems(items)
     }
@@ -134,7 +146,7 @@ class FTPBD : MainAPI() {
         }
 
         val fixedUrl = url.toAbsoluteUrl()
-        val doc = app.get(fixedUrl, headers = headers).document
+        val doc = app.get(fixedUrl, headers = headers, timeout = 10_000).document
         return when {
             fixedUrl.contains("/tv_shows/") -> loadSeries(fixedUrl, doc)
             fixedUrl.contains("/episodes/") -> loadEpisodeAsMovie(fixedUrl, doc)
@@ -207,7 +219,7 @@ class FTPBD : MainAPI() {
             return true
         }
 
-        val html = runCatching { app.get(sourcePage, headers = headers).text }.getOrNull() ?: return false
+        val html = runCatching { app.get(sourcePage, headers = headers, timeout = 15_000).text }.getOrNull() ?: return false
         val urls = linkedSetOf<String>()
         val parsed = Jsoup.parse(html, sourcePage)
         collectSubtitles(parsed, html, sourcePage, subtitleCallback)
@@ -307,6 +319,10 @@ class FTPBD : MainAPI() {
         seasonHints: Set<Int> = emptySet(),
     ): TmdbMeta {
         val tmdbId = findTmdbId(title.cleanMediaTitle(), mediaType, siteYear) ?: return TmdbMeta()
+
+        val cacheKey = "$mediaType|$tmdbId|${siteYear}|${seasonHints.sorted()}"
+        tmdbMetaCache.get(cacheKey)?.let { return it }
+
         val detail = tmdbJson(
             "/$mediaType/$tmdbId",
             mapOf(
@@ -337,7 +353,7 @@ class FTPBD : MainAPI() {
             map
         } else emptyMap()
 
-        return TmdbMeta(
+        val result = TmdbMeta(
             plot = detail.optStringOrNull("overview"),
             backdropUrl = detail.optStringOrNull("backdrop_path")?.let { tmdbImg("w1280", it) },
             logoUrl = logo ?: imdbId?.let { "https://live.metahub.space/logo/medium/$it/img" },
@@ -351,6 +367,8 @@ class FTPBD : MainAPI() {
             actors = actors,
             episodesBySeason = episodesBySeason,
         )
+        tmdbMetaCache.put(cacheKey, result)
+        return result
     }
 
     private suspend fun fetchTmdbSeasonEpisodes(tmdbId: Int, season: Int): List<TmdbEpisodeMeta> {
@@ -527,15 +545,19 @@ class FTPBD : MainAPI() {
             .distinct()
             .ifEmpty { listOf(1) }
 
-        val rawEpisodes = mutableListOf<Episode>()
         val base = url.trimEnd('/')
         val meta = fetchTmdbMeta(title, "tv", year, seasons.toSet())
-        for (season in seasons) {
-            val epDoc = runCatching {
-                app.get("$base/episodes/?season=$season", headers = headers).document
-            }.getOrNull() ?: if (season == 1) doc else continue
-            rawEpisodes += parseEpisodes(epDoc, season, meta.episodesBySeason[season])
-        }
+        // Fetch every season's episode page concurrently.
+        val rawEpisodes = coroutineScope {
+            seasons.map { season ->
+                async<List<Episode>?> {
+                    val epDoc = runCatching {
+                        app.get("$base/episodes/?season=$season", headers = headers, timeout = 10_000).document
+                    }.getOrNull() ?: if (season == 1) doc else return@async null
+                    parseEpisodes(epDoc, season, meta.episodesBySeason[season])
+                }
+            }.awaitAll().filterNotNull().flatten()
+        }.toMutableList()
         if (rawEpisodes.isEmpty()) rawEpisodes += parseEpisodes(doc, 1, meta.episodesBySeason[1])
 
         val episodes = rawEpisodes.distinctBy { it.data }
@@ -568,19 +590,25 @@ class FTPBD : MainAPI() {
         val allSeasons = loaded.flatMap { seasonNumbers(it.second) }.distinct().ifEmpty { listOf(1) }
         val meta = fetchTmdbMeta(title, "tv", year, allSeasons.toSet())
 
-        val allEpisodes = mutableListOf<EpisodeWithLabel>()
-        loaded.forEach { (seriesUrl, seriesDoc, label) ->
-            val seasons = seasonNumbers(seriesDoc).ifEmpty { listOf(1) }
-            val base = seriesUrl.trimEnd('/')
-            for (season in seasons) {
-                val epDoc = runCatching {
-                    app.get("$base/episodes/?season=$season", headers = headers).document
-                }.getOrNull() ?: if (season == 1) seriesDoc else continue
-                parseEpisodes(epDoc, season, meta.episodesBySeason[season]).forEach { ep ->
-                    allEpisodes += EpisodeWithLabel(ep, label)
+        // Fetch each source's seasons concurrently across sources.
+        val allEpisodes = coroutineScope {
+            loaded.map { (seriesUrl, seriesDoc, label) ->
+                async {
+                    val seasons = seasonNumbers(seriesDoc).ifEmpty { listOf(1) }
+                    val base = seriesUrl.trimEnd('/')
+                    val eps = mutableListOf<EpisodeWithLabel>()
+                    for (season in seasons) {
+                        val epDoc = runCatching {
+                            app.get("$base/episodes/?season=$season", headers = headers, timeout = 10_000).document
+                        }.getOrNull() ?: if (season == 1) seriesDoc else continue
+                        parseEpisodes(epDoc, season, meta.episodesBySeason[season]).forEach { ep ->
+                            eps += EpisodeWithLabel(ep, label)
+                        }
+                    }
+                    eps
                 }
-            }
-        }
+            }.awaitAll().flatten()
+        }.toMutableList()
         if (allEpisodes.isEmpty()) {
             parseEpisodes(doc, 1, meta.episodesBySeason[1]).forEach { ep ->
                 allEpisodes += EpisodeWithLabel(ep, loaded.first().third)
