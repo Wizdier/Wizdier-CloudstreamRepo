@@ -493,6 +493,7 @@ class CineplexBD : MainAPI() {
 
         val explicitSourceName = buildStreamSourceName(label, url)
         if (url.contains(".m3u8", true)) {
+            collectM3u8Subtitles(url, "$mainUrl/", subtitleCallback)
             M3u8Helper.generateM3u8(
                 source = explicitSourceName,
                 streamUrl = url,
@@ -523,6 +524,8 @@ class CineplexBD : MainAPI() {
             .find(html)?.groupValues?.getOrNull(1)?.let(sources::add)
 
         val parsed = org.jsoup.Jsoup.parse(html, url)
+        collectSubtitles(parsed, html, url, subtitleCallback)
+
         parsed.select("video[src], source[src], a[href*='.m3u8'], a[href*='.mp4'], a[href*='.mkv']")
             .forEach { el ->
                 val src = el.attr("src").ifBlank { el.attr("href") }
@@ -534,13 +537,14 @@ class CineplexBD : MainAPI() {
             .mapTo(sources) { it.value.replace("&amp;", "&") }
 
         var found = false
-        sources.map { it.toAbsoluteMediaUrl() }
+        sources.map { it.toAbsoluteMediaUrl(url) }
             .filter { it.isNotBlank() }
             .distinct()
             .forEach { finalUrl ->
-                val sourceName = buildStreamSourceName(label, finalUrl, html, url)
+                val sourceName = buildStreamSourceName(label, finalUrl, url)
                 when {
                     finalUrl.contains(".m3u8", ignoreCase = true) -> {
+                        collectM3u8Subtitles(finalUrl, url, subtitleCallback)
                         M3u8Helper.generateM3u8(
                             source = sourceName,
                             streamUrl = finalUrl,
@@ -792,6 +796,89 @@ class CineplexBD : MainAPI() {
         return finalLabel?.let { "$name • $it" } ?: name
     }
 
+    private suspend fun collectM3u8Subtitles(
+        manifestUrl: String,
+        referer: String,
+        subtitleCallback: (SubtitleFile) -> Unit,
+    ) {
+        val manifestHeaders = cfHeaders + ("Referer" to referer)
+        val manifest = runCatching { app.get(manifestUrl, headers = manifestHeaders).text }.getOrNull()
+            ?: return
+        Regex("""#EXT-X-MEDIA:([^\r\n]+)""", RegexOption.IGNORE_CASE)
+            .findAll(manifest)
+            .forEach { match ->
+                val attrs = match.groupValues[1]
+                if (!attrs.contains("TYPE=SUBTITLES", ignoreCase = true)) return@forEach
+                val rawUri = parseM3u8Attribute(attrs, "URI") ?: return@forEach
+                val subUrl = rawUri.toAbsoluteMediaUrl(manifestUrl)
+                val label = parseM3u8Attribute(attrs, "NAME")
+                    ?: parseM3u8Attribute(attrs, "LANGUAGE")
+                    ?: subtitleLabelFromUrl(subUrl)
+                subtitleCallback(newSubtitleFile(label, subUrl))
+            }
+    }
+
+    private fun parseM3u8Attribute(attrs: String, key: String): String? =
+        Regex("""$key=(?:"([^"]*)"|([^,]*))""", RegexOption.IGNORE_CASE)
+            .find(attrs)
+            ?.let { match ->
+                match.groupValues.getOrNull(1)?.takeIf { it.isNotBlank() }
+                    ?: match.groupValues.getOrNull(2)
+            }
+            ?.trim()
+            ?.takeIf { it.isNotBlank() }
+
+    private fun collectSubtitles(
+        parsed: Document,
+        html: String,
+        baseUrl: String,
+        subtitleCallback: (SubtitleFile) -> Unit,
+    ) {
+        val seen = linkedSetOf<String>()
+
+        parsed.select("track[src], a[href*='.srt'], a[href*='.vtt'], a[href*='.ass']")
+            .forEach { el ->
+                val raw = el.attr("src").ifBlank { el.attr("href") }.ifBlank { return@forEach }
+                val subUrl = raw.toAbsoluteMediaUrl(baseUrl)
+                if (subUrl.isBlank() || !seen.add(subUrl)) return@forEach
+                val label = el.attr("label")
+                    .ifBlank { el.attr("srclang") }
+                    .ifBlank { el.text() }
+                    .ifBlank { subtitleLabelFromUrl(subUrl) }
+                subtitleCallback(newSubtitleFile(label, subUrl))
+            }
+
+        Regex("""https?://[^\s"'<>]+\.(?:srt|vtt|ass)(?:\?[^\s"'<>]*)?""", RegexOption.IGNORE_CASE)
+            .findAll(html)
+            .map { it.value.replace("&amp;", "&") }
+            .forEach { raw ->
+                val subUrl = raw.toAbsoluteMediaUrl(baseUrl)
+                if (subUrl.isNotBlank() && seen.add(subUrl)) {
+                    subtitleCallback(newSubtitleFile(subtitleLabelFromUrl(subUrl), subUrl))
+                }
+            }
+
+        Regex("""["']([^"']+\.(?:srt|vtt|ass)(?:\?[^"']*)?)["']""", RegexOption.IGNORE_CASE)
+            .findAll(html)
+            .map { it.groupValues[1].replace("&amp;", "&") }
+            .forEach { raw ->
+                val subUrl = raw.toAbsoluteMediaUrl(baseUrl)
+                if (subUrl.isNotBlank() && seen.add(subUrl)) {
+                    subtitleCallback(newSubtitleFile(subtitleLabelFromUrl(subUrl), subUrl))
+                }
+            }
+    }
+
+    private fun subtitleLabelFromUrl(url: String): String {
+        val file = url.substringBefore("?").substringAfterLast('/').replace("%20", " ")
+        return when {
+            file.contains("bangla", true) || file.contains("bengali", true) || file.contains("ben", true) -> "Bangla"
+            file.contains("english", true) || file.contains("eng", true) -> "English"
+            file.contains("hindi", true) || file.contains("hin", true) -> "Hindi"
+            else -> "Subtitle"
+        }
+    }
+
     private fun buildSourceLabel(vararg hints: String?): String? {
         val raw = hints.filterNotNull().joinToString(" ")
             .replace("%20", " ")
@@ -799,50 +886,37 @@ class CineplexBD : MainAPI() {
             .replace("-", " ")
         if (raw.isBlank()) return null
 
-        val parts = linkedSetOf<String>()
         fun has(pattern: String): Boolean = Regex(pattern, RegexOption.IGNORE_CASE).containsMatchIn(raw)
+        val parts = linkedSetOf<String>()
 
-        if (has("\\b(?:4k|2160p|uhd)\\b")) parts += "4K"
+        // Keep names short: only the source's own quality/variant initials, not
+        // every category/language text that exists elsewhere on the page.
         if (has("\\b3d\\b")) parts += "3D"
-        Regex("(?i)\\b(1080|720|576|540|480|360)p\\b")
-            .findAll(raw)
-            .map { "${it.groupValues[1]}p" }
-            .forEach(parts::add)
+        if (has("\\b(?:4k|2160p|uhd)\\b")) {
+            parts += "4K"
+        } else {
+            Regex("(?i)\\b(1080|720|576|540|480|360)p\\b")
+                .findAll(raw)
+                .mapNotNull { it.groupValues[1].toIntOrNull() }
+                .maxOrNull()
+                ?.let { parts += "${it}p" }
+        }
+
         if (parts.isEmpty() && has("\\bHD\\b")) parts += "HD"
 
-        val tech = linkedSetOf<String>()
-        listOf(
-            "WEB-DL" to "(?i)\\bweb[- ]?dl\\b",
-            "WEBRip" to "(?i)\\bwebrip\\b",
-            "BluRay" to "(?i)\\b(?:bluray|blu ray|brrip)\\b",
-            "HDRip" to "(?i)\\bhdrip\\b",
-            "HEVC" to "(?i)\\b(?:hevc|x265|h265)\\b",
-            "10bit" to "(?i)\\b10[- ]?bit\\b",
-        ).forEach { (label, pattern) -> if (has(pattern)) tech += label }
-        if (tech.isNotEmpty()) parts += tech.joinToString("/")
-
-        val langs = linkedSetOf<String>()
-        listOf(
-            "Hindi Dubbed" to "(?i)\\bhindi[- /]?dubbed\\b",
-            "Bangla Dubbed" to "(?i)\\b(?:bangla|bengali)[- /]?dubbed\\b",
-            "Dual Audio" to "(?i)\\bdual[- /]?audio\\b",
-            "English" to "(?i)\\benglish\\b",
-            "Hindi" to "(?i)\\bhindi\\b",
-            "Bangla" to "(?i)\\b(?:bangla|bengali)\\b",
-            "Korean" to "(?i)\\bkorean\\b",
-            "Japanese" to "(?i)\\bjapanese\\b",
-            "Chinese" to "(?i)\\bchinese\\b",
-            "Tamil" to "(?i)\\btamil\\b",
-            "Telugu" to "(?i)\\btelugu\\b",
-            "Malayalam" to "(?i)\\bmalayalam\\b",
-            "Kannada" to "(?i)\\bkannada\\b",
-        ).forEach { (lang, pattern) ->
-            if (has(pattern) && !(lang == "Hindi" && langs.contains("Hindi Dubbed")) &&
-                !(lang == "Bangla" && langs.contains("Bangla Dubbed"))) {
-                langs += lang
-            }
+        // Only add release/codec initials when no resolution was found. This
+        // keeps the source row compact while still differentiating WEB-DL-only
+        // or BluRay-only entries.
+        if (parts.isEmpty()) {
+            listOf(
+                "WEB-DL" to "(?i)\\bweb[- ]?dl\\b",
+                "WEBRip" to "(?i)\\bwebrip\\b",
+                "BluRay" to "(?i)\\b(?:bluray|blu ray|brrip)\\b",
+                "HDRip" to "(?i)\\bhdrip\\b",
+                "HEVC" to "(?i)\\b(?:hevc|x265|h265)\\b",
+                "10bit" to "(?i)\\b10[- ]?bit\\b",
+            ).firstOrNull { (_, pattern) -> has(pattern) }?.let { (short, _) -> parts += short }
         }
-        if (langs.isNotEmpty()) parts += langs.joinToString("/")
 
         return parts.joinToString(" ").cleanSourceLabel().takeIf { it.isNotBlank() }
     }
@@ -865,11 +939,11 @@ class CineplexBD : MainAPI() {
             .replace(Regex("\\s+"), " ")
             .trim()
 
-    private fun String.toAbsoluteMediaUrl(): String = when {
-        startsWith("//") -> "https:$this"
+    private fun String.toAbsoluteMediaUrl(baseUrl: String = mainUrl): String = when {
+        startsWith("//") -> baseUrl.substringBefore("://", "http") + ":$this"
         startsWith("http", ignoreCase = true) -> this
         startsWith("/") -> mainUrl + this
-        else -> "$mainUrl/${trimStart('/')}"
+        else -> baseUrl.substringBeforeLast("/", mainUrl).trimEnd('/') + "/${trimStart('/')}"
     }
 
     private fun String.isDirectVideoUrl(): Boolean {
