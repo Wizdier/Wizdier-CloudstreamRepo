@@ -120,7 +120,7 @@ class NtvProvider(
             (0 until arr.length()).forEach { i -> arr.optJSONObject(i)?.let(all::add) }
         }
         data.optJSONArray("nonLive")?.let { arr ->
-            (0 until arr.length()).forEach { i -> arr.optJSONObject(it)?.let(all::add) }
+            (0 until arr.length()).forEach { i -> arr.optJSONObject(i)?.let(all::add) }
         }
         return all.filter { m ->
             val title = m.optString("title").lowercase()
