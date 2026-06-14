@@ -42,36 +42,32 @@ abstract class NTVStreamProvider(
         "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     )
 
-    final override val mainPage = mainPageOf(
-        "all" to "All Events",
-        "featured" to "Featured / Popular",
-        "live" to "Live Now",
-        "football" to "Football / Soccer",
-        "baseball" to "Baseball / MLB",
-        "basketball" to "Basketball",
-        "combat" to "Fight / MMA / Boxing",
-        "motorsport" to "Motorsport",
-        "rugby" to "Rugby",
-        "hockey" to "Hockey",
-        "tennis" to "Tennis",
-        "other" to "Other Sports",
-    )
+    final override val mainPage = serverMainPage()
 
     final override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        if (page > 1) return newHomePageResponse(HomePageList(request.name, emptyList(), false), false)
         val matches = fetchMatches()
-        val filteredRaw = when (request.data) {
-            "all" -> matches
-            "featured" -> matches.filter { it.optBoolean("popular", false) }.ifEmpty { matches.take(40) }
-            "live" -> matches.filter { it.isLiveEvent() }
+        val filteredRaw = when {
+            request.data == "all" -> matches
+            request.data == "featured" -> matches.filter { it.optBoolean("popular", false) }.ifEmpty { matches }
+            request.data == "live" -> matches.filter { it.isLiveEvent() }
+            request.data.startsWith("cat:") -> {
+                val cat = request.data.removePrefix("cat:")
+                matches.filter { it.optString("category", "").equals(cat, true) || it.optString("tournament", "").equals(cat, true) }
+            }
             else -> matches.filter { it.matchesSection(request.data) }
         }
         // Several upstream servers do not expose a reliable live flag and use
         // generic categories such as "Live Stream". Do not leave the Cloudstream
-        // homepage with broken/empty rows; fall back to the upcoming/all list.
-        val filtered = filteredRaw.ifEmpty { if (request.data == "live" || !supportsLiveSections) matches.take(50) else emptyList() }
-        val list = filtered.mapNotNull { it.toSearchResponse() }
-        return newHomePageResponse(HomePageList(request.name, list, isHorizontalImages = false), hasNext = false)
+        // homepage with broken/empty rows; fall back to the full list.
+        val filtered = filteredRaw.ifEmpty { if (request.data == "live" || !supportsLiveSections) matches else emptyList() }
+        val pageSize = 40
+        val from = ((page - 1).coerceAtLeast(0)) * pageSize
+        val pageItems = filtered.drop(from).take(pageSize)
+        val list = pageItems.mapNotNull { it.toSearchResponse() }
+        return newHomePageResponse(
+            HomePageList(request.name, list, isHorizontalImages = false),
+            hasNext = filtered.size > from + pageSize
+        )
     }
 
     final override suspend fun search(query: String): List<SearchResponse> {
@@ -194,6 +190,9 @@ abstract class NTVStreamProvider(
         if (found) return true
 
         val html = runCatching { app.get(url, headers = headersFor(referer), timeout = 12000).text }.getOrNull() ?: return false
+        decodeProtectedConfigMedia(html)?.let { protectedMedia ->
+            if (seen.add(protectedMedia) && emitMedia(protectedMedia, label, url, callback, subtitleCallback)) return true
+        }
         val doc = Jsoup.parse(html, url)
         collectSubtitles(doc, html, url, subtitleCallback)
 
@@ -248,6 +247,64 @@ abstract class NTVStreamProvider(
             )
         }
         return true
+    }
+
+    private fun serverMainPage(): List<Pair<String, String>> = when (serverId) {
+        "kobra" -> listOf(
+            "live" to "Live Now",
+            "featured" to "Featured / Popular",
+            "cat:football" to "Football",
+            "cat:baseball" to "Baseball",
+            "cat:basketball" to "Basketball",
+            "cat:fight" to "Fight / MMA",
+            "cat:hockey" to "Hockey",
+            "cat:rugby" to "Rugby",
+            "cat:other" to "Other Sports",
+            "all" to "All Events",
+        )
+        "raptor" -> listOf(
+            "all" to "All Events",
+            "featured" to "Featured / Popular",
+            "cat:Football" to "Football",
+            "cat:Australian Football" to "Australian Football",
+            "cat:Baseball" to "Baseball",
+            "cat:Volleyball" to "Volleyball",
+            "cat:Basketball" to "Basketball",
+            "cat:Combat Sports" to "Combat Sports",
+            "cat:Ice Hockey" to "Ice Hockey",
+        )
+        "falcon" -> listOf(
+            "all" to "All Live Streams",
+            "featured" to "Featured",
+            "football" to "Football / World Cup",
+            "other" to "Other Streams",
+        )
+        "phoenix" -> listOf(
+            "all" to "All Events",
+            "featured" to "Featured / Popular",
+            "cat:Soccer" to "Soccer",
+            "cat:Upcoming Events" to "Upcoming Events",
+            "cat:PPV Events" to "PPV Events",
+            "cat:Baseball (MLB)" to "Baseball / MLB",
+            "cat:Basketball" to "Basketball",
+            "motorsport" to "Motorsport",
+            "combat" to "MMA / Boxing",
+            "tennis" to "Tennis",
+            "rugby" to "Rugby",
+            "other" to "Other Sports",
+        )
+        "viper" -> listOf(
+            "all" to "All Events",
+            "featured" to "Featured / Popular",
+            "cat:Football" to "Football",
+            "cat:MMA" to "MMA",
+            "cat:Boxing" to "Boxing",
+            "cat:Motorsport" to "Motorsport",
+            "cat:Rugby" to "Rugby",
+            "cat:Hockey" to "Hockey",
+            "cat:Basketball" to "Basketball",
+        )
+        else -> listOf("all" to "All Events")
     }
 
     private suspend fun fetchMatches(): List<JSONObject> {
@@ -391,6 +448,36 @@ abstract class NTVStreamProvider(
         if (res.code !in 200..299 || !text.startsWith("{")) return@runCatching null
         JSONObject(text).optStringOrNull("url")?.toAbsoluteUrl(apiUrl)
     }.getOrNull()
+
+    private fun decodeProtectedConfigMedia(html: String): String? = runCatching {
+        val encoded = Regex("""window\._econfig\s*=\s*['"]([^'"]+)['"]""")
+            .find(html)?.groupValues?.getOrNull(1)
+            ?: return@runCatching null
+        val first = decodeBase64Text(encoded, latin1 = true)
+        val partsCount = 4
+        val chunkSize = kotlin.math.ceil(first.length / partsCount.toDouble()).toInt()
+        val chunks = (0 until partsCount).map { i ->
+            first.substring((i * chunkSize).coerceAtMost(first.length), ((i + 1) * chunkSize).coerceAtMost(first.length))
+        }
+        val order = listOf(2, 0, 3, 1)
+        val sortedParts = arrayOfNulls<String>(partsCount)
+        for (i in 0 until partsCount) {
+            val chunk = chunks[i]
+            val cleaned = if (chunk.length > 3) chunk.substring(0, 3) + chunk.substring(4) else chunk
+            sortedParts[order[i]] = decodeBase64Text(cleaned, latin1 = true)
+        }
+        val joined = sortedParts.filterNotNull().joinToString("")
+        val json = decodeBase64Text(joined, latin1 = false)
+        val obj = JSONObject(json)
+        obj.optStringOrNull("stream_url_nop2p") ?: obj.optStringOrNull("stream_url")
+    }.getOrNull()
+
+    private fun decodeBase64Text(value: String, latin1: Boolean): String {
+        val normalized = value.replace('-', '+').replace('_', '/')
+        val padded = normalized + "=".repeat((4 - normalized.length % 4) % 4)
+        val bytes = Base64.getDecoder().decode(padded)
+        return if (latin1) String(bytes, Charsets.ISO_8859_1) else String(bytes, Charsets.UTF_8)
+    }
 
     private fun sourceLabel(src: JSONObject, index: Int): String {
         val channel = src.optStringOrNull("channelName")
