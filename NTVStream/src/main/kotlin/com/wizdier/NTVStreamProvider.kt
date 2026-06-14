@@ -1,0 +1,461 @@
+package com.wizdier
+
+import com.lagradost.cloudstream3.*
+import com.lagradost.cloudstream3.utils.*
+import org.json.JSONArray
+import org.json.JSONObject
+import org.jsoup.Jsoup
+import org.jsoup.nodes.Document
+import java.net.URLDecoder
+import java.net.URLEncoder
+import java.text.SimpleDateFormat
+import java.util.Base64
+import java.util.Date
+import java.util.Locale
+import java.util.TimeZone
+
+class NTVStreamKobra : NTVStreamProvider("kobra", "NTVStream Kobra", true)
+class NTVStreamRaptor : NTVStreamProvider("raptor", "NTVStream Raptor", false)
+class NTVStreamFalcon : NTVStreamProvider("falcon", "NTVStream Falcon", false)
+class NTVStreamPhoenix : NTVStreamProvider("phoenix", "NTVStream Phoenix", false)
+class NTVStreamViper : NTVStreamProvider("viper", "NTVStream Viper", false)
+
+abstract class NTVStreamProvider(
+    private val serverId: String,
+    private val providerName: String,
+    private val supportsLiveSections: Boolean,
+) : MainAPI() {
+    final override var mainUrl = "https://ntvs.cx"
+    final override var name = providerName
+    final override val hasMainPage = true
+    final override val hasDownloadSupport = false
+    final override val hasQuickSearch = true
+    final override val hasChromecastSupport = true
+    final override var lang = "en"
+    final override val supportedTypes = setOf(TvType.Others)
+
+    private val webHeaders = mapOf(
+        "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+                "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+        "Referer" to "$mainUrl/",
+        "Origin" to mainUrl,
+        "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    )
+
+    final override val mainPage = mainPageOf(
+        "live" to "Live Now",
+        "all" to "All Events",
+        "football" to "Football",
+        "basketball" to "Basketball",
+        "baseball" to "Baseball",
+        "hockey" to "Hockey",
+        "fight" to "Fight / MMA",
+        "rugby" to "Rugby",
+        "darts" to "Darts",
+        "other" to "Other Sports",
+    )
+
+    final override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
+        if (page > 1) return newHomePageResponse(HomePageList(request.name, emptyList(), false), false)
+        val matches = fetchMatches()
+        val filtered = when (request.data) {
+            "live" -> matches.filter { it.optBoolean("live", false) || it.optString("status", "").equals("live", true) }
+            "all" -> matches
+            else -> matches.filter { it.optString("category", "").equals(request.data, true) }
+        }
+        val list = filtered.mapNotNull { it.toSearchResponse() }
+        return newHomePageResponse(HomePageList(request.name, list, isHorizontalImages = false), hasNext = false)
+    }
+
+    final override suspend fun search(query: String): List<SearchResponse> {
+        val q = query.trim()
+        if (q.isBlank()) return emptyList()
+        val root = apiJson("/api/search?q=${q.encodeUrl()}&server=$serverId") ?: return emptyList()
+        val arr = root.optJSONArray("data") ?: JSONArray()
+        return (0 until arr.length()).mapNotNull { arr.optJSONObject(it)?.toSearchResponse() }
+            .distinctBy { it.url }
+    }
+
+    final override suspend fun load(url: String): LoadResponse? {
+        val event = decodeEvent(url) ?: return null
+        val eventId = event.optStringOrNull("id") ?: return null
+        val fresh = findEvent(eventId) ?: event
+        val title = fresh.optStringOrNull("title") ?: "Live Event"
+        val category = fresh.optStringOrNull("category") ?: "Sports"
+        val tournament = fresh.optStringOrNull("tournament")
+        val date = fresh.optLong("date", 0L).takeIf { it > 0L }
+        val live = fresh.optBoolean("live", false) || fresh.optString("status", "").equals("live", true)
+        val sources = fresh.optJSONArray("sources") ?: JSONArray()
+        val poster = fresh.optStringOrNull("poster")?.toAbsoluteUrl()
+        val data = JSONObject()
+            .put("server", serverId)
+            .put("eventId", eventId)
+            .put("sources", sources)
+            .toString()
+
+        return newMovieLoadResponse(title.cleanTitle(), url, TvType.Others, data) {
+            posterUrl = poster
+            backgroundPosterUrl = poster
+            year = date?.let { yearFromMillis(it) }
+            plot = buildString {
+                append(if (live) "LIVE" else "Scheduled")
+                date?.let { append(" • ").append(formatDate(it)) }
+                append("\n")
+                append("Server: ").append(serverLabel())
+                append("\nSport: ").append(category)
+                tournament?.takeIf { it.isNotBlank() && !it.equals(category, true) }?.let {
+                    append("\nTournament: ").append(it)
+                }
+                append("\nSources: ").append(sources.length())
+                val teams = teamLine(fresh)
+                if (teams.isNotBlank()) append("\n\n").append(teams)
+            }
+            tags = buildList {
+                add(serverLabel())
+                add(category)
+                tournament?.takeIf { it.isNotBlank() && !it.equals(category, true) }?.let(::add)
+                add(if (live) "Live" else "Scheduled")
+            }.distinct()
+        }
+    }
+
+    final override suspend fun loadLinks(
+        data: String,
+        isCasting: Boolean,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit,
+    ): Boolean {
+        val root = runCatching { JSONObject(data) }.getOrNull() ?: return false
+        val eventId = root.optStringOrNull("eventId") ?: return false
+        val sources = root.optJSONArray("sources") ?: JSONArray()
+        val candidates = linkedMapOf<String, String>()
+
+        for (i in 0 until sources.length()) {
+            val src = sources.optJSONObject(i) ?: continue
+            val label = sourceLabel(src, i + 1)
+            src.optStringOrNull("url")?.let { candidates[it.toAbsoluteUrl()] = label }
+        }
+
+        // Kobra keeps the real embed urls only in the watch page. The other
+        // servers also expose selected /embed tokens there, so this is a useful
+        // fallback when an upstream API source url is missing or dead.
+        val watchUrl = "$mainUrl/watch/$serverId/$eventId"
+        collectWatchEmbeds(watchUrl).forEachIndexed { index, embed ->
+            candidates.putIfAbsent(embed.toAbsoluteUrl(), "${serverLabel()} ${index + 1}")
+        }
+
+        var found = false
+        val seen = linkedSetOf<String>()
+        candidates.forEach { (rawUrl, label) ->
+            if (rawUrl.isBlank() || !seen.add(rawUrl)) return@forEach
+            if (resolveCandidate(rawUrl, label.cleanSourceLabel(), watchUrl, 0, seen, subtitleCallback, callback)) {
+                found = true
+            }
+        }
+        return found
+    }
+
+    private suspend fun resolveCandidate(
+        rawUrl: String,
+        label: String,
+        referer: String,
+        depth: Int,
+        seen: MutableSet<String>,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit,
+    ): Boolean {
+        val url = rawUrl.toAbsoluteUrl(referer)
+        val decodedMedia = mediaFromUrlParameter(url)
+        if (decodedMedia != null && seen.add(decodedMedia)) {
+            return emitMedia(decodedMedia, label, url, callback, subtitleCallback)
+        }
+        if (url.isMediaUrl()) return emitMedia(url, label, referer, callback, subtitleCallback)
+        if (depth > 3) return false
+
+        var found = false
+        runCatching {
+            loadExtractor(url, referer, subtitleCallback) {
+                callback(it)
+                found = true
+            }
+        }
+        if (found) return true
+
+        val html = runCatching { app.get(url, headers = headersFor(referer), timeout = 12000).text }.getOrNull() ?: return false
+        val doc = Jsoup.parse(html, url)
+        collectSubtitles(doc, html, url, subtitleCallback)
+
+        val nested = linkedSetOf<String>()
+        doc.select("iframe[src], video[src], source[src], a[href]").forEach { el ->
+            val attr = el.attr("src").ifBlank { el.attr("href") }.htmlDecode()
+            if (attr.isNotBlank()) nested += attr.toAbsoluteUrl(url)
+        }
+        Regex("""https?://[^\s"'<>]+(?:\.m3u8|\.mp4|\.mkv|\.webm|\.m4v)(?:\?[^\s"'<>]*)?""", RegexOption.IGNORE_CASE)
+            .findAll(html)
+            .mapTo(nested) { it.value.htmlDecode() }
+        Regex("""(?:file|source|src|url)\s*[:=]\s*["']([^"']+)["']""", RegexOption.IGNORE_CASE)
+            .findAll(html)
+            .map { it.groupValues[1].htmlDecode() }
+            .filter { it.contains(".m3u8", true) || it.contains(".mp4", true) || it.contains("/embed", true) || it.contains("/stream", true) }
+            .mapTo(nested) { it.toAbsoluteUrl(url) }
+
+        for (next in nested) {
+            if (next.isBlank() || !seen.add(next)) continue
+            if (resolveCandidate(next, label, url, depth + 1, seen, subtitleCallback, callback)) found = true
+        }
+        return found
+    }
+
+    private suspend fun emitMedia(
+        url: String,
+        label: String,
+        referer: String,
+        callback: (ExtractorLink) -> Unit,
+        subtitleCallback: (SubtitleFile) -> Unit,
+    ): Boolean {
+        val sourceName = "$name • ${label.ifBlank { qualityInitials(url) ?: "Stream" }}"
+        if (url.contains(".m3u8", true)) {
+            collectM3u8Subtitles(url, referer, subtitleCallback)
+            M3u8Helper.generateM3u8(
+                source = sourceName,
+                streamUrl = url,
+                referer = referer,
+                headers = headersFor(referer),
+            ).forEach(callback)
+        } else {
+            callback(
+                newExtractorLink(
+                    source = sourceName,
+                    name = "$sourceName - Direct",
+                    url = url,
+                    type = ExtractorLinkType.VIDEO,
+                ) {
+                    this.referer = referer
+                    this.quality = getQualityFromName(url)
+                }
+            )
+        }
+        return true
+    }
+
+    private suspend fun fetchMatches(): List<JSONObject> {
+        val root = apiJson("/api/get-matches?server=$serverId&type=both") ?: return emptyList()
+        val out = linkedMapOf<String, JSONObject>()
+        listOf("live", "nonLive", "all", "data").forEach { key ->
+            val arr = root.optJSONArray(key) ?: return@forEach
+            for (i in 0 until arr.length()) {
+                val obj = arr.optJSONObject(i) ?: continue
+                val id = obj.optStringOrNull("id") ?: continue
+                out[id] = obj
+            }
+        }
+        // Servers with supports_live=false return everything in all[]. For Kobra,
+        // live/nonLive are authoritative but all can appear during cache warmup.
+        if (!supportsLiveSections && out.isEmpty()) {
+            root.optJSONArray("all")?.let { arr ->
+                for (i in 0 until arr.length()) arr.optJSONObject(i)?.let { out[it.optString("id", i.toString())] = it }
+            }
+        }
+        return out.values.toList().sortedBy { it.optLong("date", Long.MAX_VALUE) }
+    }
+
+    private suspend fun findEvent(id: String): JSONObject? =
+        fetchMatches().firstOrNull { it.optString("id") == id }
+
+    private suspend fun apiJson(path: String): JSONObject? = runCatching {
+        val res = app.get(mainUrl + path, headers = webHeaders, timeout = 15000)
+        if (res.code in 200..299) JSONObject(res.text.trim()) else null
+    }.getOrNull()
+
+    private suspend fun collectWatchEmbeds(watchUrl: String): List<String> {
+        val html = runCatching { app.get(watchUrl, headers = webHeaders, timeout = 12000).text }.getOrNull() ?: return emptyList()
+        val doc = Jsoup.parse(html, watchUrl)
+        val out = linkedSetOf<String>()
+        doc.select("iframe[src*='/embed'], iframe[src], option[value*='/embed'], option[value*='/watch/']").forEach { el ->
+            val value = el.attr("src").ifBlank { el.attr("value") }.htmlDecode()
+            if (value.contains("/embed") || value.contains("/watch/")) out += value.toAbsoluteUrl(watchUrl)
+        }
+        return out.toList()
+    }
+
+    private fun JSONObject.toSearchResponse(): SearchResponse? {
+        val title = optStringOrNull("title") ?: return null
+        val url = encodeEvent(this)
+        val poster = optStringOrNull("poster")?.toAbsoluteUrl()
+        val date = optLong("date", 0L).takeIf { it > 0L }
+        return newMovieSearchResponse(title.cleanTitle(), url, TvType.Others) {
+            posterUrl = poster
+            year = date?.let { yearFromMillis(it) }
+        }
+    }
+
+    private fun encodeEvent(event: JSONObject): String {
+        val slim = JSONObject()
+            .put("server", serverId)
+            .put("id", event.optString("id"))
+            .put("title", event.optString("title"))
+            .put("category", event.optString("category"))
+            .put("tournament", event.optString("tournament"))
+            .put("date", event.optLong("date", 0L))
+            .put("live", event.optBoolean("live", false))
+            .put("poster", event.optString("poster"))
+            .put("sources", event.optJSONArray("sources") ?: JSONArray())
+        val data = Base64.getUrlEncoder().withoutPadding().encodeToString(slim.toString().toByteArray())
+        return "load?data=$data"
+    }
+
+    private fun decodeEvent(url: String): JSONObject? = runCatching {
+        if (!url.contains("load?data=")) return@runCatching null
+        val data = url.substringAfter("load?data=").substringBefore("&")
+        JSONObject(String(Base64.getUrlDecoder().decode(data)))
+    }.getOrNull()
+
+    private suspend fun collectSubtitles(
+        doc: Document,
+        html: String,
+        baseUrl: String,
+        subtitleCallback: (SubtitleFile) -> Unit,
+    ) {
+        val seen = linkedSetOf<String>()
+        doc.select("track[src], a[href*='.srt'], a[href*='.vtt'], a[href*='.ass']").forEach { el ->
+            val raw = el.attr("src").ifBlank { el.attr("href") }.htmlDecode()
+            val subUrl = raw.toAbsoluteUrl(baseUrl)
+            if (subUrl.isNotBlank() && seen.add(subUrl)) {
+                val label = el.attr("label").ifBlank { el.attr("srclang") }.ifBlank { subtitleLabel(subUrl) }
+                subtitleCallback(newSubtitleFile(label, subUrl))
+            }
+        }
+        Regex("""https?://[^\s"'<>]+\.(?:srt|vtt|ass)(?:\?[^\s"'<>]*)?""", RegexOption.IGNORE_CASE)
+            .findAll(html)
+            .map { it.value.htmlDecode() }
+            .forEach { subUrl ->
+                if (subUrl.isNotBlank() && seen.add(subUrl)) subtitleCallback(newSubtitleFile(subtitleLabel(subUrl), subUrl))
+            }
+    }
+
+    private suspend fun collectM3u8Subtitles(
+        manifestUrl: String,
+        referer: String,
+        subtitleCallback: (SubtitleFile) -> Unit,
+    ) {
+        val text = runCatching { app.get(manifestUrl, headers = headersFor(referer), timeout = 10000).text }.getOrNull() ?: return
+        Regex("""#EXT-X-MEDIA:([^\r\n]+)""", RegexOption.IGNORE_CASE).findAll(text).forEach { match ->
+            val attrs = match.groupValues[1]
+            if (!attrs.contains("TYPE=SUBTITLES", true)) return@forEach
+            val uri = parseM3u8Attribute(attrs, "URI") ?: return@forEach
+            val subUrl = uri.toAbsoluteUrl(manifestUrl)
+            val label = parseM3u8Attribute(attrs, "NAME") ?: parseM3u8Attribute(attrs, "LANGUAGE") ?: subtitleLabel(subUrl)
+            subtitleCallback(newSubtitleFile(label, subUrl))
+        }
+    }
+
+    private fun parseM3u8Attribute(attrs: String, key: String): String? =
+        Regex("""$key=(?:"([^"]*)"|([^,]*))""", RegexOption.IGNORE_CASE)
+            .find(attrs)
+            ?.let { it.groupValues.getOrNull(1)?.takeIf { s -> s.isNotBlank() } ?: it.groupValues.getOrNull(2) }
+            ?.trim()
+            ?.takeIf { it.isNotBlank() }
+
+    private fun mediaFromUrlParameter(url: String): String? = runCatching {
+        val query = url.substringAfter("?", "")
+        query.split("&").forEach { part ->
+            val value = part.substringAfter("=", "")
+            val decoded = URLDecoder.decode(value, "UTF-8")
+            if (decoded.isMediaUrl()) return@runCatching decoded
+        }
+        null
+    }.getOrNull()
+
+    private fun sourceLabel(src: JSONObject, index: Int): String =
+        src.optStringOrNull("channelName")
+            ?: src.optStringOrNull("source")
+            ?: "Source $index"
+
+    private fun teamLine(event: JSONObject): String {
+        val teams = event.optJSONObject("teams") ?: return ""
+        val home = teams.optJSONObject("home")?.optStringOrNull("name")
+        val away = teams.optJSONObject("away")?.optStringOrNull("name")
+        return listOfNotNull(home, away).joinToString(" vs ").takeIf { it.isNotBlank() } ?: ""
+    }
+
+    private fun headersFor(referer: String): Map<String, String> = mapOf(
+        "User-Agent" to webHeaders.getValue("User-Agent"),
+        "Referer" to referer,
+        "Origin" to originOf(referer),
+        "Accept" to "*/*",
+    )
+
+    private fun originOf(url: String): String = runCatching {
+        val clean = url.substringBefore("?" )
+        val proto = clean.substringBefore("://")
+        val host = clean.substringAfter("://").substringBefore("/")
+        "$proto://$host"
+    }.getOrDefault(mainUrl)
+
+    private fun serverLabel(): String = serverId.replaceFirstChar { it.uppercase() }
+
+    private fun qualityInitials(text: String): String? {
+        val raw = text.replace("%20", " ").replace("_", " ").replace("-", " ")
+        val parts = linkedSetOf<String>()
+        if (Regex("(?i)\\b3d\\b").containsMatchIn(raw)) parts += "3D"
+        if (Regex("(?i)\\b(?:4k|2160p|uhd)\\b").containsMatchIn(raw)) {
+            parts += "4K"
+        } else {
+            Regex("(?i)\\b(1080|720|576|540|480|360)p\\b")
+                .findAll(raw)
+                .mapNotNull { it.groupValues[1].toIntOrNull() }
+                .maxOrNull()
+                ?.let { parts += "${it}p" }
+        }
+        return parts.joinToString(" ").takeIf { it.isNotBlank() }
+    }
+
+    private fun subtitleLabel(url: String): String {
+        val file = url.substringBefore("?").substringAfterLast('/').lowercase()
+        return when {
+            "eng" in file || "english" in file -> "English"
+            "spa" in file || "spanish" in file -> "Spanish"
+            "fre" in file || "french" in file -> "French"
+            else -> "Subtitle"
+        }
+    }
+
+    private fun formatDate(ms: Long): String =
+        SimpleDateFormat("EEE, dd MMM yyyy HH:mm", Locale.US).apply {
+            timeZone = TimeZone.getDefault()
+        }.format(Date(ms))
+
+    private fun yearFromMillis(ms: Long): Int? =
+        SimpleDateFormat("yyyy", Locale.US).format(Date(ms)).toIntOrNull()
+
+    private fun String.toAbsoluteUrl(baseUrl: String = mainUrl): String = when {
+        startsWith("//") -> baseUrl.substringBefore("://", "https") + ":$this"
+        startsWith("http", true) -> this
+        startsWith("/") -> mainUrl + this
+        baseUrl == mainUrl -> "$mainUrl/${trimStart('/')}"
+        else -> baseUrl.substringBeforeLast("/", mainUrl).trimEnd('/') + "/${trimStart('/')}"
+    }
+
+    private fun String.isMediaUrl(): Boolean {
+        val clean = substringBefore("?").lowercase()
+        return clean.endsWith(".m3u8") || clean.endsWith(".mp4") || clean.endsWith(".mkv") ||
+                clean.endsWith(".webm") || clean.endsWith(".m4v") || clean.endsWith(".mov") ||
+                clean.endsWith(".avi")
+    }
+
+    private fun String.cleanTitle(): String =
+        replace(Regex("\\s+"), " ").trim()
+
+    private fun String.cleanSourceLabel(): String =
+        replace(Regex("(?i)\\b(?:server|stream|source)\\b"), " ")
+            .replace(Regex("\\s+"), " ")
+            .trim(' ', '-', '•')
+            .ifBlank { this }
+
+    private fun String.encodeUrl(): String = URLEncoder.encode(this, "UTF-8")
+    private fun String.htmlDecode(): String = Jsoup.parse(this).text()
+
+    private fun JSONObject.optStringOrNull(key: String): String? =
+        if (!has(key) || isNull(key)) null
+        else optString(key, "").trim().takeIf { it.isNotBlank() && it != "null" }
+}
