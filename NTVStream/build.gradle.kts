@@ -1,4 +1,4 @@
-version = 1
+version = 2
 
 cloudstream {
     language = "en"
@@ -13,7 +13,7 @@ cloudstream {
     status = 1
 
     tvTypes = listOf(
-        "Others"
+        "Livestreams"
     )
 
     iconUrl = "https://www.google.com/s2/favicons?domain=ntvs.cx&sz=%size%"

@@ -43,26 +43,33 @@ abstract class NTVStreamProvider(
     )
 
     final override val mainPage = mainPageOf(
-        "live" to "Live Now",
         "all" to "All Events",
-        "football" to "Football",
+        "featured" to "Featured / Popular",
+        "live" to "Live Now",
+        "football" to "Football / Soccer",
+        "baseball" to "Baseball / MLB",
         "basketball" to "Basketball",
-        "baseball" to "Baseball",
-        "hockey" to "Hockey",
-        "fight" to "Fight / MMA",
+        "combat" to "Fight / MMA / Boxing",
+        "motorsport" to "Motorsport",
         "rugby" to "Rugby",
-        "darts" to "Darts",
+        "hockey" to "Hockey",
+        "tennis" to "Tennis",
         "other" to "Other Sports",
     )
 
     final override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         if (page > 1) return newHomePageResponse(HomePageList(request.name, emptyList(), false), false)
         val matches = fetchMatches()
-        val filtered = when (request.data) {
-            "live" -> matches.filter { it.optBoolean("live", false) || it.optString("status", "").equals("live", true) }
+        val filteredRaw = when (request.data) {
             "all" -> matches
-            else -> matches.filter { it.optString("category", "").equals(request.data, true) }
+            "featured" -> matches.filter { it.optBoolean("popular", false) }.ifEmpty { matches.take(40) }
+            "live" -> matches.filter { it.isLiveEvent() }
+            else -> matches.filter { it.matchesSection(request.data) }
         }
+        // Several upstream servers do not expose a reliable live flag and use
+        // generic categories such as "Live Stream". Do not leave the Cloudstream
+        // homepage with broken/empty rows; fall back to the upcoming/all list.
+        val filtered = filteredRaw.ifEmpty { if (request.data == "live" || !supportsLiveSections) matches.take(50) else emptyList() }
         val list = filtered.mapNotNull { it.toSearchResponse() }
         return newHomePageResponse(HomePageList(request.name, list, isHorizontalImages = false), hasNext = false)
     }
@@ -170,7 +177,12 @@ abstract class NTVStreamProvider(
             return emitMedia(decodedMedia, label, url, callback, subtitleCallback)
         }
         if (url.isMediaUrl()) return emitMedia(url, label, referer, callback, subtitleCallback)
-        if (depth > 3) return false
+
+        val hostPlayer = fetchKnownHostPlayer(url)
+        if (hostPlayer != null && seen.add(hostPlayer)) {
+            return resolveCandidate(hostPlayer, label, url, depth + 1, seen, subtitleCallback, callback)
+        }
+        if (depth > 4) return false
 
         var found = false
         runCatching {
@@ -366,10 +378,26 @@ abstract class NTVStreamProvider(
         null
     }.getOrNull()
 
-    private fun sourceLabel(src: JSONObject, index: Int): String =
-        src.optStringOrNull("channelName")
-            ?: src.optStringOrNull("source")
-            ?: "Source $index"
+    private suspend fun fetchKnownHostPlayer(url: String): String? = runCatching {
+        val host = hostOf(url).lowercase()
+        val id = queryParam(url, "id") ?: return@runCatching null
+        val apiUrl = when {
+            host.endsWith("sansat.link") || host.endsWith("glisco.link") || host.endsWith("dabac.link") ->
+                "${originOf(url)}/api/player.php?id=${id.encodeUrl()}"
+            else -> return@runCatching null
+        }
+        val res = app.get(apiUrl, headers = headersFor(url), timeout = 12000)
+        val text = res.text.trim()
+        if (res.code !in 200..299 || !text.startsWith("{")) return@runCatching null
+        JSONObject(text).optStringOrNull("url")?.toAbsoluteUrl(apiUrl)
+    }.getOrNull()
+
+    private fun sourceLabel(src: JSONObject, index: Int): String {
+        val channel = src.optStringOrNull("channelName")
+        val quality = qualityInitials(channel.orEmpty() + " " + src.optString("id", "") + " " + src.optString("url", ""))
+        val base = channel ?: src.optStringOrNull("source") ?: "Source $index"
+        return listOfNotNull(base.cleanSourceLabel(), quality).distinct().joinToString(" ").ifBlank { "Source $index" }
+    }
 
     private fun teamLine(event: JSONObject): String {
         val teams = event.optJSONObject("teams") ?: return ""
@@ -386,11 +414,46 @@ abstract class NTVStreamProvider(
     )
 
     private fun originOf(url: String): String = runCatching {
-        val clean = url.substringBefore("?" )
+        val clean = url.substringBefore("?")
         val proto = clean.substringBefore("://")
         val host = clean.substringAfter("://").substringBefore("/")
         "$proto://$host"
     }.getOrDefault(mainUrl)
+
+    private fun hostOf(url: String): String = runCatching {
+        url.substringAfter("://").substringBefore("/").substringBefore(":")
+    }.getOrDefault("")
+
+    private fun queryParam(url: String, key: String): String? =
+        url.substringAfter("?", "")
+            .split("&")
+            .firstOrNull { it.substringBefore("=").equals(key, true) }
+            ?.substringAfter("=", "")
+            ?.let { URLDecoder.decode(it, "UTF-8") }
+            ?.takeIf { it.isNotBlank() }
+
+    private fun JSONObject.isLiveEvent(): Boolean =
+        optBoolean("live", false) || optString("status", "").equals("live", true)
+
+    private fun JSONObject.matchesSection(section: String): Boolean {
+        val haystack = listOf(
+            optString("category", ""),
+            optString("tournament", ""),
+            optString("title", ""),
+        ).joinToString(" ").lowercase()
+        return when (section) {
+            "football" -> listOf("football", "soccer", "fifa", "world cup", "usl", "premier", "la liga").any { it in haystack }
+            "baseball" -> listOf("baseball", "mlb").any { it in haystack }
+            "basketball" -> listOf("basketball", "nba", "wnba").any { it in haystack }
+            "combat" -> listOf("fight", "mma", "ufc", "boxing", "combat").any { it in haystack }
+            "motorsport" -> listOf("motorsport", "nascar", "formula", "f1", "racing", "sprint cars").any { it in haystack }
+            "rugby" -> "rugby" in haystack
+            "hockey" -> listOf("hockey", "nhl", "ice hockey").any { it in haystack }
+            "tennis" -> "tennis" in haystack
+            "other" -> listOf("other", "ppv", "event", "live stream", "golf", "darts", "cricket", "volleyball", "horse", "sailing").any { it in haystack }
+            else -> section.lowercase() in haystack
+        }
+    }
 
     private fun serverLabel(): String = serverId.replaceFirstChar { it.uppercase() }
 
