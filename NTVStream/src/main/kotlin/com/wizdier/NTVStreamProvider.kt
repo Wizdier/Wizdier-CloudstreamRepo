@@ -42,7 +42,7 @@ abstract class NTVStreamProvider(
         "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     )
 
-    final override val mainPage = serverMainPage()
+    final override val mainPage = mainPageOf(*serverMainPagePairs().toTypedArray())
 
     final override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val matches = fetchMatches()
@@ -249,7 +249,7 @@ abstract class NTVStreamProvider(
         return true
     }
 
-    private fun serverMainPage(): List<Pair<String, String>> = when (serverId) {
+    private fun serverMainPagePairs(): List<Pair<String, String>> = when (serverId) {
         "kobra" -> listOf(
             "live" to "Live Now",
             "featured" to "Featured / Popular",
