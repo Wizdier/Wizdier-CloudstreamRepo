@@ -266,7 +266,7 @@ abstract class NTVStreamProvider(
         return found
     }
 
-    private fun emitBrowserEmbed(
+    private suspend fun emitBrowserEmbed(
         url: String,
         label: String,
         referer: String,
