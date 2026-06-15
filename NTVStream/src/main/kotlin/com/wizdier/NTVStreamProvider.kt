@@ -32,7 +32,7 @@ abstract class NTVStreamProvider(
     final override val hasQuickSearch = true
     final override val hasChromecastSupport = true
     final override var lang = "en"
-    final override val supportedTypes = setOf(TvType.Livestream)
+    final override val supportedTypes = setOf(TvType.Live)
 
     private data class WatchEmbed(
         val url: String,
