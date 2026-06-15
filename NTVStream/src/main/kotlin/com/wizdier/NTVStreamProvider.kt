@@ -166,7 +166,8 @@ abstract class NTVStreamProvider(
         val watchPath = "/watch/$serverId/$eventId"
         val watchUrl = mainUrl + watchPath
         if (serverId == "kobra" || candidates.isEmpty()) {
-            collectWatchEmbeds(watchPath).forEachIndexed { index, embed ->
+            val embeds = prioritizeWatchEmbeds(collectWatchEmbeds(watchPath))
+            embeds.forEachIndexed { index, embed ->
                 candidates.putIfAbsent(embed.url.toAbsoluteUrl(), embed.label ?: "${serverLabel()} ${index + 1}")
             }
         }
@@ -194,6 +195,36 @@ abstract class NTVStreamProvider(
             val index = priorityWords.indexOfFirst { it in text }
             if (index >= 0) index else 999
         }.take(24)
+    }
+
+    private fun prioritizeWatchEmbeds(embeds: List<WatchEmbed>): List<WatchEmbed> {
+        if (serverId != "kobra" || embeds.size <= 6) return embeds
+
+        val priorityWords = listOf("admin", "delta", "itv", "fox", "telemundo", "echo", "golf")
+        return embeds
+            .sortedWith(
+                compareByDescending<WatchEmbed> { it.label?.contains("[HD]", true) == true }
+                    .thenBy { embed ->
+                        val label = embed.label.orEmpty().lowercase()
+                        priorityWords.indexOfFirst { it in label }.let { if (it >= 0) it else 999 }
+                    }
+                    .thenBy { embed ->
+                        val label = embed.label.orEmpty().lowercase()
+                        when {
+                            "stream 1" in label -> 0
+                            "stream 3" in label -> 1
+                            else -> 2
+                        }
+                    }
+            )
+            .distinctBy { embed ->
+                embed.label.orEmpty()
+                    .replace(Regex("(?i)stream\\s*\\d+"), "")
+                    .replace(Regex("(?i)\\[HD]"), "")
+                    .cleanSourceLabel()
+                    .lowercase()
+            }
+            .take(6)
     }
 
     private suspend fun resolveCandidate(
