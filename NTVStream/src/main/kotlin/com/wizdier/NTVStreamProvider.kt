@@ -219,13 +219,6 @@ abstract class NTVStreamProvider(
         if (depth > 4) return false
 
         var found = false
-        runCatching {
-            loadExtractor(url, referer, subtitleCallback) {
-                callback(it)
-                found = true
-            }
-        }
-        if (found) return true
 
         val html = runCatching { app.get(url, headers = headersFor(referer), timeout = 12000).text }.getOrNull() ?: return false
         decodeProtectedConfigMedia(html)?.let { protectedMedia ->
@@ -255,6 +248,16 @@ abstract class NTVStreamProvider(
         for (next in nested) {
             if (next.isBlank() || !seen.add(next)) continue
             if (resolveCandidate(next, label, url, depth + 1, seen, subtitleCallback, callback)) found = true
+        }
+        if (found) return true
+
+        // Last fallback only. Some generic extractors return stale/bad links for
+        // DLHD/embed pages, so direct parsing above must win first.
+        runCatching {
+            loadExtractor(url, referer, subtitleCallback) {
+                callback(it)
+                found = true
+            }
         }
         return found
     }
@@ -621,6 +624,7 @@ abstract class NTVStreamProvider(
     private fun headersFor(referer: String): Map<String, String> = mapOf(
         "User-Agent" to userAgent,
         "Referer" to referer,
+        "Origin" to originOf(referer),
         "Accept" to "*/*",
     )
 
