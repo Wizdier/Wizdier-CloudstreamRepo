@@ -217,6 +217,11 @@ abstract class NTVStreamProvider(
         }
         if (depth > 4) return false
 
+        if (isBrowserOnlyEmbed(url)) {
+            emitBrowserEmbed(url, label, referer, callback)
+            return true
+        }
+
         var found = false
 
         val html = runCatching { app.get(url, headers = headersFor(referer), timeout = 12000).text }.getOrNull() ?: return false
@@ -259,6 +264,26 @@ abstract class NTVStreamProvider(
             }
         }
         return found
+    }
+
+    private fun emitBrowserEmbed(
+        url: String,
+        label: String,
+        referer: String,
+        callback: (ExtractorLink) -> Unit,
+    ) {
+        val sourceName = "$name • ${label.ifBlank { "Web Player" }}"
+        callback(
+            newExtractorLink(
+                source = sourceName,
+                name = sourceName,
+                url = url,
+                type = INFER_TYPE,
+            ) {
+                this.referer = referer
+                this.quality = Qualities.Unknown.value
+            }
+        )
     }
 
     private suspend fun emitMedia(
@@ -637,6 +662,11 @@ abstract class NTVStreamProvider(
     private fun hostOf(url: String): String = runCatching {
         url.substringAfter("://").substringBefore("/").substringBefore(":")
     }.getOrDefault("")
+
+    private fun isBrowserOnlyEmbed(url: String): Boolean {
+        val host = hostOf(url).lowercase()
+        return host.endsWith("embed.st") || host.endsWith("embedindia.st")
+    }
 
     private fun queryParam(url: String, key: String): String? =
         url.substringAfter("?", "")
