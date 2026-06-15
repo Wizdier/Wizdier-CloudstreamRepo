@@ -27,24 +27,39 @@ abstract class NTVStreamProvider(
 ) : MainAPI() {
     final override var mainUrl = "https://ntv.cx"
     final override var name = providerName
+
+    private val siteBases = listOf(
+        "https://ntv.cx",
+        "https://www.ntv.cx",
+        "http://ntv.cx",
+    )
     final override val hasMainPage = true
     final override val hasDownloadSupport = false
     final override val hasQuickSearch = true
     final override val hasChromecastSupport = true
     final override var lang = "en"
-    final override val supportedTypes = setOf(TvType.Live)
+    final override val supportedTypes: Set<TvType> = setOf(
+        TvType.Live
+    )
 
     private data class WatchEmbed(
         val url: String,
         val label: String?,
     )
 
+    private val userAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+            "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+
     private val webHeaders = mapOf(
-        "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
-                "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+        "User-Agent" to userAgent,
         "Referer" to "$mainUrl/",
-        "Origin" to mainUrl,
         "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    )
+
+    private fun apiHeaders(base: String): Map<String, String> = mapOf(
+        "User-Agent" to userAgent,
+        "Referer" to "$base/",
+        "Accept" to "application/json,text/plain,*/*",
     )
 
     final override val mainPage = mainPageOf(*serverMainPagePairs().toTypedArray())
@@ -88,7 +103,7 @@ abstract class NTVStreamProvider(
         val event = decodeEvent(url) ?: return null
         val eventId = event.optStringOrNull("id") ?: return null
         val fresh = findEvent(eventId) ?: event
-        val title = fresh.optStringOrNull("title") ?: "Live Event"
+        val title = cleanEventDisplayTitle(fresh.optStringOrNull("title") ?: "Live Event")
         val category = fresh.optStringOrNull("category") ?: "Sports"
         val tournament = fresh.optStringOrNull("tournament")
         val date = fresh.optLong("date", 0L).takeIf { it > 0L }
@@ -101,7 +116,7 @@ abstract class NTVStreamProvider(
             .put("sources", sources)
             .toString()
 
-        return newMovieLoadResponse(title.cleanTitle(), url, TvType.Movie, data) {
+        return newMovieLoadResponse(title, url, TvType.Movie, data) {
             posterUrl = poster
             backgroundPosterUrl = poster
             year = date?.let { yearFromMillis(it) }
@@ -148,9 +163,10 @@ abstract class NTVStreamProvider(
         // Kobra keeps the real embed urls only in the watch page. For other
         // servers the API URLs are more direct and much faster; only fall back
         // to watch scraping when API sources are missing.
-        val watchUrl = "$mainUrl/watch/$serverId/$eventId"
+        val watchPath = "/watch/$serverId/$eventId"
+        val watchUrl = mainUrl + watchPath
         if (serverId == "kobra" || candidates.isEmpty()) {
-            collectWatchEmbeds(watchUrl).forEachIndexed { index, embed ->
+            collectWatchEmbeds(watchPath).forEachIndexed { index, embed ->
                 candidates.putIfAbsent(embed.url.toAbsoluteUrl(), embed.label ?: "${serverLabel()} ${index + 1}")
             }
         }
@@ -282,9 +298,10 @@ abstract class NTVStreamProvider(
             "cat:football" to "Football",
             "cat:baseball" to "Baseball",
             "cat:basketball" to "Basketball",
-            "cat:fight" to "Fight / MMA",
-            "cat:hockey" to "Hockey",
             "cat:rugby" to "Rugby",
+            "cat:american-football" to "American Football",
+            "cat:fight" to "Fight / MMA",
+            "cat:tennis" to "Tennis",
             "cat:other" to "Other Sports",
             "all" to "All Events",
         )
@@ -292,12 +309,12 @@ abstract class NTVStreamProvider(
             "all" to "All Events",
             "featured" to "Featured / Popular",
             "cat:Football" to "Football",
-            "cat:Australian Football" to "Australian Football",
             "cat:Baseball" to "Baseball",
-            "cat:Volleyball" to "Volleyball",
+            "cat:Rugby" to "Rugby",
+            "cat:American Football" to "American Football",
+            "cat:Australian Football" to "Australian Football",
+            "cat:Wrestling" to "Wrestling",
             "cat:Basketball" to "Basketball",
-            "cat:Combat Sports" to "Combat Sports",
-            "cat:Ice Hockey" to "Ice Hockey",
         )
         "falcon" -> listOf(
             "all" to "All Live Streams",
@@ -308,14 +325,15 @@ abstract class NTVStreamProvider(
         "phoenix" -> listOf(
             "all" to "All Events",
             "featured" to "Featured / Popular",
-            "cat:Soccer" to "Soccer",
+            "cat:All Soccer Events" to "Soccer",
             "cat:Upcoming Events" to "Upcoming Events",
-            "cat:PPV Events" to "PPV Events",
             "cat:Baseball (MLB)" to "Baseball / MLB",
             "cat:Basketball" to "Basketball",
+            "cat:TV Shows" to "TV Shows / 24-7",
+            "cat:ATP - HALLE | ATP - LONDON | WTA - BERLIN | WTA - NOTTINGHAM" to "Tennis Live",
+            "tennis" to "All Tennis",
             "motorsport" to "Motorsport",
             "combat" to "MMA / Boxing",
-            "tennis" to "Tennis",
             "rugby" to "Rugby",
             "other" to "Other Sports",
         )
@@ -351,20 +369,73 @@ abstract class NTVStreamProvider(
                 for (i in 0 until arr.length()) arr.optJSONObject(i)?.let { out[it.optString("id", i.toString())] = it }
             }
         }
-        return out.values.toList().sortedBy { it.optLong("date", Long.MAX_VALUE) }
+        return mergeSimilarEvents(out.values.toList()).sortedBy { it.optLong("date", Long.MAX_VALUE) }
+    }
+
+    private fun mergeSimilarEvents(events: List<JSONObject>): List<JSONObject> {
+        val grouped = linkedMapOf<String, JSONObject>()
+        events.forEach { event ->
+            val title = event.optStringOrNull("title") ?: return@forEach
+            val category = event.optString("category", "")
+            val dateBucket = event.optLong("date", 0L).takeIf { it > 0L }?.let { it / (3 * 60 * 60 * 1000L) } ?: 0L
+            val key = "${eventMergeKey(title)}|${category.lowercase()}|$dateBucket"
+            val current = grouped[key]
+            if (current == null) {
+                grouped[key] = JSONObject(event.toString()).apply {
+                    put("title", cleanEventDisplayTitle(title))
+                }
+            } else {
+                val mergedSources = current.optJSONArray("sources") ?: JSONArray().also { current.put("sources", it) }
+                val src = event.optJSONArray("sources")
+                if (src != null) {
+                    for (i in 0 until src.length()) {
+                        val obj = src.optJSONObject(i) ?: continue
+                        val sourceKey = obj.optString("url", obj.optString("id", i.toString()))
+                        var exists = false
+                        for (j in 0 until mergedSources.length()) {
+                            val old = mergedSources.optJSONObject(j) ?: continue
+                            if (old.optString("url", old.optString("id", "")) == sourceKey) {
+                                exists = true
+                                break
+                            }
+                        }
+                        if (!exists) mergedSources.put(JSONObject(obj.toString()))
+                    }
+                }
+                if (!current.optBoolean("live", false) && event.optBoolean("live", false)) current.put("live", true)
+            }
+        }
+        return grouped.values.toList()
     }
 
     private suspend fun findEvent(id: String): JSONObject? =
         fetchMatches().firstOrNull { it.optString("id") == id }
 
-    private suspend fun apiJson(path: String): JSONObject? = runCatching {
-        val res = app.get(mainUrl + path, headers = webHeaders, timeout = 15000)
-        if (res.code in 200..299) JSONObject(res.text.trim()) else null
-    }.getOrNull()
+    private suspend fun apiJson(path: String): JSONObject? {
+        for (base in siteBases) {
+            val root = runCatching {
+                val res = app.get(base + path, headers = apiHeaders(base), timeout = 15000)
+                if (res.code in 200..299) JSONObject(res.text.trim()) else null
+            }.getOrNull()
+            if (root != null) return root
+        }
+        return null
+    }
 
-    private suspend fun collectWatchEmbeds(watchUrl: String): List<WatchEmbed> {
-        val html = runCatching { app.get(watchUrl, headers = webHeaders, timeout = 12000).text }.getOrNull() ?: return emptyList()
-        val doc = Jsoup.parse(html, watchUrl)
+    private suspend fun collectWatchEmbeds(watchPath: String): List<WatchEmbed> {
+        var html: String? = null
+        var watchUrl = mainUrl + watchPath
+        for (base in siteBases) {
+            val candidate = base + watchPath
+            val text = runCatching { app.get(candidate, headers = webHeaders + ("Referer" to "$base/"), timeout = 12000).text }.getOrNull()
+            if (!text.isNullOrBlank()) {
+                html = text
+                watchUrl = candidate
+                break
+            }
+        }
+        val page = html ?: return emptyList()
+        val doc = Jsoup.parse(page, watchUrl)
         val out = linkedMapOf<String, WatchEmbed>()
         doc.select("option[value*='/embed'], option[value*='/watch/']").forEach { el ->
             val value = el.attr("value").htmlDecode()
@@ -388,7 +459,7 @@ abstract class NTVStreamProvider(
         val url = encodeEvent(this)
         val poster = optStringOrNull("poster")?.toAbsoluteUrl() ?: defaultPoster()
         val date = optLong("date", 0L).takeIf { it > 0L }
-        return newMovieSearchResponse(title.cleanTitle(), url, TvType.Movie) {
+        return newMovieSearchResponse(cleanEventDisplayTitle(title), url, TvType.Movie) {
             posterUrl = poster
             year = date?.let { yearFromMillis(it) }
         }
@@ -548,9 +619,8 @@ abstract class NTVStreamProvider(
     }
 
     private fun headersFor(referer: String): Map<String, String> = mapOf(
-        "User-Agent" to webHeaders.getValue("User-Agent"),
+        "User-Agent" to userAgent,
         "Referer" to referer,
-        "Origin" to originOf(referer),
         "Accept" to "*/*",
     )
 
@@ -648,6 +718,18 @@ abstract class NTVStreamProvider(
                 clean.endsWith(".webm") || clean.endsWith(".m4v") || clean.endsWith(".mov") ||
                 clean.endsWith(".avi")
     }
+
+    private fun cleanEventDisplayTitle(title: String): String =
+        title.replace(Regex("(?i)^\\s*(?:fifa\\s+)?world\\s+cup\\s+2026\\s+"), "")
+            .replace(Regex("(?i)\\s+(?:eng|english|hd\\s*\\d*|hd\\d*|nl|swe|swa|jp|fr|es|cn\\s*hd|zh|uk|usa)\\s*$"), "")
+            .replace(Regex("\\s+"), " ")
+            .trim()
+            .ifBlank { title.cleanTitle() }
+
+    private fun eventMergeKey(title: String): String = cleanEventDisplayTitle(title)
+        .lowercase()
+        .replace(Regex("[^a-z0-9]+"), " ")
+        .trim()
 
     private fun String.cleanTitle(): String =
         replace(Regex("\\s+"), " ").trim()
