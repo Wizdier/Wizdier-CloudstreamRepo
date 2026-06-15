@@ -2,6 +2,7 @@ package com.wizdier
 
 import android.util.Base64
 import com.lagradost.cloudstream3.*
+import com.lagradost.cloudstream3.network.WebViewResolver
 import com.lagradost.cloudstream3.utils.*
 import org.json.JSONArray
 import org.json.JSONObject
@@ -220,23 +221,7 @@ abstract class NTVStreamProvider(
         var found = false
 
         if (isBrowserOnlyEmbed(url)) {
-            // Try Cloudstream's real extractor first. Do not emit the iframe as a
-            // fake playable link; that caused Error 3003 in the player.
-            runCatching {
-                loadExtractor(url, referer, subtitleCallback) {
-                    callback(it)
-                    found = true
-                }
-            }
-            if (!found) {
-                runCatching {
-                    loadExtractor(url, url, subtitleCallback) {
-                        callback(it)
-                        found = true
-                    }
-                }
-            }
-            if (found) return true
+            if (resolveBrowserOnlyEmbed(url, label, referer, subtitleCallback, callback)) return true
         }
 
         val html = runCatching { app.get(url, headers = headersFor(referer), timeout = 12000).text }.getOrNull() ?: return false
@@ -275,6 +260,49 @@ abstract class NTVStreamProvider(
         runCatching {
             loadExtractor(url, referer, subtitleCallback) {
                 callback(it)
+                found = true
+            }
+        }
+        return found
+    }
+
+    private suspend fun resolveBrowserOnlyEmbed(
+        url: String,
+        label: String,
+        referer: String,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit,
+    ): Boolean {
+        val resolved = runCatching {
+            WebViewResolver(
+                interceptUrl = Regex("""(?i)(?:\.m3u8(?:\?|$)|strmd\.st/.+?\.m3u8)"""),
+                additionalUrls = listOf(Regex("""(?i)(?:\.m3u8(?:\?|$)|strmd\.st/.+?\.m3u8)""")),
+                userAgent = userAgent,
+                useOkhttp = false,
+                timeout = 45_000L,
+            ).resolveUsingWebView(
+                url = url,
+                referer = referer,
+                headers = headersFor(referer),
+            )
+        }.getOrNull() ?: return false
+
+        val requests = buildList {
+            resolved.first?.let(::add)
+            addAll(resolved.second)
+        }.distinctBy { it.url.toString() }
+
+        var found = false
+        requests.forEach { req ->
+            val streamUrl = req.url.toString()
+            if (streamUrl.contains(".m3u8", true)) {
+                val sourceName = "$name • ${label.ifBlank { qualityInitials(streamUrl) ?: "Stream" }}"
+                M3u8Helper.generateM3u8(
+                    source = sourceName,
+                    streamUrl = streamUrl,
+                    referer = req.header("Referer") ?: mediaRefererFor(streamUrl, url),
+                    headers = req.headers.names().associateWith { key -> req.header(key).orEmpty() },
+                ).forEach(callback)
                 found = true
             }
         }
