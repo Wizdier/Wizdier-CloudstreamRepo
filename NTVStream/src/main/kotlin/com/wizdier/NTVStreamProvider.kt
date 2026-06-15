@@ -38,9 +38,8 @@ abstract class NTVStreamProvider(
     final override val hasQuickSearch = true
     final override val hasChromecastSupport = true
     final override var lang = "en"
-    final override val supportedTypes: Set<TvType> = setOf(
-        TvType.Live
-    )
+    private val liveTvType: TvType = TvType.Live
+    final override val supportedTypes: Set<TvType> = setOf(TvType.Live)
 
     private data class WatchEmbed(
         val url: String,
@@ -116,7 +115,7 @@ abstract class NTVStreamProvider(
             .put("sources", sources)
             .toString()
 
-        return newMovieLoadResponse(title, url, TvType.Movie, data) {
+        return newMovieLoadResponse(title, url, liveTvType, data) {
             posterUrl = poster
             backgroundPosterUrl = poster
             year = date?.let { yearFromMillis(it) }
@@ -462,7 +461,7 @@ abstract class NTVStreamProvider(
         val url = encodeEvent(this)
         val poster = optStringOrNull("poster")?.toAbsoluteUrl() ?: defaultPoster()
         val date = optLong("date", 0L).takeIf { it > 0L }
-        return newMovieSearchResponse(cleanEventDisplayTitle(title), url, TvType.Movie) {
+        return newMovieSearchResponse(cleanEventDisplayTitle(title), url, liveTvType) {
             posterUrl = poster
             year = date?.let { yearFromMillis(it) }
         }
