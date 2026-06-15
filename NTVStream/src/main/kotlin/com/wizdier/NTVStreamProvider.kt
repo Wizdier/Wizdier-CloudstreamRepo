@@ -25,7 +25,7 @@ abstract class NTVStreamProvider(
     private val providerName: String,
     private val supportsLiveSections: Boolean,
 ) : MainAPI() {
-    final override var mainUrl = "https://ntvs.cx"
+    final override var mainUrl = "https://ntv.cx"
     final override var name = providerName
     final override val hasMainPage = true
     final override val hasDownloadSupport = false
