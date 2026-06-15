@@ -217,12 +217,27 @@ abstract class NTVStreamProvider(
         }
         if (depth > 4) return false
 
-        if (isBrowserOnlyEmbed(url)) {
-            emitBrowserEmbed(url, label, referer, callback)
-            return true
-        }
-
         var found = false
+
+        if (isBrowserOnlyEmbed(url)) {
+            // Try Cloudstream's real extractor first. Do not emit the iframe as a
+            // fake playable link; that caused Error 3003 in the player.
+            runCatching {
+                loadExtractor(url, referer, subtitleCallback) {
+                    callback(it)
+                    found = true
+                }
+            }
+            if (!found) {
+                runCatching {
+                    loadExtractor(url, url, subtitleCallback) {
+                        callback(it)
+                        found = true
+                    }
+                }
+            }
+            if (found) return true
+        }
 
         val html = runCatching { app.get(url, headers = headersFor(referer), timeout = 12000).text }.getOrNull() ?: return false
         decodeProtectedConfigMedia(html)?.let { protectedMedia ->
@@ -266,26 +281,6 @@ abstract class NTVStreamProvider(
         return found
     }
 
-    private suspend fun emitBrowserEmbed(
-        url: String,
-        label: String,
-        referer: String,
-        callback: (ExtractorLink) -> Unit,
-    ) {
-        val sourceName = "$name • ${label.ifBlank { "Web Player" }}"
-        callback(
-            newExtractorLink(
-                source = sourceName,
-                name = sourceName,
-                url = url,
-                type = INFER_TYPE,
-            ) {
-                this.referer = referer
-                this.quality = Qualities.Unknown.value
-            }
-        )
-    }
-
     private suspend fun emitMedia(
         url: String,
         label: String,
@@ -294,13 +289,14 @@ abstract class NTVStreamProvider(
         subtitleCallback: (SubtitleFile) -> Unit,
     ): Boolean {
         val sourceName = "$name • ${label.ifBlank { qualityInitials(url) ?: "Stream" }}"
+        val mediaReferer = mediaRefererFor(url, referer)
         if (url.contains(".m3u8", true)) {
-            collectM3u8Subtitles(url, referer, subtitleCallback)
+            collectM3u8Subtitles(url, mediaReferer, subtitleCallback)
             M3u8Helper.generateM3u8(
                 source = sourceName,
                 streamUrl = url,
-                referer = referer,
-                headers = headersFor(referer),
+                referer = mediaReferer,
+                headers = mediaHeadersFor(url, mediaReferer),
             ).forEach(callback)
         } else {
             callback(
@@ -310,7 +306,7 @@ abstract class NTVStreamProvider(
                     url = url,
                     type = ExtractorLinkType.VIDEO,
                 ) {
-                    this.referer = referer
+                    this.referer = mediaReferer
                     this.quality = getQualityFromName(url)
                 }
             )
@@ -651,6 +647,28 @@ abstract class NTVStreamProvider(
         "Origin" to originOf(referer),
         "Accept" to "*/*",
     )
+
+    private fun mediaRefererFor(mediaUrl: String, parentReferer: String): String {
+        val host = hostOf(mediaUrl).lowercase()
+        return if (host.endsWith("strmd.st") && parentReferer.contains("embed", true)) {
+            originOf(parentReferer).trimEnd('/') + "/"
+        } else parentReferer
+    }
+
+    private fun mediaHeadersFor(mediaUrl: String, referer: String): Map<String, String> {
+        val host = hostOf(mediaUrl).lowercase()
+        val base = headersFor(referer)
+        return if (host.endsWith("strmd.st")) {
+            base + mapOf(
+                "Accept-Language" to "en-US,en;q=0.9",
+                "DNT" to "1",
+                "Sec-GPC" to "1",
+                "Sec-Fetch-Dest" to "empty",
+                "Sec-Fetch-Mode" to "cors",
+                "Sec-Fetch-Site" to "cross-site",
+            )
+        } else base
+    }
 
     private fun originOf(url: String): String = runCatching {
         val clean = url.substringBefore("?")
