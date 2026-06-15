@@ -1,5 +1,6 @@
 package com.wizdier
 
+import android.util.Base64
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
 import org.json.JSONArray
@@ -9,7 +10,6 @@ import org.jsoup.nodes.Document
 import java.net.URLDecoder
 import java.net.URLEncoder
 import java.text.SimpleDateFormat
-import java.util.Base64
 import java.util.Date
 import java.util.Locale
 import java.util.TimeZone
@@ -32,7 +32,12 @@ abstract class NTVStreamProvider(
     final override val hasQuickSearch = true
     final override val hasChromecastSupport = true
     final override var lang = "en"
-    final override val supportedTypes = setOf(TvType.Others)
+    final override val supportedTypes = setOf(TvType.Livestreams)
+
+    private data class WatchEmbed(
+        val url: String,
+        val label: String?,
+    )
 
     private val webHeaders = mapOf(
         "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
@@ -89,14 +94,14 @@ abstract class NTVStreamProvider(
         val date = fresh.optLong("date", 0L).takeIf { it > 0L }
         val live = fresh.optBoolean("live", false) || fresh.optString("status", "").equals("live", true)
         val sources = fresh.optJSONArray("sources") ?: JSONArray()
-        val poster = fresh.optStringOrNull("poster")?.toAbsoluteUrl()
+        val poster = fresh.optStringOrNull("poster")?.toAbsoluteUrl() ?: defaultPoster()
         val data = JSONObject()
             .put("server", serverId)
             .put("eventId", eventId)
             .put("sources", sources)
             .toString()
 
-        return newMovieLoadResponse(title.cleanTitle(), url, TvType.Others, data) {
+        return newMovieLoadResponse(title.cleanTitle(), url, TvType.Movie, data) {
             posterUrl = poster
             backgroundPosterUrl = poster
             year = date?.let { yearFromMillis(it) }
@@ -133,18 +138,21 @@ abstract class NTVStreamProvider(
         val sources = root.optJSONArray("sources") ?: JSONArray()
         val candidates = linkedMapOf<String, String>()
 
-        for (i in 0 until sources.length()) {
-            val src = sources.optJSONObject(i) ?: continue
+        val prioritized = prioritizeSources(sources)
+        for (i in prioritized.indices) {
+            val src = prioritized[i]
             val label = sourceLabel(src, i + 1)
             src.optStringOrNull("url")?.let { candidates[it.toAbsoluteUrl()] = label }
         }
 
-        // Kobra keeps the real embed urls only in the watch page. The other
-        // servers also expose selected /embed tokens there, so this is a useful
-        // fallback when an upstream API source url is missing or dead.
+        // Kobra keeps the real embed urls only in the watch page. For other
+        // servers the API URLs are more direct and much faster; only fall back
+        // to watch scraping when API sources are missing.
         val watchUrl = "$mainUrl/watch/$serverId/$eventId"
-        collectWatchEmbeds(watchUrl).forEachIndexed { index, embed ->
-            candidates.putIfAbsent(embed.toAbsoluteUrl(), "${serverLabel()} ${index + 1}")
+        if (serverId == "kobra" || candidates.isEmpty()) {
+            collectWatchEmbeds(watchUrl).forEachIndexed { index, embed ->
+                candidates.putIfAbsent(embed.url.toAbsoluteUrl(), embed.label ?: "${serverLabel()} ${index + 1}")
+            }
         }
 
         var found = false
@@ -156,6 +164,20 @@ abstract class NTVStreamProvider(
             }
         }
         return found
+    }
+
+    private fun prioritizeSources(sources: JSONArray): List<JSONObject> {
+        val all = (0 until sources.length()).mapNotNull { sources.optJSONObject(it) }
+        if (all.size <= 24) return all
+        val priorityWords = listOf(
+            "itv", "sbs", "fox", "telemundo", "tsn", "ctv", "bein", "dazn",
+            "npo", "rte", "srf", "sport tv", "tvp", "m6", "rai", "sky"
+        )
+        return all.sortedBy { src ->
+            val text = (src.optString("channelName", "") + " " + src.optString("source", "")).lowercase()
+            val index = priorityWords.indexOfFirst { it in text }
+            if (index >= 0) index else 999
+        }.take(24)
     }
 
     private suspend fun resolveCandidate(
@@ -193,6 +215,10 @@ abstract class NTVStreamProvider(
         decodeProtectedConfigMedia(html)?.let { protectedMedia ->
             if (seen.add(protectedMedia) && emitMedia(protectedMedia, label, url, callback, subtitleCallback)) return true
         }
+        extractAtobMedia(html).forEach { media ->
+            if (seen.add(media) && emitMedia(media, label, url, callback, subtitleCallback)) found = true
+        }
+        if (found) return true
         val doc = Jsoup.parse(html, url)
         collectSubtitles(doc, html, url, subtitleCallback)
 
@@ -336,23 +362,33 @@ abstract class NTVStreamProvider(
         if (res.code in 200..299) JSONObject(res.text.trim()) else null
     }.getOrNull()
 
-    private suspend fun collectWatchEmbeds(watchUrl: String): List<String> {
+    private suspend fun collectWatchEmbeds(watchUrl: String): List<WatchEmbed> {
         val html = runCatching { app.get(watchUrl, headers = webHeaders, timeout = 12000).text }.getOrNull() ?: return emptyList()
         val doc = Jsoup.parse(html, watchUrl)
-        val out = linkedSetOf<String>()
-        doc.select("iframe[src*='/embed'], iframe[src], option[value*='/embed'], option[value*='/watch/']").forEach { el ->
-            val value = el.attr("src").ifBlank { el.attr("value") }.htmlDecode()
-            if (value.contains("/embed") || value.contains("/watch/")) out += value.toAbsoluteUrl(watchUrl)
+        val out = linkedMapOf<String, WatchEmbed>()
+        doc.select("option[value*='/embed'], option[value*='/watch/']").forEach { el ->
+            val value = el.attr("value").htmlDecode()
+            if (value.contains("/embed") || value.contains("/watch/")) {
+                val abs = value.toAbsoluteUrl(watchUrl)
+                out[abs] = WatchEmbed(abs, el.text().cleanSourceLabel())
+            }
         }
-        return out.toList()
+        doc.select("iframe[src*='/embed'], iframe[src]").forEach { el ->
+            val value = el.attr("src").htmlDecode()
+            if (value.isNotBlank()) {
+                val abs = value.toAbsoluteUrl(watchUrl)
+                out.putIfAbsent(abs, WatchEmbed(abs, "${serverLabel()} Player"))
+            }
+        }
+        return out.values.toList()
     }
 
     private fun JSONObject.toSearchResponse(): SearchResponse? {
         val title = optStringOrNull("title") ?: return null
         val url = encodeEvent(this)
-        val poster = optStringOrNull("poster")?.toAbsoluteUrl()
+        val poster = optStringOrNull("poster")?.toAbsoluteUrl() ?: defaultPoster()
         val date = optLong("date", 0L).takeIf { it > 0L }
-        return newMovieSearchResponse(title.cleanTitle(), url, TvType.Others) {
+        return newMovieSearchResponse(title.cleanTitle(), url, TvType.Movie) {
             posterUrl = poster
             year = date?.let { yearFromMillis(it) }
         }
@@ -369,14 +405,17 @@ abstract class NTVStreamProvider(
             .put("live", event.optBoolean("live", false))
             .put("poster", event.optString("poster"))
             .put("sources", event.optJSONArray("sources") ?: JSONArray())
-        val data = Base64.getUrlEncoder().withoutPadding().encodeToString(slim.toString().toByteArray())
+        val data = Base64.encodeToString(
+            slim.toString().toByteArray(),
+            Base64.URL_SAFE or Base64.NO_WRAP or Base64.NO_PADDING
+        )
         return "load?data=$data"
     }
 
     private fun decodeEvent(url: String): JSONObject? = runCatching {
         if (!url.contains("load?data=")) return@runCatching null
         val data = url.substringAfter("load?data=").substringBefore("&")
-        JSONObject(String(Base64.getUrlDecoder().decode(data)))
+        JSONObject(String(Base64.decode(data, Base64.URL_SAFE)))
     }.getOrNull()
 
     private suspend fun collectSubtitles(
@@ -435,6 +474,21 @@ abstract class NTVStreamProvider(
         null
     }.getOrNull()
 
+    private fun extractAtobMedia(html: String): List<String> {
+        val out = linkedSetOf<String>()
+        Regex("""(?:window\.)?atob\(\s*['"]([^'"]+)['"]\s*\)""", RegexOption.IGNORE_CASE)
+            .findAll(html)
+            .forEach { match ->
+                val decoded = runCatching { decodeBase64Text(match.groupValues[1], latin1 = false) }.getOrNull()
+                    ?: return@forEach
+                if (decoded.isMediaUrl()) out += decoded
+                Regex("""https?://[^\s"'<>]+(?:\.m3u8|\.mp4|\.mkv|\.webm|\.m4v)(?:\?[^\s"'<>]*)?""", RegexOption.IGNORE_CASE)
+                    .findAll(decoded)
+                    .mapTo(out) { it.value }
+            }
+        return out.toList()
+    }
+
     private suspend fun fetchKnownHostPlayer(url: String): String? = runCatching {
         val host = hostOf(url).lowercase()
         val id = queryParam(url, "id") ?: return@runCatching null
@@ -475,7 +529,7 @@ abstract class NTVStreamProvider(
     private fun decodeBase64Text(value: String, latin1: Boolean): String {
         val normalized = value.replace('-', '+').replace('_', '/')
         val padded = normalized + "=".repeat((4 - normalized.length % 4) % 4)
-        val bytes = Base64.getDecoder().decode(padded)
+        val bytes = Base64.decode(padded, Base64.DEFAULT)
         return if (latin1) String(bytes, Charsets.ISO_8859_1) else String(bytes, Charsets.UTF_8)
     }
 
@@ -543,6 +597,8 @@ abstract class NTVStreamProvider(
     }
 
     private fun serverLabel(): String = serverId.replaceFirstChar { it.uppercase() }
+
+    private fun defaultPoster(): String = "$mainUrl/assets/img/logo1.png"
 
     private fun qualityInitials(text: String): String? {
         val raw = text.replace("%20", " ").replace("_", " ").replace("-", " ")

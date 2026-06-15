@@ -65,8 +65,7 @@ class CircleFtpProvider : MainAPI() {
         TvType.Cartoon,
         TvType.AsianDrama,
         TvType.Documentary,
-        TvType.OVA,
-        TvType.Others
+        TvType.OVA
     )
 
     override val supportedSyncNames = setOfNotNull(
