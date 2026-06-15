@@ -224,7 +224,7 @@ abstract class NTVStreamProvider(
                     .cleanSourceLabel()
                     .lowercase()
             }
-            .take(6)
+            .take(3)
     }
 
     private suspend fun resolveCandidate(
@@ -321,23 +321,56 @@ abstract class NTVStreamProvider(
         val requests = buildList {
             resolved.first?.let(::add)
             addAll(resolved.second)
-        }.distinctBy { it.url.toString() }
+        }
+            .filter { it.url.toString().contains(".m3u8", true) }
+            .distinctBy { it.url.toString() }
+            .sortedWith(compareBy(
+                { req -> if (req.url.toString().contains("/high/", true)) 0 else 1 },
+                { req -> if (req.url.toString().contains("mono.m3u8", true)) 0 else 1 },
+            ))
+            .take(1)
 
         var found = false
         requests.forEach { req ->
             val streamUrl = req.url.toString()
-            if (streamUrl.contains(".m3u8", true)) {
-                val sourceName = "$name • ${label.ifBlank { qualityInitials(streamUrl) ?: "Stream" }}"
-                M3u8Helper.generateM3u8(
-                    source = sourceName,
-                    streamUrl = streamUrl,
-                    referer = req.header("Referer") ?: mediaRefererFor(streamUrl, url),
-                    headers = req.headers.names().associateWith { key -> req.header(key).orEmpty() },
-                ).forEach(callback)
-                found = true
-            }
+            val refererHeader = req.header("Referer") ?: mediaRefererFor(streamUrl, url)
+            val capturedHeaders = req.headers.names().associateWith { key -> req.header(key).orEmpty() }
+            emitDirectM3u8(
+                streamUrl = streamUrl,
+                label = label,
+                referer = refererHeader,
+                headers = mediaHeadersFor(streamUrl, refererHeader) + capturedHeaders,
+                callback = callback,
+            )
+            found = true
         }
         return found
+    }
+
+    private suspend fun emitDirectM3u8(
+        streamUrl: String,
+        label: String,
+        referer: String,
+        headers: Map<String, String>,
+        callback: (ExtractorLink) -> Unit,
+    ) {
+        val sourceName = "$name • ${label.ifBlank { qualityInitials(streamUrl) ?: "Stream" }}"
+        callback(
+            newExtractorLink(
+                source = sourceName,
+                name = sourceName,
+                url = streamUrl,
+                type = ExtractorLinkType.M3U8,
+            ) {
+                this.referer = referer
+                this.quality = when {
+                    streamUrl.contains("/high/", true) -> Qualities.P720.value
+                    streamUrl.contains("/low/", true) -> Qualities.P480.value
+                    else -> getQualityFromName(streamUrl)
+                }
+                this.headers = headers
+            }
+        )
     }
 
     private suspend fun emitMedia(
@@ -350,13 +383,18 @@ abstract class NTVStreamProvider(
         val sourceName = "$name • ${label.ifBlank { qualityInitials(url) ?: "Stream" }}"
         val mediaReferer = mediaRefererFor(url, referer)
         if (url.contains(".m3u8", true)) {
-            collectM3u8Subtitles(url, mediaReferer, subtitleCallback)
-            M3u8Helper.generateM3u8(
-                source = sourceName,
-                streamUrl = url,
-                referer = mediaReferer,
-                headers = mediaHeadersFor(url, mediaReferer),
-            ).forEach(callback)
+            val mediaHeaders = mediaHeadersFor(url, mediaReferer)
+            if (hostOf(url).lowercase().endsWith("strmd.st")) {
+                emitDirectM3u8(url, label, mediaReferer, mediaHeaders, callback)
+            } else {
+                collectM3u8Subtitles(url, mediaReferer, subtitleCallback)
+                M3u8Helper.generateM3u8(
+                    source = sourceName,
+                    streamUrl = url,
+                    referer = mediaReferer,
+                    headers = mediaHeaders,
+                ).forEach(callback)
+            }
         } else {
             callback(
                 newExtractorLink(
