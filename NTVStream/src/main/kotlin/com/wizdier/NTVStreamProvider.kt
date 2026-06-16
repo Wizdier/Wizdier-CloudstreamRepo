@@ -14,6 +14,10 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.TimeZone
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 
 class NTVStreamKobra : NTVStreamProvider("kobra", "NTVStream Kobra", true)
 class NTVStreamRaptor : NTVStreamProvider("raptor", "NTVStream Raptor", false)
@@ -308,6 +312,69 @@ abstract class NTVStreamProvider(
         return found
     }
 
+    private suspend fun resolveUsingActiveActivityWebView(
+        url: String,
+        referer: String,
+        timeout: Long = 25000L
+    ): String? {
+        val activity = com.lagradost.cloudstream3.CommonActivity.activity ?: return null
+        val deferred = CompletableDeferred<String?>()
+
+        withContext(Dispatchers.Main) {
+            val webView = android.webkit.WebView(activity).apply {
+                settings.apply {
+                    javaScriptEnabled = true
+                    domStorageEnabled = true
+                    databaseEnabled = true
+                    mediaPlaybackRequiresUserGesture = false
+                    userAgentString = userAgent
+                }
+
+                webViewClient = object : android.webkit.WebViewClient() {
+                    override fun shouldInterceptRequest(
+                        view: android.webkit.WebView?,
+                        request: android.webkit.WebResourceRequest?
+                    ): android.webkit.WebResourceResponse? {
+                        val reqUrl = request?.url?.toString().orEmpty()
+                        if (reqUrl.contains(".m3u8", true) || reqUrl.contains("strmd.st", true)) {
+                            deferred.complete(reqUrl)
+                        }
+                        return super.shouldInterceptRequest(view, request)
+                    }
+
+                    override fun onLoadResource(view: android.webkit.WebView?, url: String?) {
+                        val reqUrl = url.orEmpty()
+                        if (reqUrl.contains(".m3u8", true) || reqUrl.contains("strmd.st", true)) {
+                            deferred.complete(reqUrl)
+                        }
+                        super.onLoadResource(view, url)
+                    }
+                }
+            }
+
+            val root = activity.findViewById<android.view.ViewGroup>(android.R.id.content)
+            val params = android.view.ViewGroup.LayoutParams(1, 1)
+            root?.addView(webView, params)
+
+            deferred.invokeOnCompletion {
+                activity.runOnUiThread {
+                    runCatching {
+                        root?.removeView(webView)
+                        webView.stopLoading()
+                        webView.destroy()
+                    }
+                }
+            }
+
+            val headers = headersFor(referer)
+            webView.loadUrl(url, headers)
+        }
+
+        return withTimeoutOrNull(timeout) {
+            deferred.await()
+        }
+    }
+
     private suspend fun resolveBrowserOnlyEmbed(
         url: String,
         label: String,
@@ -315,6 +382,20 @@ abstract class NTVStreamProvider(
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit,
     ): Boolean {
+        // 1. Try our high-compatibility active activity-attached WebView resolution first!
+        val m3u8Url = resolveUsingActiveActivityWebView(url, referer)
+        if (m3u8Url != null) {
+            emitDirectM3u8(
+                streamUrl = m3u8Url,
+                label = label,
+                referer = url,
+                headers = mediaHeadersFor(m3u8Url, url),
+                callback = callback
+            )
+            return true
+        }
+
+        // 2. Fall back to standard WebViewResolver (useOkhttp = false)
         var resolved = runCatching {
             WebViewResolver(
                 interceptUrl = Regex("""(?i)(?:\.m3u8(?:\?|$)|strmd\.st/.+?\.m3u8)"""),
@@ -329,6 +410,7 @@ abstract class NTVStreamProvider(
             )
         }.getOrNull()
 
+        // 3. Fall back to WebViewResolver (useOkhttp = true)
         if (resolved == null || (resolved.first == null && resolved.second.isEmpty())) {
             resolved = runCatching {
                 WebViewResolver(
