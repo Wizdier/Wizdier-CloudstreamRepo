@@ -328,6 +328,9 @@ abstract class NTVStreamProvider(
                     databaseEnabled = true
                     mediaPlaybackRequiresUserGesture = false
                     userAgentString = userAgent
+                    mixedContentMode = android.webkit.WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
+                    loadWithOverviewMode = true
+                    useWideViewPort = true
                 }
 
                 webViewClient = object : android.webkit.WebViewClient() {
@@ -349,10 +352,25 @@ abstract class NTVStreamProvider(
                         }
                         super.onLoadResource(view, url)
                     }
+
+                    override fun onReceivedSslError(
+                        view: android.webkit.WebView?,
+                        handler: android.webkit.SslErrorHandler?,
+                        error: android.net.http.SslError?
+                    ) {
+                        handler?.proceed()
+                    }
+
+                    override fun shouldOverrideUrlLoading(
+                        view: android.webkit.WebView?,
+                        request: android.webkit.WebResourceRequest?
+                    ): Boolean {
+                        return true
+                    }
                 }
             }
 
-            val root = activity.findViewById<android.view.ViewGroup>(android.R.id.content)
+            val root = activity.window.decorView as? android.view.ViewGroup
             val params = android.view.ViewGroup.LayoutParams(1, 1)
             root?.addView(webView, params)
 
@@ -806,9 +824,13 @@ abstract class NTVStreamProvider(
     }.getOrNull()
 
     private fun decodeProtectedConfigMedia(html: String): String? = runCatching {
-        val encoded = Regex("""window\._econfig\s*=\s*['"]([^'"]+)['"]""")
-            .find(html)?.groupValues?.getOrNull(1)
-            ?: return@runCatching null
+        var encoded = Regex("""window\[['"]([a-zA-Z0-9_]{16})['"]\]\s*=\s*['"]([^'"]{300,})['"]""")
+            .find(html)?.groupValues?.getOrNull(2)
+        if (encoded == null) {
+            encoded = Regex("""window\._econfig\s*=\s*['"]([^'"]+)['"]""")
+                .find(html)?.groupValues?.getOrNull(1)
+        }
+        if (encoded == null) return@runCatching null
         val first = decodeBase64Text(encoded, latin1 = true)
         val partsCount = 4
         val chunkSize = kotlin.math.ceil(first.length / partsCount.toDouble()).toInt()
