@@ -312,12 +312,30 @@ abstract class NTVStreamProvider(
         return found
     }
 
+    private fun getCurrentActivity(): android.app.Activity? {
+        return runCatching {
+            val activityThreadClass = Class.forName("android.app.ActivityThread")
+            val activityThread = activityThreadClass.getMethod("currentActivityThread").invoke(null)
+            val activitiesField = activityThreadClass.getDeclaredField("mActivities").apply { isAccessible = true }
+            val activities = activitiesField.get(activityThread) as Map<*, *>
+            for (activityRecord in activities.values) {
+                val activityRecordClass = activityRecord::class.java
+                val pausedField = activityRecordClass.getDeclaredField("paused").apply { isAccessible = true }
+                if (!pausedField.getBoolean(activityRecord)) {
+                    val activityField = activityRecordClass.getDeclaredField("activity").apply { isAccessible = true }
+                    return activityField.get(activityRecord) as android.app.Activity
+                }
+            }
+            null
+        }.getOrNull() ?: com.lagradost.cloudstream3.CommonActivity.activity
+    }
+
     private suspend fun resolveUsingActiveActivityWebView(
         url: String,
         referer: String,
         timeout: Long = 25000L
     ): String? {
-        val activity = com.lagradost.cloudstream3.CommonActivity.activity ?: return null
+        val activity = getCurrentActivity() ?: return null
         val deferred = CompletableDeferred<String?>()
 
         withContext(Dispatchers.Main) {
@@ -747,9 +765,9 @@ abstract class NTVStreamProvider(
         val page = html ?: return emptyList()
         val doc = Jsoup.parse(page, watchUrl)
         val out = linkedMapOf<String, WatchEmbed>()
-        doc.select("option[value*='/embed'], option[value*='/watch/']").forEach { el ->
+        doc.select("select option, option[value*='/embed'], option[value*='/watch/']").forEach { el ->
             val value = el.attr("value").htmlDecode()
-            if (value.contains("/embed") || value.contains("/watch/")) {
+            if (value.isNotBlank() && (value.contains("/embed") || value.contains("/watch/") || value.contains("t="))) {
                 val abs = value.toAbsoluteUrl(watchUrl)
                 out[abs] = WatchEmbed(abs, el.text().cleanSourceLabel())
             }
@@ -974,7 +992,7 @@ abstract class NTVStreamProvider(
 
     private fun isBrowserOnlyEmbed(url: String): Boolean {
         val host = hostOf(url).lowercase()
-        return host.endsWith("embed.st") || host.endsWith("embedindia.st")
+        return host.endsWith(".st") || host.contains("embed")
     }
 
     private fun queryParam(url: String, key: String): String? =
