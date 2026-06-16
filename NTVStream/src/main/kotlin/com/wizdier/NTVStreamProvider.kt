@@ -365,6 +365,21 @@ abstract class NTVStreamProvider(
                                         return originalOpen.apply(this, arguments);
                                     };
                                 }
+                                var tryPlay = function() {
+                                    var p = document.getElementById('player');
+                                    if (p) p.click();
+                                    var playBtn = document.querySelector('.jw-display-icon-container, .clappr-play-button, video, .vjs-big-play-button');
+                                    if (playBtn) {
+                                        playBtn.click();
+                                        var video = document.querySelector('video');
+                                        if (video) {
+                                            video.muted = true;
+                                            video.play().catch(function(e) {});
+                                        }
+                                    }
+                                };
+                                tryPlay();
+                                setInterval(tryPlay, 1000);
                             })();
                         """.trimIndent()
                         view?.evaluateJavascript(js, null)
