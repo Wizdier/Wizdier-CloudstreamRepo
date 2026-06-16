@@ -194,7 +194,7 @@ abstract class NTVStreamProvider(
             val text = (src.optString("channelName", "") + " " + src.optString("source", "")).lowercase()
             val index = priorityWords.indexOfFirst { it in text }
             if (index >= 0) index else 999
-        }.take(24)
+        }
     }
 
     private fun prioritizeWatchEmbeds(embeds: List<WatchEmbed>): List<WatchEmbed> {
@@ -224,7 +224,6 @@ abstract class NTVStreamProvider(
                     .cleanSourceLabel()
                     .lowercase()
             }
-            .take(3)
     }
 
     private suspend fun resolveCandidate(
