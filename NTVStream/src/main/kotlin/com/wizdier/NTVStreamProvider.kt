@@ -134,7 +134,7 @@ abstract class NTVStreamProvider(
             year = date?.let { yearFromMillis(it) }
             plot = buildString {
                 append(if (live) "LIVE" else "Scheduled")
-                date?.let { append(" â€¢ ").append(formatDate(it)) }
+                date?.let { append(" Ã¢â‚¬Â¢ ").append(formatDate(it)) }
                 append("\n")
                 append("Server: ").append(serverLabel())
                 append("\nSport: ").append(category)
@@ -315,7 +315,7 @@ abstract class NTVStreamProvider(
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit,
     ): Boolean {
-        val resolved = runCatching {
+        var resolved = runCatching {
             WebViewResolver(
                 interceptUrl = Regex("""(?i)(?:\.m3u8(?:\?|$)|strmd\.st/.+?\.m3u8)"""),
                 additionalUrls = listOf(Regex("""(?i)(?:\.m3u8(?:\?|$)|strmd\.st/.+?\.m3u8)""")),
@@ -327,7 +327,25 @@ abstract class NTVStreamProvider(
                 referer = referer,
                 headers = headersFor(referer),
             )
-        }.getOrNull() ?: return false
+        }.getOrNull()
+
+        if (resolved == null || (resolved.first == null && resolved.second.isEmpty())) {
+            resolved = runCatching {
+                WebViewResolver(
+                    interceptUrl = Regex("""(?i)(?:\.m3u8(?:\?|$)|strmd\.st/.+?\.m3u8)"""),
+                    additionalUrls = listOf(Regex("""(?i)(?:\.m3u8(?:\?|$)|strmd\.st/.+?\.m3u8)""")),
+                    userAgent = userAgent,
+                    useOkhttp = true,
+                    timeout = 45_000L,
+                ).resolveUsingWebView(
+                    url = url,
+                    referer = referer,
+                    headers = headersFor(referer),
+                )
+            }.getOrNull()
+        }
+
+        if (resolved == null) return false
 
         val requests = buildList {
             resolved.first?.let(::add)
@@ -365,7 +383,7 @@ abstract class NTVStreamProvider(
         headers: Map<String, String>,
         callback: (ExtractorLink) -> Unit,
     ) {
-        val sourceName = "$name â€¢ ${label.ifBlank { qualityInitials(streamUrl) ?: "Stream" }}"
+        val sourceName = "$name Ã¢â‚¬Â¢ ${label.ifBlank { qualityInitials(streamUrl) ?: "Stream" }}"
         callback(
             newExtractorLink(
                 source = sourceName,
@@ -391,7 +409,7 @@ abstract class NTVStreamProvider(
         callback: (ExtractorLink) -> Unit,
         subtitleCallback: (SubtitleFile) -> Unit,
     ): Boolean {
-        val sourceName = "$name â€¢ ${label.ifBlank { qualityInitials(url) ?: "Stream" }}"
+        val sourceName = "$name Ã¢â‚¬Â¢ ${label.ifBlank { qualityInitials(url) ?: "Stream" }}"
         val mediaReferer = mediaRefererFor(url, referer)
         if (url.contains(".m3u8", true)) {
             val mediaHeaders = mediaHeadersFor(url, mediaReferer)
