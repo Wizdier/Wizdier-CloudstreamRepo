@@ -978,7 +978,7 @@ abstract class NTVStreamProvider(
     private fun String.cleanSourceLabel(): String =
         replace(Regex("(?i)\\b(?:server|stream|source)\\b"), " ")
             .replace(Regex("\\s+"), " ")
-            .trim(' ', '-', 'â€¢')
+            .trim(' ', '-', '\u2022')
             .ifBlank { this }
 
     private fun String.xmlEscape(): String =

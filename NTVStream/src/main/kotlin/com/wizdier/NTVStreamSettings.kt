@@ -90,11 +90,11 @@ object NTVStreamSettings {
 
         val root = LinearLayout(context).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(18), dp(18), dp(18), dp(14))
+            setPadding(dp(18), dp(18), dp(18), dp(18))
             background = rounded(bg, radius = 24, strokeColor = Color.parseColor("#334155"), strokeWidth = 1)
         }
 
-        root.addView(label("NTVStream", 24f, text, bold = true))
+        root.addView(label("NTVStream", 24f, textColor, bold = true))
         root.addView(label("Server selector", 13f, accent, bold = true).apply {
             setPadding(0, dp(2), 0, dp(8))
         })
@@ -133,9 +133,11 @@ object NTVStreamSettings {
 
             val texts = LinearLayout(context).apply {
                 orientation = LinearLayout.VERTICAL
-                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
+                    setMargins(dp(12), 0, 0, 0)
+                }
             }
-            texts.addView(label("$badge  $title", 15.5f, text, bold = true))
+            texts.addView(label("$badge  $title", 15.5f, textColor, bold = true))
             texts.addView(label(subtitle, 12f, muted))
 
             card.addView(box)
@@ -163,8 +165,10 @@ object NTVStreamSettings {
         }
         val allTexts = LinearLayout(context).apply {
             orientation = LinearLayout.VERTICAL
-            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
-            addView(label("âš¡ All servers", 16f, text, bold = true))
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
+                setMargins(dp(12), 0, 0, 0)
+            }
+            addView(label("\u26A1 All servers", 16f, textColor, bold = true))
             addView(label("Show every NTVStream provider after reload", 12f, muted))
         }
         allCard.addView(allBox)
@@ -172,11 +176,11 @@ object NTVStreamSettings {
         allCard.setOnClickListener { allBox.isChecked = !allBox.isChecked }
         root.addView(allCard)
 
-        addServerCard(SERVER_KOBRA, "Kobra", "Recommended â€¢ stable browser-resolved streams", "ðŸ", recommended = true)
-        addServerCard(SERVER_RAPTOR, "Raptor", "EmbedIndia based backup server", "ðŸ¦…")
-        addServerCard(SERVER_FALCON, "Falcon", "Direct m3u8-style backup channels", "ðŸ¦‡")
-        addServerCard(SERVER_PHOENIX, "Phoenix", "Large list, upstream may be unstable", "ðŸ”¥")
-        addServerCard(SERVER_VIPER, "Viper", "Alternate broadcaster channels", "ðŸ")
+        addServerCard(SERVER_KOBRA, "Kobra", "Recommended \u2022 stable browser-resolved streams", "\uD83D\uDC0D", recommended = true)
+        addServerCard(SERVER_RAPTOR, "Raptor", "EmbedIndia based backup server", "\uD83E\uDD85")
+        addServerCard(SERVER_FALCON, "Falcon", "Direct m3u8-style backup channels", "\uD83E\uDD85")
+        addServerCard(SERVER_PHOENIX, "Phoenix", "Large list, upstream may be unstable", "\uD83D\uDD25")
+        addServerCard(SERVER_VIPER, "Viper", "Alternate broadcaster channels", "\uD83D\uDC0D")
 
         val status = label("", 12f, muted).apply { setPadding(0, dp(4), 0, 0) }
         root.addView(status)
@@ -187,9 +191,9 @@ object NTVStreamSettings {
             allBox.isChecked = checkBoxes.values.all { it.isChecked }
             val count = checkBoxes.values.count { it.isChecked }
             status.text = if (count == 0) {
-                "No server selected â€” Kobra will be used automatically."
+                "No server selected \u2014 Kobra will be used automatically."
             } else {
-                "$count server${if (count == 1) "" else "s"} selected â€¢ reload extension/app to apply"
+                "$count server${if (count == 1) "" else "s"} selected \u2022 reload extension/app to apply"
             }
             status.setTextColor(if (count == 0) accentRed else muted)
             internalUpdate = false
@@ -210,6 +214,61 @@ object NTVStreamSettings {
         }
         refreshAllState()
 
+        val buttonRow = LinearLayout(context).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { setMargins(0, dp(16), 0, 0) }
+        }
+
+        val btnCancel = TextView(context).apply {
+            text = "Cancel"
+            textSize = 14f
+            setTextColor(muted)
+            gravity = Gravity.CENTER
+            setPadding(dp(14), dp(10), dp(14), dp(10))
+            isClickable = true
+            isFocusable = true
+            background = rounded(Color.TRANSPARENT, radius = 12, strokeColor = Color.TRANSPARENT)
+        }
+
+        val btnKobra = TextView(context).apply {
+            text = "Kobra only"
+            textSize = 14f
+            setTextColor(accent)
+            gravity = Gravity.CENTER
+            setPadding(dp(14), dp(10), dp(14), dp(10))
+            isClickable = true
+            isFocusable = true
+            background = rounded(Color.TRANSPARENT, radius = 12, strokeColor = stroke)
+        }
+
+        val btnSave = TextView(context).apply {
+            text = "Save"
+            textSize = 14f
+            setTextColor(Color.parseColor("#0F172A"))
+            gravity = Gravity.CENTER
+            typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+            setPadding(dp(20), dp(10), dp(20), dp(10))
+            isClickable = true
+            isFocusable = true
+            background = rounded(accent, radius = 12, strokeColor = accent)
+        }
+
+        buttonRow.addView(btnCancel)
+        buttonRow.addView(android.view.View(context).apply {
+            layoutParams = LinearLayout.LayoutParams(0, 0, 1f)
+        })
+        buttonRow.addView(btnKobra)
+        buttonRow.addView(android.view.View(context).apply {
+            layoutParams = LinearLayout.LayoutParams(dp(8), 0)
+        })
+        buttonRow.addView(btnSave)
+
+        root.addView(buttonRow)
+
         val scroll = ScrollView(context).apply {
             setBackgroundColor(Color.TRANSPARENT)
             addView(root)
@@ -217,41 +276,38 @@ object NTVStreamSettings {
 
         val dialog = AlertDialog.Builder(context)
             .setView(scroll)
-            .setPositiveButton("Save", null)
-            .setNegativeButton("Cancel", null)
-            .setNeutralButton("Kobra only", null)
             .create()
+
+        btnCancel.setOnClickListener {
+            dialog.dismiss()
+        }
+
+        btnKobra.setOnClickListener {
+            prefs.edit()
+                .putString(PREF_SERVERS, SERVER_KOBRA)
+                .putString(PREF_SERVER, SERVER_KOBRA)
+                .apply()
+            Toast.makeText(context, "NTVStream set to Kobra only", Toast.LENGTH_SHORT).show()
+            dialog.dismiss()
+        }
+
+        btnSave.setOnClickListener {
+            val chosen = checkBoxes.entries
+                .filter { it.value.isChecked }
+                .map { it.key }
+                .ifEmpty { listOf(SERVER_KOBRA) }
+            prefs.edit()
+                .putString(PREF_SERVERS, chosen.joinToString(","))
+                .putString(PREF_SERVER, if (chosen.size == allServerIds.size) SERVER_ALL else chosen.first())
+                .apply()
+            Toast.makeText(context, "NTVStream settings saved. Reload to apply.", Toast.LENGTH_LONG).show()
+            dialog.dismiss()
+        }
 
         dialog.setOnShowListener {
             dialog.window?.setBackgroundDrawable(rounded(Color.TRANSPARENT, radius = 24, strokeColor = Color.TRANSPARENT, strokeWidth = 0))
-            dialog.getButton(AlertDialog.BUTTON_POSITIVE)?.apply {
-                setTextColor(accent)
-                setOnClickListener {
-                    val chosen = checkBoxes.entries
-                        .filter { it.value.isChecked }
-                        .map { it.key }
-                        .ifEmpty { listOf(SERVER_KOBRA) }
-                    prefs.edit()
-                        .putString(PREF_SERVERS, chosen.joinToString(","))
-                        .putString(PREF_SERVER, if (chosen.size == allServerIds.size) SERVER_ALL else chosen.first())
-                        .apply()
-                    Toast.makeText(context, "NTVStream settings saved. Reload to apply.", Toast.LENGTH_LONG).show()
-                    dialog.dismiss()
-                }
-            }
-            dialog.getButton(AlertDialog.BUTTON_NEGATIVE)?.setTextColor(muted)
-            dialog.getButton(AlertDialog.BUTTON_NEUTRAL)?.apply {
-                setTextColor(accent)
-                setOnClickListener {
-                    prefs.edit()
-                        .putString(PREF_SERVERS, SERVER_KOBRA)
-                        .putString(PREF_SERVER, SERVER_KOBRA)
-                        .apply()
-                    Toast.makeText(context, "NTVStream set to Kobra only", Toast.LENGTH_SHORT).show()
-                    dialog.dismiss()
-                }
-            }
         }
+
         dialog.show()
     }
 }
