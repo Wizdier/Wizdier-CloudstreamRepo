@@ -47,6 +47,13 @@ abstract class NTVStreamProvider(
         val label: String?,
     )
 
+    private data class EventArtwork(
+        val poster: String,
+        val background: String? = null,
+    )
+
+    private val teamLogoCache = mutableMapOf<String, String?>()
+
     private val userAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
             "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
 
@@ -83,7 +90,9 @@ abstract class NTVStreamProvider(
         val pageSize = 40
         val from = ((page - 1).coerceAtLeast(0)) * pageSize
         val pageItems = filtered.drop(from).take(pageSize)
-        val list = pageItems.mapNotNull { it.toSearchResponse() }
+        val list = buildList {
+            pageItems.forEach { event -> event.toSearchResponse()?.let(::add) }
+        }
         return newHomePageResponse(
             HomePageList(request.name, list, isHorizontalImages = false),
             hasNext = filtered.size > from + pageSize
@@ -95,8 +104,11 @@ abstract class NTVStreamProvider(
         if (q.isBlank()) return emptyList()
         val root = apiJson("/api/search?q=${q.encodeUrl()}&server=$serverId") ?: return emptyList()
         val arr = root.optJSONArray("data") ?: JSONArray()
-        return (0 until arr.length()).mapNotNull { arr.optJSONObject(it)?.toSearchResponse() }
-            .distinctBy { it.url }
+        val out = mutableListOf<SearchResponse>()
+        for (i in 0 until arr.length()) {
+            arr.optJSONObject(i)?.toSearchResponse()?.let(out::add)
+        }
+        return out.distinctBy { it.url }
     }
 
     final override suspend fun load(url: String): LoadResponse? {
@@ -109,7 +121,7 @@ abstract class NTVStreamProvider(
         val date = fresh.optLong("date", 0L).takeIf { it > 0L }
         val live = fresh.optBoolean("live", false) || fresh.optString("status", "").equals("live", true)
         val sources = fresh.optJSONArray("sources") ?: JSONArray()
-        val poster = eventPoster(fresh)
+        val artwork = eventArtwork(fresh)
         val data = JSONObject()
             .put("server", serverId)
             .put("eventId", eventId)
@@ -117,12 +129,12 @@ abstract class NTVStreamProvider(
             .toString()
 
         return newMovieLoadResponse(title, url, liveTvType, data) {
-            posterUrl = poster
-            backgroundPosterUrl = poster
+            posterUrl = artwork.poster
+            backgroundPosterUrl = artwork.background ?: artwork.poster
             year = date?.let { yearFromMillis(it) }
             plot = buildString {
                 append(if (live) "LIVE" else "Scheduled")
-                date?.let { append(" • ").append(formatDate(it)) }
+                date?.let { append(" â€¢ ").append(formatDate(it)) }
                 append("\n")
                 append("Server: ").append(serverLabel())
                 append("\nSport: ").append(category)
@@ -353,7 +365,7 @@ abstract class NTVStreamProvider(
         headers: Map<String, String>,
         callback: (ExtractorLink) -> Unit,
     ) {
-        val sourceName = "$name • ${label.ifBlank { qualityInitials(streamUrl) ?: "Stream" }}"
+        val sourceName = "$name â€¢ ${label.ifBlank { qualityInitials(streamUrl) ?: "Stream" }}"
         callback(
             newExtractorLink(
                 source = sourceName,
@@ -379,7 +391,7 @@ abstract class NTVStreamProvider(
         callback: (ExtractorLink) -> Unit,
         subtitleCallback: (SubtitleFile) -> Unit,
     ): Boolean {
-        val sourceName = "$name • ${label.ifBlank { qualityInitials(url) ?: "Stream" }}"
+        val sourceName = "$name â€¢ ${label.ifBlank { qualityInitials(url) ?: "Stream" }}"
         val mediaReferer = mediaRefererFor(url, referer)
         if (url.contains(".m3u8", true)) {
             val mediaHeaders = mediaHeadersFor(url, mediaReferer)
@@ -573,13 +585,13 @@ abstract class NTVStreamProvider(
         return out.values.toList()
     }
 
-    private fun JSONObject.toSearchResponse(): SearchResponse? {
+    private suspend fun JSONObject.toSearchResponse(): SearchResponse? {
         val title = optStringOrNull("title") ?: return null
         val url = encodeEvent(this)
-        val poster = eventPoster(this)
+        val artwork = eventArtwork(this)
         val date = optLong("date", 0L).takeIf { it > 0L }
         return newMovieSearchResponse(cleanEventDisplayTitle(title), url, liveTvType) {
-            posterUrl = poster
+            posterUrl = artwork.poster
             year = date?.let { yearFromMillis(it) }
         }
     }
@@ -815,12 +827,72 @@ abstract class NTVStreamProvider(
 
     private fun serverLabel(): String = serverId.replaceFirstChar { it.uppercase() }
 
-    private fun eventPoster(event: JSONObject): String =
-        event.optStringOrNull("poster")?.toAbsoluteUrl() ?: generatedPoster(
-            title = cleanEventDisplayTitle(event.optStringOrNull("title") ?: "Live Sports"),
-            category = event.optStringOrNull("category") ?: event.optStringOrNull("tournament") ?: serverLabel(),
-            live = event.isLiveEvent(),
+    private suspend fun eventArtwork(event: JSONObject): EventArtwork {
+        event.optStringOrNull("poster")?.toAbsoluteUrl()?.let { return EventArtwork(it, it) }
+
+        val teams = event.optJSONObject("teams")
+        val category = event.optStringOrNull("category") ?: event.optStringOrNull("tournament") ?: serverLabel()
+        val home = teams?.optJSONObject("home")?.optStringOrNull("name")
+        val away = teams?.optJSONObject("away")?.optStringOrNull("name")
+
+        val homeLogo = home?.let { fetchTeamLogo(it, category) }
+        val awayLogo = away?.let { fetchTeamLogo(it, category) }
+        if (!homeLogo.isNullOrBlank()) return EventArtwork(homeLogo, awayLogo)
+        if (!awayLogo.isNullOrBlank()) return EventArtwork(awayLogo, homeLogo)
+
+        return EventArtwork(
+            generatedPoster(
+                title = cleanEventDisplayTitle(event.optStringOrNull("title") ?: "Live Sports"),
+                category = category,
+                live = event.isLiveEvent(),
+            )
         )
+    }
+
+    private suspend fun fetchTeamLogo(teamName: String, category: String): String? {
+        val sport = sportsDbSport(category)
+        val cacheKey = "${teamName.lowercase()}|${sport.orEmpty().lowercase()}"
+        if (teamLogoCache.containsKey(cacheKey)) return teamLogoCache[cacheKey]
+
+        val found = runCatching {
+            val root = JSONObject(
+                app.get(
+                    "https://www.thesportsdb.com/api/v1/json/3/searchteams.php?t=${teamName.encodeUrl()}",
+                    headers = mapOf("User-Agent" to userAgent, "Accept" to "application/json"),
+                    timeout = 8000
+                ).text
+            )
+            val arr = root.optJSONArray("teams") ?: return@runCatching null
+            val normalizedTarget = teamName.normalizedAssetName()
+            val candidates = (0 until arr.length()).mapNotNull { arr.optJSONObject(it) }
+            val picked = candidates.firstOrNull { team ->
+                val sameSport = sport == null || team.optStringOrNull("strSport")?.equals(sport, true) == true
+                sameSport && team.optStringOrNull("strTeam")?.normalizedAssetName() == normalizedTarget
+            } ?: candidates.firstOrNull { team ->
+                sport == null || team.optStringOrNull("strSport")?.equals(sport, true) == true
+            } ?: candidates.firstOrNull()
+            picked?.optStringOrNull("strBadge")
+                ?: picked?.optStringOrNull("strLogo")
+                ?: picked?.optStringOrNull("strTeamBadge")
+        }.getOrNull()?.toAbsoluteUrl()
+
+        teamLogoCache[cacheKey] = found
+        return found
+    }
+
+    private fun sportsDbSport(category: String): String? {
+        val c = category.lowercase()
+        return when {
+            "football" in c || "soccer" in c -> "Soccer"
+            "basketball" in c -> "Basketball"
+            "baseball" in c || "mlb" in c -> "Baseball"
+            "hockey" in c -> "Ice Hockey"
+            "rugby" in c -> "Rugby"
+            "volleyball" in c -> "Volleyball"
+            "american football" in c -> "American Football"
+            else -> null
+        }
+    }
 
     private fun generatedPoster(title: String, category: String, live: Boolean): String {
         // Cloudstream image loaders are not consistent with data: SVG posters,
@@ -894,13 +966,19 @@ abstract class NTVStreamProvider(
         .replace(Regex("[^a-z0-9]+"), " ")
         .trim()
 
+    private fun String.normalizedAssetName(): String =
+        lowercase()
+            .replace(Regex("\\b(?:fc|cf|sc|afc|club|national|team)\\b"), " ")
+            .replace(Regex("[^a-z0-9]+"), " ")
+            .trim()
+
     private fun String.cleanTitle(): String =
         replace(Regex("\\s+"), " ").trim()
 
     private fun String.cleanSourceLabel(): String =
         replace(Regex("(?i)\\b(?:server|stream|source)\\b"), " ")
             .replace(Regex("\\s+"), " ")
-            .trim(' ', '-', '•')
+            .trim(' ', '-', 'â€¢')
             .ifBlank { this }
 
     private fun String.xmlEscape(): String =
