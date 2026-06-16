@@ -64,7 +64,7 @@ object NTVStreamSettings {
         val panel = Color.parseColor("#111827")
         val panel2 = Color.parseColor("#182033")
         val stroke = Color.parseColor("#263047")
-        val text = Color.parseColor("#F8FAFC")
+        val textColor = Color.parseColor("#F8FAFC")
         val muted = Color.parseColor("#A1A8B8")
         val accent = Color.parseColor("#FACC15")
         val accentRed = Color.parseColor("#FF3B30")
@@ -79,7 +79,7 @@ object NTVStreamSettings {
                 setStroke(dp(strokeWidth), strokeColor)
             }
 
-        fun label(textValue: String, size: Float, color: Int = text, bold: Boolean = false): TextView =
+        fun label(textValue: String, size: Float, color: Int = textColor, bold: Boolean = false): TextView =
             TextView(context).apply {
                 this.text = textValue
                 this.textSize = size
@@ -164,7 +164,7 @@ object NTVStreamSettings {
         val allTexts = LinearLayout(context).apply {
             orientation = LinearLayout.VERTICAL
             layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
-            addView(label("⚡ All servers", 16f, text, bold = true))
+            addView(label("âš¡ All servers", 16f, text, bold = true))
             addView(label("Show every NTVStream provider after reload", 12f, muted))
         }
         allCard.addView(allBox)
@@ -172,11 +172,11 @@ object NTVStreamSettings {
         allCard.setOnClickListener { allBox.isChecked = !allBox.isChecked }
         root.addView(allCard)
 
-        addServerCard(SERVER_KOBRA, "Kobra", "Recommended • stable browser-resolved streams", "🐍", recommended = true)
-        addServerCard(SERVER_RAPTOR, "Raptor", "EmbedIndia based backup server", "🦅")
-        addServerCard(SERVER_FALCON, "Falcon", "Direct m3u8-style backup channels", "🦇")
-        addServerCard(SERVER_PHOENIX, "Phoenix", "Large list, upstream may be unstable", "🔥")
-        addServerCard(SERVER_VIPER, "Viper", "Alternate broadcaster channels", "🐍")
+        addServerCard(SERVER_KOBRA, "Kobra", "Recommended â€¢ stable browser-resolved streams", "ðŸ", recommended = true)
+        addServerCard(SERVER_RAPTOR, "Raptor", "EmbedIndia based backup server", "ðŸ¦…")
+        addServerCard(SERVER_FALCON, "Falcon", "Direct m3u8-style backup channels", "ðŸ¦‡")
+        addServerCard(SERVER_PHOENIX, "Phoenix", "Large list, upstream may be unstable", "ðŸ”¥")
+        addServerCard(SERVER_VIPER, "Viper", "Alternate broadcaster channels", "ðŸ")
 
         val status = label("", 12f, muted).apply { setPadding(0, dp(4), 0, 0) }
         root.addView(status)
@@ -187,9 +187,9 @@ object NTVStreamSettings {
             allBox.isChecked = checkBoxes.values.all { it.isChecked }
             val count = checkBoxes.values.count { it.isChecked }
             status.text = if (count == 0) {
-                "No server selected — Kobra will be used automatically."
+                "No server selected â€” Kobra will be used automatically."
             } else {
-                "$count server${if (count == 1) "" else "s"} selected • reload extension/app to apply"
+                "$count server${if (count == 1) "" else "s"} selected â€¢ reload extension/app to apply"
             }
             status.setTextColor(if (count == 0) accentRed else muted)
             internalUpdate = false
