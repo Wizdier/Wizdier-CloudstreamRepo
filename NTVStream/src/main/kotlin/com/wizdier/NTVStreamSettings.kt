@@ -64,7 +64,7 @@ object NTVStreamSettings {
         val panel = Color.parseColor("#111827")
         val panel2 = Color.parseColor("#182033")
         val stroke = Color.parseColor("#263047")
-        val text = Color.parseColor("#F8FAFC")
+        val textColor = Color.parseColor("#F8FAFC")
         val muted = Color.parseColor("#A1A8B8")
         val accent = Color.parseColor("#FACC15")
         val accentRed = Color.parseColor("#FF3B30")
@@ -79,7 +79,7 @@ object NTVStreamSettings {
                 setStroke(dp(strokeWidth), strokeColor)
             }
 
-        fun label(textValue: String, size: Float, color: Int = text, bold: Boolean = false): TextView =
+        fun label(textValue: String, size: Float, color: Int = textColor, bold: Boolean = false): TextView =
             TextView(context).apply {
                 this.text = textValue
                 this.textSize = size
