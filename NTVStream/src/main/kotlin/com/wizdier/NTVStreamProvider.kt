@@ -823,38 +823,14 @@ abstract class NTVStreamProvider(
         )
 
     private fun generatedPoster(title: String, category: String, live: Boolean): String {
-        val safeTitle = title.xmlEscape().chunkedWords(maxChars = 18, maxLines = 4)
-        val safeCategory = category.xmlEscape().uppercase().take(28)
-        val status = if (live) "LIVE" else "NTVSTREAM"
-        val accent = if (live) "#ff3b30" else "#facc15"
-        val lines = safeTitle.mapIndexed { index, line ->
-            """<text x="40" y="${250 + index * 58}" fill="#ffffff" font-size="44" font-weight="800" font-family="Arial, sans-serif">$line</text>"""
-        }.joinToString("")
-        val svg = """
-            <svg xmlns="http://www.w3.org/2000/svg" width="500" height="750" viewBox="0 0 500 750">
-              <defs>
-                <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
-                  <stop offset="0" stop-color="#070b16"/>
-                  <stop offset="0.52" stop-color="#111827"/>
-                  <stop offset="1" stop-color="#27272a"/>
-                </linearGradient>
-                <radialGradient id="glow" cx="50%" cy="28%" r="70%">
-                  <stop offset="0" stop-color="$accent" stop-opacity="0.42"/>
-                  <stop offset="1" stop-color="$accent" stop-opacity="0"/>
-                </radialGradient>
-              </defs>
-              <rect width="500" height="750" fill="url(#bg)"/>
-              <rect width="500" height="750" fill="url(#glow)"/>
-              <rect x="26" y="26" width="448" height="698" rx="30" fill="none" stroke="$accent" stroke-opacity="0.7" stroke-width="3"/>
-              <rect x="40" y="54" width="150" height="42" rx="21" fill="$accent"/>
-              <text x="115" y="83" text-anchor="middle" fill="#0b1020" font-size="22" font-weight="900" font-family="Arial, sans-serif">$status</text>
-              <text x="40" y="150" fill="$accent" font-size="25" font-weight="800" font-family="Arial, sans-serif">$safeCategory</text>
-              $lines
-              <text x="40" y="662" fill="#d4d4d8" font-size="24" font-weight="700" font-family="Arial, sans-serif">${serverLabel()} Server</text>
-              <text x="40" y="700" fill="#a1a1aa" font-size="20" font-family="Arial, sans-serif">Live sports streaming</text>
-            </svg>
-        """.trimIndent()
-        return "data:image/svg+xml;base64," + Base64.encodeToString(svg.toByteArray(), Base64.NO_WRAP)
+        // Cloudstream image loaders are not consistent with data: SVG posters,
+        // so use a real HTTPS image endpoint for clean fallback posters.
+        val headline = title.chunkedWords(maxChars = 16, maxLines = 4).joinToString("\n")
+        val badge = if (live) "LIVE" else serverLabel().uppercase()
+        val label = "$badge\n${category.uppercase().take(22)}\n\n$headline"
+        val bg = if (live) "160B0B" else "0B1020"
+        val fg = if (live) "FFDD55" else "FACC15"
+        return "https://placehold.co/500x750/$bg/$fg/png?font=montserrat&text=${label.encodeUrl()}"
     }
 
     private fun qualityInitials(text: String): String? {
