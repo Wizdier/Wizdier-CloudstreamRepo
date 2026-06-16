@@ -8,26 +8,16 @@ import com.lagradost.cloudstream3.plugins.Plugin
 class NTVStreamPlugin : Plugin() {
     override fun load(context: Context) {
         val prefs = context.getSharedPreferences(NTVStreamSettings.PREF_FILE, Context.MODE_PRIVATE)
+        val selectedServers = NTVStreamSettings.selectedServers(prefs)
 
-        when (NTVStreamSettings.selectedServer(prefs)) {
-            NTVStreamSettings.SERVER_KOBRA -> registerMainAPI(NTVStreamKobra())
-            NTVStreamSettings.SERVER_RAPTOR -> registerMainAPI(NTVStreamRaptor())
-            NTVStreamSettings.SERVER_FALCON -> registerMainAPI(NTVStreamFalcon())
-            NTVStreamSettings.SERVER_PHOENIX -> registerMainAPI(NTVStreamPhoenix())
-            NTVStreamSettings.SERVER_VIPER -> registerMainAPI(NTVStreamViper())
-            else -> registerAllServers()
-        }
+        if (NTVStreamSettings.SERVER_KOBRA in selectedServers) registerMainAPI(NTVStreamKobra())
+        if (NTVStreamSettings.SERVER_RAPTOR in selectedServers) registerMainAPI(NTVStreamRaptor())
+        if (NTVStreamSettings.SERVER_FALCON in selectedServers) registerMainAPI(NTVStreamFalcon())
+        if (NTVStreamSettings.SERVER_PHOENIX in selectedServers) registerMainAPI(NTVStreamPhoenix())
+        if (NTVStreamSettings.SERVER_VIPER in selectedServers) registerMainAPI(NTVStreamViper())
 
         openSettings = { ctx ->
             NTVStreamSettings.show(ctx, prefs)
         }
-    }
-
-    private fun registerAllServers() {
-        registerMainAPI(NTVStreamKobra())
-        registerMainAPI(NTVStreamRaptor())
-        registerMainAPI(NTVStreamFalcon())
-        registerMainAPI(NTVStreamPhoenix())
-        registerMainAPI(NTVStreamViper())
     }
 }
