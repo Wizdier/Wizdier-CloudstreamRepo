@@ -333,7 +333,53 @@ abstract class NTVStreamProvider(
                     useWideViewPort = true
                 }
 
+                // Add Javascript interface to intercept JS fetch/XHR requests (critical for hls.js / Clappr on Android TV)
+                val jsBridge = object {
+                    @android.webkit.JavascriptInterface
+                    fun onUrlIntercepted(url: String) {
+                        deferred.complete(url)
+                    }
+                }
+                addJavascriptInterface(jsBridge, "JSBridge")
+
                 webViewClient = object : android.webkit.WebViewClient() {
+                    private fun injectBridge(view: android.webkit.WebView?) {
+                        val js = """
+                            (function() {
+                                var originalFetch = window.fetch;
+                                if (originalFetch) {
+                                    window.fetch = function(input, init) {
+                                        var url = (typeof input === 'string') ? input : (input && input.url);
+                                        if (url && (url.indexOf('.m3u8') !== -1 || url.indexOf('strmd.st') !== -1)) {
+                                            if (window.JSBridge) window.JSBridge.onUrlIntercepted(url);
+                                        }
+                                        return originalFetch.apply(this, arguments);
+                                    };
+                                }
+                                var originalOpen = XMLHttpRequest.prototype.open;
+                                if (originalOpen) {
+                                    XMLHttpRequest.prototype.open = function(method, url) {
+                                        if (url && (url.indexOf('.m3u8') !== -1 || url.indexOf('strmd.st') !== -1)) {
+                                            if (window.JSBridge) window.JSBridge.onUrlIntercepted(url);
+                                        }
+                                        return originalOpen.apply(this, arguments);
+                                    };
+                                }
+                            })();
+                        """.trimIndent()
+                        view?.evaluateJavascript(js, null)
+                    }
+
+                    override fun onPageStarted(view: android.webkit.WebView?, url: String?, favicon: android.graphics.Bitmap?) {
+                        injectBridge(view)
+                        super.onPageStarted(view, url, favicon)
+                    }
+
+                    override fun onPageFinished(view: android.webkit.WebView?, url: String?) {
+                        injectBridge(view)
+                        super.onPageFinished(view, url)
+                    }
+
                     override fun shouldInterceptRequest(
                         view: android.webkit.WebView?,
                         request: android.webkit.WebResourceRequest?
