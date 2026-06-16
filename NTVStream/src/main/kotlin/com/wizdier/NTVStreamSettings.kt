@@ -81,8 +81,8 @@ object NTVStreamSettings {
 
         fun label(textValue: String, size: Float, color: Int = text, bold: Boolean = false): TextView =
             TextView(context).apply {
-                text = textValue
-                textSize = size
+                this.text = textValue
+                this.textSize = size
                 setTextColor(color)
                 if (bold) setTypeface(typeface, Typeface.BOLD)
                 includeFontPadding = true
