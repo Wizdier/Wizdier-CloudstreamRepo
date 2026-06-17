@@ -98,7 +98,7 @@ abstract class NTVStreamProvider(
             pageItems.forEach { event -> event.toSearchResponse()?.let(::add) }
         }
         return newHomePageResponse(
-            HomePageList(request.name, list, isHorizontalImages = false),
+            HomePageList(request.name, list, isHorizontalImages = true),
             hasNext = filtered.size > from + pageSize
         )
     }
@@ -1036,6 +1036,15 @@ abstract class NTVStreamProvider(
         val home = teams?.optJSONObject("home")?.optStringOrNull("name")
         val away = teams?.optJSONObject("away")?.optStringOrNull("name")
 
+        // Try to fetch beautiful 16:9 landscape match fanart/thumbnails first for spectacular visual design
+        val homeLandscape = home?.let { fetchTeamLandscape(it, category) }
+        val awayLandscape = away?.let { fetchTeamLandscape(it, category) }
+        val primaryLandscape = homeLandscape ?: awayLandscape
+        if (primaryLandscape != null) {
+            val secondaryLandscape = awayLandscape ?: homeLandscape ?: primaryLandscape
+            return EventArtwork(primaryLandscape, secondaryLandscape)
+        }
+
         val homeLogo = home?.let { fetchTeamLogo(it, category) }
         val awayLogo = away?.let { fetchTeamLogo(it, category) }
         if (!homeLogo.isNullOrBlank()) return EventArtwork(homeLogo, awayLogo)
@@ -1075,6 +1084,39 @@ abstract class NTVStreamProvider(
             picked?.optStringOrNull("strBadge")
                 ?: picked?.optStringOrNull("strLogo")
                 ?: picked?.optStringOrNull("strTeamBadge")
+        }.getOrNull()?.toAbsoluteUrl()
+
+        teamLogoCache[cacheKey] = found
+        return found
+    }
+
+    private suspend fun fetchTeamLandscape(teamName: String, category: String): String? {
+        val sport = sportsDbSport(category)
+        val cacheKey = "${teamName.lowercase()}|${sport.orEmpty().lowercase()}|landscape"
+        if (teamLogoCache.containsKey(cacheKey)) return teamLogoCache[cacheKey]
+
+        val found = runCatching {
+            val root = JSONObject(
+                app.get(
+                    "https://www.thesportsdb.com/api/v1/json/3/searchteams.php?t=${teamName.encodeUrl()}",
+                    headers = mapOf("User-Agent" to userAgent, "Accept" to "application/json"),
+                    timeout = 8000
+                ).text
+            )
+            val arr = root.optJSONArray("teams") ?: return@runCatching null
+            val normalizedTarget = teamName.normalizedAssetName()
+            val candidates = (0 until arr.length()).mapNotNull { arr.optJSONObject(it) }
+            val picked = candidates.firstOrNull { team ->
+                val sameSport = sport == null || team.optStringOrNull("strSport")?.equals(sport, true) == true
+                sameSport && team.optStringOrNull("strTeam")?.normalizedAssetName() == normalizedTarget
+            } ?: candidates.firstOrNull { team ->
+                sport == null || team.optStringOrNull("strSport")?.equals(sport, true) == true
+            } ?: candidates.firstOrNull()
+            
+            picked?.optStringOrNull("strFanart1")
+                ?: picked?.optStringOrNull("strFanart")
+                ?: picked?.optStringOrNull("strThumb")
+                ?: picked?.optStringOrNull("strBanner")
         }.getOrNull()?.toAbsoluteUrl()
 
         teamLogoCache[cacheKey] = found
