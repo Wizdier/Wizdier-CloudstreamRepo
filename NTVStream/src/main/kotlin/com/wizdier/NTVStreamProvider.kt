@@ -319,7 +319,7 @@ abstract class NTVStreamProvider(
             val activitiesField = activityThreadClass.getDeclaredField("mActivities").apply { isAccessible = true }
             val activities = activitiesField.get(activityThread) as Map<*, *>
             for (activityRecord in activities.values) {
-                val activityRecordClass = activityRecord::class.java
+                val activityRecordClass = activityRecord!!::class.java
                 val pausedField = activityRecordClass.getDeclaredField("paused").apply { isAccessible = true }
                 if (!pausedField.getBoolean(activityRecord)) {
                     val activityField = activityRecordClass.getDeclaredField("activity").apply { isAccessible = true }
