@@ -138,7 +138,7 @@ abstract class NTVStreamProvider(
             year = date?.let { yearFromMillis(it) }
             plot = buildString {
                 append(if (live) "LIVE" else "Scheduled")
-                date?.let { append(" â€¢ ").append(formatDate(it)) }
+                date?.let { append(" Ã¢â‚¬Â¢ ").append(formatDate(it)) }
                 append("\n")
                 append("Server: ").append(serverLabel())
                 append("\nSport: ").append(category)
@@ -562,7 +562,7 @@ abstract class NTVStreamProvider(
         headers: Map<String, String>,
         callback: (ExtractorLink) -> Unit,
     ) {
-        val sourceName = "$name â€¢ ${label.ifBlank { qualityInitials(streamUrl) ?: "Stream" }}"
+        val sourceName = "$name Ã¢â‚¬Â¢ ${label.ifBlank { qualityInitials(streamUrl) ?: "Stream" }}"
         callback(
             newExtractorLink(
                 source = sourceName,
@@ -588,7 +588,7 @@ abstract class NTVStreamProvider(
         callback: (ExtractorLink) -> Unit,
         subtitleCallback: (SubtitleFile) -> Unit,
     ): Boolean {
-        val sourceName = "$name â€¢ ${label.ifBlank { qualityInitials(url) ?: "Stream" }}"
+        val sourceName = "$name Ã¢â‚¬Â¢ ${label.ifBlank { qualityInitials(url) ?: "Stream" }}"
         val mediaReferer = mediaRefererFor(url, referer)
         if (url.contains(".m3u8", true)) {
             val mediaHeaders = mediaHeadersFor(url, mediaReferer)
@@ -1029,14 +1029,12 @@ abstract class NTVStreamProvider(
     private fun serverLabel(): String = serverId.replaceFirstChar { it.uppercase() }
 
     private suspend fun eventArtwork(event: JSONObject): EventArtwork {
-        event.optStringOrNull("poster")?.toAbsoluteUrl()?.let { return EventArtwork(it, it) }
-
         val teams = event.optJSONObject("teams")
         val category = event.optStringOrNull("category") ?: event.optStringOrNull("tournament") ?: serverLabel()
         val home = teams?.optJSONObject("home")?.optStringOrNull("name")
         val away = teams?.optJSONObject("away")?.optStringOrNull("name")
 
-        // Try to fetch beautiful 16:9 landscape match fanart/thumbnails first for spectacular visual design
+        // 1. Try to fetch beautiful 16:9 landscape match fanart/thumbnails first for spectacular visual design
         val homeLandscape = home?.let { fetchTeamLandscape(it, category) }
         val awayLandscape = away?.let { fetchTeamLandscape(it, category) }
         val primaryLandscape = homeLandscape ?: awayLandscape
@@ -1045,11 +1043,22 @@ abstract class NTVStreamProvider(
             return EventArtwork(primaryLandscape, secondaryLandscape)
         }
 
+        // 2. Try to fetch team logos from SportsDB
         val homeLogo = home?.let { fetchTeamLogo(it, category) }
         val awayLogo = away?.let { fetchTeamLogo(it, category) }
-        if (!homeLogo.isNullOrBlank()) return EventArtwork(homeLogo, awayLogo)
-        if (!awayLogo.isNullOrBlank()) return EventArtwork(awayLogo, homeLogo)
+        if (!homeLogo.isNullOrBlank() || !awayLogo.isNullOrBlank()) {
+            val homeFinal = homeLogo ?: awayLogo ?: ""
+            val awayFinal = awayLogo ?: homeLogo ?: ""
+            return EventArtwork(homeFinal, awayFinal)
+        }
 
+        // 3. Fall back to the upstream poster if it is not using the broken proxy path (which returns 404)
+        val upstreamPoster = event.optStringOrNull("poster")?.toAbsoluteUrl()
+        if (upstreamPoster != null && !upstreamPoster.contains("/api/images/proxy/", true)) {
+            return EventArtwork(upstreamPoster, upstreamPoster)
+        }
+
+        // 4. Fall back to the generated card poster
         return EventArtwork(
             generatedPoster(
                 title = cleanEventDisplayTitle(event.optStringOrNull("title") ?: "Live Sports"),
