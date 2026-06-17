@@ -173,7 +173,7 @@ object CTGSettingsUI {
         content.buildContent()
 
         val chevron = TextView(ctx).apply {
-            text = if (expanded) "▲" else "▼"; textSize = 10f; setTextColor(TEXT_SEC)
+            text = if (expanded) "\u25B2" else "\u25BC"; textSize = 10f; setTextColor(TEXT_SEC) // ▲ : ▼
         }
 
         card.addView(LinearLayout(ctx).apply {
@@ -199,7 +199,7 @@ object CTGSettingsUI {
 
             setOnClickListener {
                 expanded = !expanded
-                chevron.text = if (expanded) "▲" else "▼"
+                chevron.text = if (expanded) "\u25B2" else "\u25BC"
                 animateExpand(content, expanded)
             }
         })
@@ -245,37 +245,53 @@ object CTGSettingsUI {
         ctx: Context, labelText: String, value: String?, hint: String,
         isPassword: Boolean = false, isMultiLine: Boolean = false,
     ): Field {
-        val edit = input(ctx, value, hint, isPassword, isMultiLine)
         if (isPassword) {
-            val toggle = TextView(ctx).apply {
-                text = "👁"; textSize = 14f
-                setPadding(0, 0, dp(ctx, 16), 0)
-                gravity = Gravity.CENTER
+            val edit = EditText(ctx).apply {
+                setText(value.orEmpty())
+                this.hint = hint
+                setHintTextColor(Color.parseColor("#3E4255"))
+                setTextColor(TEXT_PRI)
+                textSize = 13f
+                background = ColorDrawable(Color.TRANSPARENT)
+                setPadding(dp(ctx, 14), dp(ctx, 11), dp(ctx, 8), dp(ctx, 11))
+                inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
+                setSingleLine(true)
             }
+
+            val toggle = TextView(ctx).apply {
+                text = "\uD83D\uDC41" // 👁
+                textSize = 14f
+                setPadding(dp(ctx, 8), dp(ctx, 8), dp(ctx, 14), dp(ctx, 8))
+                gravity = Gravity.CENTER
+                isClickable = true
+                isFocusable = true
+            }
+
             toggle.setOnClickListener {
                 val hidden = edit.transformationMethod is PasswordTransformationMethod
                 edit.transformationMethod = if (hidden)
                     HideReturnsTransformationMethod.getInstance()
                 else PasswordTransformationMethod.getInstance()
-                toggle.text = if (hidden) "🙈" else "👁"
+                toggle.text = if (hidden) "\uD83D\uDE48" else "\uD83D\uDC41" // 🙈 : 👁
                 edit.setSelection(edit.text?.length ?: 0)
             }
-            // Replace edit's own margins with a wrapper row
-            edit.layoutParams = LinearLayout.LayoutParams(
-                0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f
-            )
+
             val row = LinearLayout(ctx).apply {
                 orientation = LinearLayout.HORIZONTAL
                 gravity = Gravity.CENTER_VERTICAL
+                background = roundRect(BG_INPUT, dp(ctx, 10).toFloat(), BORDER, 1)
                 layoutParams = LinearLayout.LayoutParams(
                     LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
                 ).apply { setMargins(dp(ctx, 20), 0, dp(ctx, 20), dp(ctx, 12)) }
+                edit.layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
                 addView(edit)
                 addView(toggle)
             }
             return Field(edit, row)
+        } else {
+            val edit = input(ctx, value, hint, isPassword, isMultiLine)
+            return Field(edit, edit)
         }
-        return Field(edit, edit)
     }
 
     // ── Pill button ──────────────────────────────────────────────────────────
@@ -309,7 +325,7 @@ object CTGSettingsUI {
             gravity = Gravity.TOP
 
             addView(TextView(ctx).apply {
-                text = "💡"; textSize = 13f
+                text = "\uD83D\uDCA1"; textSize = 13f // 💡
                 setPadding(0, 0, dp(ctx, 10), 0)
             })
             addView(TextView(ctx).apply {
@@ -347,7 +363,7 @@ object CTGSettingsUI {
         val fApi    = field(ctx, "API Base", prefs.getString(CTGMovies.PREF_API_BASE, CTGMovies.DEFAULT_API_BASE), CTGMovies.DEFAULT_API_BASE)
 
         // ── Card: Account Login ──────────────────────────────────────────────
-        root.addView(buildCard(ctx, "🔐  ACCOUNT LOGIN",
+        root.addView(buildCard(ctx, "\uD83D\uDD12  ACCOUNT LOGIN",
             accentA = Color.parseColor("#6C63FF"), accentB = Color.parseColor("#8B5CF6"),
             startOpen = true,
         ) {
@@ -359,7 +375,7 @@ object CTGSettingsUI {
         })
 
         // ── Card: Quick Access ───────────────────────────────────────────────
-        root.addView(buildCard(ctx, "🔑  QUICK ACCESS",
+        root.addView(buildCard(ctx, "\uD83D\uDD11  QUICK ACCESS",
             accentA = Color.parseColor("#A855F7"), accentB = Color.parseColor("#C084FC"),
         ) {
             addView(label(ctx, "Token"))
@@ -370,7 +386,7 @@ object CTGSettingsUI {
         })
 
         // ── Card: Advanced ───────────────────────────────────────────────────
-        root.addView(buildCard(ctx, "⚙️  ADVANCED",
+        root.addView(buildCard(ctx, "\u2699\uFE0F  ADVANCED",
             accentA = Color.parseColor("#38BDF8"), accentB = Color.parseColor("#0EA5E9"),
         ) {
             addView(label(ctx, "API Base"))
@@ -414,7 +430,7 @@ object CTGSettingsUI {
                                 ?: CTGMovies.DEFAULT_API_BASE
                         )
                         .apply()
-                    Toast.makeText(ctx, "✓ Saved", Toast.LENGTH_SHORT).show()
+                    Toast.makeText(ctx, "\u2713 Saved", Toast.LENGTH_SHORT).show()
                     dialog.dismiss()
                 }
             }

@@ -138,7 +138,7 @@ abstract class NTVStreamProvider(
             year = date?.let { yearFromMillis(it) }
             plot = buildString {
                 append(if (live) "LIVE" else "Scheduled")
-                date?.let { append(" Ã¢â‚¬Â¢ ").append(formatDate(it)) }
+                date?.let { append(" â€¢ ").append(formatDate(it)) }
                 append("\n")
                 append("Server: ").append(serverLabel())
                 append("\nSport: ").append(category)
@@ -562,7 +562,7 @@ abstract class NTVStreamProvider(
         headers: Map<String, String>,
         callback: (ExtractorLink) -> Unit,
     ) {
-        val sourceName = "$name Ã¢â‚¬Â¢ ${label.ifBlank { qualityInitials(streamUrl) ?: "Stream" }}"
+        val sourceName = "$name â€¢ ${label.ifBlank { qualityInitials(streamUrl) ?: "Stream" }}"
         callback(
             newExtractorLink(
                 source = sourceName,
@@ -588,7 +588,7 @@ abstract class NTVStreamProvider(
         callback: (ExtractorLink) -> Unit,
         subtitleCallback: (SubtitleFile) -> Unit,
     ): Boolean {
-        val sourceName = "$name Ã¢â‚¬Â¢ ${label.ifBlank { qualityInitials(url) ?: "Stream" }}"
+        val sourceName = "$name â€¢ ${label.ifBlank { qualityInitials(url) ?: "Stream" }}"
         val mediaReferer = mediaRefererFor(url, referer)
         if (url.contains(".m3u8", true)) {
             val mediaHeaders = mediaHeadersFor(url, mediaReferer)
