@@ -30,6 +30,10 @@ abstract class NTVStreamProvider(
     private val providerName: String,
     private val supportsLiveSections: Boolean,
 ) : MainAPI() {
+    companion object {
+        var globalContext: android.content.Context? = null
+    }
+
     final override var mainUrl = "https://ntv.cx"
     final override var name = providerName
 
@@ -331,8 +335,11 @@ abstract class NTVStreamProvider(
     }
 
     private fun isTvDevice(): Boolean {
-        val activity = getCurrentActivity() ?: return false
-        return activity.packageManager.hasSystemFeature("android.software.leanback")
+        val ctx = globalContext ?: getCurrentActivity() ?: return false
+        val uiModeManager = ctx.getSystemService(android.content.Context.UI_MODE_SERVICE) as? android.app.UiModeManager
+        val isTvMode = uiModeManager?.currentModeType == android.content.res.Configuration.UI_MODE_TYPE_TELEVISION
+        val hasLeanback = ctx.packageManager.hasSystemFeature("android.software.leanback")
+        return isTvMode || hasLeanback
     }
 
     private suspend fun resolveUsingActiveActivityWebView(

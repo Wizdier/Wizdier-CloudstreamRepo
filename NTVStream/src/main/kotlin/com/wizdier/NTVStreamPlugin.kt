@@ -7,6 +7,7 @@ import com.lagradost.cloudstream3.plugins.Plugin
 @CloudstreamPlugin
 class NTVStreamPlugin : Plugin() {
     override fun load(context: Context) {
+        NTVStreamProvider.globalContext = context
         val prefs = context.getSharedPreferences(NTVStreamSettings.PREF_FILE, Context.MODE_PRIVATE)
         val selectedServers = NTVStreamSettings.selectedServers(prefs)
 
