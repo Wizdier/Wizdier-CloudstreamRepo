@@ -330,6 +330,11 @@ abstract class NTVStreamProvider(
         }.getOrNull() ?: com.lagradost.cloudstream3.CommonActivity.activity
     }
 
+    private fun isTvDevice(): Boolean {
+        val activity = getCurrentActivity() ?: return false
+        return activity.packageManager.hasSystemFeature("android.software.leanback")
+    }
+
     private suspend fun resolveUsingActiveActivityWebView(
         url: String,
         referer: String,
@@ -479,6 +484,10 @@ abstract class NTVStreamProvider(
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit,
     ): Boolean {
+        // If we are on Android TV, completely bypass WebView resolution to avoid the system auto-play freeze 
+        // and instantly fall back to our fast HTML scraper which resolves in milliseconds!
+        if (isTvDevice()) return false
+
         // 1. Try our high-compatibility active activity-attached WebView resolution first (tight 12s timeout)!
         val m3u8Url = resolveUsingActiveActivityWebView(url, referer, timeout = 12000L)
         if (m3u8Url != null) {
