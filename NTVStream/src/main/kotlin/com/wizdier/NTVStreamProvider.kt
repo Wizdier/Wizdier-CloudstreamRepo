@@ -479,8 +479,8 @@ abstract class NTVStreamProvider(
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit,
     ): Boolean {
-        // 1. Try our high-compatibility active activity-attached WebView resolution first!
-        val m3u8Url = resolveUsingActiveActivityWebView(url, referer)
+        // 1. Try our high-compatibility active activity-attached WebView resolution first (tight 12s timeout)!
+        val m3u8Url = resolveUsingActiveActivityWebView(url, referer, timeout = 12000L)
         if (m3u8Url != null) {
             emitDirectM3u8(
                 streamUrl = m3u8Url,
