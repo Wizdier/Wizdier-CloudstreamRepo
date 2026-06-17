@@ -24,6 +24,27 @@ class StreamFreeProvider : MainAPI() {
         "Accept" to "*/*"
     )
 
+    // Custom SSL-ignoring requests client to bypass SSL/TLS handshake errors on older TVs (Let's Encrypt / expired CAs)
+    private val ignoreSslRequests: com.lagradost.nicehttp.Requests by lazy {
+        val trustAllCerts = arrayOf<javax.net.ssl.TrustManager>(
+            object : javax.net.ssl.X509TrustManager {
+                override fun checkClientTrusted(chain: Array<java.security.cert.X509Certificate>?, authType: String?) {}
+                override fun checkServerTrusted(chain: Array<java.security.cert.X509Certificate>?, authType: String?) {}
+                override fun getAcceptedIssuers(): Array<java.security.cert.X509Certificate> = arrayOf()
+            }
+        )
+        val sslContext = javax.net.ssl.SSLContext.getInstance("SSL").apply {
+            init(null, trustAllCerts, java.security.SecureRandom())
+        }
+        val builder = okhttp3.OkHttpClient.Builder()
+            .sslSocketFactory(sslContext.socketFactory, trustAllCerts[0] as javax.net.ssl.X509TrustManager)
+            .hostnameVerifier { _, _ -> true }
+            .connectTimeout(15, java.util.concurrent.TimeUnit.SECONDS)
+            .readTimeout(15, java.util.concurrent.TimeUnit.SECONDS)
+            
+        com.lagradost.nicehttp.Requests(builder.build())
+    }
+
     private val homePageList = listOf(
         MainPageData("all", "All Live Streams"),
         MainPageData("soccer", "Soccer"),
@@ -39,7 +60,7 @@ class StreamFreeProvider : MainAPI() {
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val res = runCatching {
-            app.get(
+            ignoreSslRequests.get(
                 "$mainUrl/api/carousel-streams",
                 headers = baseHeaders + ("Referer" to "$mainUrl/"),
                 timeout = 15000
@@ -69,7 +90,7 @@ class StreamFreeProvider : MainAPI() {
         if (q.isBlank()) return emptyList()
 
         val res = runCatching {
-            app.get(
+            ignoreSslRequests.get(
                 "$mainUrl/api/carousel-streams",
                 headers = baseHeaders + ("Referer" to "$mainUrl/"),
                 timeout = 15000
@@ -96,7 +117,7 @@ class StreamFreeProvider : MainAPI() {
         val streamKey = cleanUrl.substringAfterLast("/")
 
         val res = runCatching {
-            app.get(
+            ignoreSslRequests.get(
                 "$mainUrl/api/carousel-streams",
                 headers = baseHeaders + ("Referer" to "$mainUrl/"),
                 timeout = 15000
@@ -152,7 +173,7 @@ class StreamFreeProvider : MainAPI() {
 
         // 1. Load the embed frame HTML with player page Referer
         val embedRes = runCatching {
-            app.get(embedUrl, headers = baseHeaders + ("Referer" to playerUrl), timeout = 15000)
+            ignoreSslRequests.get(embedUrl, headers = baseHeaders + ("Referer" to playerUrl), timeout = 15000)
         }.getOrNull() ?: return false
 
         if (embedRes.code !in 200..299 || embedRes.text.isBlank()) return false
@@ -165,7 +186,7 @@ class StreamFreeProvider : MainAPI() {
         // 3. Fetch stream routing key from the direct JSON API
         val streamKeyUrl = "$mainUrl/get-stream-key/$streamKey"
         val keyRes = runCatching {
-            app.get(streamKeyUrl, headers = baseHeaders + ("Referer" to embedUrl), timeout = 12000)
+            ignoreSslRequests.get(streamKeyUrl, headers = baseHeaders + ("Referer" to embedUrl), timeout = 12000)
         }.getOrNull() ?: return false
 
         if (keyRes.code !in 200..299 || keyRes.text.isBlank()) return false
