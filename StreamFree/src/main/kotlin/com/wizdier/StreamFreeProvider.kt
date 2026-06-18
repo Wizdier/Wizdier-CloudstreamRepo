@@ -45,18 +45,16 @@ class StreamFreeProvider : MainAPI() {
         com.lagradost.nicehttp.Requests(builder.build())
     }
 
-    private val homePageList = listOf(
-        MainPageData("all", "All Live Streams"),
-        MainPageData("soccer", "Soccer"),
-        MainPageData("basketball", "Basketball"),
-        MainPageData("baseball", "Baseball"),
-        MainPageData("combat", "Fight / MMA / UFC"),
-        MainPageData("racing", "Motorsport / F1"),
-        MainPageData("tennis", "Tennis"),
-        MainPageData("cricket", "Cricket")
+    override val mainPage = mainPageOf(
+        "all" to "All Live Streams",
+        "soccer" to "Soccer",
+        "basketball" to "Basketball",
+        "baseball" to "Baseball",
+        "combat" to "Fight / MMA / UFC",
+        "racing" to "Motorsport / F1",
+        "tennis" to "Tennis",
+        "cricket" to "Cricket"
     )
-
-    override val mainPage = mainPageOf(*homePageList.map { Pair(it.data, it.name) }.toTypedArray())
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val res = runCatching {
@@ -74,7 +72,8 @@ class StreamFreeProvider : MainAPI() {
         for (i in 0 until streams.length()) {
             val obj = streams.optJSONObject(i) ?: continue
             val category = obj.optString("category", "").lowercase()
-            if (request.data == "all" || request.data == category) {
+            val data = request.data ?: "all"
+            if (data == "all" || data == category) {
                 obj.toSearchResponse()?.let(list::add)
             }
         }
@@ -207,7 +206,7 @@ class StreamFreeProvider : MainAPI() {
             }
             val m3u8Url = "$mainUrl$path?_t=${p.optString("_t")}&_e=${p.optString("_e")}&_n=${p.optString("_n")}"
 
-            val label = "$name • $quality"
+            val label = "$name â€¢ $quality"
             callback(
                 newExtractorLink(
                     source = label,
