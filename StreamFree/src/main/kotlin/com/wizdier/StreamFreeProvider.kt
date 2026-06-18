@@ -179,8 +179,8 @@ class StreamFreeProvider : MainAPI() {
         val html = embedRes.text
 
         // 2. Extract _0x quality tokens
-        val tokensString = Regex("""const\s+_0x\s*=\s*(\{.*?\});""").find(html)?.groupValues?.getOrNull(1) ?: return false
-        val tokens = JSONObject(tokensString)
+        val tokensString = Regex("""const\s+_0x\s*=\s*(\{.*\});""").find(html)?.groupValues?.getOrNull(1) ?: return false
+        val tokens = runCatching { JSONObject(tokensString) }.getOrNull() ?: return false
 
         // 3. Fetch stream routing key from the direct JSON API
         val streamKeyUrl = "$mainUrl/get-stream-key/$streamKey"
@@ -192,7 +192,6 @@ class StreamFreeProvider : MainAPI() {
         val keyData = JSONObject(keyRes.text)
 
         val serverName = keyData.optString("server_name", "origin")
-        val serverDomain = keyData.optStringOrNull("server_domain") ?: mainUrl
         val finalStreamKey = keyData.optString("stream_key", streamKey)
 
         var found = false
@@ -205,7 +204,7 @@ class StreamFreeProvider : MainAPI() {
             } else {
                 "/live/$finalStreamKey$quality/index.m3u8"
             }
-            val m3u8Url = "$serverDomain$path?_t=${p.optString("_t")}&_e=${p.optString("_e")}&_n=${p.optString("_n")}"
+            val m3u8Url = "$mainUrl$path?_t=${p.optString("_t")}&_e=${p.optString("_e")}&_n=${p.optString("_n")}"
 
             val label = "$name â€¢ $quality"
             callback(
