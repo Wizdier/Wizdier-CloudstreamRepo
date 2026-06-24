@@ -6,7 +6,7 @@ import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import java.util.concurrent.ConcurrentHashMap
 
-internal object LiveXConcurrent {
+internal object NTVConcurrent {
 
     suspend fun <T, R> parallelMapNotNull(
         items: List<T>,
@@ -37,7 +37,7 @@ internal object LiveXConcurrent {
         return null
     }
 
-    class TtlCache<K, V>(private val ttlMs: Long = 5 * 60 * 1000L) {
+    class TtlCache<K, V>(private val ttlMs: Long = 3 * 60 * 1000L) {
         private val store = ConcurrentHashMap<K, Pair<V, Long>>()
 
         fun get(key: K): V? {
@@ -52,9 +52,6 @@ internal object LiveXConcurrent {
         fun put(key: K, value: V) {
             store[key] = value to System.currentTimeMillis()
         }
-
-        fun getOrPut(key: K, compute: () -> V): V =
-            get(key) ?: compute().also { put(key, it) }
 
         fun clear() = store.clear()
     }
