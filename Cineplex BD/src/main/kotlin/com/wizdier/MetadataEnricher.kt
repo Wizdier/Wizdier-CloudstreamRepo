@@ -1,6 +1,8 @@
 package com.wizdier
 
 import com.lagradost.cloudstream3.app
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
 import okhttp3.MediaType.Companion.toMediaTypeOrNull
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
@@ -168,16 +170,22 @@ internal object MetadataEnricher {
         val isAnimeHint = originalLanguage == "ja" &&
                 genres.any { it.equals("Animation", true) }
 
-        // Episode list for the target season (TV only).
-        val episodes = if (mediaType == "tv") {
-            fetchTmdbSeasonEpisodes(tmdbId, seasonHint ?: 1)
-        } else emptyList()
+        // Episode list for the target season (TV only) AND Simkl ID lookup
+        // are independent network calls — fan them out concurrently. The old
+        // code did them sequentially, so a TV load paid 2× latency for these.
+        val (episodes, simklId) = coroutineScope {
+            val epsA = async {
+                if (mediaType == "tv") fetchTmdbSeasonEpisodes(tmdbId, seasonHint ?: 1)
+                else emptyList()
+            }
+            val simklA = async { fetchSimklId(imdbId, mediaType) }
+            Pair(epsA.await(), simklA.await())
+        }
 
         val recs = parseRecommendations(
             details.optJSONObject("recommendations")?.optJSONArray("results")
         )
 
-        val simklId = fetchSimklId(imdbId, mediaType)
         val actors = parseActors(details.optJSONObject("credits")?.optJSONArray("cast"))
 
         val result = MetaInfo(
@@ -290,33 +298,49 @@ internal object MetadataEnricher {
             }
         }
 
-        var logo: String? = null
-        var betterBackdrop: String? = null
-        var trailer: String? = null
-        var imdbId: String? = null
-        var recs: List<RecommendationItem> = emptyList()
-        var episodes: List<EpisodeMeta> = emptyList()
-        if (tmdbId != null) {
-            runCatching {
-                val tv = JSONObject(
-                    app.get(
-                        "$TMDB_API/tv/$tmdbId?api_key=$TMDB_KEY" +
-                                "&append_to_response=images,videos,external_ids,recommendations",
-                        timeout = 8000
-                    ).text
-                )
-                logo = pickLogo(tv.optJSONObject("images")?.optJSONArray("logos"))
-                trailer = pickTrailer(tv.optJSONObject("videos")?.optJSONArray("results"))
-                val bp = tv.optString("backdrop_path", "")
-                betterBackdrop = bp.toTmdbImg("original")
-                imdbId = tv.optJSONObject("external_ids")
-                    ?.optStringOrNull("imdb_id")?.takeIf { it.startsWith("tt") }
-                recs = parseRecommendations(
-                    tv.optJSONObject("recommendations")?.optJSONArray("results")
-                )
+        // TV details (for logo, trailer, imdb, recommendations) and the
+        // per-season episodes are independent — fetch them concurrently.
+        // Previously they were sequential, so an anime load with a known
+        // tmdbId paid 2× TMDB latency for these calls.
+        data class TvDetails(
+            val logo: String?,
+            val trailer: String?,
+            val backdrop: String?,
+            val imdbId: String?,
+            val recs: List<RecommendationItem>,
+        )
+        val resolvedTmdbId = tmdbId
+        val (tvDetails, episodes) = if (resolvedTmdbId != null) coroutineScope {
+            val tvA = async<TvDetails?> {
+                runCatching {
+                    val tv = JSONObject(
+                        app.get(
+                            "$TMDB_API/tv/$resolvedTmdbId?api_key=$TMDB_KEY" +
+                                    "&append_to_response=images,videos,external_ids,recommendations",
+                            timeout = 8000
+                        ).text
+                    )
+                    TvDetails(
+                        logo = pickLogo(tv.optJSONObject("images")?.optJSONArray("logos")),
+                        trailer = pickTrailer(tv.optJSONObject("videos")?.optJSONArray("results")),
+                        backdrop = tv.optString("backdrop_path", "").toTmdbImg("original"),
+                        imdbId = tv.optJSONObject("external_ids")
+                            ?.optStringOrNull("imdb_id")?.takeIf { it.startsWith("tt") },
+                        recs = parseRecommendations(
+                            tv.optJSONObject("recommendations")?.optJSONArray("results")
+                        ),
+                    )
+                }.getOrNull()
             }
-            episodes = fetchTmdbSeasonEpisodes(tmdbId, seasonHint ?: 1)
-        }
+            val epsA = async { fetchTmdbSeasonEpisodes(resolvedTmdbId, seasonHint ?: 1) }
+            Pair(tvA.await(), epsA.await())
+        } else Pair<TvDetails?, List<EpisodeMeta>>(null, emptyList())
+
+        val logo = tvDetails?.logo
+        val trailer = tvDetails?.trailer
+        val betterBackdrop = tvDetails?.backdrop
+        val imdbId = tvDetails?.imdbId
+        val recs = tvDetails?.recs ?: emptyList()
 
         val simklId = fetchSimklId(imdbId, "tv")
 

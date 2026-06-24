@@ -17,7 +17,6 @@ import java.util.Base64
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
-import java.util.concurrent.ConcurrentHashMap
 
 class FTPBD : MainAPI() {
     override var mainUrl = "https://ftpbd.net"
@@ -155,10 +154,16 @@ class FTPBD : MainAPI() {
     }
 
     private suspend fun loadGrouped(url: String, items: List<GroupedFtpItem>): LoadResponse? {
-        val loaded = items.distinctBy { it.url }.mapNotNull { item ->
-            val fixed = item.url.toAbsoluteUrl()
-            val doc = runCatching { app.get(fixed, headers = headers).document }.getOrNull()
-            doc?.let { Triple(fixed, it, item.label) }
+        // Fetch every grouped source's page concurrently. The old code used
+        // `mapNotNull { ... }` which is sequential — so a 5-source grouped
+        // load paid 5× the per-page latency. Now it's bounded-concurrent via
+        // FTPBDConcurrent.parallelMapNotNull (max 8 in flight).
+        val loaded = FTPBDConcurrent.parallelMapNotNull(items.distinctBy { it.url }) { item ->
+            runCatching {
+                val fixed = item.url.toAbsoluteUrl()
+                val doc = app.get(fixed, headers = headers).document
+                Triple(fixed, doc, item.label)
+            }.getOrNull()
         }
         if (loaded.isEmpty()) return null
         val primaryUrl = loaded.first().first
@@ -345,13 +350,23 @@ class FTPBD : MainAPI() {
             ?.let { tmdbImg("w500", it) }
         val actors = detail.optJSONObject("credits")?.optJSONArray("cast")?.toActors()
         val targetSeasons = seasonHints.takeIf { it.isNotEmpty() } ?: setOf(1)
-        val episodesBySeason = if (mediaType == "tv") {
-            val map = linkedMapOf<Int, List<TmdbEpisodeMeta>>()
-            for (season in targetSeasons) {
-                map[season] = fetchTmdbSeasonEpisodes(tmdbId, season)
+        // Fan out season-episode fetches AND the Simkl ID lookup concurrently.
+        // Previously they were sequential, so an N-season show paid (1 + N)
+        // extra round-trips of latency.
+        val (episodesBySeason, simklId) = coroutineScope {
+            val epsA = async {
+                if (mediaType == "tv") {
+                    val map = linkedMapOf<Int, List<TmdbEpisodeMeta>>()
+                    val pairs = FTPBDConcurrent.parallelMapNotNull(targetSeasons.toList()) { s ->
+                        runCatching { s to fetchTmdbSeasonEpisodes(tmdbId, s) }.getOrNull()
+                    }
+                    pairs.forEach { (s, eps) -> map[s] = eps }
+                    map
+                } else emptyMap()
             }
-            map
-        } else emptyMap()
+            val simklA = async { fetchSimklId(imdbId, mediaType) }
+            Pair(epsA.await(), simklA.await())
+        }
 
         val result = TmdbMeta(
             plot = detail.optStringOrNull("overview"),
@@ -363,7 +378,7 @@ class FTPBD : MainAPI() {
             rating = detail.optDoubleOrNull("vote_average"),
             trailerUrl = detail.optJSONObject("videos")?.optJSONArray("results")?.bestYoutubeTrailer(),
             imdbId = imdbId,
-            simklId = fetchSimklId(imdbId, mediaType),
+            simklId = simklId,
             actors = actors,
             episodesBySeason = episodesBySeason,
         )
@@ -547,16 +562,19 @@ class FTPBD : MainAPI() {
 
         val base = url.trimEnd('/')
         val meta = fetchTmdbMeta(title, "tv", year, seasons.toSet())
-        // Fetch every season's episode page concurrently.
+        // Fetch every season's episode page concurrently. The old code did
+        // this sequentially inside an async block, so a 5-season show paid
+        // 5× per-page latency. Now it's bounded-concurrent.
         val rawEpisodes = coroutineScope {
-            seasons.map { season ->
-                async<List<Episode>?> {
-                    val epDoc = runCatching {
-                        app.get("$base/episodes/?season=$season", headers = headers, timeout = 10_000).document
-                    }.getOrNull() ?: if (season == 1) doc else return@async null
-                    parseEpisodes(epDoc, season, meta.episodesBySeason[season])
-                }
-            }.awaitAll().filterNotNull().flatten()
+            val seasonResults = FTPBDConcurrent.parallelMapNotNull(seasons) { season ->
+                runCatching {
+                    val epDoc = app.get("$base/episodes/?season=$season", headers = headers, timeout = 10_000).document
+                    season to parseEpisodes(epDoc, season, meta.episodesBySeason[season])
+                }.getOrNull() ?: if (season == 1) {
+                    1 to parseEpisodes(doc, 1, meta.episodesBySeason[1])
+                } else null
+            }
+            seasonResults.flatMap { it.second }
         }.toMutableList()
         if (rawEpisodes.isEmpty()) rawEpisodes += parseEpisodes(doc, 1, meta.episodesBySeason[1])
 
@@ -590,22 +608,26 @@ class FTPBD : MainAPI() {
         val allSeasons = loaded.flatMap { seasonNumbers(it.second) }.distinct().ifEmpty { listOf(1) }
         val meta = fetchTmdbMeta(title, "tv", year, allSeasons.toSet())
 
-        // Fetch each source's seasons concurrently across sources.
+        // For each grouped source, fetch every season's episode page. The
+        // previous code held the per-source season loop sequential inside each
+        // async block, so a source with 5 seasons paid 5× latency. We now
+        // fan out the seasons inside each source too, so total wall-clock is
+        // max(per-source-seasons) instead of sum.
         val allEpisodes = coroutineScope {
             loaded.map { (seriesUrl, seriesDoc, label) ->
                 async {
                     val seasons = seasonNumbers(seriesDoc).ifEmpty { listOf(1) }
                     val base = seriesUrl.trimEnd('/')
-                    val eps = mutableListOf<EpisodeWithLabel>()
-                    for (season in seasons) {
-                        val epDoc = runCatching {
-                            app.get("$base/episodes/?season=$season", headers = headers, timeout = 10_000).document
-                        }.getOrNull() ?: if (season == 1) seriesDoc else continue
-                        parseEpisodes(epDoc, season, meta.episodesBySeason[season]).forEach { ep ->
-                            eps += EpisodeWithLabel(ep, label)
-                        }
-                    }
-                    eps
+                    // Parallel season fetch within this source. Each lambda
+                    // returns a List<Episode>, then we flatten the outer
+                    // List<List<Episode>> into a single per-source list.
+                    val eps = FTPBDConcurrent.parallelMapNotNull(seasons) { season ->
+                        runCatching {
+                            val epDoc = app.get("$base/episodes/?season=$season", headers = headers, timeout = 10_000).document
+                            parseEpisodes(epDoc, season, meta.episodesBySeason[season])
+                        }.getOrNull() ?: if (season == 1) parseEpisodes(seriesDoc, 1, meta.episodesBySeason[1]) else emptyList()
+                    }.flatten()
+                    eps.map { ep -> EpisodeWithLabel(ep, label) }
                 }
             }.awaitAll().flatten()
         }.toMutableList()

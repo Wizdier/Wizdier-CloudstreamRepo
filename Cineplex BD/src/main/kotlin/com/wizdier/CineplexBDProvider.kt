@@ -338,15 +338,18 @@ class CineplexBD : MainAPI() {
         }
 
         // ── (3-extra) numeric fallback when the page exposes no season UI ─
-        for (s in 1..12) {
+        // Fire all 12 candidate seasons concurrently (bounded by
+        // parallelMapNotNull's internal semaphore). The previous code did
+        // these sequentially, so a missing-season page could cost up to 12
+        // serial round-trips. Now they share one burst of latency.
+        val numericSeasonResults = CineplexConcurrent.parallelMapNotNull((1..12).toList()) { s ->
             val metaUrl = "$mainUrl/watch.php?$seriesIdKey=$seriesId&season=$s&meta=1"
             val text = runCatching { app.get(metaUrl, headers = cfHeaders, timeout = 10_000).text }.getOrNull()
-                ?: continue
+                ?: return@parallelMapNotNull null
             val parsed = parseEpisodesFromMetaJson(text, s, meta.episodes)
-            if (parsed.isNotEmpty()) episodes += parsed
-            // Stop if 3 consecutive empty seasons after we've already seen content
-            if (episodes.isNotEmpty() && parsed.isEmpty() && s - (episodes.last().season ?: 0) >= 3) break
+            if (parsed.isEmpty()) null else s to parsed
         }
+        for ((_, eps) in numericSeasonResults) episodes += eps
         if (episodes.isNotEmpty()) return episodes.dedupAndSort()
 
         // ── (4) HTML fallback: scrape anchors on the watch page ───────────

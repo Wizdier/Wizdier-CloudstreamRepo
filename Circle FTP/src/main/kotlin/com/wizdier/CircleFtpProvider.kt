@@ -34,6 +34,7 @@ import com.lagradost.cloudstream3.LoadResponse.Companion.addMalId
 import com.lagradost.cloudstream3.LoadResponse.Companion.addTrailer
 import com.lagradost.cloudstream3.syncproviders.SyncIdName
 import com.lagradost.cloudstream3.utils.ExtractorLink
+import com.lagradost.cloudstream3.utils.getQualityFromName
 import com.lagradost.cloudstream3.utils.newExtractorLink
 import com.lagradost.api.Log
 import kotlinx.coroutines.async
@@ -98,33 +99,25 @@ class CircleFtpProvider : MainAPI() {
         return meta?.posterUrl
     }
 
-    private fun selectUntilNonInt(string: String?): Int? {
-        return string?.let { Regex("^.*?(?=\\D|$)").find(it)?.value?.toIntOrNull() }
-    }
+    private fun selectUntilNonInt(string: String?): Int? =
+        string?.let { Regex("\\d+").find(it)?.value?.toIntOrNull() }
 
     private fun getSearchQuality(check: String?): SearchQuality? {
-        val lowercaseCheck = check?.lowercase()
-        if (lowercaseCheck != null) {
-            return when {
-                lowercaseCheck.contains("webrip") || lowercaseCheck.contains("web-dl") -> SearchQuality.WebRip
-                lowercaseCheck.contains("bluray") -> SearchQuality.BlueRay
-                lowercaseCheck.contains("hdts") || lowercaseCheck.contains("hdcam") || lowercaseCheck.contains(
-                    "hdtc"
-                ) -> SearchQuality.HdCam
-
-                lowercaseCheck.contains("dvd") -> SearchQuality.DVD
-                lowercaseCheck.contains("cam") -> SearchQuality.Cam
-                lowercaseCheck.contains("camrip") || lowercaseCheck.contains("rip") -> SearchQuality.CamRip
-                lowercaseCheck.contains("hdrip") || lowercaseCheck.contains("hd") || lowercaseCheck.contains(
-                    "hdtv"
-                ) -> SearchQuality.HD
-
-                lowercaseCheck.contains("telesync") -> SearchQuality.Telesync
-                lowercaseCheck.contains("telecine") -> SearchQuality.Telecine
-                else -> null
-            }
+        val c = check?.lowercase() ?: return null
+        // Ordered most-specific → least-specific so e.g. "HDCAM" matches HdCam
+        // before the bare "cam" clause fires.
+        return when {
+            c.contains("webrip") || c.contains("web-dl") -> SearchQuality.WebRip
+            c.contains("bluray")                          -> SearchQuality.BlueRay
+            c.contains("hdts") || c.contains("hdcam") || c.contains("hdtc") -> SearchQuality.HdCam
+            c.contains("camrip") || (c.contains("rip") && !c.contains("webrip")) -> SearchQuality.CamRip
+            c.contains("dvd")                             -> SearchQuality.DVD
+            c.contains("telesync")                        -> SearchQuality.Telesync
+            c.contains("telecine")                        -> SearchQuality.Telecine
+            c.contains("hdrip") || c.contains("hdtv") || c.contains("hd") -> SearchQuality.HD
+            c.contains("cam")                             -> SearchQuality.Cam
+            else -> null
         }
-        return null
     }
 
     companion object {
@@ -133,7 +126,41 @@ class CircleFtpProvider : MainAPI() {
             return optString(key, "").takeIf { it.isNotBlank() && it != "null" }
         }
 
-        private val metadataCache = ConcurrentHashMap<String, MetadataInfo>()
+        // TTL + LRU cache for metadata lookups. Previously this was a bare
+        // ConcurrentHashMap with no eviction, which leaked memory forever:
+        // every distinct title+season combo stayed in the map for the lifetime
+        // of the process. The bounded TTL cache here auto-expires entries
+        // after 10 minutes AND evicts the oldest entries when the cache
+        // exceeds 256 entries, so memory stays flat even on long sessions.
+        private val metadataCache = object {
+            private const val TTL_MS = 10 * 60 * 1000L
+            private const val MAX_ENTRIES = 256
+            private val store = ConcurrentHashMap<String, Pair<MetadataInfo, Long>>()
+            private var sweepCounter = 0L
+
+            operator fun get(key: String): MetadataInfo? {
+                val (value, ts) = store[key] ?: return null
+                if (System.currentTimeMillis() - ts > TTL_MS) {
+                    store.remove(key)
+                    return null
+                }
+                return value
+            }
+
+            operator fun set(key: String, value: MetadataInfo) {
+                store[key] = value to System.currentTimeMillis()
+                if (++sweepCounter % 32 == 0L) {
+                    val now = System.currentTimeMillis()
+                    store.entries.removeAll { (_, v) -> now - v.second > TTL_MS }
+                    if (store.size > MAX_ENTRIES) {
+                        store.entries
+                            .sortedBy { it.value.second }
+                            .take(store.size - MAX_ENTRIES)
+                            .forEach { (k, _) -> store.remove(k) }
+                    }
+                }
+            }
+        }
 
         data class GroupedPostInfo(
             val id: Int,
@@ -711,10 +738,32 @@ class CircleFtpProvider : MainAPI() {
                     if (firstResult != null) {
                         val tmdbId = firstResult.optInt("id")
                         val mediaType = firstResult.optString("media_type") // "movie" or "tv"
-                        
-                        val detailsUrl = "https://api.themoviedb.org/3/$mediaType/$tmdbId?api_key=98ae14df2b8d8f8f8136499daf79f0e0&append_to_response=alternative_titles,credits,external_ids,videos,recommendations,images"
-                        val detailsText = app.get(detailsUrl, timeout = 8_000).text
-                        val details = JSONObject(detailsText)
+
+                        // Fire off the details call AND (for TV) the per-season
+                        // episodes call concurrently. The previous code awaited
+                        // them sequentially, so metadata wall-clock time was
+                        // 2× a single TMDB round-trip. Now it's 1×.
+                        val (detailsText, seasonText) = coroutineScope {
+                            val detailsA = async {
+                                runCatching {
+                                    app.get(
+                                        "https://api.themoviedb.org/3/$mediaType/$tmdbId?api_key=98ae14df2b8d8f8f8136499daf79f0e0&append_to_response=alternative_titles,credits,external_ids,videos,recommendations,images",
+                                        timeout = 8_000
+                                    ).text
+                                }.getOrNull()
+                            }
+                            val seasonA = if (mediaType == "tv") async {
+                                runCatching {
+                                    app.get(
+                                        "https://api.themoviedb.org/3/tv/$tmdbId/season/$targetSeason?api_key=98ae14df2b8d8f8f8136499daf79f0e0",
+                                        timeout = 8_000
+                                    ).text
+                                }.getOrNull()
+                            } else null
+                            Pair(detailsA.await(), seasonA?.await())
+                        }
+                        val details = detailsText?.let { runCatching { JSONObject(it) }.getOrNull() }
+                            ?: return null
 
                         val displayTitle = details.optString("title", details.optString("name", title))
                         val posterPath = details.optStringOrNull("poster_path")
@@ -740,10 +789,13 @@ class CircleFtpProvider : MainAPI() {
                             }
                         }
 
-                        var logoUrl: String? = null
-                        try {
-                            logoUrl = fetchTmdbLogoUrl("https://api.themoviedb.org/3", "98ae14df2b8d8f8f8136499daf79f0e0", if (mediaType == "movie") TvType.Movie else TvType.TvSeries, tmdbId, "en")
-                        } catch (_: Exception) { }
+                        // Logo: the details call already fetched /images via
+                        // append_to_response, so reuse it instead of issuing a
+                        // second /images request. This saves one round-trip per
+                        // load on TV series and movies.
+                        val logoUrl: String? = details.optJSONObject("images")
+                            ?.optJSONArray("logos")
+                            ?.let { logos -> pickBestTmdbLogo(logos, "en") }
 
                         val extIds = details.optJSONObject("external_ids")
                         val imdbId = extIds?.optStringSafe("imdb_id") ?: details.optStringSafe("imdb_id")
@@ -752,10 +804,9 @@ class CircleFtpProvider : MainAPI() {
                         val epList = mutableListOf<EpisodeMetadata>()
                         var seasonPoster: String? = null
                         var seasonPlot: String? = null
-                        if (mediaType == "tv") {
-                            try {
-                                val seasonUrl = "https://api.themoviedb.org/3/tv/$tmdbId/season/$targetSeason?api_key=98ae14df2b8d8f8f8136499daf79f0e0"
-                                val seasonRes = JSONObject(app.get(seasonUrl, timeout = 8_000).text)
+                        if (mediaType == "tv" && seasonText != null) {
+                            runCatching {
+                                val seasonRes = JSONObject(seasonText)
                                 val sPosterPath = seasonRes.optStringOrNull("poster_path")
                                 if (sPosterPath != null) {
                                     seasonPoster = "https://image.tmdb.org/t/p/original$sPosterPath"
@@ -778,7 +829,7 @@ class CircleFtpProvider : MainAPI() {
                                         )
                                     }
                                 }
-                            } catch (_: Exception) {}
+                            }
                         }
 
                         val genres = mutableListOf<String>()
@@ -884,6 +935,40 @@ class CircleFtpProvider : MainAPI() {
             val value = this.optString(key)
             if (value == "null" || value.trim().lowercase() == "null") return null
             return value
+        }
+
+        /**
+         * Pick the best TMDB logo from a `logos` JSON array. Prefers logos in
+         * the user's language, then non-SVG logos (better compatibility), then
+         * the highest-voted logo. Mirrors the behaviour of `fetchTmdbLogoUrl`
+         * but operates on an already-fetched array, so callers that already
+         * pulled `images` via `append_to_response` don't need a second HTTP
+         * round-trip.
+         */
+        private fun pickBestTmdbLogo(logos: JSONArray, preferredLang: String?): String? {
+            if (logos.length() == 0) return null
+            val lang = preferredLang?.trim()?.lowercase()?.substringBefore("-")
+            var enSvg: JSONObject? = null
+            var anyNonSvg: JSONObject? = null
+            var anySvg: JSONObject? = null
+
+            for (i in 0 until logos.length()) {
+                val l = logos.optJSONObject(i) ?: continue
+                val path = l.optString("file_path", "")
+                if (path.isBlank()) continue
+                val lLang = l.optString("iso_639_1").trim().lowercase()
+                val isSvg = path.endsWith(".svg", true)
+                if (lLang == lang && !isSvg) {
+                    return "https://image.tmdb.org/t/p/w500$path"
+                }
+                if (lLang == lang && isSvg && enSvg == null) enSvg = l
+                if (!isSvg && anyNonSvg == null) anyNonSvg = l
+                if (isSvg && anySvg == null) anySvg = l
+            }
+            return (enSvg ?: anyNonSvg ?: anySvg)
+                ?.optString("file_path")
+                ?.takeIf { it.isNotBlank() }
+                ?.let { "https://image.tmdb.org/t/p/w500$it" }
         }
 
         // Highly accurate, zero-network anime detection using category mapping (Issue 2)
@@ -1380,29 +1465,38 @@ class CircleFtpProvider : MainAPI() {
         }
     }
 
+    /**
+     * Map of CDN hostname → raw IP. Used to swap public DNS names for their
+     * BDIX-routable IPs when the user is on a network that blocks the
+     * hostname but allows the IP. Kept as a single ordered map so adding a
+     * new mirror is a one-line edit instead of another `when` branch.
+     */
+    private val cdnHostToIp: List<Pair<String, String>> = listOf(
+        "index.circleftp.net"  to "15.1.4.2",
+        "index2.circleftp.net" to "15.1.4.5",
+        "index1.circleftp.net" to "15.1.4.9",
+        "ftp3.circleftp.net"   to "15.1.4.7",
+        "ftp4.circleftp.net"   to "15.1.1.5",
+        "ftp5.circleftp.net"   to "15.1.1.15",
+        "ftp6.circleftp.net"   to "15.1.2.3",
+        "ftp7.circleftp.net"   to "15.1.4.8",
+        "ftp8.circleftp.net"   to "15.1.2.2",
+        "ftp9.circleftp.net"   to "15.1.2.12",
+        "ftp10.circleftp.net"  to "15.1.4.3",
+        "ftp11.circleftp.net"  to "15.1.2.6",
+        "ftp12.circleftp.net"  to "15.1.2.1",
+        "ftp13.circleftp.net"  to "15.1.1.18",
+        "ftp15.circleftp.net"  to "15.1.4.12",
+        "ftp17.circleftp.net"  to "15.1.3.8",
+    )
+
     private fun linkToIp(data: String?): String {
-        if (data != null) {
-            return when {
-                "index.circleftp.net" in data -> data.replace("index.circleftp.net", "15.1.4.2")
-                "index2.circleftp.net" in data -> data.replace("index2.circleftp.net", "15.1.4.5")
-                "index1.circleftp.net" in data -> data.replace("index1.circleftp.net", "15.1.4.9")
-                "ftp3.circleftp.net" in data -> data.replace("ftp3.circleftp.net", "15.1.4.7")
-                "ftp4.circleftp.net" in data -> data.replace("ftp4.circleftp.net", "15.1.1.5")
-                "ftp5.circleftp.net" in data -> data.replace("ftp5.circleftp.net", "15.1.1.15")
-                "ftp6.circleftp.net" in data -> data.replace("ftp6.circleftp.net", "15.1.2.3")
-                "ftp7.circleftp.net" in data -> data.replace("ftp7.circleftp.net", "15.1.4.8")
-                "ftp8.circleftp.net" in data -> data.replace("ftp8.circleftp.net", "15.1.2.2")
-                "ftp9.circleftp.net" in data -> data.replace("ftp9.circleftp.net", "15.1.2.12")
-                "ftp10.circleftp.net" in data -> data.replace("ftp10.circleftp.net", "15.1.4.3")
-                "ftp11.circleftp.net" in data -> data.replace("ftp11.circleftp.net", "15.1.2.6")
-                "ftp12.circleftp.net" in data -> data.replace("ftp12.circleftp.net", "15.1.2.1")
-                "ftp13.circleftp.net" in data -> data.replace("ftp13.circleftp.net", "15.1.1.18")
-                "ftp15.circleftp.net" in data -> data.replace("ftp15.circleftp.net", "15.1.4.12")
-                "ftp17.circleftp.net" in data -> data.replace("ftp17.circleftp.net", "15.1.3.8")
-                else -> data
-            }
+        if (data.isNullOrEmpty()) return ""
+        // First-match wins, mirroring the old `when` chain's precedence.
+        for ((host, ip) in cdnHostToIp) {
+            if (host in data) return data.replace(host, ip)
         }
-        else return ""
+        return data
     }
 
     override suspend fun loadLinks(
@@ -1411,52 +1505,55 @@ class CircleFtpProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        if (data.contains("movie?data=")) {
-            val base64Data = data.substringAfter("movie?data=")
-            val jsonStr = String(Base64.getDecoder().decode(base64Data))
-            val arr = JSONArray(jsonStr)
-            for (i in 0 until arr.length()) {
-                val linkObj = arr.getJSONObject(i)
-                val url = linkObj.getString("url")
-                val audio = linkObj.optStringOrNull("audio")
-                val nameWithAudio = if (audio != null) "$name [$audio]" else name
+        // Both movie and episode payloads use the same JSON shape: an array of
+        // {url, audio?} objects, base64-encoded after a small prefix. We
+        // extract the prefix to detect quality on the resulting URL, then
+        // share a single emit loop. The previous implementation had two
+        // near-identical branches that always drifted out of sync.
+        val prefix = when {
+            data.contains("movie?data=")   -> "movie?data="
+            data.contains("episode?data=") -> "episode?data="
+            else -> {
+                // Raw URL — emit it as a single direct link.
                 callback.invoke(
                     newExtractorLink(
-                        source = name,
-                        name = nameWithAudio,
-                        url = url
-                    )
+                        source = this.name,
+                        name = this.name,
+                        url = data
+                    ) {
+                        this.quality = getQualityFromName(data)
+                    }
                 )
+                return true
             }
-            return true
-        } else if (data.contains("episode?data=")) {
-            val base64Data = data.substringAfter("episode?data=")
-            val jsonStr = String(Base64.getDecoder().decode(base64Data))
-            val arr = JSONArray(jsonStr)
-            for (i in 0 until arr.length()) {
-                val linkObj = arr.getJSONObject(i)
-                val url = linkObj.getString("url")
-                val audio = linkObj.optStringOrNull("audio")
-                val nameWithAudio = if (audio != null) "$name [$audio]" else name
-                callback.invoke(
-                    newExtractorLink(
-                        source = name,
-                        name = nameWithAudio,
-                        url = url
-                    )
-                )
-            }
-            return true
         }
 
-        callback.invoke(
-            newExtractorLink(
-                source = this.name,
-                name = this.name,
-                url = data
+        val jsonStr = runCatching {
+            String(Base64.getDecoder().decode(data.substringAfter(prefix)))
+        }.getOrNull() ?: return false
+
+        val arr = runCatching { JSONArray(jsonStr) }.getOrNull() ?: return false
+        if (arr.length() == 0) return false
+
+        var found = false
+        for (i in 0 until arr.length()) {
+            val linkObj = arr.optJSONObject(i) ?: continue
+            val url = linkObj.optStringOrNull("url") ?: continue
+            val audio = linkObj.optStringOrNull("audio")
+            val nameWithAudio = if (audio != null) "$name [$audio]" else name
+            callback.invoke(
+                newExtractorLink(
+                    source = name,
+                    name = nameWithAudio,
+                    url = url
+                ) {
+                    // Quality detection from the URL (e.g. ...1080p.mkv → 1080p).
+                    this.quality = getQualityFromName(url)
+                }
             )
-        )
-        return true
+            found = true
+        }
+        return found
     }
 
     data class PageData(

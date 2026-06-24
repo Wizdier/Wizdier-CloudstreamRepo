@@ -19,7 +19,6 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.net.URLEncoder
 import java.util.Base64
-import java.util.concurrent.ConcurrentHashMap
 
 class CTGMovies(private val prefs: SharedPreferences? = null) : MainAPI() {
     override var mainUrl = "https://ctgmovies.com"
@@ -355,15 +354,27 @@ class CTGMovies(private val prefs: SharedPreferences? = null) : MainAPI() {
         val imdbId = detail.optJSONObject("external_ids")?.optStringOrNull("imdb_id")
             ?: detail.optStringOrNull("imdb_id")
             ?: obj.optStringOrNull("imdb_id")
-        val simklId = fetchSimklId(imdbId, mediaType)
         val targetSeasons = seasonHints.takeIf { it.isNotEmpty() } ?: setOf(1)
-        val episodesBySeason = if (mediaType == "tv") {
-            val map = linkedMapOf<Int, List<TmdbEpisodeMeta>>()
-            for (season in targetSeasons) {
-                map[season] = fetchTmdbSeasonEpisodes(tmdbId, season)
+        // Run the Simkl ID lookup and all season-episode fetches concurrently.
+        // The previous code did each of these sequentially, so a multi-season
+        // TV show with an IMDb id paid (1 + N) extra round-trips of latency.
+        val (simklId, episodesBySeason) = coroutineScope {
+            val simklA = async { fetchSimklId(imdbId, mediaType) }
+            // Fan out season-episode fetches concurrently — bounded by the
+            // shared parallelMapNotNull (max 8 in flight) so we don't trip
+            // TMDB's rate limit.
+            val epsA = async {
+                if (mediaType == "tv") {
+                    val map = linkedMapOf<Int, List<TmdbEpisodeMeta>>()
+                    val pairs = CTGConcurrent.parallelMapNotNull(targetSeasons.toList()) { s ->
+                        runCatching { s to fetchTmdbSeasonEpisodes(tmdbId, s) }.getOrNull()
+                    }
+                    pairs.forEach { (s, eps) -> map[s] = eps }
+                    map
+                } else emptyMap()
             }
-            map
-        } else emptyMap()
+            Pair(simklA.await(), epsA.await())
+        }
         val episodes = episodesBySeason[targetSeasons.firstOrNull() ?: 1] ?: emptyList()
 
         val result = TmdbMeta(
@@ -802,9 +813,22 @@ class CTGMovies(private val prefs: SharedPreferences? = null) : MainAPI() {
     private suspend fun apiGet(path: String, query: Map<String, Any?> = emptyMap()): String {
         ensureToken(false)
         val url = buildApiUrl(path, query)
-        var response = app.get(url, headers = apiHeaders(), timeout = 10_000)
+
+        // Bounded retry on transient failures (5xx + network errors). The old
+        // code only retried on 401/403 (auth refresh); a 503 from a flaky
+        // backend surfaced as an empty result. We retry on any non-2xx that
+        // isn't 401/403 (which are handled separately below) plus any network
+        // exception. Jittered back-off is provided by CTGConcurrent.retry.
+        var response = CTGConcurrent.retry(maxAttempts = 2, initialDelayMs = 300) {
+            val r = app.get(url, headers = apiHeaders(), timeout = 10_000)
+            // Treat 5xx as retryable. 4xx (except 401/403) is not retryable —
+            // a 404 is a real "not found" and retrying just wastes time.
+            if (r.code in 500..599) throw java.io.IOException("HTTP ${r.code}")
+            r
+        } ?: app.get(url, headers = apiHeaders(), timeout = 10_000)
 
         if (response.code == 401 || response.code == 403) {
+            // Token expired mid-session — refresh once and retry.
             ensureToken(true)
             response = app.get(url, headers = apiHeaders(), timeout = 10_000)
         }

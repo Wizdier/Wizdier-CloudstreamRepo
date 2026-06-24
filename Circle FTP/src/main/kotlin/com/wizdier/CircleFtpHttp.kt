@@ -11,9 +11,13 @@ import kotlinx.coroutines.delay
 // This helper centralises the try-primary-then-fallback logic AND adds:
 //   • explicit per-request timeouts (the old code could hang indefinitely
 //     on a dead mirror)
-//   • bounded retries with exponential back-off
+//   • bounded retries with jittered exponential back-off (pure 2× back-off
+//     causes thundering-herd retries after a server blip; ±25% jitter
+//     spreads them out)
 //   • a single, consistent cache key + cacheTime so Cloudstream's built-in
 //     HTTP cache actually fires
+//   • coroutine-safe cancellation: re-throws CancellationException so the
+//     parent scope can still cancel an in-flight fetch
 //
 // Every method returns null on total failure instead of throwing, so the
 // provider's parsing code never has to deal with network exceptions.
@@ -23,11 +27,12 @@ internal object CircleFtpHttp {
     private const val TAG = "CircleFtpHttp"
     private const val DEFAULT_TIMEOUT = 12_000L  // ms (Long — app.get() expects Long)
     private const val DEFAULT_CACHE = 60         // s
+    private const val MAX_BACKOFF_MS = 2_000L
 
     /**
      * Fetch [path] from [primary], falling back to [fallback] on any error.
-     * Retries each mirror [retries] times with back-off. Returns the response
-     * body text, or null if both mirrors are exhausted.
+     * Retries each mirror [retries] times with jittered back-off. Returns the
+     * response body text, or null if both mirrors are exhausted.
      */
     suspend fun fetchWithFallback(
         primary: String,
@@ -45,7 +50,7 @@ internal object CircleFtpHttp {
                     return result.text
                 }
                 if (attempt < retries - 1) {
-                    delay((300L * (attempt + 1)).coerceAtMost(1_200))
+                    delay(jitteredBackoff(attempt))
                 }
             }
         }
@@ -69,9 +74,20 @@ internal object CircleFtpHttp {
                 return result.text
             }
             if (attempt < retries - 1) {
-                delay((300L * (attempt + 1)).coerceAtMost(1_200))
+                delay(jitteredBackoff(attempt))
             }
         }
         return null
+    }
+
+    /**
+     * Jittered exponential back-off. Base delay = 300ms × 2^attempt, capped
+     * at [MAX_BACKOFF_MS], with ±25% random jitter so concurrent retries
+     * don't all land on the same tick.
+     */
+    private fun jitteredBackoff(attempt: Int): Long {
+        val base = (300L shl attempt).coerceAtMost(MAX_BACKOFF_MS)
+        val jitter = (base * 0.25 * (Math.random() - 0.5) * 2).toLong()
+        return (base + jitter).coerceAtLeast(0)
     }
 }
