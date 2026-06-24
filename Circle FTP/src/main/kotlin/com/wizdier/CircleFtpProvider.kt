@@ -132,9 +132,14 @@ class CircleFtpProvider : MainAPI() {
         // of the process. The bounded TTL cache here auto-expires entries
         // after 10 minutes AND evicts the oldest entries when the cache
         // exceeds 256 entries, so memory stays flat even on long sessions.
+        //
+        // NOTE: Kotlin forbids `const val` inside an anonymous object, so we
+        // use plain `val` — the values are compile-time constants in intent
+        // but the compiler treats them as instance fields. The JIT inlines
+        // them at call sites anyway, so there's no perf hit.
         private val metadataCache = object {
-            private const val TTL_MS = 10 * 60 * 1000L
-            private const val MAX_ENTRIES = 256
+            private val TTL_MS = 10 * 60 * 1000L
+            private val MAX_ENTRIES = 256
             private val store = ConcurrentHashMap<String, Pair<MetadataInfo, Long>>()
             private var sweepCounter = 0L
 

@@ -31,11 +31,15 @@ internal object FTPBDConcurrent {
      * runCatching so a single failure (timeout, parse error) can never drop
      * the rest of the batch. In-flight concurrency is bounded by [concurrency]
      * to avoid socket exhaustion and API rate-limit blowups.
+     *
+     * Parameter order note: [concurrency] is intentionally placed BEFORE
+     * [fetch] so callers can use Kotlin's trailing-lambda syntax without
+     * the compiler mis-binding the lambda to the `Int` parameter.
      */
     suspend fun <T, R> parallelMapNotNull(
         items: List<T>,
-        fetch: suspend (T) -> R?,
         concurrency: Int = DEFAULT_PARALLELISM,
+        fetch: suspend (T) -> R?,
     ): List<R> {
         if (items.isEmpty()) return emptyList()
         val limited = concurrency.coerceAtLeast(1)
