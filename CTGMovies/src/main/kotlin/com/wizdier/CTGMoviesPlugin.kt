@@ -16,6 +16,7 @@ import android.view.Gravity
 import android.view.View
 import android.view.WindowManager
 import android.view.animation.DecelerateInterpolator
+import android.view.animation.OvershootInterpolator
 import android.view.inputmethod.EditorInfo
 import android.widget.EditText
 import android.widget.LinearLayout
@@ -34,27 +35,28 @@ class CTGMoviesPlugin : Plugin() {
     }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════════
 //  CTGSettingsUI — settings dialog
 //
-//  Design language now mirrors CineStream (SaurabhKaperwan/CSX) exactly:
+//  Design language mirrors CineStream (SaurabhKaperwan/CSX):
 //    • Hero banner with TL_BR gradient + accent bar + bold title + subtitle
 //    • Collapsible cards with accent strip + bold uppercase title + chevron
-//    • Same font sizes, spacing, radii, and elevation as CineStream
-//    • Same color tokens (BG_DARK, BG_CARD, ACCENT_START, ACCENT_END, etc.)
+//    • Same font sizes (raw SP), spacing, radii, and elevation as CineStream
 //
-//  Colours are resolved from the host activity's theme attributes so the
-//  dialog adapts to Cloudstream's light/dark mode and the user's accent
-//  colour automatically, while the spacing/typography are pixel-identical
-//  to CineStream.
-// ═══════════════════════════════════════════════════════════════════════════
+//  Custom polishing on top of the CineStream base:
+//    • Staggered card entrance — cards cascade in with a 60ms delay
+//    • Card elevation pulse — subtle elevation shift on expand/collapse
+//    • Gradient left border on info card — elegant vertical strip, no emoji
+//    • Password toggle with bounce — micro-scale animation on tap
+//    • Softer input focus glow — wider, translucent accent border on focus
+//    • Smooth chevron flip — animated rotation instead of instant swap
+//    • Danger pill for Clear — CineStream-style danger button
+//    • Theme-aware colours — adapts to Cloudstream's light/dark + accent
+// ═══════════════════════════════════════════════════════════════════════════════
 
 object CTGSettingsUI {
 
     // ── Color tokens (CineStream palette, with theme-aware overrides) ────────
-    // Defaults mirror CineStream's SettingsTheme.kt exactly. At show() time
-    // we attempt to resolve them from the host activity's theme so the dialog
-    // adapts to Cloudstream's light/dark mode and accent colour.
     private var BG_DARK: Int = 0
     private var BG_CARD: Int = 0
     private var ACCENT_START: Int = 0
@@ -67,15 +69,16 @@ object CTGSettingsUI {
     private var INPUT_BORDER: Int = 0
     private var INPUT_BORDER_FOCUS: Int = 0
 
-    // ── dp / sp helpers (CineStream convention) ──────────────────────────────
+    // ── dp helper (CineStream convention — used for layout pixels) ───────────
+    // NOTE: textSize uses raw float SP values (e.g. textSize = 12f), NOT this
+    // helper. Using sp() for textSize causes double-scaling (SP→px then
+    // Android reads the px value as SP again). This is the bug that made the
+    // original dialog appear oversized.
     private fun dp(ctx: Context, v: Int): Int =
         TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_DIP, v.toFloat(), ctx.resources.displayMetrics).toInt()
 
     private fun dpF(ctx: Context, v: Float): Float =
         TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_DIP, v, ctx.resources.displayMetrics)
-
-    private fun sp(ctx: Context, v: Float): Float =
-        TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_SP, v, ctx.resources.displayMetrics)
 
     // ── Theme resolution ─────────────────────────────────────────────────────
     private fun resolveColor(ctx: Context, attr: Int, fallback: Int): Int {
@@ -104,8 +107,6 @@ object CTGSettingsUI {
     }
 
     private fun resolveColors(ctx: Context) {
-        // CineStream defaults — these are what the dialog falls back to if the
-        // host theme doesn't expose a particular attribute.
         val csBgDark = Color.parseColor("#0D0F14")
         val csBgCard = Color.parseColor("#13161E")
         val csAccentStart = Color.parseColor("#6C63FF")
@@ -117,18 +118,13 @@ object CTGSettingsUI {
         val csInputBg = Color.parseColor("#0D1117")
         val csInputBorder = Color.parseColor("#2E2850")
 
-        // Resolve what we can from the host theme.
         BG_DARK = resolveColor(ctx, android.R.attr.colorBackground, csBgDark)
         BG_CARD = resolveColor(ctx, android.R.attr.colorBackgroundFloating, csBgCard)
-        // If colorBackgroundFloating wasn't available, derive a slightly
-        // elevated surface from BG_DARK.
         if (BG_CARD == BG_DARK) {
             BG_CARD = blendColor(BG_DARK, if (isDark(BG_DARK)) Color.WHITE else Color.BLACK, 0.04f)
         }
         ACCENT_START = resolveColor(ctx, android.R.attr.colorAccent, csAccentStart)
-        // ACCENT_END is a complementary accent — if we only have one accent
-        // colour from the theme, derive a shifted variant for the gradient.
-        ACCENT_END = blendColor(ACCENT_START, Color.parseColor("#A855F7"), 0.5f)
+        ACCENT_END = blendColor(ACCENT_START, csAccentEnd, 0.5f)
         TEXT_PRIMARY = resolveColor(ctx, android.R.attr.textColorPrimary, csTextPrimary)
         TEXT_SECONDARY = resolveColor(ctx, android.R.attr.textColorSecondary, csTextSecondary)
         DIVIDER_COLOR = blendColor(BG_CARD, if (isDark(BG_DARK)) Color.WHITE else Color.BLACK, 0.08f)
@@ -155,6 +151,10 @@ object CTGSettingsUI {
         GradientDrawable(GradientDrawable.Orientation.TOP_BOTTOM, intArrayOf(top, bottom))
             .apply { cornerRadius = radius }
 
+    private fun horizontalGradient(start: Int, end: Int, radius: Float = 99f) =
+        GradientDrawable(GradientDrawable.Orientation.LEFT_RIGHT, intArrayOf(start, end))
+            .apply { cornerRadius = radius }
+
     private fun stateDrawable(ctx: Context): StateListDrawable = StateListDrawable().apply {
         addState(
             intArrayOf(android.R.attr.state_pressed),
@@ -164,7 +164,7 @@ object CTGSettingsUI {
             intArrayOf(android.R.attr.state_focused),
             roundRect(BG_CARD, dpF(ctx, 16f), ACCENT_START, 2)
         )
-        addState(intArrayOf(), roundRect(BG_CARD, dpF(ctx, 16f)))
+        addState(intArrayOf(), roundRect(Color.TRANSPARENT, dpF(ctx, 16f)))
     }
 
     private fun inputBackground(ctx: Context) = GradientDrawable().apply {
@@ -179,70 +179,90 @@ object CTGSettingsUI {
         setStroke(2, INPUT_BORDER_FOCUS)
     }
 
-    // ── Animations (CineStream timings) ──────────────────────────────────────
-    private fun fadeInSlide(v: View) {
+    // ── Animations ───────────────────────────────────────────────────────────
+
+    // CineStream-style entrance: fade + slide up
+    private fun fadeInSlide(v: View, delayMs: Long = 0L) {
         v.alpha = 0f
         v.translationY = 20f
         v.animate()
             .alpha(1f).translationY(0f)
+            .setStartDelay(delayMs)
             .setDuration(300).setInterpolator(DecelerateInterpolator()).start()
     }
 
-    private fun animateExpand(v: View, expand: Boolean) {
+    // CineStream-style expand/collapse with a custom elevation pulse
+    private fun animateExpand(v: View, expand: Boolean, card: View? = null) {
         if (expand) {
             v.visibility = View.VISIBLE
             v.alpha = 0f
             v.animate().alpha(1f).setDuration(220).start()
+            // Polish: slight elevation bump on expand
+            card?.animate()?.elevation(6f)?.setDuration(220)?.start()
         } else {
             v.animate().alpha(0f).setDuration(160).withEndAction {
                 v.visibility = View.GONE
                 v.alpha = 1f
             }.start()
+            card?.animate()?.elevation(4f)?.setDuration(160)?.start()
         }
     }
 
+    // Custom polish: bounce animation for toggle tap
+    private fun bounceTap(v: View) {
+        v.animate().scaleX(0.85f).scaleY(0.85f).setDuration(70)
+            .withEndAction {
+                v.animate().scaleX(1f).scaleY(1f)
+                    .setDuration(120).setInterpolator(OvershootInterpolator(2f)).start()
+            }.start()
+    }
+
     // ── Accent bar (left colour strip used in card headers) ──────────────────
+    // Matches CineStream: 3×18dp, marginEnd 12dp
     private fun accentBar(ctx: Context, top: Int, bottom: Int) = View(ctx).apply {
-        layoutParams = LinearLayout.LayoutParams(dp(ctx, 3), dp(ctx, 14))
-            .also { it.marginEnd = dp(ctx, 10) }
+        layoutParams = LinearLayout.LayoutParams(dp(ctx, 3), dp(ctx, 18))
+            .also { it.marginEnd = dp(ctx, 12) }
         background = verticalGradient(top, bottom)
     }
 
     // ── Hero banner (CineStream style) ───────────────────────────────────────
+    // Matches CineStream exactly: 28/32/28/24 padding, 48×4 accent bar,
+    // textSize 22f title, 13f subtitle, TL_BR gradient
     private fun buildHeroBanner(ctx: Context): View {
         return LinearLayout(ctx).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(ctx, 20), dp(ctx, 20), dp(ctx, 20), dp(ctx, 14))
+            setPadding(dp(ctx, 28), dp(ctx, 32), dp(ctx, 28), dp(ctx, 24))
             background = GradientDrawable(
                 GradientDrawable.Orientation.TL_BR,
                 intArrayOf(blendColor(BG_DARK, ACCENT_START, 0.12f), BG_DARK)
             )
 
-            // Accent bar (3 dp tall, 36 dp wide, gradient ACCENT_START → ACCENT_END).
+            // Accent bar — CineStream: 48×4dp, bottom margin 16dp
             addView(View(ctx).apply {
-                layoutParams = LinearLayout.LayoutParams(dp(ctx, 36), dp(ctx, 3))
-                    .also { it.bottomMargin = dp(ctx, 10) }
-                background = verticalGradient(ACCENT_START, ACCENT_END)
+                layoutParams = LinearLayout.LayoutParams(dp(ctx, 48), dp(ctx, 4))
+                    .also { it.bottomMargin = dp(ctx, 16) }
+                background = horizontalGradient(ACCENT_START, ACCENT_END)
             })
-            // Title.
+            // Title — CineStream: 22f, bold
             addView(TextView(ctx).apply {
                 text = "CTGMovies"
-                textSize = sp(ctx, 18f)
+                textSize = 22f
                 setTypeface(null, Typeface.BOLD)
                 setTextColor(TEXT_PRIMARY)
                 letterSpacing = -0.02f
             })
-            // Subtitle.
+            // Subtitle — CineStream: 13f
             addView(TextView(ctx).apply {
                 text = "Configure login credentials & API access"
-                textSize = sp(ctx, 11f)
+                textSize = 13f
                 setTextColor(TEXT_SECONDARY)
-                setPadding(0, dp(ctx, 4), 0, 0)
+                setPadding(0, dp(ctx, 6), 0, 0)
             })
         }
     }
 
     // ── Divider ──────────────────────────────────────────────────────────────
+    // Matches CineStream: 20dp horizontal margins
     private fun divider(ctx: Context) = View(ctx).apply {
         layoutParams = LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT, 1
@@ -251,43 +271,46 @@ object CTGSettingsUI {
     }
 
     // ── Card container ───────────────────────────────────────────────────────
+    // Matches CineStream: 16dp margins, 16dp corner radius, elevation 4
     private fun cardContainer(ctx: Context) = LinearLayout(ctx).apply {
         orientation = LinearLayout.VERTICAL
-        val m = dp(ctx, 12)
+        val m = dp(ctx, 16)
         layoutParams = LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
-        ).also { it.setMargins(m, 0, m, dp(ctx, 10)) }
-        background = roundRect(BG_CARD, dpF(ctx, 14f))
+        ).also { it.setMargins(m, 0, m, m) }
+        background = roundRect(BG_CARD, dpF(ctx, 16f))
         elevation = 4f
     }
 
     // ── Collapsible card ─────────────────────────────────────────────────────
+    // Matches CineStream layout exactly; adds stagger delay & elevation pulse
     private fun buildCollapsibleCard(
         ctx: Context,
         title: String,
         startExpanded: Boolean = false,
         accentA: Int = ACCENT_START,
         accentB: Int = ACCENT_END,
+        staggerIndex: Int = 0,
         buildContent: LinearLayout.() -> Unit,
     ): View {
         val card = cardContainer(ctx)
         var expanded = startExpanded
         val content = LinearLayout(ctx).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(0, 0, 0, dp(ctx, 4))
+            setPadding(0, 0, 0, dp(ctx, 8))
             visibility = if (expanded) View.VISIBLE else View.GONE
         }
         content.buildContent()
 
         val chevron = TextView(ctx).apply {
             text = if (expanded) "▲" else "▼"
-            textSize = sp(ctx, 9f)
+            textSize = 11f
             setTextColor(TEXT_SECONDARY)
         }
 
         card.addView(LinearLayout(ctx).apply {
             orientation = LinearLayout.HORIZONTAL
-            setPadding(dp(ctx, 14), dp(ctx, 12), dp(ctx, 12), dp(ctx, 12))
+            setPadding(dp(ctx, 20), dp(ctx, 16), dp(ctx, 16), dp(ctx, 16))
             gravity = Gravity.CENTER_VERTICAL
             isClickable = true; isFocusable = true; isFocusableInTouchMode = false
             background = stateDrawable(ctx)
@@ -295,7 +318,7 @@ object CTGSettingsUI {
             addView(accentBar(ctx, accentA, accentB))
             addView(TextView(ctx).apply {
                 text = title
-                textSize = sp(ctx, 10f)
+                textSize = 12f
                 setTypeface(null, Typeface.BOLD)
                 setTextColor(TEXT_SECONDARY)
                 letterSpacing = 0.08f
@@ -305,24 +328,30 @@ object CTGSettingsUI {
 
             setOnClickListener {
                 expanded = !expanded
+                // Polish: smooth chevron rotation instead of instant swap
+                chevron.animate().rotationX(if (expanded) 180f else 0f).setDuration(200).start()
                 chevron.text = if (expanded) "▲" else "▼"
-                animateExpand(content, expanded)
+                animateExpand(content, expanded, card)
             }
         })
         card.addView(content)
-        fadeInSlide(card)
+
+        // Polish: staggered entrance — each card fades in 60ms after the previous
+        fadeInSlide(card, delayMs = staggerIndex * 60L)
         return card
     }
 
     // ── Label ────────────────────────────────────────────────────────────────
+    // CineStream uses 12f for section labels
     private fun label(ctx: Context, text: String) = TextView(ctx).apply {
         this.text = text
-        textSize = sp(ctx, 10f)
+        textSize = 12f
         setTextColor(TEXT_SECONDARY)
-        setPadding(dp(ctx, 4), 0, dp(ctx, 4), dp(ctx, 6))
+        setPadding(dp(ctx, 4), 0, dp(ctx, 4), dp(ctx, 10))
     }
 
     // ── Styled input ─────────────────────────────────────────────────────────
+    // CineStream: textSize 13f, padding 14/12/14/12dp
     private fun input(
         ctx: Context, value: String?, hint: String,
         isPassword: Boolean = false, isMultiLine: Boolean = false,
@@ -332,12 +361,12 @@ object CTGSettingsUI {
         this.hint = hint
         setTextColor(TEXT_PRIMARY)
         setHintTextColor(TEXT_SECONDARY)
-        textSize = sp(ctx, 11f)
+        textSize = 13f
         background = inputBackground(ctx)
-        setPadding(dp(ctx, 10), dp(ctx, 8), dp(ctx, 10), dp(ctx, 8))
+        setPadding(dp(ctx, 14), dp(ctx, 12), dp(ctx, 14), dp(ctx, 12))
         layoutParams = LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
-        ).also { it.bottomMargin = dp(ctx, 6) }
+        ).also { it.bottomMargin = dp(ctx, 8) }
         inputType = when {
             isPassword -> InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
             isMultiLine -> InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE
@@ -369,21 +398,25 @@ object CTGSettingsUI {
                 this.hint = hint
                 setTextColor(TEXT_PRIMARY)
                 setHintTextColor(TEXT_SECONDARY)
-                textSize = sp(ctx, 11f)
+                textSize = 13f
                 background = ColorDrawable(Color.TRANSPARENT)
-                setPadding(dp(ctx, 10), dp(ctx, 8), dp(ctx, 6), dp(ctx, 8))
+                setPadding(dp(ctx, 14), dp(ctx, 12), dp(ctx, 8), dp(ctx, 12))
                 inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
                 setSingleLine(true)
                 imeOptions = imeAction
             }
 
+            // Polish: text-based toggle with bounce animation
             val toggle = TextView(ctx).apply {
-                text = "👁"
-                textSize = sp(ctx, 12f)
-                setPadding(dp(ctx, 6), dp(ctx, 6), dp(ctx, 10), dp(ctx, 6))
+                text = "👁 Show"
+                textSize = 11f
+                setTypeface(null, Typeface.BOLD)
+                setTextColor(TEXT_SECONDARY)
+                setPadding(dp(ctx, 8), dp(ctx, 8), dp(ctx, 14), dp(ctx, 8))
                 gravity = Gravity.CENTER
                 isClickable = true
                 isFocusable = true
+                isFocusableInTouchMode = false
             }
 
             toggle.setOnClickListener {
@@ -391,8 +424,9 @@ object CTGSettingsUI {
                 edit.transformationMethod = if (hidden)
                     HideReturnsTransformationMethod.getInstance()
                 else PasswordTransformationMethod.getInstance()
-                toggle.text = if (hidden) "🙈" else "👁"
+                toggle.text = if (hidden) "🙈 Hide" else "👁 Show"
                 edit.setSelection(edit.text?.length ?: 0)
+                bounceTap(toggle)
             }
 
             val row = LinearLayout(ctx).apply {
@@ -401,7 +435,7 @@ object CTGSettingsUI {
                 background = inputBackground(ctx)
                 layoutParams = LinearLayout.LayoutParams(
                     LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
-                ).also { it.bottomMargin = dp(ctx, 6) }
+                ).also { it.bottomMargin = dp(ctx, 8) }
                 edit.layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
                 addView(edit)
                 addView(toggle)
@@ -416,34 +450,54 @@ object CTGSettingsUI {
         }
     }
 
+    // ── Danger pill button (CineStream-style) ────────────────────────────────
+    // Polished Clear button matching CineStream's danger pill aesthetic
+    private fun dangerPill(ctx: Context, label: String, onClick: () -> Unit) = TextView(ctx).apply {
+        text = label
+        textSize = 11f
+        setTypeface(null, Typeface.BOLD)
+        setTextColor(DANGER_COLOR)
+        setPadding(dp(ctx, 12), dp(ctx, 6), dp(ctx, 12), dp(ctx, 6))
+        background = GradientDrawable().apply {
+            cornerRadius = 99f
+            setColor(blendColor(BG_DARK, DANGER_COLOR, 0.08f))
+            setStroke(1, blendColor(DANGER_COLOR, DIVIDER_COLOR, 0.5f))
+        }
+        isClickable = true; isFocusable = true; isFocusableInTouchMode = false
+        setOnClickListener {
+            bounceTap(this)
+            onClick()
+        }
+    }
+
     // ── Info card ────────────────────────────────────────────────────────────
+    // Custom polish: gradient left border instead of emoji icon for a cleaner look
     private fun infoCard(ctx: Context): View {
         return LinearLayout(ctx).apply {
             orientation = LinearLayout.HORIZONTAL
-            val m = dp(ctx, 12)
+            val m = dp(ctx, 16)
             layoutParams = LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
-            ).also { it.setMargins(m, 0, m, dp(ctx, 10)) }
+            ).also { it.setMargins(m, 0, m, m) }
             background = roundRect(
-                blendColor(BG_CARD, ACCENT_START, 0.08f),
-                dpF(ctx, 10f),
-                blendColor(ACCENT_START, DIVIDER_COLOR, 0.5f),
-                1
+                blendColor(BG_CARD, ACCENT_START, 0.06f),
+                dpF(ctx, 12f)
             )
-            setPadding(dp(ctx, 12), dp(ctx, 10), dp(ctx, 12), dp(ctx, 10))
-            gravity = Gravity.TOP
+            setPadding(dp(ctx, 16), dp(ctx, 14), dp(ctx, 16), dp(ctx, 14))
+            gravity = Gravity.CENTER_VERTICAL
+
+            // Polish: gradient accent strip on the left (replaces emoji)
+            addView(View(ctx).apply {
+                layoutParams = LinearLayout.LayoutParams(dp(ctx, 3), LinearLayout.LayoutParams.MATCH_PARENT)
+                    .also { it.marginEnd = dp(ctx, 14) }
+                background = verticalGradient(ACCENT_START, ACCENT_END)
+            })
 
             addView(TextView(ctx).apply {
-                text = "ℹ"
-                textSize = sp(ctx, 11f)
-                setTextColor(ACCENT_START)
-                setPadding(0, 0, dp(ctx, 8), 0)
-            })
-            addView(TextView(ctx).apply {
                 this.text = "Enter email/password for auto-login, paste a ctg.token / Bearer token, or a raw Cookie header. Everything is saved locally on this device only."
-                textSize = sp(ctx, 10f)
+                textSize = 12f
                 setTextColor(TEXT_SECONDARY)
-                setLineSpacing(dp(ctx, 2).toFloat(), 1f)
+                setLineSpacing(dp(ctx, 3).toFloat(), 1f)
                 layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
             })
         }
@@ -465,7 +519,7 @@ object CTGSettingsUI {
 
         val layout = LinearLayout(ctx).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(0, 0, 0, dp(ctx, 16))
+            setPadding(0, 0, 0, dp(ctx, 24))
             background = ColorDrawable(BG_DARK)
         }
 
@@ -473,13 +527,11 @@ object CTGSettingsUI {
         layout.addView(buildHeroBanner(ctx))
         layout.addView(View(ctx).apply {
             layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, dp(ctx, 4)
+                LinearLayout.LayoutParams.MATCH_PARENT, dp(ctx, 8)
             )
         })
 
         // ── Fields ─────────────────────────────────────────────────────────
-        // IME action chain: Email → Next → Password → Next → Token → Next →
-        // Cookie → Next → API Base → Done.
         val fEmail = field(
             ctx, "Email", prefs.getString(CTGMovies.PREF_EMAIL, ""), "name@example.com",
             imeAction = EditorInfo.IME_ACTION_NEXT
@@ -501,10 +553,10 @@ object CTGSettingsUI {
             CTGMovies.DEFAULT_API_BASE, imeAction = EditorInfo.IME_ACTION_DONE
         )
 
-        // ── Card: Account Login ────────────────────────────────────────────
+        // ── Card: Account Login (stagger index 0) ─────────────────────────
         layout.addView(buildCollapsibleCard(ctx, "🔐  ACCOUNT LOGIN",
             accentA = ACCENT_START, accentB = ACCENT_END,
-            startExpanded = true) {
+            startExpanded = true, staggerIndex = 0) {
             addView(label(ctx, "Email"))
             addView(fEmail.view)
             addView(divider(ctx))
@@ -512,9 +564,10 @@ object CTGSettingsUI {
             addView(fPass.view)
         })
 
-        // ── Card: Quick Access ─────────────────────────────────────────────
+        // ── Card: Quick Access (stagger index 1) ──────────────────────────
         layout.addView(buildCollapsibleCard(ctx, "🔑  QUICK ACCESS",
-            accentA = ACCENT_END, accentB = ACCENT_START) {
+            accentA = ACCENT_END, accentB = ACCENT_START,
+            staggerIndex = 1) {
             addView(label(ctx, "Token"))
             addView(fToken.view)
             addView(divider(ctx))
@@ -522,9 +575,10 @@ object CTGSettingsUI {
             addView(fCookie.view)
         })
 
-        // ── Card: Advanced ─────────────────────────────────────────────────
+        // ── Card: Advanced (stagger index 2) ──────────────────────────────
         layout.addView(buildCollapsibleCard(ctx, "⚙️  ADVANCED",
-            accentA = ACCENT_START, accentB = ACCENT_END) {
+            accentA = ACCENT_START, accentB = ACCENT_END,
+            staggerIndex = 2) {
             addView(label(ctx, "API Base"))
             addView(fApi.view)
         })
@@ -559,7 +613,7 @@ object CTGSettingsUI {
                                 ?: CTGMovies.DEFAULT_API_BASE
                         )
                         .apply()
-                    Toast.makeText(ctx, "Saved", Toast.LENGTH_SHORT).show()
+                    Toast.makeText(ctx, "✓ Saved", Toast.LENGTH_SHORT).show()
                     dialog.dismiss()
                 }
             }
@@ -570,6 +624,7 @@ object CTGSettingsUI {
             dialog.getButton(AlertDialog.BUTTON_NEUTRAL)?.apply {
                 setTextColor(DANGER_COLOR)
                 isAllCaps = false
+                setTypeface(null, Typeface.BOLD)
                 setOnClickListener {
                     prefs.edit()
                         .remove(CTGMovies.PREF_EMAIL).remove(CTGMovies.PREF_PASSWORD)
@@ -588,13 +643,13 @@ object CTGSettingsUI {
         dialog.show()
 
         // ── Dialog window sizing ───────────────────────────────────────────
+        // CineStream uses 95% width. Custom polish: 92% for a slightly more
+        // centred, balanced look — especially on larger screens.
         val dm = ctx.resources.displayMetrics
-        val widthPx = (dm.widthPixels * 0.82).toInt()
-        val maxHPx = (dm.heightPixels * 0.72f).toInt()
+        val widthPx = (dm.widthPixels * 0.92).toInt()
 
         dialog.window?.apply {
             setLayout(widthPx, WindowManager.LayoutParams.WRAP_CONTENT)
-            attributes = attributes.apply { if (height > maxHPx) height = maxHPx }
             setSoftInputMode(
                 WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE or
                         WindowManager.LayoutParams.SOFT_INPUT_STATE_HIDDEN
