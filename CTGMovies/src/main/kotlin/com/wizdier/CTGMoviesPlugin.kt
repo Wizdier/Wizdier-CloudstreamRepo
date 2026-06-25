@@ -199,7 +199,7 @@ object CTGSettingsUI {
             // gradient banner).
             addView(TextView(ctx).apply {
                 text = "C"
-                textSize = sp(ctx, 15f)
+                textSize = sp(ctx, 12f)
                 setTypeface(null, Typeface.BOLD)
                 setTextColor(accentTextColor)
                 gravity = Gravity.CENTER
@@ -216,14 +216,14 @@ object CTGSettingsUI {
 
                 addView(TextView(ctx).apply {
                     text = "CTGMovies"
-                    textSize = sp(ctx, 14f)
+                    textSize = sp(ctx, 8f)
                     setTypeface(null, Typeface.BOLD)
                     setTextColor(textPrimary)
                     letterSpacing = -0.01f
                 })
                 addView(TextView(ctx).apply {
                     text = "Login credentials & API access"
-                    textSize = sp(ctx, 11f)
+                    textSize = sp(ctx, 8f)
                     setTextColor(textSecondary)
                     setPadding(0, dp(ctx, 2), 0, 0)
                     letterSpacing = 0.01f
@@ -290,7 +290,7 @@ object CTGSettingsUI {
             })
             addView(TextView(ctx).apply {
                 this.text = title
-                textSize = sp(ctx, 10.5f)
+                textSize = sp(ctx, 8.5f)
                 setTypeface(null, Typeface.BOLD)
                 setTextColor(textSecondary)
                 letterSpacing = 0.08f
@@ -312,7 +312,7 @@ object CTGSettingsUI {
     // ── Label ────────────────────────────────────────────────────────────────
     private fun label(ctx: Context, text: String) = TextView(ctx).apply {
         this.text = text
-        textSize = sp(ctx, 10f)
+        textSize = sp(ctx, 7f)
         setTextColor(textSecondary)
         letterSpacing = 0.04f
         setPadding(dp(ctx, 20), dp(ctx, 4), dp(ctx, 20), dp(ctx, 4))
@@ -334,7 +334,7 @@ object CTGSettingsUI {
         this.hint = hint
         setHintTextColor(textHint)
         setTextColor(textPrimary)
-        textSize = sp(ctx, 12f)
+        textSize = sp(ctx, 9f)
         background = roundRect(bgInput, dp(ctx, 10).toFloat(), border, 1)
         setPadding(dp(ctx, 14), dp(ctx, 10), dp(ctx, 14), dp(ctx, 10))
         layoutParams = LinearLayout.LayoutParams(
@@ -376,7 +376,7 @@ object CTGSettingsUI {
                 this.hint = hint
                 setHintTextColor(textHint)
                 setTextColor(textPrimary)
-                textSize = sp(ctx, 12f)
+                textSize = sp(ctx, 9f)
                 background = ColorDrawable(Color.TRANSPARENT)
                 setPadding(dp(ctx, 14), dp(ctx, 10), dp(ctx, 8), dp(ctx, 10))
                 inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
@@ -386,7 +386,7 @@ object CTGSettingsUI {
 
             val toggle = TextView(ctx).apply {
                 text = "\uD83D\uDC41"  // 👁
-                textSize = sp(ctx, 12f)
+                textSize = sp(ctx, 9f)
                 setPadding(dp(ctx, 8), dp(ctx, 8), dp(ctx, 14), dp(ctx, 8))
                 gravity = Gravity.CENTER
                 isClickable = true
@@ -447,13 +447,13 @@ object CTGSettingsUI {
 
             addView(TextView(ctx).apply {
                 text = "\u2139"  // ℹ
-                textSize = sp(ctx, 12f)
+                textSize = sp(ctx, 9f)
                 setTextColor(accent)
                 setPadding(0, 0, dp(ctx, 10), 0)
             })
             addView(TextView(ctx).apply {
                 this.text = "Enter email/password for auto-login, paste a ctg.token / Bearer token, or a raw Cookie header. Everything is saved locally on this device only."
-                textSize = sp(ctx, 10f)
+                textSize = sp(ctx, 7f)
                 setTextColor(textSecondary)
                 setLineSpacing(dp(ctx, 2).toFloat(), 1f)
                 layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
