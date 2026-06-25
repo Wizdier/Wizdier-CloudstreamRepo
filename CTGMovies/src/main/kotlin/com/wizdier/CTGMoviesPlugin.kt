@@ -115,8 +115,6 @@ object CTGSettingsUI {
         val csTextSecondary = Color.parseColor("#7B82A0")
         val csDivider = Color.parseColor("#1F2235")
         val csDanger = Color.parseColor("#FF4E6A")
-        val csInputBg = Color.parseColor("#0D1117")
-        val csInputBorder = Color.parseColor("#2E2850")
 
         BG_DARK = resolveColor(ctx, android.R.attr.colorBackground, csBgDark)
         BG_CARD = resolveColor(ctx, android.R.attr.colorBackgroundFloating, csBgCard)
@@ -388,7 +386,7 @@ object CTGSettingsUI {
     private class Field(val edit: EditText, val view: View)
 
     private fun field(
-        ctx: Context, labelText: String, value: String?, hint: String,
+        ctx: Context, value: String?, hint: String,
         isPassword: Boolean = false, isMultiLine: Boolean = false,
         imeAction: Int = EditorInfo.IME_ACTION_NEXT,
     ): Field {
@@ -533,23 +531,23 @@ object CTGSettingsUI {
 
         // ── Fields ─────────────────────────────────────────────────────────
         val fEmail = field(
-            ctx, "Email", prefs.getString(CTGMovies.PREF_EMAIL, ""), "name@example.com",
+            ctx, prefs.getString(CTGMovies.PREF_EMAIL, ""), "name@example.com",
             imeAction = EditorInfo.IME_ACTION_NEXT
         )
         val fPass = field(
-            ctx, "Password", prefs.getString(CTGMovies.PREF_PASSWORD, ""), "Account password",
+            ctx, prefs.getString(CTGMovies.PREF_PASSWORD, ""), "Account password",
             isPassword = true, imeAction = EditorInfo.IME_ACTION_NEXT
         )
         val fToken = field(
-            ctx, "Token", prefs.getString(CTGMovies.PREF_TOKEN, ""), "Bearer token / ctg.token",
+            ctx, prefs.getString(CTGMovies.PREF_TOKEN, ""), "Bearer token / ctg.token",
             isMultiLine = true
         )
         val fCookie = field(
-            ctx, "Cookie", prefs.getString(CTGMovies.PREF_COOKIE, ""), "Optional raw Cookie header",
+            ctx, prefs.getString(CTGMovies.PREF_COOKIE, ""), "Optional raw Cookie header",
             isMultiLine = true
         )
         val fApi = field(
-            ctx, "API Base", prefs.getString(CTGMovies.PREF_API_BASE, CTGMovies.DEFAULT_API_BASE),
+            ctx, prefs.getString(CTGMovies.PREF_API_BASE, CTGMovies.DEFAULT_API_BASE),
             CTGMovies.DEFAULT_API_BASE, imeAction = EditorInfo.IME_ACTION_DONE
         )
 
@@ -647,9 +645,11 @@ object CTGSettingsUI {
         // centred, balanced look — especially on larger screens.
         val dm = ctx.resources.displayMetrics
         val widthPx = (dm.widthPixels * 0.92).toInt()
+        val maxHPx = (dm.heightPixels * 0.80f).toInt()
 
         dialog.window?.apply {
             setLayout(widthPx, WindowManager.LayoutParams.WRAP_CONTENT)
+            attributes = attributes.apply { if (height > maxHPx) height = maxHPx }
             setSoftInputMode(
                 WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE or
                         WindowManager.LayoutParams.SOFT_INPUT_STATE_HIDDEN
