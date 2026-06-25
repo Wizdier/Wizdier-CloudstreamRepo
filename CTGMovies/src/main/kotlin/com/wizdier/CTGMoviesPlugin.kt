@@ -203,8 +203,8 @@ object CTGSettingsUI {
 
     // ── Accent bar (left colour strip used in card headers) ──────────────────
     private fun accentBar(ctx: Context, top: Int, bottom: Int) = View(ctx).apply {
-        layoutParams = LinearLayout.LayoutParams(dp(ctx, 3), dp(ctx, 18))
-            .also { it.marginEnd = dp(ctx, 12) }
+        layoutParams = LinearLayout.LayoutParams(dp(ctx, 3), dp(ctx, 14))
+            .also { it.marginEnd = dp(ctx, 10) }
         background = verticalGradient(top, bottom)
     }
 
@@ -212,22 +212,22 @@ object CTGSettingsUI {
     private fun buildHeroBanner(ctx: Context): View {
         return LinearLayout(ctx).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(ctx, 28), dp(ctx, 32), dp(ctx, 28), dp(ctx, 24))
+            setPadding(dp(ctx, 20), dp(ctx, 20), dp(ctx, 20), dp(ctx, 14))
             background = GradientDrawable(
                 GradientDrawable.Orientation.TL_BR,
                 intArrayOf(blendColor(BG_DARK, ACCENT_START, 0.12f), BG_DARK)
             )
 
-            // Accent bar (4 dp tall, 48 dp wide, gradient ACCENT_START → ACCENT_END).
+            // Accent bar (3 dp tall, 36 dp wide, gradient ACCENT_START → ACCENT_END).
             addView(View(ctx).apply {
-                layoutParams = LinearLayout.LayoutParams(dp(ctx, 48), dp(ctx, 4))
-                    .also { it.bottomMargin = dp(ctx, 16) }
+                layoutParams = LinearLayout.LayoutParams(dp(ctx, 36), dp(ctx, 3))
+                    .also { it.bottomMargin = dp(ctx, 10) }
                 background = verticalGradient(ACCENT_START, ACCENT_END)
             })
             // Title.
             addView(TextView(ctx).apply {
                 text = "CTGMovies"
-                textSize = sp(ctx, 22f)
+                textSize = sp(ctx, 18f)
                 setTypeface(null, Typeface.BOLD)
                 setTextColor(TEXT_PRIMARY)
                 letterSpacing = -0.02f
@@ -235,9 +235,9 @@ object CTGSettingsUI {
             // Subtitle.
             addView(TextView(ctx).apply {
                 text = "Configure login credentials & API access"
-                textSize = sp(ctx, 13f)
+                textSize = sp(ctx, 11f)
                 setTextColor(TEXT_SECONDARY)
-                setPadding(0, dp(ctx, 6), 0, 0)
+                setPadding(0, dp(ctx, 4), 0, 0)
             })
         }
     }
@@ -253,11 +253,11 @@ object CTGSettingsUI {
     // ── Card container ───────────────────────────────────────────────────────
     private fun cardContainer(ctx: Context) = LinearLayout(ctx).apply {
         orientation = LinearLayout.VERTICAL
-        val m = dp(ctx, 16)
+        val m = dp(ctx, 12)
         layoutParams = LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
-        ).also { it.setMargins(m, 0, m, m) }
-        background = roundRect(BG_CARD, dpF(ctx, 16f))
+        ).also { it.setMargins(m, 0, m, dp(ctx, 10)) }
+        background = roundRect(BG_CARD, dpF(ctx, 14f))
         elevation = 4f
     }
 
@@ -274,20 +274,20 @@ object CTGSettingsUI {
         var expanded = startExpanded
         val content = LinearLayout(ctx).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(0, 0, 0, dp(ctx, 8))
+            setPadding(0, 0, 0, dp(ctx, 4))
             visibility = if (expanded) View.VISIBLE else View.GONE
         }
         content.buildContent()
 
         val chevron = TextView(ctx).apply {
             text = if (expanded) "▲" else "▼"
-            textSize = sp(ctx, 11f)
+            textSize = sp(ctx, 9f)
             setTextColor(TEXT_SECONDARY)
         }
 
         card.addView(LinearLayout(ctx).apply {
             orientation = LinearLayout.HORIZONTAL
-            setPadding(dp(ctx, 20), dp(ctx, 16), dp(ctx, 16), dp(ctx, 16))
+            setPadding(dp(ctx, 14), dp(ctx, 12), dp(ctx, 12), dp(ctx, 12))
             gravity = Gravity.CENTER_VERTICAL
             isClickable = true; isFocusable = true; isFocusableInTouchMode = false
             background = stateDrawable(ctx)
@@ -295,7 +295,7 @@ object CTGSettingsUI {
             addView(accentBar(ctx, accentA, accentB))
             addView(TextView(ctx).apply {
                 text = title
-                textSize = sp(ctx, 12f)
+                textSize = sp(ctx, 10f)
                 setTypeface(null, Typeface.BOLD)
                 setTextColor(TEXT_SECONDARY)
                 letterSpacing = 0.08f
@@ -317,9 +317,9 @@ object CTGSettingsUI {
     // ── Label ────────────────────────────────────────────────────────────────
     private fun label(ctx: Context, text: String) = TextView(ctx).apply {
         this.text = text
-        textSize = sp(ctx, 12f)
+        textSize = sp(ctx, 10f)
         setTextColor(TEXT_SECONDARY)
-        setPadding(dp(ctx, 4), 0, dp(ctx, 4), dp(ctx, 10))
+        setPadding(dp(ctx, 4), 0, dp(ctx, 4), dp(ctx, 6))
     }
 
     // ── Styled input ─────────────────────────────────────────────────────────
@@ -332,12 +332,12 @@ object CTGSettingsUI {
         this.hint = hint
         setTextColor(TEXT_PRIMARY)
         setHintTextColor(TEXT_SECONDARY)
-        textSize = sp(ctx, 13f)
+        textSize = sp(ctx, 11f)
         background = inputBackground(ctx)
-        setPadding(dp(ctx, 14), dp(ctx, 12), dp(ctx, 14), dp(ctx, 12))
+        setPadding(dp(ctx, 10), dp(ctx, 8), dp(ctx, 10), dp(ctx, 8))
         layoutParams = LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
-        ).also { it.bottomMargin = dp(ctx, 8) }
+        ).also { it.bottomMargin = dp(ctx, 6) }
         inputType = when {
             isPassword -> InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
             isMultiLine -> InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE
@@ -369,9 +369,9 @@ object CTGSettingsUI {
                 this.hint = hint
                 setTextColor(TEXT_PRIMARY)
                 setHintTextColor(TEXT_SECONDARY)
-                textSize = sp(ctx, 13f)
+                textSize = sp(ctx, 11f)
                 background = ColorDrawable(Color.TRANSPARENT)
-                setPadding(dp(ctx, 14), dp(ctx, 12), dp(ctx, 8), dp(ctx, 12))
+                setPadding(dp(ctx, 10), dp(ctx, 8), dp(ctx, 6), dp(ctx, 8))
                 inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
                 setSingleLine(true)
                 imeOptions = imeAction
@@ -379,8 +379,8 @@ object CTGSettingsUI {
 
             val toggle = TextView(ctx).apply {
                 text = "👁"
-                textSize = sp(ctx, 14f)
-                setPadding(dp(ctx, 8), dp(ctx, 8), dp(ctx, 14), dp(ctx, 8))
+                textSize = sp(ctx, 12f)
+                setPadding(dp(ctx, 6), dp(ctx, 6), dp(ctx, 10), dp(ctx, 6))
                 gravity = Gravity.CENTER
                 isClickable = true
                 isFocusable = true
@@ -401,7 +401,7 @@ object CTGSettingsUI {
                 background = inputBackground(ctx)
                 layoutParams = LinearLayout.LayoutParams(
                     LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
-                ).also { it.bottomMargin = dp(ctx, 8) }
+                ).also { it.bottomMargin = dp(ctx, 6) }
                 edit.layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
                 addView(edit)
                 addView(toggle)
@@ -420,28 +420,28 @@ object CTGSettingsUI {
     private fun infoCard(ctx: Context): View {
         return LinearLayout(ctx).apply {
             orientation = LinearLayout.HORIZONTAL
-            val m = dp(ctx, 16)
+            val m = dp(ctx, 12)
             layoutParams = LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
-            ).also { it.setMargins(m, 0, m, m) }
+            ).also { it.setMargins(m, 0, m, dp(ctx, 10)) }
             background = roundRect(
                 blendColor(BG_CARD, ACCENT_START, 0.08f),
-                dpF(ctx, 12f),
+                dpF(ctx, 10f),
                 blendColor(ACCENT_START, DIVIDER_COLOR, 0.5f),
                 1
             )
-            setPadding(dp(ctx, 16), dp(ctx, 14), dp(ctx, 16), dp(ctx, 14))
+            setPadding(dp(ctx, 12), dp(ctx, 10), dp(ctx, 12), dp(ctx, 10))
             gravity = Gravity.TOP
 
             addView(TextView(ctx).apply {
                 text = "ℹ"
-                textSize = sp(ctx, 14f)
+                textSize = sp(ctx, 11f)
                 setTextColor(ACCENT_START)
-                setPadding(0, 0, dp(ctx, 10), 0)
+                setPadding(0, 0, dp(ctx, 8), 0)
             })
             addView(TextView(ctx).apply {
                 this.text = "Enter email/password for auto-login, paste a ctg.token / Bearer token, or a raw Cookie header. Everything is saved locally on this device only."
-                textSize = sp(ctx, 12f)
+                textSize = sp(ctx, 10f)
                 setTextColor(TEXT_SECONDARY)
                 setLineSpacing(dp(ctx, 2).toFloat(), 1f)
                 layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
@@ -465,7 +465,7 @@ object CTGSettingsUI {
 
         val layout = LinearLayout(ctx).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(0, 0, 0, dp(ctx, 24))
+            setPadding(0, 0, 0, dp(ctx, 16))
             background = ColorDrawable(BG_DARK)
         }
 
@@ -473,7 +473,7 @@ object CTGSettingsUI {
         layout.addView(buildHeroBanner(ctx))
         layout.addView(View(ctx).apply {
             layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, dp(ctx, 8)
+                LinearLayout.LayoutParams.MATCH_PARENT, dp(ctx, 4)
             )
         })
 
@@ -588,10 +588,9 @@ object CTGSettingsUI {
         dialog.show()
 
         // ── Dialog window sizing ───────────────────────────────────────────
-        // CineStream convention: 95% of screen width, wrap-content height.
         val dm = ctx.resources.displayMetrics
-        val widthPx = (dm.widthPixels * 0.95).toInt()
-        val maxHPx = (dm.heightPixels * 0.85f).toInt()
+        val widthPx = (dm.widthPixels * 0.82).toInt()
+        val maxHPx = (dm.heightPixels * 0.72f).toInt()
 
         dialog.window?.apply {
             setLayout(widthPx, WindowManager.LayoutParams.WRAP_CONTENT)
