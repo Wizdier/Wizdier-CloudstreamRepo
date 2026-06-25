@@ -5,8 +5,8 @@ import android.content.Context
 import android.content.SharedPreferences
 import android.graphics.Color
 import android.graphics.Typeface
-import android.graphics.drawable.GradientDrawable
 import android.graphics.drawable.ColorDrawable
+import android.graphics.drawable.GradientDrawable
 import android.graphics.drawable.StateListDrawable
 import android.text.InputType
 import android.text.method.HideReturnsTransformationMethod
@@ -35,62 +35,49 @@ class CTGMoviesPlugin : Plugin() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  CTGSettingsUI — Cloudstream-native settings dialog
+//  CTGSettingsUI — settings dialog
 //
-//  Design goals (revised):
-//    1. Resolve colours from the host activity's theme so the dialog matches
-//       Cloudstream's light/dark mode and any user-customised accent colour
-//       automatically. The previous version hardcoded a charcoal/indigo
-//       palette that clashed with light-mode users.
-//    2. Use the Material 8 dp spacing grid throughout (4 / 8 / 12 / 16 / 24)
-//       so spacing feels even and predictable.
-//    3. Replace the gaudy gradient hero banner with a clean header: icon tile
-//       + title + one-line description. Reads like a real settings screen,
-//       not a marketing splash.
-//    4. Replace emoji-laden section titles with plain uppercase letterspaced
-//       text + a thin accent strip — matches the AOSP/Material settings
-//       convention.
-//    5. Add proper ripple feedback to every tappable surface (cards, buttons).
-//    6. Fix the dialog sizing: phones get 94 % width, tablets get capped at
-//       600 dp so the dialog doesn't stretch absurdly on landscape/foldables.
-//    7. Input fields get focus-state border colour, larger touch padding,
-//       and IME actionNext / actionDone so the keyboard's "next" button
-//       moves the user through the form.
+//  Design language now mirrors CineStream (SaurabhKaperwan/CSX) exactly:
+//    • Hero banner with TL_BR gradient + accent bar + bold title + subtitle
+//    • Collapsible cards with accent strip + bold uppercase title + chevron
+//    • Same font sizes, spacing, radii, and elevation as CineStream
+//    • Same color tokens (BG_DARK, BG_CARD, ACCENT_START, ACCENT_END, etc.)
 //
-//  Built entirely from framework widgets (no androidx dependency).
+//  Colours are resolved from the host activity's theme attributes so the
+//  dialog adapts to Cloudstream's light/dark mode and the user's accent
+//  colour automatically, while the spacing/typography are pixel-identical
+//  to CineStream.
 // ═══════════════════════════════════════════════════════════════════════════
 
 object CTGSettingsUI {
 
-    // ── Theme-resolved palette (computed in show()) ──────────────────────────
-    // These are populated from the host activity's theme attributes so the
-    // dialog inherits Cloudstream's colours instead of imposing its own.
-    private var bgRoot: Int = 0
-    private var bgCard: Int = 0
-    private var bgInput: Int = 0
-    private var bgInputFocused: Int = 0
-    private var border: Int = 0
-    private var borderFocused: Int = 0
-    private var textPrimary: Int = 0
-    private var textSecondary: Int = 0
-    private var textHint: Int = 0
-    private var divider: Int = 0
-    private var accent: Int = 0
-    private var danger: Int = 0
+    // ── Color tokens (CineStream palette, with theme-aware overrides) ────────
+    // Defaults mirror CineStream's SettingsTheme.kt exactly. At show() time
+    // we attempt to resolve them from the host activity's theme so the dialog
+    // adapts to Cloudstream's light/dark mode and accent colour.
+    private var BG_DARK: Int = 0
+    private var BG_CARD: Int = 0
+    private var ACCENT_START: Int = 0
+    private var ACCENT_END: Int = 0
+    private var TEXT_PRIMARY: Int = 0
+    private var TEXT_SECONDARY: Int = 0
+    private var DIVIDER_COLOR: Int = 0
+    private var DANGER_COLOR: Int = 0
+    private var INPUT_BG: Int = 0
+    private var INPUT_BORDER: Int = 0
+    private var INPUT_BORDER_FOCUS: Int = 0
 
-    // ── dp / sp helpers ──────────────────────────────────────────────────────
+    // ── dp / sp helpers (CineStream convention) ──────────────────────────────
     private fun dp(ctx: Context, v: Int): Int =
         TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_DIP, v.toFloat(), ctx.resources.displayMetrics).toInt()
+
+    private fun dpF(ctx: Context, v: Float): Float =
+        TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_DIP, v, ctx.resources.displayMetrics)
 
     private fun sp(ctx: Context, v: Float): Float =
         TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_SP, v, ctx.resources.displayMetrics)
 
     // ── Theme resolution ─────────────────────────────────────────────────────
-    /**
-     * Resolve a theme attribute to a colour. Falls back to [fallback] if the
-     * attribute isn't defined (e.g. on very old Android where Material attrs
-     * aren't available).
-     */
     private fun resolveColor(ctx: Context, attr: Int, fallback: Int): Int {
         val tv = TypedValue()
         val ok = ctx.theme.resolveAttribute(attr, tv, true)
@@ -99,39 +86,14 @@ object CTGSettingsUI {
         ) tv.data else fallback
     }
 
-    private fun resolveColors(ctx: Context) {
-        // Material/AndroidX attrs we want to honour. Cloudstream uses Material
-        // Components, so these resolve on every supported API level.
-        bgRoot = resolveColor(ctx, android.R.attr.colorBackground, Color.parseColor("#121212"))
-        bgCard = resolveColor(ctx, android.R.attr.colorBackground, Color.parseColor("#121212"))
-        // Slightly elevated surface for cards — if the theme exposes
-        // colorBackgroundFloating, use it; otherwise lift bgRoot by a few %.
-        bgCard = resolveColor(ctx, android.R.attr.colorBackgroundFloating, bgCard)
-        bgInput = resolveColor(ctx, android.R.attr.colorBackground, bgRoot)
-        border = blendColor(bgCard, if (isDark(bgRoot)) Color.WHITE else Color.BLACK, 0.12f)
-        borderFocused = resolveColor(ctx, android.R.attr.colorAccent, Color.parseColor("#6C63FF"))
-        textPrimary = resolveColor(ctx, android.R.attr.textColorPrimary, Color.parseColor("#EDEDED"))
-        textSecondary = resolveColor(ctx, android.R.attr.textColorSecondary, Color.parseColor("#B0B0B0"))
-        textHint = blendColor(textSecondary, bgRoot, 0.4f)
-        divider = blendColor(bgCard, if (isDark(bgRoot)) Color.WHITE else Color.BLACK, 0.08f)
-        accent = resolveColor(ctx, android.R.attr.colorAccent, Color.parseColor("#6C63FF"))
-        danger = resolveColor(ctx, android.R.attr.colorError, Color.parseColor("#FF4E6A"))
-        // When focused, the field gets a faint accent tint so the focus ring
-        // is more perceptible on themes with low border/text contrast.
-        bgInputFocused = blendColor(bgInput, accent, 0.06f)
-    }
-
-    /** True if [c] is perceptually dark (luminance < 0.5). */
     private fun isDark(c: Int): Boolean {
         val r = Color.red(c) / 255f
         val g = Color.green(c) / 255f
         val b = Color.blue(c) / 255f
-        // Relative luminance (Rec. 709).
         val l = 0.2126f * r + 0.7152f * g + 0.0722f * b
         return l < 0.5f
     }
 
-    /** Linear blend between two colours. [t]=0 → a, [t]=1 → b. */
     private fun blendColor(a: Int, b: Int, t: Float): Int {
         val ar = Color.red(a); val ag = Color.green(a); val ab = Color.blue(a)
         val br = Color.red(b); val bg = Color.green(b); val bb = Color.blue(b)
@@ -141,93 +103,141 @@ object CTGSettingsUI {
         return Color.argb(255, r, g, b2)
     }
 
-    // ── Drawables ────────────────────────────────────────────────────────────
-    private fun roundRect(color: Int, radius: Float, stroke: Int? = null, sw: Int = 0) =
+    private fun resolveColors(ctx: Context) {
+        // CineStream defaults — these are what the dialog falls back to if the
+        // host theme doesn't expose a particular attribute.
+        val csBgDark = Color.parseColor("#0D0F14")
+        val csBgCard = Color.parseColor("#13161E")
+        val csAccentStart = Color.parseColor("#6C63FF")
+        val csAccentEnd = Color.parseColor("#A855F7")
+        val csTextPrimary = Color.parseColor("#F0F2FF")
+        val csTextSecondary = Color.parseColor("#7B82A0")
+        val csDivider = Color.parseColor("#1F2235")
+        val csDanger = Color.parseColor("#FF4E6A")
+        val csInputBg = Color.parseColor("#0D1117")
+        val csInputBorder = Color.parseColor("#2E2850")
+
+        // Resolve what we can from the host theme.
+        BG_DARK = resolveColor(ctx, android.R.attr.colorBackground, csBgDark)
+        BG_CARD = resolveColor(ctx, android.R.attr.colorBackgroundFloating, csBgCard)
+        // If colorBackgroundFloating wasn't available, derive a slightly
+        // elevated surface from BG_DARK.
+        if (BG_CARD == BG_DARK) {
+            BG_CARD = blendColor(BG_DARK, if (isDark(BG_DARK)) Color.WHITE else Color.BLACK, 0.04f)
+        }
+        ACCENT_START = resolveColor(ctx, android.R.attr.colorAccent, csAccentStart)
+        // ACCENT_END is a complementary accent — if we only have one accent
+        // colour from the theme, derive a shifted variant for the gradient.
+        ACCENT_END = blendColor(ACCENT_START, Color.parseColor("#A855F7"), 0.5f)
+        TEXT_PRIMARY = resolveColor(ctx, android.R.attr.textColorPrimary, csTextPrimary)
+        TEXT_SECONDARY = resolveColor(ctx, android.R.attr.textColorSecondary, csTextSecondary)
+        DIVIDER_COLOR = blendColor(BG_CARD, if (isDark(BG_DARK)) Color.WHITE else Color.BLACK, 0.08f)
+        DANGER_COLOR = resolveColor(ctx, android.R.attr.colorError, csDanger)
+        INPUT_BG = blendColor(BG_DARK, if (isDark(BG_DARK)) Color.WHITE else Color.BLACK, 0.03f)
+        INPUT_BORDER = blendColor(BG_CARD, ACCENT_START, 0.25f)
+        INPUT_BORDER_FOCUS = ACCENT_START
+    }
+
+    // ── Drawable factories (CineStream style) ────────────────────────────────
+    private fun roundRect(color: Int, radius: Float) = GradientDrawable().apply {
+        cornerRadius = radius
+        setColor(color)
+    }
+
+    private fun roundRect(color: Int, radius: Float, stroke: Int, sw: Int) =
         GradientDrawable().apply {
             cornerRadius = radius
             setColor(color)
-            if (stroke != null) setStroke(sw, stroke)
+            setStroke(sw, stroke)
         }
 
-    private fun accentBar(color: Int) =
-        GradientDrawable().apply {
-            cornerRadius = 99f
-            setColor(color)
-        }
+    private fun verticalGradient(top: Int, bottom: Int, radius: Float = 99f) =
+        GradientDrawable(GradientDrawable.Orientation.TOP_BOTTOM, intArrayOf(top, bottom))
+            .apply { cornerRadius = radius }
 
-    private fun selectableBackground(radius: Float): StateListDrawable = StateListDrawable().apply {
-        val pressed = roundRect(blendColor(bgCard, accent, 0.12f), radius)
-        addState(intArrayOf(android.R.attr.state_pressed), pressed)
-        addState(intArrayOf(), roundRect(bgCard, radius))
+    private fun stateDrawable(ctx: Context): StateListDrawable = StateListDrawable().apply {
+        addState(
+            intArrayOf(android.R.attr.state_pressed),
+            roundRect(blendColor(BG_CARD, ACCENT_START, 0.12f), dpF(ctx, 16f))
+        )
+        addState(
+            intArrayOf(android.R.attr.state_focused),
+            roundRect(BG_CARD, dpF(ctx, 16f), ACCENT_START, 2)
+        )
+        addState(intArrayOf(), roundRect(BG_CARD, dpF(ctx, 16f)))
     }
 
-    // ── Animations ───────────────────────────────────────────────────────────
+    private fun inputBackground(ctx: Context) = GradientDrawable().apply {
+        cornerRadius = dpF(ctx, 10f)
+        setColor(INPUT_BG)
+        setStroke(1, INPUT_BORDER)
+    }
+
+    private fun inputBackgroundFocused(ctx: Context) = GradientDrawable().apply {
+        cornerRadius = dpF(ctx, 10f)
+        setColor(INPUT_BG)
+        setStroke(2, INPUT_BORDER_FOCUS)
+    }
+
+    // ── Animations (CineStream timings) ──────────────────────────────────────
     private fun fadeInSlide(v: View) {
         v.alpha = 0f
-        v.translationY = 12f
-        v.animate().alpha(1f).translationY(0f)
-            .setDuration(220).setInterpolator(DecelerateInterpolator()).start()
+        v.translationY = 20f
+        v.animate()
+            .alpha(1f).translationY(0f)
+            .setDuration(300).setInterpolator(DecelerateInterpolator()).start()
     }
 
     private fun animateExpand(v: View, expand: Boolean) {
         if (expand) {
             v.visibility = View.VISIBLE
             v.alpha = 0f
-            v.animate().alpha(1f).setDuration(180).start()
+            v.animate().alpha(1f).setDuration(220).start()
         } else {
-            v.animate().alpha(0f).setDuration(120)
-                .withEndAction { v.visibility = View.GONE; v.alpha = 1f }.start()
+            v.animate().alpha(0f).setDuration(160).withEndAction {
+                v.visibility = View.GONE
+                v.alpha = 1f
+            }.start()
         }
     }
 
-    // ── Header (replaces the old hero banner) ────────────────────────────────
-    /**
-     * Clean header: small accent square + title + one-line description.
-     * Reads like the top of a real settings screen, not a marketing splash.
-     */
-    private fun buildHeader(ctx: Context): View {
-        val d12 = dp(ctx, 12); val d16 = dp(ctx, 16); val d20 = dp(ctx, 20)
-        // Accent-tile text colour: white on dark accents, black on light ones.
-        val accentTextColor = if (isDark(accent)) Color.WHITE else Color.BLACK
+    // ── Accent bar (left colour strip used in card headers) ──────────────────
+    private fun accentBar(ctx: Context, top: Int, bottom: Int) = View(ctx).apply {
+        layoutParams = LinearLayout.LayoutParams(dp(ctx, 3), dp(ctx, 18))
+            .also { it.marginEnd = dp(ctx, 12) }
+        background = verticalGradient(top, bottom)
+    }
+
+    // ── Hero banner (CineStream style) ───────────────────────────────────────
+    private fun buildHeroBanner(ctx: Context): View {
         return LinearLayout(ctx).apply {
-            orientation = LinearLayout.HORIZONTAL
-            setPadding(d20, d20, d20, d16)
-            gravity = Gravity.CENTER_VERTICAL
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(ctx, 28), dp(ctx, 32), dp(ctx, 28), dp(ctx, 24))
+            background = GradientDrawable(
+                GradientDrawable.Orientation.TL_BR,
+                intArrayOf(blendColor(BG_DARK, ACCENT_START, 0.12f), BG_DARK)
+            )
 
-            // Accent tile (small rounded square with the first letter of the
-            // extension name — gives the user a visual anchor without a big
-            // gradient banner).
-            addView(TextView(ctx).apply {
-                text = "C"
-                textSize = sp(ctx, 12f)
-                setTypeface(null, Typeface.BOLD)
-                setTextColor(accentTextColor)
-                gravity = Gravity.CENTER
-                background = roundRect(accent, dp(ctx, 10).toFloat())
-                layoutParams = LinearLayout.LayoutParams(dp(ctx, 36), dp(ctx, 36)).apply {
-                    marginEnd = d12
-                }
+            // Accent bar (4 dp tall, 48 dp wide, gradient ACCENT_START → ACCENT_END).
+            addView(View(ctx).apply {
+                layoutParams = LinearLayout.LayoutParams(dp(ctx, 48), dp(ctx, 4))
+                    .also { it.bottomMargin = dp(ctx, 16) }
+                background = verticalGradient(ACCENT_START, ACCENT_END)
             })
-
-            // Title + subtitle column.
-            addView(LinearLayout(ctx).apply {
-                orientation = LinearLayout.VERTICAL
-                layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
-
-                addView(TextView(ctx).apply {
-                    text = "CTGMovies"
-                    textSize = sp(ctx, 8f)
-                    setTypeface(null, Typeface.BOLD)
-                    setTextColor(textPrimary)
-                    letterSpacing = -0.01f
-                })
-                addView(TextView(ctx).apply {
-                    text = "Login credentials & API access"
-                    textSize = sp(ctx, 8f)
-                    setTextColor(textSecondary)
-                    setPadding(0, dp(ctx, 2), 0, 0)
-                    letterSpacing = 0.01f
-                })
+            // Title.
+            addView(TextView(ctx).apply {
+                text = "CTGMovies"
+                textSize = sp(ctx, 22f)
+                setTypeface(null, Typeface.BOLD)
+                setTextColor(TEXT_PRIMARY)
+                letterSpacing = -0.02f
+            })
+            // Subtitle.
+            addView(TextView(ctx).apply {
+                text = "Configure login credentials & API access"
+                textSize = sp(ctx, 13f)
+                setTextColor(TEXT_SECONDARY)
+                setPadding(0, dp(ctx, 6), 0, 0)
             })
         }
     }
@@ -236,8 +246,8 @@ object CTGSettingsUI {
     private fun divider(ctx: Context) = View(ctx).apply {
         layoutParams = LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT, 1
-        ).apply { setMargins(dp(ctx, 20), 0, dp(ctx, 20), 0) }
-        setBackgroundColor(divider)
+        ).also { it.setMargins(dp(ctx, 20), 0, dp(ctx, 20), 0) }
+        setBackgroundColor(DIVIDER_COLOR)
     }
 
     // ── Card container ───────────────────────────────────────────────────────
@@ -246,20 +256,22 @@ object CTGSettingsUI {
         val m = dp(ctx, 16)
         layoutParams = LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
-        ).apply { setMargins(m, 0, m, dp(ctx, 12)) }
-        background = roundRect(bgCard, dp(ctx, 14).toFloat())
-        elevation = dp(ctx, 2).toFloat()
+        ).also { it.setMargins(m, 0, m, m) }
+        background = roundRect(BG_CARD, dpF(ctx, 16f))
+        elevation = 4f
     }
 
     // ── Collapsible card ─────────────────────────────────────────────────────
-    private fun buildCard(
+    private fun buildCollapsibleCard(
         ctx: Context,
         title: String,
-        startOpen: Boolean = false,
+        startExpanded: Boolean = false,
+        accentA: Int = ACCENT_START,
+        accentB: Int = ACCENT_END,
         buildContent: LinearLayout.() -> Unit,
     ): View {
         val card = cardContainer(ctx)
-        var expanded = startOpen
+        var expanded = startExpanded
         val content = LinearLayout(ctx).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(0, 0, 0, dp(ctx, 8))
@@ -268,31 +280,24 @@ object CTGSettingsUI {
         content.buildContent()
 
         val chevron = TextView(ctx).apply {
-            text = if (expanded) "\u25B2" else "\u25BC"  // ▲ : ▼
-            textSize = sp(ctx, 9f)
-            setTextColor(textSecondary)
+            text = if (expanded) "▲" else "▼"
+            textSize = sp(ctx, 11f)
+            setTextColor(TEXT_SECONDARY)
         }
 
         card.addView(LinearLayout(ctx).apply {
             orientation = LinearLayout.HORIZONTAL
             setPadding(dp(ctx, 20), dp(ctx, 16), dp(ctx, 16), dp(ctx, 16))
             gravity = Gravity.CENTER_VERTICAL
-            isClickable = true
-            isFocusable = true
-            background = selectableBackground(dp(ctx, 14).toFloat())
+            isClickable = true; isFocusable = true; isFocusableInTouchMode = false
+            background = stateDrawable(ctx)
 
-            // Thin accent strip (2 dp wide, rounded).
-            addView(View(ctx).apply {
-                layoutParams = LinearLayout.LayoutParams(dp(ctx, 3), dp(ctx, 16)).apply {
-                    marginEnd = dp(ctx, 12)
-                }
-                background = accentBar(accent)
-            })
+            addView(accentBar(ctx, accentA, accentB))
             addView(TextView(ctx).apply {
-                this.text = title
-                textSize = sp(ctx, 8.5f)
+                text = title
+                textSize = sp(ctx, 12f)
                 setTypeface(null, Typeface.BOLD)
-                setTextColor(textSecondary)
+                setTextColor(TEXT_SECONDARY)
                 letterSpacing = 0.08f
                 layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
             })
@@ -300,7 +305,7 @@ object CTGSettingsUI {
 
             setOnClickListener {
                 expanded = !expanded
-                chevron.text = if (expanded) "\u25B2" else "\u25BC"
+                chevron.text = if (expanded) "▲" else "▼"
                 animateExpand(content, expanded)
             }
         })
@@ -312,19 +317,12 @@ object CTGSettingsUI {
     // ── Label ────────────────────────────────────────────────────────────────
     private fun label(ctx: Context, text: String) = TextView(ctx).apply {
         this.text = text
-        textSize = sp(ctx, 7f)
-        setTextColor(textSecondary)
-        letterSpacing = 0.04f
-        setPadding(dp(ctx, 20), dp(ctx, 4), dp(ctx, 20), dp(ctx, 4))
+        textSize = sp(ctx, 12f)
+        setTextColor(TEXT_SECONDARY)
+        setPadding(dp(ctx, 4), 0, dp(ctx, 4), dp(ctx, 10))
     }
 
     // ── Styled input ─────────────────────────────────────────────────────────
-    /**
-     * Edit box with focus-aware border: when focused, the border switches to
-     * the accent colour and the background lifts slightly. IME action is set
-     * to IME_ACTION_NEXT for single-line fields (so the keyboard's "Next"
-     * button advances focus) and IME_ACTION_DONE for the last field.
-     */
     private fun input(
         ctx: Context, value: String?, hint: String,
         isPassword: Boolean = false, isMultiLine: Boolean = false,
@@ -332,14 +330,14 @@ object CTGSettingsUI {
     ): EditText = EditText(ctx).apply {
         setText(value.orEmpty())
         this.hint = hint
-        setHintTextColor(textHint)
-        setTextColor(textPrimary)
-        textSize = sp(ctx, 9f)
-        background = roundRect(bgInput, dp(ctx, 10).toFloat(), border, 1)
-        setPadding(dp(ctx, 14), dp(ctx, 10), dp(ctx, 14), dp(ctx, 10))
+        setTextColor(TEXT_PRIMARY)
+        setHintTextColor(TEXT_SECONDARY)
+        textSize = sp(ctx, 13f)
+        background = inputBackground(ctx)
+        setPadding(dp(ctx, 14), dp(ctx, 12), dp(ctx, 14), dp(ctx, 12))
         layoutParams = LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
-        ).apply { setMargins(dp(ctx, 20), 0, dp(ctx, 20), dp(ctx, 12)) }
+        ).also { it.bottomMargin = dp(ctx, 8) }
         inputType = when {
             isPassword -> InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
             isMultiLine -> InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE
@@ -352,13 +350,8 @@ object CTGSettingsUI {
             setSingleLine(true)
             imeOptions = imeAction
         }
-        // Focus-aware border.
         setOnFocusChangeListener { _, hasFocus ->
-            background = if (hasFocus) {
-                roundRect(bgInputFocused, dp(ctx, 10).toFloat(), borderFocused, 2)
-            } else {
-                roundRect(bgInput, dp(ctx, 10).toFloat(), border, 1)
-            }
+            background = if (hasFocus) inputBackgroundFocused(ctx) else inputBackground(ctx)
         }
     }
 
@@ -374,19 +367,19 @@ object CTGSettingsUI {
             val edit = EditText(ctx).apply {
                 setText(value.orEmpty())
                 this.hint = hint
-                setHintTextColor(textHint)
-                setTextColor(textPrimary)
-                textSize = sp(ctx, 9f)
+                setTextColor(TEXT_PRIMARY)
+                setHintTextColor(TEXT_SECONDARY)
+                textSize = sp(ctx, 13f)
                 background = ColorDrawable(Color.TRANSPARENT)
-                setPadding(dp(ctx, 14), dp(ctx, 10), dp(ctx, 8), dp(ctx, 10))
+                setPadding(dp(ctx, 14), dp(ctx, 12), dp(ctx, 8), dp(ctx, 12))
                 inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
                 setSingleLine(true)
                 imeOptions = imeAction
             }
 
             val toggle = TextView(ctx).apply {
-                text = "\uD83D\uDC41"  // 👁
-                textSize = sp(ctx, 9f)
+                text = "👁"
+                textSize = sp(ctx, 14f)
                 setPadding(dp(ctx, 8), dp(ctx, 8), dp(ctx, 14), dp(ctx, 8))
                 gravity = Gravity.CENTER
                 isClickable = true
@@ -398,28 +391,23 @@ object CTGSettingsUI {
                 edit.transformationMethod = if (hidden)
                     HideReturnsTransformationMethod.getInstance()
                 else PasswordTransformationMethod.getInstance()
-                toggle.text = if (hidden) "\uD83D\uDE48" else "\uD83D\uDC41"  // 🙈 : 👁
+                toggle.text = if (hidden) "🙈" else "👁"
                 edit.setSelection(edit.text?.length ?: 0)
             }
 
             val row = LinearLayout(ctx).apply {
                 orientation = LinearLayout.HORIZONTAL
                 gravity = Gravity.CENTER_VERTICAL
-                background = roundRect(bgInput, dp(ctx, 10).toFloat(), border, 1)
+                background = inputBackground(ctx)
                 layoutParams = LinearLayout.LayoutParams(
                     LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
-                ).apply { setMargins(dp(ctx, 20), 0, dp(ctx, 20), dp(ctx, 12)) }
+                ).also { it.bottomMargin = dp(ctx, 8) }
                 edit.layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
                 addView(edit)
                 addView(toggle)
             }
-            // Focus-aware border for the wrapper row.
             edit.setOnFocusChangeListener { _, hasFocus ->
-                row.background = if (hasFocus) {
-                    roundRect(bgInputFocused, dp(ctx, 10).toFloat(), borderFocused, 2)
-                } else {
-                    roundRect(bgInput, dp(ctx, 10).toFloat(), border, 1)
-                }
+                row.background = if (hasFocus) inputBackgroundFocused(ctx) else inputBackground(ctx)
             }
             return Field(edit, row)
         } else {
@@ -435,26 +423,26 @@ object CTGSettingsUI {
             val m = dp(ctx, 16)
             layoutParams = LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
-            ).apply { setMargins(m, 0, m, dp(ctx, 16)) }
+            ).also { it.setMargins(m, 0, m, m) }
             background = roundRect(
-                blendColor(bgCard, accent, 0.08f),
-                dp(ctx, 12).toFloat(),
-                blendColor(accent, border, 0.5f),
+                blendColor(BG_CARD, ACCENT_START, 0.08f),
+                dpF(ctx, 12f),
+                blendColor(ACCENT_START, DIVIDER_COLOR, 0.5f),
                 1
             )
             setPadding(dp(ctx, 16), dp(ctx, 14), dp(ctx, 16), dp(ctx, 14))
             gravity = Gravity.TOP
 
             addView(TextView(ctx).apply {
-                text = "\u2139"  // ℹ
-                textSize = sp(ctx, 9f)
-                setTextColor(accent)
+                text = "ℹ"
+                textSize = sp(ctx, 14f)
+                setTextColor(ACCENT_START)
                 setPadding(0, 0, dp(ctx, 10), 0)
             })
             addView(TextView(ctx).apply {
                 this.text = "Enter email/password for auto-login, paste a ctg.token / Bearer token, or a raw Cookie header. Everything is saved locally on this device only."
-                textSize = sp(ctx, 7f)
-                setTextColor(textSecondary)
+                textSize = sp(ctx, 12f)
+                setTextColor(TEXT_SECONDARY)
                 setLineSpacing(dp(ctx, 2).toFloat(), 1f)
                 layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
             })
@@ -466,25 +454,30 @@ object CTGSettingsUI {
     // ═════════════════════════════════════════════════════════════════════════
 
     fun show(ctx: Context, prefs: SharedPreferences) {
-        // Resolve theme colours BEFORE building any view so every helper can
-        // use the resolved palette.
         resolveColors(ctx)
 
-        val root = LinearLayout(ctx).apply {
-            orientation = LinearLayout.VERTICAL
-            background = ColorDrawable(bgRoot)
+        val scroll = ScrollView(ctx).apply {
+            isScrollbarFadingEnabled = true
+            background = ColorDrawable(BG_DARK)
+            isFocusable = false
+            descendantFocusability = ScrollView.FOCUS_AFTER_DESCENDANTS
         }
 
-        // ── Header ──────────────────────────────────────────────────────────
-        root.addView(buildHeader(ctx))
-        root.addView(divider(ctx))
-        root.addView(View(ctx).apply {
+        val layout = LinearLayout(ctx).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(0, 0, 0, dp(ctx, 24))
+            background = ColorDrawable(BG_DARK)
+        }
+
+        // ── Hero banner ────────────────────────────────────────────────────
+        layout.addView(buildHeroBanner(ctx))
+        layout.addView(View(ctx).apply {
             layoutParams = LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT, dp(ctx, 8)
             )
         })
 
-        // ── Fields ──────────────────────────────────────────────────────────
+        // ── Fields ─────────────────────────────────────────────────────────
         // IME action chain: Email → Next → Password → Next → Token → Next →
         // Cookie → Next → API Base → Done.
         val fEmail = field(
@@ -508,8 +501,10 @@ object CTGSettingsUI {
             CTGMovies.DEFAULT_API_BASE, imeAction = EditorInfo.IME_ACTION_DONE
         )
 
-        // ── Card: Account Login ─────────────────────────────────────────────
-        root.addView(buildCard(ctx, "ACCOUNT LOGIN", startOpen = true) {
+        // ── Card: Account Login ────────────────────────────────────────────
+        layout.addView(buildCollapsibleCard(ctx, "🔐  ACCOUNT LOGIN",
+            accentA = ACCENT_START, accentB = ACCENT_END,
+            startExpanded = true) {
             addView(label(ctx, "Email"))
             addView(fEmail.view)
             addView(divider(ctx))
@@ -517,8 +512,9 @@ object CTGSettingsUI {
             addView(fPass.view)
         })
 
-        // ── Card: Quick Access ──────────────────────────────────────────────
-        root.addView(buildCard(ctx, "QUICK ACCESS") {
+        // ── Card: Quick Access ─────────────────────────────────────────────
+        layout.addView(buildCollapsibleCard(ctx, "🔑  QUICK ACCESS",
+            accentA = ACCENT_END, accentB = ACCENT_START) {
             addView(label(ctx, "Token"))
             addView(fToken.view)
             addView(divider(ctx))
@@ -526,28 +522,20 @@ object CTGSettingsUI {
             addView(fCookie.view)
         })
 
-        // ── Card: Advanced ──────────────────────────────────────────────────
-        root.addView(buildCard(ctx, "ADVANCED") {
+        // ── Card: Advanced ─────────────────────────────────────────────────
+        layout.addView(buildCollapsibleCard(ctx, "⚙️  ADVANCED",
+            accentA = ACCENT_START, accentB = ACCENT_END) {
             addView(label(ctx, "API Base"))
             addView(fApi.view)
         })
 
-        // ── Info ────────────────────────────────────────────────────────────
-        root.addView(infoCard(ctx))
-        root.addView(View(ctx).apply {
-            layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, dp(ctx, 4)
-            )
-        })
+        // ── Info ───────────────────────────────────────────────────────────
+        layout.addView(infoCard(ctx))
 
-        val scroll = ScrollView(ctx).apply {
-            background = ColorDrawable(bgRoot)
-            addView(root)
-            isFillViewport = true
-        }
+        scroll.addView(layout)
 
-        // ── Dialog ──────────────────────────────────────────────────────────
-        val dialog = AlertDialog.Builder(ctx)
+        // ── Dialog ─────────────────────────────────────────────────────────
+        val dialog = AlertDialog.Builder(ctx, android.R.style.Theme_Material_Dialog)
             .setView(scroll)
             .setPositiveButton("Save", null)
             .setNegativeButton("Cancel", null)
@@ -555,10 +543,8 @@ object CTGSettingsUI {
             .create()
 
         dialog.setOnShowListener {
-            // Style buttons using the resolved accent colour so they match
-            // the rest of the dialog instead of the platform default.
             dialog.getButton(AlertDialog.BUTTON_POSITIVE)?.apply {
-                setTextColor(accent)
+                setTextColor(ACCENT_START)
                 isAllCaps = false
                 setTypeface(null, Typeface.BOLD)
                 setOnClickListener {
@@ -578,11 +564,11 @@ object CTGSettingsUI {
                 }
             }
             dialog.getButton(AlertDialog.BUTTON_NEGATIVE)?.apply {
-                setTextColor(textSecondary)
+                setTextColor(TEXT_SECONDARY)
                 isAllCaps = false
             }
             dialog.getButton(AlertDialog.BUTTON_NEUTRAL)?.apply {
-                setTextColor(danger)
+                setTextColor(DANGER_COLOR)
                 isAllCaps = false
                 setOnClickListener {
                     prefs.edit()
@@ -598,24 +584,18 @@ object CTGSettingsUI {
             }
         }
 
+        dialog.window?.setBackgroundDrawable(roundRect(BG_DARK, dpF(ctx, 20f)))
         dialog.show()
 
-        // ── Dialog window sizing ────────────────────────────────────────────
-        // Phones: 94 % of screen width. Tablets (>= 600 dp): capped at 600 dp
-        // so the dialog doesn't stretch absurdly wide. Height: wrap content,
-        // but never exceed 85 % of screen height.
+        // ── Dialog window sizing ───────────────────────────────────────────
+        // CineStream convention: 95% of screen width, wrap-content height.
         val dm = ctx.resources.displayMetrics
-        val screenWidthDp = dm.widthPixels / dm.density
-        val maxWidthDp = if (screenWidthDp >= 600) 600 else (screenWidthDp * 0.94).toInt()
-        val widthPx = (maxWidthDp * dm.density).toInt()
+        val widthPx = (dm.widthPixels * 0.95).toInt()
         val maxHPx = (dm.heightPixels * 0.85f).toInt()
 
         dialog.window?.apply {
-            setBackgroundDrawable(roundRect(bgRoot, dp(ctx, 20).toFloat()))
             setLayout(widthPx, WindowManager.LayoutParams.WRAP_CONTENT)
             attributes = attributes.apply { if (height > maxHPx) height = maxHPx }
-            // Soft input: resize the dialog so the keyboard doesn't cover the
-            // input fields.
             setSoftInputMode(
                 WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE or
                         WindowManager.LayoutParams.SOFT_INPUT_STATE_HIDDEN
