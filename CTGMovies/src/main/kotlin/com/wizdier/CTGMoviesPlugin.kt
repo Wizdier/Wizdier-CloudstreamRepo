@@ -45,12 +45,10 @@ class CTGMoviesPlugin : Plugin() {
 //
 //  Custom polishing on top of the CineStream base:
 //    • Staggered card entrance — cards cascade in with a 60ms delay
-//    • Card elevation pulse — subtle elevation shift on expand/collapse
-//    • Gradient left border on info card — elegant vertical strip, no emoji
 //    • Password toggle with bounce — micro-scale animation on tap
-//    • Softer input focus glow — wider, translucent accent border on focus
-//    • Smooth chevron flip — animated rotation instead of instant swap
-//    • Danger pill for Clear — CineStream-style danger button
+//    • Smooth chevron flip — animated rotation on expand/collapse
+//    • Gradient left border on info card — elegant vertical strip, no emoji
+//    • Softer input focus glow — accent border highlight on focus
 //    • Theme-aware colours — adapts to Cloudstream's light/dark + accent
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -189,20 +187,17 @@ object CTGSettingsUI {
             .setDuration(300).setInterpolator(DecelerateInterpolator()).start()
     }
 
-    // CineStream-style expand/collapse with a custom elevation pulse
-    private fun animateExpand(v: View, expand: Boolean, card: View? = null) {
+    // CineStream-style expand/collapse
+    private fun animateExpand(v: View, expand: Boolean) {
         if (expand) {
             v.visibility = View.VISIBLE
             v.alpha = 0f
             v.animate().alpha(1f).setDuration(220).start()
-            // Polish: slight elevation bump on expand
-            card?.animate()?.elevation(6f)?.setDuration(220)?.start()
         } else {
             v.animate().alpha(0f).setDuration(160).withEndAction {
                 v.visibility = View.GONE
                 v.alpha = 1f
             }.start()
-            card?.animate()?.elevation(4f)?.setDuration(160)?.start()
         }
     }
 
@@ -281,7 +276,7 @@ object CTGSettingsUI {
     }
 
     // ── Collapsible card ─────────────────────────────────────────────────────
-    // Matches CineStream layout exactly; adds stagger delay & elevation pulse
+    // Matches CineStream layout exactly; adds stagger delay
     private fun buildCollapsibleCard(
         ctx: Context,
         title: String,
@@ -329,7 +324,7 @@ object CTGSettingsUI {
                 // Polish: smooth chevron rotation instead of instant swap
                 chevron.animate().rotationX(if (expanded) 180f else 0f).setDuration(200).start()
                 chevron.text = if (expanded) "▲" else "▼"
-                animateExpand(content, expanded, card)
+                animateExpand(content, expanded)
             }
         })
         card.addView(content)
@@ -445,26 +440,6 @@ object CTGSettingsUI {
         } else {
             val edit = input(ctx, value, hint, isPassword, isMultiLine, imeAction)
             return Field(edit, edit)
-        }
-    }
-
-    // ── Danger pill button (CineStream-style) ────────────────────────────────
-    // Polished Clear button matching CineStream's danger pill aesthetic
-    private fun dangerPill(ctx: Context, label: String, onClick: () -> Unit) = TextView(ctx).apply {
-        text = label
-        textSize = 11f
-        setTypeface(null, Typeface.BOLD)
-        setTextColor(DANGER_COLOR)
-        setPadding(dp(ctx, 12), dp(ctx, 6), dp(ctx, 12), dp(ctx, 6))
-        background = GradientDrawable().apply {
-            cornerRadius = 99f
-            setColor(blendColor(BG_DARK, DANGER_COLOR, 0.08f))
-            setStroke(1, blendColor(DANGER_COLOR, DIVIDER_COLOR, 0.5f))
-        }
-        isClickable = true; isFocusable = true; isFocusableInTouchMode = false
-        setOnClickListener {
-            bounceTap(this)
-            onClick()
         }
     }
 
