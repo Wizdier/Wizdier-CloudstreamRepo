@@ -41,7 +41,6 @@ class CTGMoviesPlugin : Plugin() {
 //  CTGSettingsUI — "Aurora Glass" settings dialog
 //
 //  Built from scratch with a vivid gradient + glassmorphism design language.
-//  No CineStream reference — this is its own thing.
 //
 //  Design pillars:
 //    1. AURORA HERO — multi-stop flowing gradient banner with a pulsing
@@ -186,25 +185,35 @@ object CTGSettingsUI {
 
     /**
      * Input field background — base (unfocused) state. Subtle accent-tinted
-     * border so fields feel connected to their parent card.
+     * border so fields feel connected to their parent card. The stroke uses
+     * partial alpha so the 1 dp line reads as a faint hairline instead of a
+     * hard outline — Android's setStroke width is an int (so we can't go
+     * below 1 dp), but lowering the alpha makes the border visually
+     * disappear to a refined whisper.
      */
     private fun inputBg(ctx: Context, accentA: Int) = GradientDrawable().apply {
         cornerRadius = dpF(ctx, 10f)
         setColor(INPUT_BG)
-        setStroke(1, blendColor(INPUT_BORDER, accentA, 0.4f))
+        // 1 dp stroke at ~30% alpha — Android's setStroke width is an int so
+        // we can't go below 1 dp, but lowering the alpha makes the border
+        // read as a faint hairline instead of a hard rectangle outline.
+        val borderWhisper = blendColor(INPUT_BORDER, accentA, 0.4f)
+        setStroke(1, (borderWhisper and 0x00FFFFFF) or 0x4D000000.toInt())
     }
 
     /**
-     * Input field background — focused state. The border switches to a
-     * 2 dp gradient stroke and the fill gets a soft accent glow.
+     * Input field background — focused state. Border stays at 1 dp (was 2 dp)
+     * so the focus indicator is a refined accent line, not a chunky frame.
+     * The accent-tinted fill provides the actual focus glow.
      */
     private fun inputBgFocused(ctx: Context, accentA: Int, accentB: Int): GradientDrawable {
-        // Gradient stroke isn't directly supported on GradientDrawable, so we
-        // emulate it with a solid accent-A stroke + an accent-tinted fill.
         return GradientDrawable().apply {
             cornerRadius = dpF(ctx, 10f)
             setColor(blendColor(INPUT_BG, accentA, 0.08f))
-            setStroke(2, accentB)
+            // 1 dp accent-B stroke — same width as unfocused, just brighter
+            // and more saturated so the focus state is clearly distinguishable
+            // without thickening the border.
+            setStroke(1, accentB)
         }
     }
 
