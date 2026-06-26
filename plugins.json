@@ -1,0 +1,97 @@
+[
+    {
+        "iconUrl": "https://www.google.com/s2/favicons?domain=cineplexbd.net&sz=%size%",
+        "fileHash": "sha256-01267cba952c041277e2aa5fa6601bb76156b986e5085057596b729411157bfa",
+        "apiVersion": 1,
+        "repositoryUrl": "https://github.com/Wizdier/Wizdier-CloudstreamRepo",
+        "fileSize": 93629,
+        "status": 1,
+        "language": "bn",
+        "authors": [
+            "Wizdier"
+        ],
+        "tvTypes": [
+            "Movie",
+            "TvSeries",
+            "Anime",
+            "AnimeMovie",
+            "Cartoon"
+        ],
+        "version": 7,
+        "internalName": "Cineplex BD",
+        "description": "Stream movies, anime, web-series & TV from cineplexbd.net.",
+        "url": "https://raw.githubusercontent.com/Wizdier/Wizdier-CloudstreamRepo/builds/Cineplex BD.cs3",
+        "name": "Cineplex BD"
+    },
+    {
+        "iconUrl": "https://www.google.com/s2/favicons?domain=new.circleftp.net&sz=%size%",
+        "fileHash": "sha256-0c0536f6d2d50a642cacbc0d9e6aa332317e7a40eb8a3ac867a5c3a003edebb4",
+        "apiVersion": 1,
+        "repositoryUrl": "https://github.com/Wizdier/Wizdier-CloudstreamRepo",
+        "fileSize": 80129,
+        "status": 1,
+        "authors": [
+            "Wizdier"
+        ],
+        "tvTypes": [
+            "Movie",
+            "TvSeries",
+            "Anime",
+            "AnimeMovie",
+            "Cartoon",
+            "AsianDrama",
+            "Documentary",
+            "OVA"
+        ],
+        "version": 8,
+        "internalName": "Circle FTP",
+        "description": "Circle FTP \u2014 movies, TV series and anime with rich metadata.",
+        "url": "https://raw.githubusercontent.com/Wizdier/Wizdier-CloudstreamRepo/builds/Circle FTP.cs3",
+        "name": "Circle FTP"
+    },
+    {
+        "iconUrl": "https://www.google.com/s2/favicons?domain=ctgmovies.com&sz=%size%",
+        "fileHash": "sha256-77a22e7b846c44babf645579c4317a008d2822ce83be480ef060decb874def7b",
+        "apiVersion": 1,
+        "repositoryUrl": "https://github.com/Wizdier/Wizdier-CloudstreamRepo",
+        "fileSize": 94450,
+        "status": 1,
+        "language": "bn",
+        "authors": [
+            "Wizdier"
+        ],
+        "tvTypes": [
+            "Movie",
+            "TvSeries",
+            "Anime",
+            "AnimeMovie"
+        ],
+        "version": 4,
+        "internalName": "CTGMovies",
+        "description": "CTGMovies \u2014 movies, TV shows and anime with account/token settings for protected content.",
+        "url": "https://raw.githubusercontent.com/Wizdier/Wizdier-CloudstreamRepo/builds/CTGMovies.cs3",
+        "name": "CTGMovies"
+    },
+    {
+        "iconUrl": "https://www.google.com/s2/favicons?domain=ftpbd.net&sz=%size%",
+        "fileHash": "sha256-0432c650d8007510cba998475cf5e1e2cbf2b08e9e56920a34d44d2240a04b81",
+        "apiVersion": 1,
+        "repositoryUrl": "https://github.com/Wizdier/Wizdier-CloudstreamRepo",
+        "fileSize": 87991,
+        "status": 1,
+        "language": "bn",
+        "authors": [
+            "Wizdier"
+        ],
+        "tvTypes": [
+            "Movie",
+            "TvSeries",
+            "AnimeMovie"
+        ],
+        "version": 3,
+        "internalName": "FTPBD",
+        "description": "FTPBD \u2014 movies and TV shows from ftpbd.net with HLS/direct FTP links.",
+        "url": "https://raw.githubusercontent.com/Wizdier/Wizdier-CloudstreamRepo/builds/FTPBD.cs3",
+        "name": "FTPBD"
+    }
+]
