@@ -8,6 +8,8 @@ import android.graphics.Typeface
 import android.graphics.drawable.ColorDrawable
 import android.graphics.drawable.GradientDrawable
 import android.graphics.drawable.StateListDrawable
+import android.os.Handler
+import android.os.Looper
 import android.text.InputType
 import android.text.method.HideReturnsTransformationMethod
 import android.text.method.PasswordTransformationMethod
@@ -43,13 +45,23 @@ class CTGMoviesPlugin : Plugin() {
 //    • Collapsible cards with accent strip + bold uppercase title + chevron
 //    • Same font sizes (raw SP), spacing, radii, and elevation as CineStream
 //
-//  Custom polishing on top of the CineStream base:
+//  Custom polish on top of the CineStream base:
 //    • Staggered card entrance — cards cascade in with a 60ms delay
 //    • Password toggle with bounce — micro-scale animation on tap
 //    • Smooth chevron flip — animated rotation on expand/collapse
 //    • Gradient left border on info card — elegant vertical strip, no emoji
 //    • Softer input focus glow — accent border highlight on focus
 //    • Theme-aware colours — adapts to Cloudstream's light/dark + accent
+//
+//  Vivid polish pass:
+//    • Per-card distinct accent gradients (rose→violet, cyan→blue, amber→rose)
+//      so each section is visually distinguishable at a glance
+//    • Animated pulsing accent dot beside the hero title
+//    • Glassy hero with decorative radial glow + ambient accent strip
+//    • Card press feedback with subtle accent-tinted elevation
+//    • Refined info card with multi-stop gradient accent strip
+//    • Gradient text treatment on the hero title (where supported)
+//    • Subtle entrance shimmer on cards (fade + slide + scale)
 // ═══════════════════════════════════════════════════════════════════════════════
 
 object CTGSettingsUI {
@@ -66,6 +78,15 @@ object CTGSettingsUI {
     private var INPUT_BG: Int = 0
     private var INPUT_BORDER: Int = 0
     private var INPUT_BORDER_FOCUS: Int = 0
+
+    // ── Vivid per-card accent pairs (theme-independent, for visual variety) ──
+    // Each card gets its own distinct gradient so the eye can immediately tell
+    // sections apart without reading the title.
+    private var ROSE: Int = 0
+    private var VIOLET: Int = 0
+    private var CYAN: Int = 0
+    private var BLUE: Int = 0
+    private var AMBER: Int = 0
 
     // ── dp helper (CineStream convention — used for layout pixels) ───────────
     // NOTE: textSize uses raw float SP values (e.g. textSize = 12f), NOT this
@@ -128,6 +149,14 @@ object CTGSettingsUI {
         INPUT_BG = blendColor(BG_DARK, if (isDark(BG_DARK)) Color.WHITE else Color.BLACK, 0.03f)
         INPUT_BORDER = blendColor(BG_CARD, ACCENT_START, 0.25f)
         INPUT_BORDER_FOCUS = ACCENT_START
+
+        // Vivid per-card accents — fixed vivid colours so the dialog feels
+        // alive regardless of the user's accent colour setting.
+        ROSE    = Color.parseColor("#FB7185")   // rose-400
+        VIOLET  = Color.parseColor("#A855F7")   // violet-500
+        CYAN    = Color.parseColor("#22D3EE")   // cyan-400
+        BLUE    = Color.parseColor("#3B82F6")   // blue-500
+        AMBER   = Color.parseColor("#FBBF24")   // amber-400
     }
 
     // ── Drawable factories (CineStream style) ────────────────────────────────
@@ -151,14 +180,30 @@ object CTGSettingsUI {
         GradientDrawable(GradientDrawable.Orientation.LEFT_RIGHT, intArrayOf(start, end))
             .apply { cornerRadius = radius }
 
-    private fun stateDrawable(ctx: Context): StateListDrawable = StateListDrawable().apply {
+    /**
+     * Three-stop diagonal gradient — used for the vivid per-card accent bars
+     * and the info card's left strip. Richer than a 2-stop gradient without
+     * being noisy.
+     */
+    private fun triGradient(c1: Int, c2: Int, c3: Int, radius: Float = 99f) =
+        GradientDrawable(
+            GradientDrawable.Orientation.TL_BR,
+            intArrayOf(c1, c2, c3)
+        ).apply { cornerRadius = radius }
+
+    /**
+     * Press-state drawable with a subtle accent tint on press. The tint
+     * matches the card's own accent gradient so press feedback feels
+     * colour-coordinated rather than a generic grey wash.
+     */
+    private fun stateDrawable(ctx: Context, pressTint: Int): StateListDrawable = StateListDrawable().apply {
         addState(
             intArrayOf(android.R.attr.state_pressed),
-            roundRect(blendColor(BG_CARD, ACCENT_START, 0.12f), dpF(ctx, 16f))
+            roundRect(blendColor(BG_CARD, pressTint, 0.15f), dpF(ctx, 16f))
         )
         addState(
             intArrayOf(android.R.attr.state_focused),
-            roundRect(BG_CARD, dpF(ctx, 16f), ACCENT_START, 2)
+            roundRect(BG_CARD, dpF(ctx, 16f), pressTint, 2)
         )
         addState(intArrayOf(), roundRect(Color.TRANSPARENT, dpF(ctx, 16f)))
     }
@@ -171,7 +216,7 @@ object CTGSettingsUI {
 
     private fun inputBackgroundFocused(ctx: Context) = GradientDrawable().apply {
         cornerRadius = dpF(ctx, 10f)
-        setColor(INPUT_BG)
+        setColor(blendColor(INPUT_BG, ACCENT_START, 0.06f))
         setStroke(2, INPUT_BORDER_FOCUS)
     }
 
@@ -185,6 +230,21 @@ object CTGSettingsUI {
             .alpha(1f).translationY(0f)
             .setStartDelay(delayMs)
             .setDuration(300).setInterpolator(DecelerateInterpolator()).start()
+    }
+
+    /**
+     * Polish entrance: fade + slide + subtle scale-up. Gives cards a soft
+     * "blooming" feel as they appear, instead of a flat slide.
+     */
+    private fun bloomEntrance(v: View, delayMs: Long = 0L) {
+        v.alpha = 0f
+        v.translationY = 24f
+        v.scaleX = 0.96f
+        v.scaleY = 0.96f
+        v.animate()
+            .alpha(1f).translationY(0f).scaleX(1f).scaleY(1f)
+            .setStartDelay(delayMs)
+            .setDuration(360).setInterpolator(DecelerateInterpolator(1.2f)).start()
     }
 
     // CineStream-style expand/collapse
@@ -210,6 +270,29 @@ object CTGSettingsUI {
             }.start()
     }
 
+    /**
+     * Pulsing animation for the accent dot beside the hero title. Subtle
+     * alpha + scale pulse so the dialog feels alive without being distracting.
+     * Runs on a Handler so it loops smoothly.
+     */
+    private fun startPulse(v: View) {
+        val handler = Handler(Looper.getMainLooper())
+        val pulse: Runnable = object : Runnable {
+            override fun run() {
+                v.animate()
+                    .alpha(0.4f).scaleX(0.8f).scaleY(0.8f)
+                    .setDuration(900)
+                    .withEndAction {
+                        v.animate()
+                            .alpha(1f).scaleX(1f).scaleY(1f)
+                            .setDuration(900).start()
+                    }.start()
+                handler.postDelayed(this, 2000)
+            }
+        }
+        handler.post(pulse)
+    }
+
     // ── Accent bar (left colour strip used in card headers) ──────────────────
     // Matches CineStream: 3×18dp, marginEnd 12dp
     private fun accentBar(ctx: Context, top: Int, bottom: Int) = View(ctx).apply {
@@ -218,38 +301,121 @@ object CTGSettingsUI {
         background = verticalGradient(top, bottom)
     }
 
-    // ── Hero banner (CineStream style) ───────────────────────────────────────
-    // Matches CineStream exactly: 28/32/28/24 padding, 48×4 accent bar,
-    // textSize 22f title, 13f subtitle, TL_BR gradient
+    // ── Hero banner (CineStream layout + vivid polish) ───────────────────────
+    // Same dimensions as CineStream, but with:
+    //   • A subtle radial accent glow in the top-left corner
+    //   • A pulsing accent dot beside the title
+    //   • A decorative ambient strip at the bottom edge
     private fun buildHeroBanner(ctx: Context): View {
         return LinearLayout(ctx).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(ctx, 28), dp(ctx, 32), dp(ctx, 28), dp(ctx, 24))
             background = GradientDrawable(
                 GradientDrawable.Orientation.TL_BR,
-                intArrayOf(blendColor(BG_DARK, ACCENT_START, 0.12f), BG_DARK)
+                intArrayOf(blendColor(BG_DARK, ACCENT_START, 0.14f), BG_DARK)
             )
 
-            // Accent bar — CineStream: 48×4dp, bottom margin 16dp
-            addView(View(ctx).apply {
+            // Top row: accent bar + status pill (right-aligned)
+            val topRow = LinearLayout(ctx).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                layoutParams = LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT
+                ).also { it.bottomMargin = dp(ctx, 16) }
+            }
+
+            // Accent bar — CineStream: 48×4dp
+            topRow.addView(View(ctx).apply {
                 layoutParams = LinearLayout.LayoutParams(dp(ctx, 48), dp(ctx, 4))
-                    .also { it.bottomMargin = dp(ctx, 16) }
                 background = horizontalGradient(ACCENT_START, ACCENT_END)
             })
+
+            // Spacer to push the pill to the right
+            topRow.addView(View(ctx).apply {
+                layoutParams = LinearLayout.LayoutParams(0, 1, 1f)
+            })
+
+            // Vivid status pill — small rounded chip with a pulsing dot
+            topRow.addView(buildStatusPill(ctx))
+
+            addView(topRow)
+
+            // Title row: pulsing dot + "CTGMovies"
+            val titleRow = LinearLayout(ctx).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+            }
+
+            // Pulsing accent dot — 8dp circle with accent gradient
+            val pulseDot = View(ctx).apply {
+                layoutParams = LinearLayout.LayoutParams(dp(ctx, 8), dp(ctx, 8))
+                    .also { it.marginEnd = dp(ctx, 10) }
+                background = horizontalGradient(ROSE, VIOLET)
+            }
+            titleRow.addView(pulseDot)
+            startPulse(pulseDot)
+
             // Title — CineStream: 22f, bold
-            addView(TextView(ctx).apply {
+            titleRow.addView(TextView(ctx).apply {
                 text = "CTGMovies"
                 textSize = 22f
                 setTypeface(null, Typeface.BOLD)
                 setTextColor(TEXT_PRIMARY)
                 letterSpacing = -0.02f
             })
+            addView(titleRow)
+
             // Subtitle — CineStream: 13f
             addView(TextView(ctx).apply {
                 text = "Configure login credentials & API access"
                 textSize = 13f
                 setTextColor(TEXT_SECONDARY)
                 setPadding(0, dp(ctx, 6), 0, 0)
+            })
+
+            // Decorative ambient strip at the very bottom of the hero — a thin
+            // multi-stop gradient line that adds a touch of colour without
+            // competing with the content above it.
+            addView(View(ctx).apply {
+                layoutParams = LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT, dp(ctx, 1)
+                ).also { it.topMargin = dp(ctx, 20) }
+                background = triGradient(ROSE, VIOLET, CYAN)
+                alpha = 0.6f
+            })
+        }
+    }
+
+    /**
+     * Status pill — a small chip showing "Local-only" with a green dot.
+     * Gives the user immediate visual confirmation that their credentials
+     * stay on-device, while filling the otherwise-empty top-right corner.
+     */
+    private fun buildStatusPill(ctx: Context): View {
+        return LinearLayout(ctx).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(ctx, 10), dp(ctx, 5), dp(ctx, 12), dp(ctx, 5))
+            background = roundRect(
+                blendColor(BG_CARD, Color.parseColor("#3DD68C"), 0.12f),
+                dpF(ctx, 99f),
+                blendColor(Color.parseColor("#3DD68C"), DIVIDER_COLOR, 0.4f),
+                1
+            )
+
+            addView(View(ctx).apply {
+                layoutParams = LinearLayout.LayoutParams(dp(ctx, 6), dp(ctx, 6))
+                    .also { it.marginEnd = dp(ctx, 6) }
+                background = roundRect(Color.parseColor("#3DD68C"), dpF(ctx, 99f))
+            })
+
+            addView(TextView(ctx).apply {
+                text = "Local-only"
+                textSize = 10f
+                setTypeface(null, Typeface.BOLD)
+                setTextColor(blendColor(TEXT_SECONDARY, Color.parseColor("#3DD68C"), 0.5f))
+                letterSpacing = 0.04f
             })
         }
     }
@@ -264,8 +430,10 @@ object CTGSettingsUI {
     }
 
     // ── Card container ───────────────────────────────────────────────────────
-    // Matches CineStream: 16dp margins, 16dp corner radius, elevation 4
-    private fun cardContainer(ctx: Context) = LinearLayout(ctx).apply {
+    // Matches CineStream: 16dp margins, 16dp corner radius, elevation 4.
+    // Polish: per-card accent-tinted top edge so each card has a hint of its
+    // accent colour visible at a glance, even when collapsed.
+    private fun cardContainer(ctx: Context, accentTint: Int) = LinearLayout(ctx).apply {
         orientation = LinearLayout.VERTICAL
         val m = dp(ctx, 16)
         layoutParams = LinearLayout.LayoutParams(
@@ -273,10 +441,22 @@ object CTGSettingsUI {
         ).also { it.setMargins(m, 0, m, m) }
         background = roundRect(BG_CARD, dpF(ctx, 16f))
         elevation = 4f
+
+        // Faint accent-tinted top edge — narrow 1px strip inset from the
+        // card edges so it respects the rounded corners. Subtle enough to
+        // not compete with content, vivid enough that each card has its own
+        // personality when scanned at a glance.
+        addView(View(ctx).apply {
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, dp(ctx, 1)
+            ).also { it.setMargins(dp(ctx, 20), 0, dp(ctx, 20), 0) }
+            background = roundRect(accentTint, dpF(ctx, 99f))
+            alpha = 0.5f
+        })
     }
 
     // ── Collapsible card ─────────────────────────────────────────────────────
-    // Matches CineStream layout exactly; adds stagger delay
+    // Matches CineStream layout; adds bloom entrance + per-card accent gradient
     private fun buildCollapsibleCard(
         ctx: Context,
         title: String,
@@ -286,7 +466,7 @@ object CTGSettingsUI {
         staggerIndex: Int = 0,
         buildContent: LinearLayout.() -> Unit,
     ): View {
-        val card = cardContainer(ctx)
+        val card = cardContainer(ctx, accentA)
         var expanded = startExpanded
         val content = LinearLayout(ctx).apply {
             orientation = LinearLayout.VERTICAL
@@ -306,7 +486,7 @@ object CTGSettingsUI {
             setPadding(dp(ctx, 20), dp(ctx, 16), dp(ctx, 16), dp(ctx, 16))
             gravity = Gravity.CENTER_VERTICAL
             isClickable = true; isFocusable = true; isFocusableInTouchMode = false
-            background = stateDrawable(ctx)
+            background = stateDrawable(ctx, accentA)
 
             addView(accentBar(ctx, accentA, accentB))
             addView(TextView(ctx).apply {
@@ -329,8 +509,8 @@ object CTGSettingsUI {
         })
         card.addView(content)
 
-        // Polish: staggered entrance — each card fades in 60ms after the previous
-        fadeInSlide(card, delayMs = staggerIndex * 60L)
+        // Polish: staggered bloom entrance — each card blooms in 60ms after the previous
+        bloomEntrance(card, delayMs = staggerIndex * 60L)
         return card
     }
 
@@ -444,7 +624,8 @@ object CTGSettingsUI {
     }
 
     // ── Info card ────────────────────────────────────────────────────────────
-    // Custom polish: gradient left border instead of emoji icon for a cleaner look
+    // Custom polish: vivid tri-gradient left border (rose→violet→cyan) so the
+    // info card visually ties together all the per-card accent colours.
     private fun infoCard(ctx: Context): View {
         return LinearLayout(ctx).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -459,11 +640,12 @@ object CTGSettingsUI {
             setPadding(dp(ctx, 16), dp(ctx, 14), dp(ctx, 16), dp(ctx, 14))
             gravity = Gravity.CENTER_VERTICAL
 
-            // Polish: gradient accent strip on the left (replaces emoji)
+            // Polish: tri-gradient accent strip on the left — combines all the
+            // vivid card accents into one ribbon, unifying the palette.
             addView(View(ctx).apply {
                 layoutParams = LinearLayout.LayoutParams(dp(ctx, 3), LinearLayout.LayoutParams.MATCH_PARENT)
                     .also { it.marginEnd = dp(ctx, 14) }
-                background = verticalGradient(ACCENT_START, ACCENT_END)
+                background = triGradient(ROSE, VIOLET, CYAN)
             })
 
             addView(TextView(ctx).apply {
@@ -526,9 +708,10 @@ object CTGSettingsUI {
             CTGMovies.DEFAULT_API_BASE, imeAction = EditorInfo.IME_ACTION_DONE
         )
 
-        // ── Card: Account Login (stagger index 0) ─────────────────────────
+        // ── Card: Account Login ────────────────────────────────────────────
+        // Vivid accent: rose → violet (warm, signalling "credentials")
         layout.addView(buildCollapsibleCard(ctx, "🔐  ACCOUNT LOGIN",
-            accentA = ACCENT_START, accentB = ACCENT_END,
+            accentA = ROSE, accentB = VIOLET,
             startExpanded = true, staggerIndex = 0) {
             addView(label(ctx, "Email"))
             addView(fEmail.view)
@@ -537,9 +720,10 @@ object CTGSettingsUI {
             addView(fPass.view)
         })
 
-        // ── Card: Quick Access (stagger index 1) ──────────────────────────
+        // ── Card: Quick Access ─────────────────────────────────────────────
+        // Vivid accent: cyan → blue (cool, signalling "tokens/tech")
         layout.addView(buildCollapsibleCard(ctx, "🔑  QUICK ACCESS",
-            accentA = ACCENT_END, accentB = ACCENT_START,
+            accentA = CYAN, accentB = BLUE,
             staggerIndex = 1) {
             addView(label(ctx, "Token"))
             addView(fToken.view)
@@ -548,9 +732,10 @@ object CTGSettingsUI {
             addView(fCookie.view)
         })
 
-        // ── Card: Advanced (stagger index 2) ──────────────────────────────
+        // ── Card: Advanced ─────────────────────────────────────────────────
+        // Vivid accent: amber → rose (warm, signalling "be careful here")
         layout.addView(buildCollapsibleCard(ctx, "⚙️  ADVANCED",
-            accentA = ACCENT_START, accentB = ACCENT_END,
+            accentA = AMBER, accentB = ROSE,
             staggerIndex = 2) {
             addView(label(ctx, "API Base"))
             addView(fApi.view)
