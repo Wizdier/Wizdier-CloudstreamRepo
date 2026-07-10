@@ -306,6 +306,7 @@ class CinebyProvider : MainAPI() {
 
     // ── LOAD LINKS ──
     override suspend fun loadLinks(data: String, isCasting: Boolean, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit): Boolean {
+        emittedSubUrls.clear()  // fresh dedup per episode
         val parts = data.split("|")
         if (parts.size < 3) return false
         val type = parts[0]
@@ -335,6 +336,54 @@ class CinebyProvider : MainAPI() {
             extractFromAllServers("tv", tmdbId, seasonId, episodeId, title, year, imdbId, callback, subtitleCallback)
         }
         return true
+    }
+
+    // ── Subtitle helpers ──
+
+    /** Maps ISO 639-1 codes to human-readable language names */
+    private val langNames = mapOf(
+        "en" to "English", "es" to "Spanish", "fr" to "French", "de" to "German",
+        "it" to "Italian", "pt" to "Portuguese", "ru" to "Russian", "ja" to "Japanese",
+        "ko" to "Korean", "zh" to "Chinese", "ar" to "Arabic", "hi" to "Hindi",
+        "bn" to "Bengali", "tr" to "Turkish", "nl" to "Dutch", "sv" to "Swedish",
+        "no" to "Norwegian", "da" to "Danish", "fi" to "Finnish", "pl" to "Polish",
+        "cs" to "Czech", "hu" to "Hungarian", "ro" to "Romanian", "th" to "Thai",
+        "vi" to "Vietnamese", "id" to "Indonesian", "ms" to "Malay", "tl" to "Filipino",
+        "uk" to "Ukrainian", "el" to "Greek", "he" to "Hebrew", "bg" to "Bulgarian",
+        "sr" to "Serbian", "hr" to "Croatian", "sk" to "Slovak", "sl" to "Slovenian",
+        "lt" to "Lithuanian", "lv" to "Latvian", "et" to "Estonian", "fa" to "Persian"
+    )
+
+    /** Track deduplication — one URL per language, best quality wins */
+    private val emittedSubUrls = mutableSetOf<String>()
+
+    /** Emit a single subtitle track with deduplication & proper language name */
+    private fun emitSub(
+        url: String,
+        rawLang: String?,
+        subtitleCallback: (SubtitleFile) -> Unit
+    ) {
+        if (url in emittedSubUrls) return
+        emittedSubUrls.add(url)
+
+        val langCode = rawLang?.trim()?.lowercase()?.substringBefore("-")?.takeIf { it.length in 2..3 } ?: "unknown"
+        val displayName = langNames[langCode] ?: langCode.uppercase()
+
+        subtitleCallback(SubtitleFile(url, displayName))
+    }
+
+    /** Batch-emit subtitles from a WingsDatabase decrypted result */
+    private fun emitSubsFromResult(
+        result: JSONObject,
+        subtitleCallback: (SubtitleFile) -> Unit
+    ) {
+        val subtitles = result.optJSONArray("subtitles") ?: return
+        for (i in 0 until subtitles.length()) {
+            val sub = subtitles.getJSONObject(i)
+            val url = sub.optStringOrNull("url") ?: continue
+            val lang = sub.optStringOrNull("lang")
+            emitSub(url, lang, subtitleCallback)
+        }
     }
 
     // ── WingsDatabase 8-server extraction ──
@@ -369,9 +418,7 @@ class CinebyProvider : MainAPI() {
                     val quality = src.optStringOrNull("quality") ?: "Unknown"
                     callback.invoke(newExtractorLink("$name ($label)", "$label - $quality", url) { this.quality = getQualityFromName(quality) })
                 }
-                obj.optJSONArray("subtitles")?.let { subs ->
-                    for (i in 0 until subs.length()) { val s = subs.getJSONObject(i); s.optStringOrNull("url")?.let { subtitleCallback(SubtitleFile(it, s.optStringOrNull("lang") ?: "unknown")) } }
-                }
+                emitSubsFromResult(obj, subtitleCallback)
             } catch (_: Exception) { continue }
         }
     }
