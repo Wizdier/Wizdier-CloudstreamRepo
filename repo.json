@@ -1,6 +1,6 @@
 {
     "name": "Wizdier BDIX Repository",
-    "description": "BDIX streaming: Circle FTP & Cineplex BD with MAL, AniList, Kitsu & Simkl tracking",
+    "description": "BDIX streaming: Circle FTP, Cineplex BD, CTGMovies, FTPBD & Cineby with MAL, AniList, Kitsu & Simkl tracking",
     "manifestVersion": 1,
     "pluginLists": [
         "https://raw.githubusercontent.com/Wizdier/Wizdier-CloudstreamRepo/builds/plugins.json"
