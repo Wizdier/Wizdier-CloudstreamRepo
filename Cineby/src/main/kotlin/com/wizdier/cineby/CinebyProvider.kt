@@ -11,6 +11,7 @@ import kotlinx.coroutines.coroutineScope
 import okhttp3.MediaType.Companion.toMediaTypeOrNull
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONObject
+import org.json.JSONArray
 
 class CinebyProvider : MainAPI() {
     override var mainUrl = "https://www.cineby.at"
@@ -21,15 +22,12 @@ class CinebyProvider : MainAPI() {
     override val hasQuickSearch = false
     override val hasChromecastSupport = true
 
-    private val tmdbBase = "https://db.wingsdatabase.com/3"
+    private val tmdbAPI = "https://api.themoviedb.org/3"
+    private val tmdbKey = "98ae14df2b8d8f8f8136499daf79f0e0"
     private val imgBase = "https://image.tmdb.org/t/p"
-    private val vidKingBase = "https://www.vidking.net"
 
     override val supportedTypes = setOf(
-        TvType.Movie,
-        TvType.TvSeries,
-        TvType.Anime,
-        TvType.AsianDrama
+        TvType.Movie, TvType.TvSeries, TvType.Anime, TvType.AsianDrama
     )
 
     override val mainPage = mainPageOf(
@@ -57,6 +55,7 @@ class CinebyProvider : MainAPI() {
         "discover_movie_hi" to "Indian Movies"
     )
 
+    // ── Helpers ──
     private fun posterUrl(path: String?, size: String = "w342"): String? {
         if (path.isNullOrBlank()) return null
         return "$imgBase/$size$path"
@@ -67,29 +66,44 @@ class CinebyProvider : MainAPI() {
         return optString(key, "").takeIf { it.isNotBlank() && it != "null" }
     }
 
+    private fun JSONObject.optStringSafe(key: String): String? {
+        if (isNull(key)) return null
+        val v = optString(key)
+        return v.takeIf { it.isNotBlank() && it != "null" }
+    }
+
     private suspend fun tmdbGet(endpoint: String): JSONObject? {
+        val sep = if (endpoint.contains("?")) "&" else "?"
         return try {
-            JSONObject(app.get("$tmdbBase/$endpoint", timeout = 10_000).text)
+            JSONObject(app.get("$tmdbAPI/$endpoint${sep}api_key=$tmdbKey", timeout = 10_000).text)
         } catch (e: Exception) {
-            Log.e("Cineby", "TMDB $endpoint failed: ${e.message}")
+            Log.e("Cineby", "TMDB $endpoint: ${e.message}")
             null
         }
     }
 
-    // ── TMDB search → search responses ──
-    private fun tmdbResultsToSearch(arr: org.json.JSONArray?, type: String): List<SearchResponse> {
-        if (arr == null) return emptyList()
-        val tvType = if (type == "movie") TvType.Movie else TvType.TvSeries
-        return (0 until arr.length()).mapNotNull { i ->
-            val item = arr.getJSONObject(i)
-            val id = item.optInt("id", 0).takeIf { it > 0 } ?: return@mapNotNull null
-            val title = item.optStringOrNull("title") ?: item.optStringOrNull("name") ?: "?"
-            val rating = item.optDouble("vote_average", 0.0).takeIf { it > 0 }
-            newMovieSearchResponse(title, "$type/$id", tvType) {
-                this.posterUrl = posterUrl(item.optStringOrNull("poster_path"))
-                if (rating != null) this.score = Score.from10(rating)
-            }
+    /**
+     * Pick the best TMDB title logo. Prefers: user language + non-SVG >
+     * user language SVG > best voted non-SVG > best voted SVG.
+     * Identical to the CircleFTP/CineplexBD logo picker.
+     */
+    private fun pickBestTmdbLogo(logos: JSONArray, preferredLang: String?): String? {
+        if (logos.length() == 0) return null
+        val lang = preferredLang?.trim()?.lowercase()?.substringBefore("-")
+        var enSvg: JSONObject? = null; var anyNonSvg: JSONObject? = null; var anySvg: JSONObject? = null
+
+        for (i in 0 until logos.length()) {
+            val l = logos.optJSONObject(i) ?: continue
+            val path = l.optString("file_path", ""); if (path.isBlank()) continue
+            val lLang = l.optString("iso_639_1").trim().lowercase()
+            val isSvg = path.endsWith(".svg", true)
+            if (lLang == lang && !isSvg) return "$imgBase/w500$path"
+            if (lLang == lang && isSvg && enSvg == null) enSvg = l
+            if (!isSvg && anyNonSvg == null) anyNonSvg = l
+            if (isSvg && anySvg == null) anySvg = l
         }
+        return (enSvg ?: anyNonSvg ?: anySvg)?.optString("file_path")
+            ?.takeIf { it.isNotBlank() }?.let { "$imgBase/w500$it" }
     }
 
     // ── SEARCH ──
@@ -98,115 +112,107 @@ class CinebyProvider : MainAPI() {
         return coroutineScope {
             val movies = async {
                 tmdbGet("search/movie?query=${java.net.URLEncoder.encode(query, "UTF-8")}")
-                    ?.optJSONArray("results")?.let { tmdbResultsToSearch(it, "movie") } ?: emptyList()
+                    ?.optJSONArray("results")?.let { resultsToSearch(it, "movie") } ?: emptyList()
             }
             val tv = async {
                 tmdbGet("search/tv?query=${java.net.URLEncoder.encode(query, "UTF-8")}")
-                    ?.optJSONArray("results")?.let { tmdbResultsToSearch(it, "tv") } ?: emptyList()
+                    ?.optJSONArray("results")?.let { resultsToSearch(it, "tv") } ?: emptyList()
             }
             movies.await() + tv.await()
         }
     }
 
+    private fun resultsToSearch(arr: JSONArray, type: String): List<SearchResponse> {
+        val tvType = if (type == "movie") TvType.Movie else TvType.TvSeries
+        return (0 until arr.length()).mapNotNull { i ->
+            val item = arr.getJSONObject(i)
+            val id = item.optInt("id", 0).takeIf { it > 0 } ?: return@mapNotNull null
+            val title = item.optStringOrNull("title") ?: item.optStringOrNull("name") ?: "?"
+            val r = item.optDouble("vote_average", 0.0).takeIf { it > 0 }
+            val y = (item.optStringOrNull("release_date") ?: item.optStringOrNull("first_air_date"))?.substringBefore("-")?.toIntOrNull()
+            newMovieSearchResponse(title, "$type/$id", tvType) {
+                this.posterUrl = posterUrl(item.optStringOrNull("poster_path"))
+                if (r != null) this.score = Score.from10(r)
+                if (y != null) this.year = y
+            }
+        }
+    }
+
     // ── HOME PAGE ──
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        val data = request.data
-        val results = mutableListOf<SearchResponse>()
+        val data = request.data; val results = mutableListOf<SearchResponse>()
 
         when {
             data.startsWith("trending_") -> {
                 val parts = data.removePrefix("trending_").split("_")
-                val mediaType = parts[0]
-                val time = parts.getOrElse(1) { "day" }
-                val json = tmdbGet("trending/$mediaType/$time?page=$page")
-                json?.optJSONArray("results")?.let { arr ->
+                val mediaType = parts[0]; val time = parts.getOrElse(1) { "day" }
+                tmdbGet("trending/$mediaType/$time?page=$page")?.optJSONArray("results")?.let { arr ->
                     for (i in 0 until arr.length()) {
-                        val item = arr.getJSONObject(i)
-                        val id = item.optInt("id", 0).takeIf { it > 0 } ?: continue
-                        val mediaTypeItem = item.optStringOrNull("media_type") ?: "movie"
+                        val item = arr.getJSONObject(i); val id = item.optInt("id", 0).takeIf { it > 0 } ?: continue
+                        val mt = item.optStringOrNull("media_type") ?: "movie"
                         val title = item.optStringOrNull("title") ?: item.optStringOrNull("name") ?: "?"
-                        val tvType = if (mediaTypeItem == "movie") TvType.Movie else TvType.TvSeries
-                        results.add(
-                            newMovieSearchResponse(title, "$mediaTypeItem/$id", tvType) {
-                                this.posterUrl = posterUrl(item.optStringOrNull("poster_path"))
-                                item.optDouble("vote_average", 0.0).takeIf { it > 0 }?.let { this.score = Score.from10(it) }
-                            }
-                        )
+                        val tvType = if (mt == "movie") TvType.Movie else TvType.TvSeries
+                        results.add(newMovieSearchResponse(title, "$mt/$id", tvType) {
+                            this.posterUrl = posterUrl(item.optStringOrNull("poster_path"))
+                            item.optDouble("vote_average", 0.0).takeIf { it > 0 }?.let { this.score = Score.from10(it) }
+                        })
                     }
                 }
             }
             data.endsWith("_top_rated") || data.endsWith("_popular") -> {
                 val suffix = if (data.endsWith("_top_rated")) "_top_rated" else "_popular"
                 val type = data.removeSuffix(suffix)
-                val tmdbType = when (suffix) { "_top_rated" -> "top_rated" else -> "popular" }
-                val json = tmdbGet("$type/$tmdbType?page=$page")
-                json?.optJSONArray("results")?.let { arr -> results.addAll(tmdbResultsToSearch(arr, type)) }
+                val ep = if (suffix == "_top_rated") "top_rated" else "popular"
+                tmdbGet("$type/$ep?page=$page")?.optJSONArray("results")?.let { results.addAll(resultsToSearch(it, type)) }
             }
-            data.startsWith("movie_now_playing") -> {
-                tmdbGet("movie/now_playing?page=$page")?.optJSONArray("results")?.let { results.addAll(tmdbResultsToSearch(it, "movie")) }
-            }
-            data.startsWith("movie_upcoming") -> {
-                tmdbGet("movie/upcoming?page=$page")?.optJSONArray("results")?.let { results.addAll(tmdbResultsToSearch(it, "movie")) }
-            }
-            data.startsWith("tv_airing_today") -> {
-                tmdbGet("tv/airing_today?page=$page")?.optJSONArray("results")?.let { results.addAll(tmdbResultsToSearch(it, "tv")) }
-            }
+            data.startsWith("movie_now_playing") -> tmdbGet("movie/now_playing?page=$page")?.optJSONArray("results")?.let { results.addAll(resultsToSearch(it, "movie")) }
+            data.startsWith("movie_upcoming") -> tmdbGet("movie/upcoming?page=$page")?.optJSONArray("results")?.let { results.addAll(resultsToSearch(it, "movie")) }
+            data.startsWith("tv_airing_today") -> tmdbGet("tv/airing_today?page=$page")?.optJSONArray("results")?.let { results.addAll(resultsToSearch(it, "tv")) }
             data.startsWith("discover_") -> {
-                val parts = data.removePrefix("discover_").split("_")
-                val type = parts[0]
-                val param = parts.getOrElse(1) { "" }
+                val parts = data.removePrefix("discover_").split("_"); val type = parts[0]; val param = parts.getOrElse(1) { "" }
                 val p = mutableListOf<String>()
                 param.toIntOrNull()?.let { p.add("with_genres=$it") }
                 if (param.length == 2 && param !in listOf("tv", "mo")) p.add("with_original_language=$param")
-                p.add("sort_by=popularity.desc")
-                p.add("page=$page")
-                tmdbGet("discover/$type?${p.joinToString("&")}")?.optJSONArray("results")?.let {
-                    results.addAll(tmdbResultsToSearch(it, type))
-                }
+                p.add("sort_by=popularity.desc"); p.add("page=$page")
+                tmdbGet("discover/$type?${p.joinToString("&")}")?.optJSONArray("results")?.let { results.addAll(resultsToSearch(it, type)) }
             }
         }
-
         return newHomePageResponse(request.name, results, results.isNotEmpty() && page < 10)
     }
 
-    // ── LOAD (Detail page) ──
+    // ── LOAD ──
     override suspend fun load(url: String): LoadResponse? {
-        // Cloudstream prepends mainUrl → url can be "https://.../movie/123" or just "movie/123"
-        // Grab the last two path segments: type then id
         val segments = url.trimEnd('/').split("/")
         if (segments.size < 2) return null
         val tmdbId = segments.last()
         val type = segments[segments.size - 2]
-        return when (type) {
-            "movie" -> loadMovie(tmdbId)
-            "tv" -> loadTvSeries(tmdbId)
-            else -> null
-        }
+        return when (type) { "movie" -> loadMovie(tmdbId); "tv" -> loadTvSeries(tmdbId); else -> null }
     }
 
+    // ── LOAD MOVIE ──
     private suspend fun loadMovie(tmdbId: String): LoadResponse? {
-        val json = tmdbGet("movie/$tmdbId?append_to_response=credits,videos,recommendations") ?: return null
+        // append_to_response=images fetches logos alongside details → 1 request instead of 2
+        val json = tmdbGet("movie/$tmdbId?append_to_response=credits,videos,recommendations,external_ids,images") ?: return null
         val title = json.optStringOrNull("title") ?: return null
+        val ogTitle = json.optStringOrNull("original_title")
         val poster = posterUrl(json.optStringOrNull("poster_path"))
         val backdrop = posterUrl(json.optStringOrNull("backdrop_path"), "w780")
         val plot = json.optStringOrNull("overview")
         val year = json.optStringOrNull("release_date")?.substringBefore("-")?.toIntOrNull()
         val rating = json.optDouble("vote_average", 0.0).takeIf { it > 0 }
-        val imdbId = json.optStringOrNull("imdb_id")
+        val imdbId = json.optJSONObject("external_ids")?.optStringSafe("imdb_id") ?: json.optStringSafe("imdb_id")
         val runtime = json.optInt("runtime", 0).takeIf { it > 0 }
+        val tagline = json.optStringOrNull("tagline")
 
-        val genres = json.optJSONArray("genres")?.let { arr ->
-            (0 until arr.length()).mapNotNull { arr.getJSONObject(it).optStringOrNull("name") }
-        }
+        // Logo from embedded images
+        val logoUrl = json.optJSONObject("images")?.optJSONArray("logos")?.let { pickBestTmdbLogo(it, lang) }
+
+        val genres = json.optJSONArray("genres")?.let { arr -> (0 until arr.length()).mapNotNull { arr.getJSONObject(it).optStringOrNull("name") } }
 
         val actors = json.optJSONObject("credits")?.optJSONArray("cast")?.let { arr ->
             (0 until minOf(arr.length(), 15)).mapNotNull { i ->
-                val p = arr.getJSONObject(i)
-                val name = p.optStringOrNull("name") ?: return@mapNotNull null
-                ActorData(
-                    actor = Actor(name, posterUrl(p.optStringOrNull("profile_path"), "w185")),
-                    roleString = p.optStringOrNull("character")
-                )
+                val p = arr.getJSONObject(i); val n = p.optStringOrNull("name") ?: return@mapNotNull null
+                ActorData(Actor(n, posterUrl(p.optStringOrNull("profile_path"), "w185")), roleString = p.optStringOrNull("character"))
             }
         }
 
@@ -214,294 +220,160 @@ class CinebyProvider : MainAPI() {
         json.optJSONObject("videos")?.optJSONArray("results")?.let { arr ->
             for (i in 0 until arr.length()) {
                 val v = arr.getJSONObject(i)
-                if (v.optString("type") == "Trailer" && v.optString("site") == "YouTube") {
-                    trailer = "https://www.youtube.com/watch?v=${v.optString("key")}"
-                    break
-                }
+                if (v.optString("type") == "Trailer" && v.optString("site") == "YouTube") { trailer = "https://www.youtube.com/watch?v=${v.optString("key")}"; break }
             }
         }
 
         val recs = json.optJSONObject("recommendations")?.optJSONArray("results")?.let { arr ->
             (0 until minOf(arr.length(), 10)).mapNotNull { i ->
-                val item = arr.getJSONObject(i)
-                val id = item.optInt("id", 0).takeIf { it > 0 } ?: return@mapNotNull null
-                newMovieSearchResponse(item.optStringOrNull("title") ?: "?", "movie/$id", TvType.Movie) {
-                    this.posterUrl = posterUrl(item.optStringOrNull("poster_path"))
-                }
+                val item = arr.getJSONObject(i); val id = item.optInt("id", 0).takeIf { it > 0 } ?: return@mapNotNull null
+                newMovieSearchResponse(item.optStringOrNull("title") ?: "?", "movie/$id", TvType.Movie) { this.posterUrl = posterUrl(item.optStringOrNull("poster_path")) }
             }
         }
 
-        val loadUrl = "movie/$tmdbId"
-        // Pipe-delimited data: movie_extract|tmdbId|encodedTitle|year|imdbId
-        val data = "movie_extract|$tmdbId|${java.net.URLEncoder.encode(title, "UTF-8")}|${year ?: ""}|${imdbId ?: ""}"
-
-        return newMovieLoadResponse(title, loadUrl, TvType.Movie, data) {
-            this.posterUrl = poster
-            this.backgroundPosterUrl = backdrop
-            this.plot = plot
-            this.year = year
+        val data = "movie|$tmdbId|${java.net.URLEncoder.encode(title, "UTF-8")}|${year ?: ""}|${imdbId ?: ""}"
+        return newMovieLoadResponse(title, "movie/$tmdbId", TvType.Movie, data) {
+            this.posterUrl = poster; this.backgroundPosterUrl = backdrop
+            this.plot = plot; this.year = year
             if (rating != null) this.score = Score.from10(rating)
-            this.tags = genres
-            if (actors != null) this.actors = actors
-            if (recs != null) this.recommendations = recs
-            if (trailer != null) addTrailer(trailer)
-            if (imdbId != null) addImdbId(imdbId)
+            this.tags = genres; if (actors != null) this.actors = actors; if (recs != null) this.recommendations = recs
+            if (trailer != null) addTrailer(trailer); if (imdbId != null) addImdbId(imdbId)
             if (runtime != null) this.duration = runtime
+            if (tagline != null) this.tagline = tagline
+            if (logoUrl != null) this.logoUrl = logoUrl
         }
     }
 
+    // ── LOAD TV SERIES ──
     private suspend fun loadTvSeries(tmdbId: String): LoadResponse? {
-        val json = tmdbGet("tv/$tmdbId?append_to_response=external_ids,credits,recommendations") ?: return null
+        val json = tmdbGet("tv/$tmdbId?append_to_response=external_ids,credits,recommendations,images") ?: return null
         val title = json.optStringOrNull("name") ?: return null
         val poster = posterUrl(json.optStringOrNull("poster_path"))
         val backdrop = posterUrl(json.optStringOrNull("backdrop_path"), "w780")
         val plot = json.optStringOrNull("overview")
         val year = json.optStringOrNull("first_air_date")?.substringBefore("-")?.toIntOrNull()
         val rating = json.optDouble("vote_average", 0.0).takeIf { it > 0 }
-        val imdbId = json.optJSONObject("external_ids")?.optStringOrNull("imdb_id")
-            ?: json.optStringOrNull("imdb_id")
+        val imdbId = json.optJSONObject("external_ids")?.optStringSafe("imdb_id") ?: json.optStringSafe("imdb_id")
         val seasons = json.optInt("number_of_seasons", 1)
+        val tagline = json.optStringOrNull("tagline")
 
-        val genres = json.optJSONArray("genres")?.let { arr ->
-            (0 until arr.length()).mapNotNull { arr.getJSONObject(it).optStringOrNull("name") }
-        }
+        // Logo from embedded images
+        val logoUrl = json.optJSONObject("images")?.optJSONArray("logos")?.let { pickBestTmdbLogo(it, lang) }
+
+        val genres = json.optJSONArray("genres")?.let { arr -> (0 until arr.length()).mapNotNull { arr.getJSONObject(it).optStringOrNull("name") } }
 
         val actors = json.optJSONObject("credits")?.optJSONArray("cast")?.let { arr ->
             (0 until minOf(arr.length(), 15)).mapNotNull { i ->
-                val p = arr.getJSONObject(i)
-                val name = p.optStringOrNull("name") ?: return@mapNotNull null
-                ActorData(
-                    actor = Actor(name, posterUrl(p.optStringOrNull("profile_path"), "w185")),
-                    roleString = p.optStringOrNull("character")
-                )
+                val p = arr.getJSONObject(i); val n = p.optStringOrNull("name") ?: return@mapNotNull null
+                ActorData(Actor(n, posterUrl(p.optStringOrNull("profile_path"), "w185")), roleString = p.optStringOrNull("character"))
             }
         }
 
         val recs = json.optJSONObject("recommendations")?.optJSONArray("results")?.let { arr ->
             (0 until minOf(arr.length(), 10)).mapNotNull { i ->
-                val item = arr.getJSONObject(i)
-                val id = item.optInt("id", 0).takeIf { it > 0 } ?: return@mapNotNull null
-                newMovieSearchResponse(item.optStringOrNull("name") ?: "?", "tv/$id", TvType.TvSeries) {
-                    this.posterUrl = posterUrl(item.optStringOrNull("poster_path"))
-                }
+                val item = arr.getJSONObject(i); val id = item.optInt("id", 0).takeIf { it > 0 } ?: return@mapNotNull null
+                newMovieSearchResponse(item.optStringOrNull("name") ?: "?", "tv/$id", TvType.TvSeries) { this.posterUrl = posterUrl(item.optStringOrNull("poster_path")) }
             }
         }
 
-        // Build episodes
+        // Fetch all seasons concurrently
+        val maxSeasons = minOf(seasons, 15)
         val episodes = mutableListOf<Episode>()
-        for (s in 1..minOf(seasons, 20)) {
-            val sJson = tmdbGet("tv/$tmdbId/season/$s") ?: continue
-            val epArr = sJson.optJSONArray("episodes") ?: continue
+        val seasonResults = coroutineScope { (1..maxSeasons).map { s -> async { val sJson = tmdbGet("tv/$tmdbId/season/$s"); s to (sJson?.optJSONArray("episodes")) } }.awaitAll() }
+        for ((s, epArr) in seasonResults) {
+            if (epArr == null) continue
             for (j in 0 until epArr.length()) {
                 val ep = epArr.getJSONObject(j)
                 val epNum = ep.optInt("episode_number", j + 1)
                 val epName = ep.optStringOrNull("name") ?: "Episode $epNum"
-                val epStill = posterUrl(ep.optStringOrNull("still_path"), "w300")
-                val epDesc = ep.optStringOrNull("overview")
-
-                // Format: "tv_extract|tmdbId|season|episode|encodedTitle|year|imdbId"
-                val edata = "tv_extract|$tmdbId|$s|$epNum|${java.net.URLEncoder.encode(title, "UTF-8")}|${year ?: ""}|${imdbId ?: ""}"
-
-                episodes.add(
-                    newEpisode(edata) {
-                        this.name = epName
-                        this.season = s
-                        this.episode = epNum
-                        this.posterUrl = epStill
-                        this.description = epDesc
-                    }
-                )
+                val edata = "tv|$tmdbId|$s|$epNum|${java.net.URLEncoder.encode(title, "UTF-8")}|${year ?: ""}|${imdbId ?: ""}"
+                episodes.add(newEpisode(edata) {
+                    this.name = epName; this.season = s; this.episode = epNum
+                    this.posterUrl = posterUrl(ep.optStringOrNull("still_path"), "w300")
+                    this.description = ep.optStringOrNull("overview")
+                })
             }
         }
 
         return newTvSeriesLoadResponse(title, "tv/$tmdbId", TvType.TvSeries, episodes) {
-            this.posterUrl = poster
-            this.backgroundPosterUrl = backdrop
-            this.plot = plot
-            this.year = year
+            this.posterUrl = poster; this.backgroundPosterUrl = backdrop
+            this.plot = plot; this.year = year
             if (rating != null) this.score = Score.from10(rating)
-            this.tags = genres
-            if (actors != null) this.actors = actors
-            if (recs != null) this.recommendations = recs
-            if (imdbId != null) addImdbId(imdbId)
+            this.tags = genres; if (actors != null) this.actors = actors; if (recs != null) this.recommendations = recs
+            if (imdbId != null) addImdbId(imdbId); if (tagline != null) this.tagline = tagline
+            if (logoUrl != null) this.logoUrl = logoUrl
         }
     }
 
-    // ── LOAD LINKS (8 WingsDatabase servers + VidKing web fallback) ──
-    override suspend fun loadLinks(
-        data: String,
-        isCasting: Boolean,
-        subtitleCallback: (SubtitleFile) -> Unit,
-        callback: (ExtractorLink) -> Unit
-    ): Boolean {
+    // ── LOAD LINKS ──
+    override suspend fun loadLinks(data: String, isCasting: Boolean, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit): Boolean {
         val parts = data.split("|")
         if (parts.size < 3) return false
+        val type = parts[0]
+        if (type !in listOf("movie", "tv")) return false
 
-        val extractType = parts[0]
-        if (extractType !in listOf("movie_extract", "tv_extract")) return false
-
-        try {
-            val tmdbId = parts[1]
-            val title: String
-            val year: String
-            val imdbId: String
-            val mediaType: String
-            val seasonId: String
-            val episodeId: String
-
-            if (extractType == "movie_extract") {
-                title = java.net.URLDecoder.decode(parts.getOrElse(2) { "" }, "UTF-8")
-                year = parts.getOrElse(3) { "" }
-                imdbId = parts.getOrElse(4) { "" }
-                mediaType = "movie"; seasonId = "1"; episodeId = "1"
-            } else {
-                seasonId = parts.getOrElse(2) { "1" }
-                episodeId = parts.getOrElse(3) { "1" }
-                title = java.net.URLDecoder.decode(parts.getOrElse(4) { "" }, "UTF-8")
-                year = parts.getOrElse(5) { "" }
-                imdbId = parts.getOrElse(6) { "" }
-                mediaType = "tv"
-            }
-
-            // Try WingsDatabase → enc-dec.app for direct stream URLs
-            extractFromAllServers(mediaType, tmdbId, seasonId, episodeId, title, year, imdbId, callback, subtitleCallback)
-
-            // Fallback: VidKing embed page (always available, web-based player)
-            val fallbackUrl = if (mediaType == "movie") {
-                "$vidKingBase/embed/movie/$tmdbId"
-            } else {
-                "$vidKingBase/embed/tv/$tmdbId/$seasonId/$episodeId"
-            }
-            callback.invoke(
-                newExtractorLink(
-                    source = "$name (Web)",
-                    name = "VidKing Player",
-                    url = fallbackUrl
-                ) {
-                    this.quality = Qualities.Unknown.value
-                }
-            )
-
-            return true
-        } catch (e: Exception) {
-            Log.e("Cineby", "loadLinks: ${e.message}")
-            return false
+        val tmdbId = parts[1]; val title: String; val year: String; val imdbId: String; val seasonId: String; val episodeId: String
+        if (type == "movie") {
+            title = java.net.URLDecoder.decode(parts.getOrElse(2) { "" }, "UTF-8"); year = parts.getOrElse(3) { "" }; imdbId = parts.getOrElse(4) { "" }
+            seasonId = "1"; episodeId = "1"
+        } else {
+            seasonId = parts.getOrElse(2) { "1" }; episodeId = parts.getOrElse(3) { "1" }
+            title = java.net.URLDecoder.decode(parts.getOrElse(4) { "" }, "UTF-8"); year = parts.getOrElse(5) { "" }; imdbId = parts.getOrElse(6) { "" }
         }
+
+        if (type == "movie") {
+            loadExtractor("https://vidsrc.to/embed/movie/$tmdbId", mainUrl, subtitleCallback, callback)
+            loadExtractor("https://vidlink.pro/movie/$tmdbId", mainUrl, subtitleCallback, callback)
+            loadExtractor("https://vidsrc.cc/v2/embed/movie/$tmdbId", mainUrl, subtitleCallback, callback)
+            loadExtractor("https://player.smashy.stream/movie/$tmdbId", mainUrl, subtitleCallback, callback)
+            extractFromAllServers("movie", tmdbId, "1", "1", title, year, imdbId, callback, subtitleCallback)
+        } else {
+            loadExtractor("https://vidsrc.to/embed/tv/$tmdbId/$seasonId/$episodeId", mainUrl, subtitleCallback, callback)
+            loadExtractor("https://vidlink.pro/tv/$tmdbId/$seasonId/$episodeId", mainUrl, subtitleCallback, callback)
+            loadExtractor("https://vidsrc.cc/v2/embed/tv/$tmdbId/$seasonId/$episodeId", mainUrl, subtitleCallback, callback)
+            loadExtractor("https://player.smashy.stream/tv/$tmdbId/$seasonId/$episodeId", mainUrl, subtitleCallback, callback)
+            loadExtractor("https://autoembed.co/tv/$tmdbId/$seasonId/$episodeId", mainUrl, subtitleCallback, callback)
+            extractFromAllServers("tv", tmdbId, seasonId, episodeId, title, year, imdbId, callback, subtitleCallback)
+        }
+        return true
     }
 
-    private suspend fun extractFromAllServers(
-        mediaType: String, tmdbId: String, seasonId: String, episodeId: String,
-        title: String, year: String, imdbId: String,
-        callback: (ExtractorLink) -> Unit, subtitleCallback: (SubtitleFile) -> Unit
-    ) {
-        // All 8 English servers from WingsDatabase
-        val servers = listOf(
-            "jett" to "jett/sources-with-title",
-            "cdn" to "cdn/sources-with-title",        // Yoru — movies only
-            "tejo" to "tejo/sources-with-title",
-            "neon2" to "neon2/sources-with-title",
-            "ym" to "ym/sources-with-title",
-            "downloader2" to "downloader2/sources-with-title",
-            "m4uhd" to "m4uhd/sources-with-title",
-            "hdmovie" to "hdmovie/sources-with-title"
-        )
+    // ── WingsDatabase 8-server extraction ──
+    private suspend fun extractFromAllServers(mediaType: String, tmdbId: String, seasonId: String, episodeId: String, title: String, year: String, imdbId: String, callback: (ExtractorLink) -> Unit, subtitleCallback: (SubtitleFile) -> Unit) {
+        val servers = listOf("jett" to "jett", "cdn" to "cdn", "tejo" to "tejo", "neon2" to "neon2", "ym" to "ym", "downloader2" to "downloader2", "m4uhd" to "m4uhd", "hdmovie" to "hdmovie")
+        val labels = mapOf("jett" to "Jett", "cdn" to "Yoru", "tejo" to "Tejo", "neon2" to "Neon", "ym" to "Sage", "downloader2" to "Cypher", "m4uhd" to "Breach", "hdmovie" to "Vyse")
 
-        val serverLabels = mapOf(
-            "jett" to "Jett", "cdn" to "Yoru", "tejo" to "Tejo", "neon2" to "Neon",
-            "ym" to "Sage", "downloader2" to "Cypher", "m4uhd" to "Breach", "hdmovie" to "Vyse"
-        )
-
-        // Step 1: Get seed
         val seed: String
         try {
-            val seedResp = app.get(
-                "https://api.wingsdatabase.com/seed?mediaId=$tmdbId",
-                timeout = 10_000,
-                headers = mapOf(
-                    "User-Agent" to "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36",
-                    "Accept" to "application/json",
-                    "Referer" to "$vidKingBase/",
-                    "Origin" to vidKingBase
-                )
-            ).text
-            seed = JSONObject(seedResp).optStringOrNull("seed") ?: return
-        } catch (e: Exception) {
-            Log.e("Cineby", "Seed failed: ${e.message}")
-            return
-        }
+            seed = JSONObject(app.get("https://api.wingsdatabase.com/seed?mediaId=$tmdbId", timeout = 10_000,
+                headers = mapOf("User-Agent" to "Mozilla/5.0 (Linux; Android 14)", "Accept" to "application/json", "Referer" to "https://www.vidking.net/", "Origin" to "https://www.vidking.net")).text).optStringOrNull("seed") ?: return
+        } catch (_: Exception) { return }
 
-        // Double-encode title
         val encTitle = java.net.URLEncoder.encode(java.net.URLEncoder.encode(title, "UTF-8"), "UTF-8")
-
-        for ((serverKey, endpoint) in servers) {
-            // Yoru is movies-only
-            if (serverKey == "cdn" && mediaType != "movie") continue
-
+        for ((key, _) in servers) {
+            if (key == "cdn" && mediaType != "movie") continue
             try {
-                val params = listOf(
-                    "title" to encTitle, "mediaType" to mediaType, "year" to year,
-                    "episodeId" to episodeId, "seasonId" to seasonId,
-                    "tmdbId" to tmdbId, "imdbId" to imdbId,
-                    "enc" to "2", "seed" to seed
-                )
-                val qs = params.joinToString("&") { (k, v) -> "$k=${java.net.URLEncoder.encode(v, "UTF-8")}" }
-                val apiUrl = "https://api.wingsdatabase.com/$endpoint?$qs"
-
-                val encData = app.get(apiUrl, timeout = 15_000, headers = mapOf(
-                    "User-Agent" to "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36",
-                    "Accept" to "application/json, text/plain, */*",
-                    "Referer" to "$vidKingBase/",
-                    "Origin" to vidKingBase,
-                    "Cache-Control" to "no-cache"
-                )).text
-
+                val qs = listOf("title" to encTitle, "mediaType" to mediaType, "year" to year, "episodeId" to episodeId, "seasonId" to seasonId, "tmdbId" to tmdbId, "imdbId" to imdbId, "enc" to "2", "seed" to seed).joinToString("&") { (k, v) -> "$k=${java.net.URLEncoder.encode(v, "UTF-8")}" }
+                val encData = app.get("https://api.wingsdatabase.com/${key}/sources-with-title?$qs", timeout = 15_000,
+                    headers = mapOf("User-Agent" to "Mozilla/5.0 (Linux; Android 14)", "Accept" to "application/json, text/plain, */*", "Referer" to "https://www.vidking.net/", "Origin" to "https://www.vidking.net", "Cache-Control" to "no-cache")).text
                 if (encData.isBlank() || encData.startsWith("{") || encData.length < 100) continue
 
-                // Step 3: Decrypt via enc-dec.app
-                val decryptBody = JSONObject().apply {
-                    put("text", encData); put("id", tmdbId); put("seed", seed)
-                }
-                val decryptResp = app.post(
-                    "https://enc-dec.app/api/dec-videasy",
-                    requestBody = decryptBody.toString().toRequestBody("application/json".toMediaTypeOrNull()),
-                    timeout = 20_000,
-                    headers = mapOf("Content-Type" to "application/json")
-                ).text
-
-                val result = JSONObject(decryptResp)
-                if (result.optInt("status", -1) != 200) continue
-
-                val obj = result.optJSONObject("result") ?: continue
+                val body = JSONObject().apply { put("text", encData); put("id", tmdbId); put("seed", seed) }
+                val resp = JSONObject(app.post("https://enc-dec.app/api/dec-videasy", requestBody = body.toString().toRequestBody("application/json".toMediaTypeOrNull()), timeout = 20_000, headers = mapOf("Content-Type" to "application/json")).text)
+                if (resp.optInt("status", -1) != 200) continue
+                val obj = resp.optJSONObject("result") ?: continue
                 val sources = obj.optJSONArray("sources") ?: continue
-                val label = serverLabels[serverKey] ?: serverKey
+                val label = labels[key] ?: key
 
                 for (i in 0 until sources.length()) {
-                    val src = sources.getJSONObject(i)
-                    val url = src.optStringOrNull("url") ?: continue
+                    val src = sources.getJSONObject(i); val url = src.optStringOrNull("url") ?: continue
                     val quality = src.optStringOrNull("quality") ?: "Unknown"
-                    callback.invoke(
-                        newExtractorLink(
-                            source = "$name ($label)",
-                            name = "$label - $quality",
-                            url = url
-                        ) {
-                            this.quality = getQualityFromName(quality)
-                        }
-                    )
+                    callback.invoke(newExtractorLink("$name ($label)", "$label - $quality", url) { this.quality = getQualityFromName(quality) })
                 }
-
-                // Subtitles
                 obj.optJSONArray("subtitles")?.let { subs ->
-                    for (i in 0 until subs.length()) {
-                        val sub = subs.getJSONObject(i)
-                        val subUrl = sub.optStringOrNull("url") ?: continue
-                        val lang = sub.optStringOrNull("lang") ?: "unknown"
-                        subtitleCallback.invoke(SubtitleFile(subUrl, lang))
-                    }
+                    for (i in 0 until subs.length()) { val s = subs.getJSONObject(i); s.optStringOrNull("url")?.let { subtitleCallback(SubtitleFile(it, s.optStringOrNull("lang") ?: "unknown")) } }
                 }
-            } catch (_: Exception) {
-                continue
-            }
+            } catch (_: Exception) { continue }
         }
     }
 }
