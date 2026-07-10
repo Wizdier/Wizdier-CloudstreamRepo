@@ -239,7 +239,6 @@ class CinebyProvider : MainAPI() {
             this.tags = genres; if (actors != null) this.actors = actors; if (recs != null) this.recommendations = recs
             if (trailer != null) addTrailer(trailer); if (imdbId != null) addImdbId(imdbId)
             if (runtime != null) this.duration = runtime
-            if (tagline != null) this.tagline = tagline
             if (logoUrl != null) this.logoUrl = logoUrl
         }
     }
@@ -300,7 +299,7 @@ class CinebyProvider : MainAPI() {
             this.plot = plot; this.year = year
             if (rating != null) this.score = Score.from10(rating)
             this.tags = genres; if (actors != null) this.actors = actors; if (recs != null) this.recommendations = recs
-            if (imdbId != null) addImdbId(imdbId); if (tagline != null) this.tagline = tagline
+            if (imdbId != null) addImdbId(imdbId)
             if (logoUrl != null) this.logoUrl = logoUrl
         }
     }
