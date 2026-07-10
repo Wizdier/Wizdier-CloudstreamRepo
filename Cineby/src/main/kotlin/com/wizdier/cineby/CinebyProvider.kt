@@ -171,10 +171,12 @@ class CinebyProvider : MainAPI() {
 
     // ── LOAD (Detail page) ──
     override suspend fun load(url: String): LoadResponse? {
-        val parts = url.split("/")
-        if (parts.size < 2) return null
-        val type = parts[0]
-        val tmdbId = parts[1]
+        // Cloudstream prepends mainUrl → url can be "https://.../movie/123" or just "movie/123"
+        // Grab the last two path segments: type then id
+        val segments = url.trimEnd('/').split("/")
+        if (segments.size < 2) return null
+        val tmdbId = segments.last()
+        val type = segments[segments.size - 2]
         return when (type) {
             "movie" -> loadMovie(tmdbId)
             "tv" -> loadTvSeries(tmdbId)
@@ -229,9 +231,11 @@ class CinebyProvider : MainAPI() {
             }
         }
 
+        val loadUrl = "movie/$tmdbId"
+        // Pipe-delimited data: movie_extract|tmdbId|encodedTitle|year|imdbId
         val data = "movie_extract|$tmdbId|${java.net.URLEncoder.encode(title, "UTF-8")}|${year ?: ""}|${imdbId ?: ""}"
 
-        return newMovieLoadResponse(title, data, TvType.Movie, data) {
+        return newMovieLoadResponse(title, loadUrl, TvType.Movie, data) {
             this.posterUrl = poster
             this.backgroundPosterUrl = backdrop
             this.plot = plot
@@ -323,7 +327,7 @@ class CinebyProvider : MainAPI() {
         }
     }
 
-    // ── LOAD LINKS (Video extraction from all 8 servers) ──
+    // ── LOAD LINKS (8 WingsDatabase servers + VidKing web fallback) ──
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
@@ -359,7 +363,25 @@ class CinebyProvider : MainAPI() {
                 mediaType = "tv"
             }
 
+            // Try WingsDatabase → enc-dec.app for direct stream URLs
             extractFromAllServers(mediaType, tmdbId, seasonId, episodeId, title, year, imdbId, callback, subtitleCallback)
+
+            // Fallback: VidKing embed page (always available, web-based player)
+            val fallbackUrl = if (mediaType == "movie") {
+                "$vidKingBase/embed/movie/$tmdbId"
+            } else {
+                "$vidKingBase/embed/tv/$tmdbId/$seasonId/$episodeId"
+            }
+            callback.invoke(
+                newExtractorLink(
+                    source = "$name (Web)",
+                    name = "VidKing Player",
+                    url = fallbackUrl
+                ) {
+                    this.quality = Qualities.Unknown.value
+                }
+            )
+
             return true
         } catch (e: Exception) {
             Log.e("Cineby", "loadLinks: ${e.message}")
