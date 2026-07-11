@@ -1,6 +1,7 @@
 package com.wizdier.anistream
 
 import com.lagradost.cloudstream3.*
+import com.lagradost.cloudstream3.LoadResponse.Companion.addTrailer
 import com.lagradost.cloudstream3.utils.*
 import com.lagradost.api.Log
 import kotlinx.coroutines.async
@@ -365,7 +366,7 @@ class AniStreamProvider : MainAPI() {
         val et = java.net.URLEncoder.encode(java.net.URLEncoder.encode(t, "UTF-8"), "UTF-8")
         for ((k, lb) in servers) {
             try {
-                val q = listOf("title" to et, "mediaType" to "anime", "year" to y, "episodeId" to e, "seasonId" to s, "tmdbId" to id, "imdbId" to imdb, "enc" to "2", "seed" to seed).joinToString("&") { (kv, _) -> "$kv=${java.net.URLEncoder.encode(_, "UTF-8")}" }
+                val q = listOf("title" to et, "mediaType" to "anime", "year" to y, "episodeId" to e, "seasonId" to s, "tmdbId" to id, "imdbId" to imdb, "enc" to "2", "seed" to seed).joinToString("&") { (kv, vv) -> "$kv=${java.net.URLEncoder.encode(vv, "UTF-8")}" }
                 val enc = app.get("https://api.wingsdatabase.com/${k}/sources-with-title?$q", timeout = 15000, headers = mapOf("User-Agent" to "Mozilla/5.0 (Linux; Android 14)", "Accept" to "application/json, text/plain, */*", "Referer" to "https://www.vidking.net/", "Origin" to "https://www.vidking.net", "Cache-Control" to "no-cache")).text
                 if (enc.isBlank() || enc.startsWith("{") || enc.length < 100) continue
                 val bd = JSONObject().apply { put("text", enc); put("id", id); put("seed", seed) }
