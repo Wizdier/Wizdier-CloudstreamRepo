@@ -318,7 +318,7 @@ class AniStreamProvider : MainAPI() {
 
         val (sid, eid) = if (tp == "anime-ep") { Pair(p.getOrElse(2) { "1" }, p.getOrElse(3) { "1" }) } else { Pair("1", "1") }
 
-        fun ld(u: String) { loadExtractor(u, mainUrl, sc, cb) }
+        suspend fun ld(u: String) { loadExtractor(u, mainUrl, sc, cb) }
 
         // ── Anime-specific embed & API sources ──
         // AnimeKai-style embeds (use AniList ID)
