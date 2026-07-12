@@ -268,8 +268,8 @@ class AniStreamProvider : MainAPI() {
             }
         }
 
-        // Data for loadLinks — pack title + romaji for search fallback
-        val data = "anime|$id|${java.net.URLEncoder.encode(title, "UTF-8")}|${java.net.URLEncoder.encode(romaji, "UTF-8")}"
+        // Data for loadLinks — pack title + romaji + malId for MALSync resolution
+        val data = "anime|$id|${java.net.URLEncoder.encode(title, "UTF-8")}|${java.net.URLEncoder.encode(romaji, "UTF-8")}|${malId ?: 0}"
 
         return if (tvType == TvType.AnimeMovie) {
             newMovieLoadResponse(title, "anime/$id", tvType, data) {
@@ -290,7 +290,7 @@ class AniStreamProvider : MainAPI() {
             val eps = mutableListOf<Episode>()
             val epCount = episodes ?: nextAiringEp?.let { it + 5 } ?: 12
             // Pack title + romaji into episode data for the search scrapers.
-            val epData = "anime-ep|$id|1|EP|${java.net.URLEncoder.encode(title, "UTF-8")}|${java.net.URLEncoder.encode(romaji, "UTF-8")}"
+            val epData = "anime-ep|$id|1|EP|${java.net.URLEncoder.encode(title, "UTF-8")}|${java.net.URLEncoder.encode(romaji, "UTF-8")}|${malId ?: 0}"
             for (ep in 1..epCount) {
                 eps.add(newEpisode(epData.replace("EP", ep.toString())) {
                     this.name = "Episode $ep"; this.season = 1; this.episode = ep
@@ -317,39 +317,38 @@ class AniStreamProvider : MainAPI() {
         val anilistId = p.getOrNull(1)?.toIntOrNull() ?: return false
         if (tp != "anime" && tp != "anime-ep") return false
 
-        val epNum: Int?; val title: String; val romaji: String
+        val epNum: Int?; val title: String; val romaji: String; val malId: Int?
         when (tp) {
             "anime" -> {
-                // movie data: anime|id|title|romaji
+                // movie data: anime|id|title|romaji|malId
                 epNum = null
                 title = java.net.URLDecoder.decode(p.getOrElse(2) { "" }, "UTF-8")
                 romaji = java.net.URLDecoder.decode(p.getOrElse(3) { "" }, "UTF-8")
+                malId = p.getOrElse(4) { "0" }.toIntOrNull()?.takeIf { it > 0 }
             }
             "anime-ep" -> {
-                // episode data: anime-ep|id|season|episode|title|romaji
+                // episode data: anime-ep|id|season|episode|title|romaji|malId
                 epNum = p.getOrElse(3) { "1" }.toIntOrNull() ?: 1
                 title = java.net.URLDecoder.decode(p.getOrElse(4) { "" }, "UTF-8")
                 romaji = java.net.URLDecoder.decode(p.getOrElse(5) { "" }, "UTF-8")
+                malId = p.getOrElse(6) { "0" }.toIntOrNull()?.takeIf { it > 0 }
             }
             else -> return false
         }
         val searchTitle = title.takeIf { it.isNotBlank() } ?: romaji.takeIf { it.isNotBlank() } ?: return false
 
         // ── Dispatch every source concurrently ──
-        // 5 source groups, all parallel via runLimitedAsync:
-        //   1. Animepahe (CF-protected, uses cfGet + Pahe extractor)
-        //   2. AllAnime/MKissa (GraphQL API with persisted queries)
-        //   3. GogoAnime (search HTML → slug → episode)
-        //   4. Miruro (direct AniList ID, CF-gated)
-        //   5. TMDB-bridge (Vidlink + VidFast + Videasy 11 servers)
-        // No source is skipped based on format — movies, TV, OVA, ONA, specials
-        // all get every source tried.
+        // 4 source groups, all parallel via runLimitedAsync:
+        //   1. MALSync → Animepahe (CF-protected, uses cfGet + Pahe/Kwik extractors)
+        //   2. AllAnime/MKissa (GraphQL API with persisted queries — confirmed working)
+        //   3. TMDB-bridge (Vidlink + VidFast + Videasy 11 servers)
+        //   4. GogoAnime via MALSync (if MALSync provides a Gogo URL)
+        // GogoAnime search and Miruro removed — both are dead/CF-blocked.
         runLimitedAsync(
-            { invokeAnimepahe(searchTitle, epNum, sc, cb) },
+            { invokeAnimepaheByMal(malId, epNum, sc, cb) },
             { invokeAllanime(searchTitle, epNum, sc, cb) },
-            { invokeGogo(searchTitle, epNum, sc, cb) },
-            { invokeMiruro(anilistId, epNum, sc, cb) },
-            { invokeTmdbBridge(searchTitle, epNum, sc, cb) }
+            { invokeTmdbBridge(searchTitle, epNum, sc, cb) },
+            { invokeGogoByMal(malId, epNum, sc, cb) }
         )
         return true
     }

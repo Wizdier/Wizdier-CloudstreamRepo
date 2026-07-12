@@ -32,6 +32,9 @@ data class VidfastTrack(@param:JsonProperty("file") val file: String?, @param:Js
  * WingsDatabase / Videasy — 11 servers, all queried in parallel.
  * No server is ever skipped based on media type (movie vs tv).
  * Uses the same encryption/decryption flow as the videasy.to player.
+ *
+ * Implementation matches CineStream's invokeVideasy exactly — no extra
+ * filters or checks that could silently drop valid server responses.
  */
 suspend fun invokeVideasy(
     title: String,
@@ -50,82 +53,65 @@ suspend fun invokeVideasy(
         "Referer" to "https://player.videasy.to/"
     )
 
-    // 11 servers — matches the current videasy.to player config.
     val servers = listOf(
         "myflixerzupcloud", "downloader2", "m4uhd", "hdmovie", "cdn",
         "superflix", "lamovie", "jett", "tejo", "neon2", "ym"
     )
 
-    // Double URL-encode the title — videasy expects this.
     val encTitle = quote(quote(title))
+    val enc = 2
 
-    // Fetch the seed for this TMDB ID. Without a valid seed, decryption fails.
-    val seed = try {
-        JSONObject(app.get("$VIDEASY_API/seed?mediaId=$tmdbId", headers = headers, timeout = 10_000).text)
-            .getString("seed")
-    } catch (e: Exception) {
-        Log.w("StreamFlix", "Videasy: seed fetch failed for tmdbId=$tmdbId — ${e.message}")
-        return
-    }
+    // Fetch the seed — no try/catch, let safeAmap handle errors downstream.
+    val seedJson = app.get("$VIDEASY_API/seed?mediaId=$tmdbId", headers = headers).text
+    val seed = JSONObject(seedJson).getString("seed")
 
-    // Query all 11 servers concurrently. Each is independent; if one fails
-    // or returns no sources, the others still produce links.
     servers.safeAmap { server ->
         val url = if (season == null) {
-            "$VIDEASY_API/$server/sources-with-title?title=$encTitle&mediaType=movie&year=$year&tmdbId=$tmdbId&imdbId=$imdbId&enc=2&seed=$seed"
+            "$VIDEASY_API/$server/sources-with-title?title=$encTitle&mediaType=movie&year=$year&tmdbId=$tmdbId&imdbId=$imdbId&enc=$enc&seed=$seed"
         } else {
-            "$VIDEASY_API/$server/sources-with-title?title=$encTitle&mediaType=tv&year=$year&tmdbId=$tmdbId&episodeId=$episode&seasonId=$season&imdbId=$imdbId&enc=2&seed=$seed"
+            "$VIDEASY_API/$server/sources-with-title?title=$encTitle&mediaType=tv&year=$year&tmdbId=$tmdbId&episodeId=$episode&seasonId=$season&imdbId=$imdbId&enc=$enc&seed=$seed"
         }
 
-        val encData = try { app.get(url, headers = headers, timeout = 15_000).text }
-        catch (e: Exception) { return@safeAmap }
-        if (encData.isBlank() || encData.startsWith("{")) return@safeAmap
+        val enc_data = app.get(url, headers = headers).text
 
-        // POST the encrypted payload to enc-dec.app for decryption.
-        val resp = try {
-            app.post("$ENC_DEC_API/dec-videasy",
-                json = mapOf("text" to encData, "id" to tmdbId, "seed" to seed),
-                headers = mapOf("Content-Type" to "application/json"),
-                timeout = 20_000
-            )
-        } catch (e: Exception) { return@safeAmap }
-        if (!resp.isSuccessful) return@safeAmap
+        val jsonBody = mapOf("text" to enc_data, "id" to tmdbId, "seed" to seed)
+        val response = app.post("$ENC_DEC_API/dec-videasy", json = jsonBody)
 
-        val result = try { JSONObject(resp.text).getJSONObject("result") }
-        catch (e: Exception) { return@safeAmap }
+        if (response.isSuccessful) {
+            val result = JSONObject(response.text).getJSONObject("result")
 
-        // Emit every source URL with proper type inference + quality detection.
-        val sources = result.optJSONArray("sources") ?: return@safeAmap
-        for (i in 0 until sources.length()) {
-            val src = sources.getJSONObject(i)
-            val sourceUrl = src.optString("url").takeIf { it.isNotBlank() } ?: continue
-            val quality = src.optString("quality")
-            val type = when {
-                sourceUrl.contains(".m3u8") -> ExtractorLinkType.M3U8
-                sourceUrl.contains(".mp4") || sourceUrl.contains(".mkv") -> ExtractorLinkType.VIDEO
-                else -> INFER_TYPE
+            val sourcesArray = result.getJSONArray("sources")
+            for (i in 0 until sourcesArray.length()) {
+                val obj = sourcesArray.getJSONObject(i)
+                val quality = obj.getString("quality")
+                val source = obj.getString("url")
+
+                val type = if (source.contains(".m3u8")) ExtractorLinkType.M3U8
+                           else if (source.contains(".mp4") || source.contains(".mkv")) ExtractorLinkType.VIDEO
+                           else INFER_TYPE
+
+                callback.invoke(
+                    newExtractorLink(
+                        "Videasy[${server.capitalizeServer()}]",
+                        "Videasy[${server.capitalizeServer()}] $quality",
+                        source, type
+                    ) {
+                        this.quality = getIndexQuality(quality)
+                        this.headers = headers
+                    }
+                )
             }
-            callback.invoke(
-                newExtractorLink(
-                    "Videasy[${server.capitalizeServer()}]",
-                    "Videasy[${server.capitalizeServer()}] $quality",
-                    sourceUrl, type
-                ) {
-                    this.quality = getIndexQuality(quality)
-                    this.headers = headers
-                }
-            )
-        }
 
-        // Emit subtitles with proper language mapping.
-        val subs = result.optJSONArray("subtitles") ?: return@safeAmap
-        for (i in 0 until subs.length()) {
-            val sb = subs.getJSONObject(i)
-            val subUrl = sb.optString("url").takeIf { it.isNotBlank() } ?: continue
-            val lang = sb.optString("language").ifBlank { sb.optString("lang") }
-            subtitleCallback.invoke(
-                newSubtitleFile(getLanguage(lang) ?: lang, subUrl)
-            )
+            val subtitlesArray = result.getJSONArray("subtitles")
+            for (i in 0 until subtitlesArray.length()) {
+                val obj = subtitlesArray.getJSONObject(i)
+                val source = obj.getString("url")
+                val language = obj.getString("language")
+
+                subtitleCallback.invoke(
+                    newSubtitleFile(getLanguage(language) ?: language, source)
+                )
+            }
         }
     }
 }

@@ -86,45 +86,56 @@ fun decodeToBeParsed(encoded: String): String? = try {
 } catch (e: Exception) { null }
 
 // ═══════════════════════════════════════════════════════════════
-//  SOURCE 1: Animepahe — CF-protected, uses cfGet + Pahe extractor
+//  SOURCE 1: Animepahe via MALSync — resolves exact anime URL by MAL ID
+//  Much more reliable than title search (which matches wrong anime).
 // ═══════════════════════════════════════════════════════════════
-suspend fun invokeAnimepahe(
-    title: String, episode: Int?,
+suspend fun invokeAnimepaheByMal(
+    malId: Int?, episode: Int?,
     subtitleCallback: (SubtitleFile) -> Unit,
     callback: (ExtractorLink) -> Unit
 ) {
+    if (malId == null) return
     val headers = mapOf("User-Agent" to USER_AGENT, "Cookie" to "__ddg2_=1234567890")
-    val q = quote(title)
 
-    // Search for the anime via the JSON API.
-    val searchUrl = "$ANIMEPAHE_API/api?m=search&q=$q"
-    val searchDoc = try { cfGet(searchUrl, headers).document } catch (e: Exception) { return }
-    val animeUrl = searchDoc.selectFirst("meta[property=og:url]")?.attr("content")?.toString() ?: return
-    val animeId = animeUrl.substringAfterLast("/")
+    // Use MALSync to get the exact Animepahe URL for this MAL ID.
+    val malsyncUrl = "$MALSYNC_API/mal/anime/$malId"
+    val malsyncJson = try { app.get(malsyncUrl, headers = headers, timeout = 10_000).text }
+                       catch (e: Exception) { return }
+    val sites = try { JSONObject(malsyncJson).optJSONObject("Sites") } catch (e: Exception) { return } ?: return
+    val animepaheObj = sites.optJSONObject("animepahe") ?: return
+    val animepaheUrl = animepaheObj.keys()?.asSequence()?.firstOrNull()?.let { animepaheObj.optJSONObject(it)?.optString("url") }
+        ?: return
+    if (animepaheUrl.isBlank()) return
+
+    // Fetch the anime page to get the internal ID (from og:url meta tag).
+    val pageUrl = animepaheUrl.replace(".com", ".pw")
+    val doc = try { cfGet(pageUrl, headers).document } catch (e: Exception) { return }
+    val animeId = doc.selectFirst("meta[property=og:url]")?.attr("content")?.toString()?.substringAfterLast("/")
+        ?: return
     if (animeId.isBlank()) return
 
-    // Fetch the episode list for this anime.
+    // Fetch the episode list.
     val epData = try {
         cfGet("$ANIMEPAHE_API/api?m=release&id=$animeId&sort=episode_asc&page=1", headers)
             .parsedSafe<animepahe>()
     } catch (e: Exception) { return } ?: return
 
-    // Pick the episode session — first episode if episode==null (movie/special).
+    // Pick the episode session.
     val session = if (episode == null) epData.data.firstOrNull()?.session ?: return
                   else epData.data.firstOrNull { it.episode == episode }?.session ?: return
 
     // Fetch the play page which contains download + stream links.
-    val doc = try { cfGet("$ANIMEPAHE_API/play/$animeId/$session", headers).document }
-              catch (e: Exception) { return }
+    val playDoc = try { cfGet("$ANIMEPAHE_API/play/$animeId/$session", headers).document }
+                  catch (e: Exception) { return }
 
     runLimitedAsync(
-        { doc.select("div#pickDownload > a").safeAmap {
+        { playDoc.select("div#pickDownload > a").safeAmap {
             val href = it.attr("href").ifBlank { return@safeAmap }
             val type = if (it.attr("data-audio") == "Eng") "DUB" else "SUB"
             loadCustomExtractor("Animepahe [$type]", href, "$ANIMEPAHE_API/",
                 subtitleCallback, callback, getIndexQuality(it.text()))
         }},
-        { doc.select("div#resolutionMenu > button").safeAmap {
+        { playDoc.select("div#resolutionMenu > button").safeAmap {
             val type = if (it.attr("data-audio") == "Eng") "DUB" else "SUB"
             val quality = it.attr("data-resolution")
             val href = it.attr("data-src").ifBlank { return@safeAmap }
@@ -233,34 +244,42 @@ suspend fun invokeAllanime(
 }
 
 // ═══════════════════════════════════════════════════════════════
-//  SOURCE 3: GogoAnime — search HTML → slug → episode
+//  SOURCE 3: GogoAnime via MALSync — resolves exact anime URL by MAL ID
+//  Classic search.html is dead on all GogoAnime domains (verified 2026-07-12).
+//  MALSync provides direct GogoAnime URLs for many anime.
 // ═══════════════════════════════════════════════════════════════
-suspend fun invokeGogo(
-    title: String, episode: Int?,
+suspend fun invokeGogoByMal(
+    malId: Int?, episode: Int?,
     subtitleCallback: (SubtitleFile) -> Unit,
     callback: (ExtractorLink) -> Unit
 ) {
-    val q = quote(title)
-    val doc = try { app.get("$GOGO_API/search.html?keyword=$q",
-        headers = mapOf("User-Agent" to USER_AGENT), timeout = 10_000).document }
-        catch (e: Exception) { return }
-    val href = doc.selectFirst("ul.items li a")?.attr("href")?.takeIf { it.isNotBlank() } ?: return
-    val slug = href.substringAfterLast("/")
-    val ep = episode ?: 1
-    safeLoadExtractor("$GOGO_API/$slug-episode-$ep", "$GOGO_API/", subtitleCallback, callback)
-}
+    if (malId == null) return
+    val headers = mapOf("User-Agent" to USER_AGENT)
 
-// ═══════════════════════════════════════════════════════════════
-//  SOURCE 4: Miruro — direct AniList ID (CF-gated, loadExtractor handles)
-// ═══════════════════════════════════════════════════════════════
-suspend fun invokeMiruro(
-    anilistId: Int, episode: Int?,
-    subtitleCallback: (SubtitleFile) -> Unit,
-    callback: (ExtractorLink) -> Unit
-) {
-    val url = if (episode == null || episode <= 1) "$MIRURO_API/anime/$anilistId"
-              else "$MIRURO_API/watch/$anilistId?ep=$episode"
-    safeLoadExtractor(url, "$MIRURO_API/", subtitleCallback, callback)
+    // Use MALSync to find GogoAnime URL.
+    val malsyncUrl = "$MALSYNC_API/mal/anime/$malId"
+    val malsyncJson = try { app.get(malsyncUrl, headers = headers, timeout = 10_000).text }
+                       catch (e: Exception) { return }
+    val sites = try { JSONObject(malsyncJson).optJSONObject("Sites") } catch (e: Exception) { return } ?: return
+
+    // MALSync may list GogoAnime under "Gogoanime" or "9anime" etc.
+    // Try common keys.
+    val gogoUrl = listOf("Gogoanime", "GogoAnime", "gogoanime").firstNotNullOfOrNull { key ->
+        sites.optJSONObject(key)?.keys()?.asSequence()?.firstOrNull()?.let {
+            sites.optJSONObject(key)?.optJSONObject(it)?.optString("url")?.takeIf { url -> url.isNotBlank() }
+        }
+    } ?: return
+
+    // The MALSync URL is the category page (e.g. /category/naruto).
+    // Build the episode URL from the slug.
+    val ep = episode ?: 1
+    val slug = gogoUrl.substringAfterLast("/").substringBefore("/")
+    // Try multiple GogoAnime domains — they change frequently.
+    val domains = listOf("https://gogoanime3.co", "https://gogoanime.fi", "https://gogoanimehd.to")
+    domains.safeAmap { domain ->
+        val epUrl = "$domain/$slug-episode-$ep"
+        safeLoadExtractor(epUrl, domain, subtitleCallback, callback)
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -309,7 +328,7 @@ suspend fun invokeTmdbBridge(
     )
 }
 
-// ── Videasy / Vidlink / VidFast — same proven patterns as StreamFlix ──
+// ── Videasy — exact match of CineStream's invokeVideasy (no extra filters) ──
 suspend fun invokeVideasy(
     title: String, tmdbId: Int, imdbId: String?, year: Int?,
     season: Int?, episode: Int?,
@@ -317,59 +336,68 @@ suspend fun invokeVideasy(
     callback: (ExtractorLink) -> Unit
 ) {
     val headers = mapOf(
-        "Accept" to "*/*", "User-Agent" to USER_AGENT,
-        "Origin" to "https://player.videasy.to", "Referer" to "https://player.videasy.to/"
+        "Accept" to "*/*",
+        "User-Agent" to USER_AGENT,
+        "Origin" to "https://player.videasy.to",
+        "Referer" to "https://player.videasy.to/"
     )
-    val servers = listOf("myflixerzupcloud", "downloader2", "m4uhd", "hdmovie", "cdn",
-        "superflix", "lamovie", "jett", "tejo", "neon2", "ym")
+    val servers = listOf(
+        "myflixerzupcloud", "downloader2", "m4uhd", "hdmovie", "cdn",
+        "superflix", "lamovie", "jett", "tejo", "neon2", "ym"
+    )
     val encTitle = quote(quote(title))
+    val enc = 2
 
-    val seed = try {
-        JSONObject(app.get("$VIDEASY_API/seed?mediaId=$tmdbId", headers = headers, timeout = 10_000).text)
-            .getString("seed")
-    } catch (e: Exception) { return }
+    val seedJson = app.get("$VIDEASY_API/seed?mediaId=$tmdbId", headers = headers).text
+    val seed = JSONObject(seedJson).getString("seed")
 
     servers.safeAmap { server ->
         val url = if (season == null) {
-            "$VIDEASY_API/$server/sources-with-title?title=$encTitle&mediaType=movie&year=$year&tmdbId=$tmdbId&imdbId=$imdbId&enc=2&seed=$seed"
+            "$VIDEASY_API/$server/sources-with-title?title=$encTitle&mediaType=movie&year=$year&tmdbId=$tmdbId&imdbId=$imdbId&enc=$enc&seed=$seed"
         } else {
-            "$VIDEASY_API/$server/sources-with-title?title=$encTitle&mediaType=tv&year=$year&tmdbId=$tmdbId&episodeId=$episode&seasonId=$season&imdbId=$imdbId&enc=2&seed=$seed"
+            "$VIDEASY_API/$server/sources-with-title?title=$encTitle&mediaType=tv&year=$year&tmdbId=$tmdbId&episodeId=$episode&seasonId=$season&imdbId=$imdbId&enc=$enc&seed=$seed"
         }
-        val encData = try { app.get(url, headers = headers, timeout = 15_000).text }
-                      catch (e: Exception) { return@safeAmap }
-        if (encData.isBlank() || encData.startsWith("{")) return@safeAmap
 
-        val resp = try {
-            app.post("$ENC_DEC_API/dec-videasy", json = mapOf("text" to encData, "id" to tmdbId, "seed" to seed),
-                headers = mapOf("Content-Type" to "application/json"), timeout = 20_000)
-        } catch (e: Exception) { return@safeAmap }
-        if (!resp.isSuccessful) return@safeAmap
+        val enc_data = app.get(url, headers = headers).text
 
-        val result = try { JSONObject(resp.text).getJSONObject("result") }
-                      catch (e: Exception) { return@safeAmap }
-        val sources = result.optJSONArray("sources") ?: return@safeAmap
-        for (i in 0 until sources.length()) {
-            val src = sources.getJSONObject(i)
-            val sourceUrl = src.optString("url").takeIf { it.isNotBlank() } ?: continue
-            val quality = src.optString("quality")
-            val type = when {
-                sourceUrl.contains(".m3u8") -> ExtractorLinkType.M3U8
-                sourceUrl.contains(".mp4") || sourceUrl.contains(".mkv") -> ExtractorLinkType.VIDEO
-                else -> INFER_TYPE
+        val jsonBody = mapOf("text" to enc_data, "id" to tmdbId, "seed" to seed)
+        val response = app.post("$ENC_DEC_API/dec-videasy", json = jsonBody)
+
+        if (response.isSuccessful) {
+            val result = JSONObject(response.text).getJSONObject("result")
+
+            val sourcesArray = result.getJSONArray("sources")
+            for (i in 0 until sourcesArray.length()) {
+                val obj = sourcesArray.getJSONObject(i)
+                val quality = obj.getString("quality")
+                val source = obj.getString("url")
+
+                val type = if (source.contains(".m3u8")) ExtractorLinkType.M3U8
+                           else if (source.contains(".mp4") || source.contains(".mkv")) ExtractorLinkType.VIDEO
+                           else INFER_TYPE
+
+                callback.invoke(
+                    newExtractorLink(
+                        "Videasy[${server.capitalizeServer()}]",
+                        "Videasy[${server.capitalizeServer()}] $quality",
+                        source, type
+                    ) {
+                        this.quality = getIndexQuality(quality)
+                        this.headers = headers
+                    }
+                )
             }
-            callback.invoke(
-                newExtractorLink("Videasy[${server.capitalizeServer()}]",
-                    "Videasy[${server.capitalizeServer()}] $quality", sourceUrl, type) {
-                    this.quality = getIndexQuality(quality); this.headers = headers
-                }
-            )
-        }
-        val subs = result.optJSONArray("subtitles") ?: return@safeAmap
-        for (i in 0 until subs.length()) {
-            val sb = subs.getJSONObject(i)
-            val subUrl = sb.optString("url").takeIf { it.isNotBlank() } ?: continue
-            val lang = sb.optString("language").ifBlank { sb.optString("lang") }
-            subtitleCallback.invoke(newSubtitleFile(getLanguage(lang) ?: lang, subUrl))
+
+            val subtitlesArray = result.getJSONArray("subtitles")
+            for (i in 0 until subtitlesArray.length()) {
+                val obj = subtitlesArray.getJSONObject(i)
+                val source = obj.getString("url")
+                val language = obj.getString("language")
+
+                subtitleCallback.invoke(
+                    newSubtitleFile(getLanguage(language) ?: language, source)
+                )
+            }
         }
     }
 }
