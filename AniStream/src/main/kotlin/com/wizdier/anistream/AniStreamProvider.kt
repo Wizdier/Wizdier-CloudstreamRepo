@@ -16,13 +16,19 @@ import org.json.JSONArray
  * AniStream — AniList-powered anime catalog.
  *
  * Metadata: AniList GraphQL API (graphql.anilist.co)
- * Sources: Top streaming sites from everythingmoe.com:
- *   Anikoto, animepahe, MKissa/AllAnime, Miruro, AniZone, AniNeko,
- *   Senshi, AnimeStream, Crunchyroll, KickAssAnime, AnimeOnsen,
- *   AnimeNexus, Bilibili, AniSnatch, AnimeX
+ * Sources (concurrent, no type discrimination):
+ *   1. Miruro              — direct AniList ID
+ *   2. GogoAnime           — search by title → slug → episode
+ *   3. AnimePahe           — search by title → JSON API → episode session
+ *   4. AllAnime / MKissa   — search by title → API → embed
+ *   5. TMDB-bridge embeds  — title→TMDB lookup → vidsrc.to, vidlink.pro,
+ *                            vidfast.pro, 2embed.cc, autoembed.co,
+ *                            vidking.net, vidsrc.cc
+ *   6. WingsDatabase       — via TMDB lookup, 8 servers (Jett, Yoru, Tejo,
+ *                            Neon, Sage, Cypher, Breach, Vyse)
  *
- * Video extraction: Uses loadExtractor for the embed/API endpoints
- *   of each site plus WingsDatabase direct sources.
+ * Every source above is tried for every title — movie, TV, OVA, ONA, special.
+ * No source is skipped based on format/type.
  */
 class AniStreamProvider : MainAPI() {
     override var mainUrl = "https://anilist.co"
@@ -34,6 +40,9 @@ class AniStreamProvider : MainAPI() {
     override val hasChromecastSupport = true
 
     private val imgBase = "https://image.tmdb.org/t/p"
+    private val tmdbAPI = "https://api.themoviedb.org/3"
+    private val tmdbKey = "98ae14df2b8d8f8f8136499daf79f0e0"
+    private val UA = "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
 
     override val supportedTypes = setOf(TvType.Anime, TvType.AnimeMovie, TvType.OVA)
 
@@ -96,7 +105,7 @@ class AniStreamProvider : MainAPI() {
             this.posterUrl = image
             if (rating != null) this.score = Score.from10(rating / 10.0)
             if (year != null) this.year = year
-            addDubStatus(media.optBoolean("isLicensed", false), false)
+            addDubStatus(true, false)
         }
     }
 
@@ -206,7 +215,10 @@ class AniStreamProvider : MainAPI() {
         val media = anilistQuery(q, vars)?.optJSONObject("Media") ?: return null
 
         val titleObj = media.optJSONObject("title")
+        // Prefer English for search (most scrapers match English titles best),
+        // fall back to romaji, then native — never blank.
         val title = titleObj?.str("english") ?: titleObj?.str("romaji") ?: titleObj?.str("native") ?: "?"
+        val romaji = titleObj?.str("romaji") ?: title
         val image = media.optJSONObject("coverImage")?.str("extraLarge") ?: media.optJSONObject("coverImage")?.str("large")
         val banner = media.str("bannerImage")
         val plot = media.str("description")
@@ -217,7 +229,7 @@ class AniStreamProvider : MainAPI() {
         val episodes = media.optInt("episodes", 0).takeIf { it > 0 }
         val duration = media.optInt("duration", 0).takeIf { it > 0 }
         val malId = media.optInt("idMal", 0).takeIf { it > 0 }
-        
+        val nextAiringEp = media.optJSONObject("nextAiringEpisode")?.optInt("episode", 0)?.takeIf { it > 0 }
 
         // Genres
         val genres = media.optJSONArray("genres")?.let { a -> (0 until a.length()).mapNotNull { a.optString(it, null as String?)?.takeIf { it.isNotBlank() } ?: a.getString(it).takeIf { it.isNotBlank() } } }
@@ -262,8 +274,8 @@ class AniStreamProvider : MainAPI() {
             }
         }
 
-        // Data for loadLinks
-        val data = "anime|$id|${java.net.URLEncoder.encode(title, "UTF-8")}"
+        // Data for loadLinks — pack title + romaji for search fallback
+        val data = "anime|$id|${java.net.URLEncoder.encode(title, "UTF-8")}|${java.net.URLEncoder.encode(romaji, "UTF-8")}"
 
         return if (tvType == TvType.AnimeMovie) {
             newMovieLoadResponse(title, "anime/$id", tvType, data) {
@@ -276,16 +288,19 @@ class AniStreamProvider : MainAPI() {
                 if (trailer != null) addTrailer(trailer)
             }
         } else {
-            // Build episode placeholders based on episode count
+            // ── Build episode list from AniList's REAL episode count ──
+            // Single season (most anime sequels are separate AniList entries,
+            // not multi-season). If count is unknown, use nextAiringEpisode as
+            // a lower bound + a small buffer, else default to 12. Never split
+            // into fake seasons and never cap long-running shows.
             val eps = mutableListOf<Episode>()
-            val epCount = episodes ?: 12
-            for (s in 1..minOf(if (epCount > 100) 4 else 1, 4)) {
-                val seasonEps = if (epCount > 100) minOf(epCount / (s), 26) else epCount
-                for (ep in 1..minOf(seasonEps, 26)) {
-                    eps.add(newEpisode("anime-ep|$id|$s|$ep|${java.net.URLEncoder.encode(title, "UTF-8")}") {
-                        this.name = "Episode $ep"; this.season = s; this.episode = ep
-                    })
-                }
+            val epCount = episodes ?: nextAiringEp?.let { it + 5 } ?: 12
+            // Pack title + romaji into episode data for the search scrapers.
+            val epData = "anime-ep|$id|1|EP|${java.net.URLEncoder.encode(title, "UTF-8")}|${java.net.URLEncoder.encode(romaji, "UTF-8")}"
+            for (ep in 1..epCount) {
+                eps.add(newEpisode(epData.replace("EP", ep.toString())) {
+                    this.name = "Episode $ep"; this.season = 1; this.episode = ep
+                })
             }
             newAnimeLoadResponse(title, "anime/$id", tvType) {
                 addEpisodes(DubStatus.Subbed, eps)
@@ -300,7 +315,7 @@ class AniStreamProvider : MainAPI() {
     }
 
     // ═══════════════════════════════════════════
-    //  LOAD LINKS — Top 15 anime sites + embeds
+    //  LOAD LINKS — concurrent, no type discrimination
     // ═══════════════════════════════════════════
     private val langNames = mapOf(
         "en" to "English", "ja" to "Japanese", "ko" to "Korean", "zh" to "Chinese",
@@ -312,70 +327,238 @@ class AniStreamProvider : MainAPI() {
 
     override suspend fun loadLinks(data: String, isCasting: Boolean, sc: (SubtitleFile) -> Unit, cb: (ExtractorLink) -> Unit): Boolean {
         emittedSubs.clear()
-        val p = data.split("|"); if (p.size < 2) return false
-        val tp = p[0]; val id = p[1]; val title = java.net.URLDecoder.decode(p.getOrElse(2) { "" }, "UTF-8")
-        if (tp !in listOf("anime", "anime-ep")) return false
+        val p = data.split("|")
+        val tp = p.getOrNull(0) ?: return false
+        val id = p.getOrNull(1) ?: return false
+        if (tp != "anime" && tp != "anime-ep") return false
 
-        val (sid, eid) = if (tp == "anime-ep") { Pair(p.getOrElse(2) { "1" }, p.getOrElse(3) { "1" }) } else { Pair("1", "1") }
+        val sid: String; val eid: String; val epNum: Int; val title: String; val romaji: String
+        when (tp) {
+            "anime" -> {
+                // movie data: anime|id|title|romaji
+                sid = "1"; eid = "1"; epNum = 1
+                title = java.net.URLDecoder.decode(p.getOrElse(2) { "" }, "UTF-8")
+                romaji = java.net.URLDecoder.decode(p.getOrElse(3) { "" }, "UTF-8")
+            }
+            "anime-ep" -> {
+                // episode data: anime-ep|id|season|episode|title|romaji
+                sid = p.getOrElse(2) { "1" }
+                eid = p.getOrElse(3) { "1" }
+                epNum = eid.toIntOrNull() ?: 1
+                title = java.net.URLDecoder.decode(p.getOrElse(4) { "" }, "UTF-8")
+                romaji = java.net.URLDecoder.decode(p.getOrElse(5) { "" }, "UTF-8")
+            }
+            else -> return false
+        }
+        // If the search title is blank, fall back to romaji
+        val searchTitle = title.takeIf { it.isNotBlank() } ?: romaji.takeIf { it.isNotBlank() } ?: return false
 
-        suspend fun ld(u: String) { loadExtractor(u, mainUrl, sc, cb) }
-
-        // ── Anime-specific embed & API sources ──
-        // AnimeKai-style embeds (use AniList ID)
-        ld("https://vidsrc.to/embed/anime/$id/$sid/$eid")
-        ld("https://anikoto.vercel.app/api/anime/$id/$sid/$eid")
-
-        // General-purpose embeds that also work with anime
-        ld("https://vidlink.pro/anime/$id/$sid/$eid")
-        ld("https://www.2embed.cc/embed/anime/$id/$sid/$eid")
-        ld("https://embed.su/embed/anime/$id/$sid/$eid")
-
-        // AnimeKai scraper endpoints
-        ld("https://animekai.to/watch/$id/$sid/$eid")
-
-        // AnimePahe API
-        ld("https://animepahe.ru/api?m=search&q=${java.net.URLEncoder.encode(title, "UTF-8")}")
-
-        // Miruro embed
-        ld("https://miruro.tv/anime/$id")
-
-        // AllAnime/MKissa
-        ld("https://allanime.to/anime/$id")
-
-        // KickAssAnime
-        ld("https://kickassanime.mx/anime/$id")
-
-        // AnimeOnsen
-        ld("https://animeonsen.xyz/anime/$id")
-
-        // General vid embeds
-        ld("https://nites.is/embed/anime/$id/$sid/$eid")
-        ld("https://vidsrc.cc/v2/embed/anime/$id/$sid/$eid")
-        ld("https://player.smashy.stream/anime/$id/$sid/$eid")
-
-        // WingsDatabase direct sources
-        wdb("anime", id, sid, eid, title, "", "", cb, sc)
-
+        // ── Concurrent multi-source loading ──
+        // Every source runs in parallel; one slow or dead host can never block
+        // the others. No source is skipped based on anime format — movies, TV,
+        // OVA, ONA, specials all get every source tried.
+        coroutineScope {
+            listOf(
+                // 1. Miruro — direct AniList ID (CF-gated, loadExtractor handles via WebView)
+                async {
+                    try {
+                        val url = if (tp == "anime") "https://www.miruro.tv/anime/$id"
+                                  else "https://www.miruro.tv/watch/$id?ep=$epNum"
+                        loadExtractor(url, mainUrl, sc, cb)
+                    } catch (e: Exception) { Log.w(name, "Miruro: ${e.message}") }
+                },
+                // 2. GogoAnime — search by title → slug → episode
+                async {
+                    try { gogo(searchTitle, epNum, sc, cb) }
+                    catch (e: Exception) { Log.w(name, "Gogo: ${e.message}") }
+                },
+                // 3. AnimePahe — search via JSON API → episode session → play URL
+                async {
+                    try { pahe(searchTitle, epNum, sc, cb) }
+                    catch (e: Exception) { Log.w(name, "Pahe: ${e.message}") }
+                },
+                // 4. AllAnime / MKissa — search via API → embed URL
+                async {
+                    try { allanime(searchTitle, epNum, sc, cb) }
+                    catch (e: Exception) { Log.w(name, "MKissa: ${e.message}") }
+                },
+                // 5. TMDB-bridge: title → TMDB lookup → 7 embed hosts + WingsDatabase (8 servers)
+                async {
+                    try { tmdbEmbeds(searchTitle, epNum, sc, cb) }
+                    catch (e: Exception) { Log.w(name, "TMDB-bridge: ${e.message}") }
+                }
+            ).awaitAll()
+        }
         return true
     }
 
-    private suspend fun wdb(mt: String, id: String, s: String, e: String, t: String, y: String, imdb: String, cb: (ExtractorLink) -> Unit, sc: (SubtitleFile) -> Unit) {
+    // ═══════════════════════════════════════════
+    //  SOURCE HELPERS — each is independent & robust
+    // ═══════════════════════════════════════════
+
+    // GogoAnime — search HTML → first match's slug → episode URL → loadExtractor
+    private suspend fun gogo(title: String, ep: Int, sc: (SubtitleFile) -> Unit, cb: (ExtractorLink) -> Unit) {
+        val q = java.net.URLEncoder.encode(title, "UTF-8")
+        val doc = app.get("https://gogoanime3.co/search.html?keyword=$q",
+            headers = mapOf("User-Agent" to UA), timeout = 10_000).document
+        val href = doc.selectFirst("ul.items li a")?.attr("href")?.takeIf { it.isNotBlank() } ?: return
+        val slug = href.substringAfterLast("/")
+        loadExtractor("https://gogoanime3.co/$slug-episode-$ep", mainUrl, sc, cb)
+    }
+
+    // AnimePahe — search JSON API → resolve episode session → play URL → loadExtractor
+    private suspend fun pahe(title: String, ep: Int, sc: (SubtitleFile) -> Unit, cb: (ExtractorLink) -> Unit) {
+        val q = java.net.URLEncoder.encode(title, "UTF-8")
+        val search = JSONObject(app.get("https://animepahe.pw/api?m=search&q=$q",
+            headers = mapOf("User-Agent" to UA), timeout = 10_000).text)
+        val results = search.optJSONArray("data") ?: return
+        if (results.length() == 0) return
+        val first = results.getJSONObject(0)
+        val animeId = first.optInt("id", 0).takeIf { it > 0 } ?: return
+        val animeSession = first.optString("session").takeIf { it.isNotBlank() } ?: return
+
+        // Fetch episode list and find the requested episode number
+        val relResp = app.get("https://animepahe.pw/api?m=release&id=$animeId&sort=episode_asc&page=1",
+            headers = mapOf("User-Agent" to UA), timeout = 10_000).text
+        val eps = JSONObject(relResp).optJSONArray("data") ?: return
+        var epSession: String? = null
+        for (i in 0 until eps.length()) {
+            val e = eps.getJSONObject(i)
+            if (e.optInt("episode", 0) == ep) { epSession = e.optString("session"); break }
+        }
+        if (epSession.isNullOrBlank()) return
+        loadExtractor("https://animepahe.pw/play/$animeSession/$epSession", mainUrl, sc, cb)
+    }
+
+    // AllAnime / MKissa — search API → slug → episode URL → loadExtractor
+    private suspend fun allanime(title: String, ep: Int, sc: (SubtitleFile) -> Unit, cb: (ExtractorLink) -> Unit) {
+        val q = java.net.URLEncoder.encode(title, "UTF-8")
+        // MKissa is the current domain of AllAnime; API returns JSON search results
+        val resp = app.get("https://api.mkissa.to/api/v1/hianime/search?q=$q",
+            headers = mapOf("User-Agent" to UA, "Accept" to "application/json"), timeout = 10_000).text
+        val j = JSONObject(resp)
+        val results = j.optJSONArray("data") ?: j.optJSONArray("results") ?: return
+        if (results.length() == 0) return
+        val first = results.optJSONObject(0) ?: return
+        val slug = first.optString("slug").ifBlank { first.optString("id") }.takeIf { it.isNotBlank() } ?: return
+        loadExtractor("https://mkissa.to/watch/$slug/ep-$ep", mainUrl, sc, cb)
+    }
+
+    // TMDB title-search → (mediaType, tmdbId). Returns null if no match.
+    // Tries TV first (most anime), then movie (anime movies).
+    private suspend fun tmdbIdFor(title: String): Pair<String, Int>? {
+        val q = java.net.URLEncoder.encode(title, "UTF-8")
+        // Try TV with Japanese-language filter for better anime matching
+        try {
+            val url = "$tmdbAPI/search/tv?api_key=$tmdbKey&query=$q&with_original_language=ja"
+            val results = JSONObject(app.get(url, headers = mapOf("User-Agent" to UA), timeout = 10_000).text)
+                .optJSONArray("results")
+            if (results != null && results.length() > 0) {
+                val id = results.getJSONObject(0).optInt("id", 0)
+                if (id > 0) return "tv" to id
+            }
+        } catch (_: Exception) { }
+        // Fall back to movie
+        try {
+            val url = "$tmdbAPI/search/movie?api_key=$tmdbKey&query=$q"
+            val results = JSONObject(app.get(url, headers = mapOf("User-Agent" to UA), timeout = 10_000).text)
+                .optJSONArray("results")
+            if (results != null && results.length() > 0) {
+                val id = results.getJSONObject(0).optInt("id", 0)
+                if (id > 0) return "movie" to id
+            }
+        } catch (_: Exception) { }
+        return null
+    }
+
+    // TMDB-bridge multi-embed: search TMDB by anime title, then use the TMDB ID
+    // with every alive embed host + WingsDatabase (8 servers). If the TMDB lookup
+    // fails (obscure anime not on TMDB), this source is skipped silently — the
+    // anime-specific sources above (Miruro, Gogo, Pahe, MKissa) still work.
+    private suspend fun tmdbEmbeds(title: String, ep: Int, sc: (SubtitleFile) -> Unit, cb: (ExtractorLink) -> Unit) {
+        val (mt, tmdbId) = tmdbIdFor(title) ?: return
+        val s = "1"; val e = ep.toString()
+
+        val urls = mutableListOf<String>()
+        if (mt == "movie") {
+            urls.add("https://vidsrc.to/embed/movie/$tmdbId")
+            urls.add("https://vidlink.pro/movie/$tmdbId")
+            urls.add("https://www.2embed.cc/embed/movie?id=$tmdbId")
+            urls.add("https://vidfast.pro/movie/$tmdbId")
+            urls.add("https://autoembed.co/movie/tmdb/$tmdbId")
+            urls.add("https://www.vidking.net/embed/movie/$tmdbId")
+            urls.add("https://vidsrc.cc/v2/embed/movie/$tmdbId")
+        } else {
+            urls.add("https://vidsrc.to/embed/tv/$tmdbId/$s/$e")
+            urls.add("https://vidlink.pro/tv/$tmdbId/$s/$e")
+            urls.add("https://www.2embed.cc/embed/tv?id=$tmdbId&s=$s&e=$e")
+            urls.add("https://vidfast.pro/tv/$tmdbId/$s/$e")
+            urls.add("https://autoembed.co/tv/tmdb/$tmdbId-$s-$e")
+            urls.add("https://www.vidking.net/embed/tv/$tmdbId/$s/$e")
+            urls.add("https://vidsrc.cc/v2/embed/tv/$tmdbId/$s-$e")
+        }
+
+        coroutineScope {
+            val tasks = urls.map { url ->
+                async {
+                    try { loadExtractor(url, mainUrl, sc, cb) }
+                    catch (_: Exception) { }
+                }
+            } + async {
+                try { wdbFromTmdb(mt, tmdbId.toString(), s, e, title, "", "", cb, sc) }
+                catch (_: Exception) { }
+            }
+            tasks.awaitAll()
+        }
+    }
+
+    // WingsDatabase via TMDB ID — same 8-server extraction as StreamFlix.
+    // All 8 servers (Jett, Yoru, Tejo, Neon, Sage, Cypher, Breach, Vyse) are
+    // queried in parallel; no server is ever skipped based on media type.
+    private suspend fun wdbFromTmdb(mt: String, id: String, s: String, e: String, t: String, y: String, imdb: String, cb: (ExtractorLink) -> Unit, sc: (SubtitleFile) -> Unit) {
         val servers = listOf("jett" to "Jett", "cdn" to "Yoru", "tejo" to "Tejo", "neon2" to "Neon", "ym" to "Sage", "downloader2" to "Cypher", "m4uhd" to "Breach", "hdmovie" to "Vyse")
-        val seed: String
-        try { seed = JSONObject(app.get("https://api.wingsdatabase.com/seed?mediaId=$id", timeout = 10000, headers = mapOf("User-Agent" to "Mozilla/5.0 (Linux; Android 14)", "Accept" to "application/json", "Referer" to "https://www.vidking.net/", "Origin" to "https://www.vidking.net")).text).str("seed") ?: return } catch (_: Exception) { return }
+        val seed: String = try {
+            JSONObject(app.get("https://api.wingsdatabase.com/seed?mediaId=$id", timeout = 10000,
+                headers = mapOf("User-Agent" to UA, "Accept" to "application/json",
+                    "Referer" to "https://www.vidking.net/", "Origin" to "https://www.vidking.net")).text
+            ).str("seed") ?: return
+        } catch (_: Exception) { return }
         val et = java.net.URLEncoder.encode(java.net.URLEncoder.encode(t, "UTF-8"), "UTF-8")
-        for ((k, lb) in servers) {
-            try {
-                val q = listOf("title" to et, "mediaType" to "anime", "year" to y, "episodeId" to e, "seasonId" to s, "tmdbId" to id, "imdbId" to imdb, "enc" to "2", "seed" to seed).joinToString("&") { (kv, vv) -> "$kv=${java.net.URLEncoder.encode(vv, "UTF-8")}" }
-                val enc = app.get("https://api.wingsdatabase.com/${k}/sources-with-title?$q", timeout = 15000, headers = mapOf("User-Agent" to "Mozilla/5.0 (Linux; Android 14)", "Accept" to "application/json, text/plain, */*", "Referer" to "https://www.vidking.net/", "Origin" to "https://www.vidking.net", "Cache-Control" to "no-cache")).text
-                if (enc.isBlank() || enc.startsWith("{") || enc.length < 100) continue
-                val bd = JSONObject().apply { put("text", enc); put("id", id); put("seed", seed) }
-                val rp = JSONObject(app.post("https://enc-dec.app/api/dec-videasy", requestBody = bd.toString().toRequestBody("application/json".toMediaTypeOrNull()), timeout = 20000, headers = mapOf("Content-Type" to "application/json")).text)
-                if (rp.optInt("status", -1) != 200) continue
-                val obj = rp.optJSONObject("result") ?: continue; val srcs = obj.optJSONArray("sources") ?: continue
-                for (i in 0 until srcs.length()) { val src = srcs.getJSONObject(i); src.str("url")?.let { u -> cb(newExtractorLink("$name ($lb)", "$lb - ${src.str("quality") ?: "?"}", u) { this.quality = getQualityFromName(src.str("quality") ?: "Unknown") }) } }
-                obj.optJSONArray("subtitles")?.let { subs -> for (i in 0 until subs.length()) { val sb = subs.getJSONObject(i); sb.str("url")?.let { emSub(it, sb.str("lang"), sc) } } }
-            } catch (_: Exception) { continue }
+
+        coroutineScope {
+            servers.map { (k, lb) ->
+                async {
+                    try {
+                        val q = listOf("title" to et, "mediaType" to mt, "year" to y,
+                            "episodeId" to e, "seasonId" to s, "tmdbId" to id,
+                            "imdbId" to imdb, "enc" to "2", "seed" to seed
+                        ).joinToString("&") { (key, value) -> "$key=${java.net.URLEncoder.encode(value, "UTF-8")}" }
+                        val enc = app.get("https://api.wingsdatabase.com/$k/sources-with-title?$q", timeout = 15000,
+                            headers = mapOf("User-Agent" to UA, "Accept" to "application/json, text/plain, */*",
+                                "Referer" to "https://www.vidking.net/", "Origin" to "https://www.vidking.net",
+                                "Cache-Control" to "no-cache")).text
+                        if (enc.isBlank() || enc.startsWith("{")) return@async
+                        val bd = JSONObject().apply { put("text", enc); put("id", id); put("seed", seed) }
+                        val rp = JSONObject(app.post("https://enc-dec.app/api/dec-videasy",
+                            requestBody = bd.toString().toRequestBody("application/json".toMediaTypeOrNull()), timeout = 20000,
+                            headers = mapOf("Content-Type" to "application/json")).text)
+                        if (rp.optInt("status", -1) != 200) return@async
+                        val obj = rp.optJSONObject("result") ?: return@async
+                        val srcs = obj.optJSONArray("sources") ?: return@async
+                        for (i in 0 until srcs.length()) {
+                            val src = srcs.getJSONObject(i)
+                            src.str("url")?.let { u ->
+                                cb(newExtractorLink("$name ($lb)", "$lb - ${src.str("quality") ?: "?"}", u) {
+                                    this.quality = getQualityFromName(src.str("quality") ?: "Unknown")
+                                })
+                            }
+                        }
+                        obj.optJSONArray("subtitles")?.let { subs ->
+                            for (i in 0 until subs.length()) { val sb = subs.getJSONObject(i); sb.str("url")?.let { emSub(it, sb.str("lang"), sc) } }
+                        }
+                    } catch (_: Exception) { }
+                }
+            }.awaitAll()
         }
     }
 
