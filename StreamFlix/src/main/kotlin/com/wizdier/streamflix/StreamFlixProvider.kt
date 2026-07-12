@@ -8,8 +8,6 @@ import com.lagradost.api.Log
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
-import okhttp3.MediaType.Companion.toMediaTypeOrNull
-import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONObject
 import org.json.JSONArray
 
@@ -33,7 +31,6 @@ class StreamFlixProvider : MainAPI() {
     private val tmdbAPI = "https://api.themoviedb.org/3"
     private val tmdbKey = "98ae14df2b8d8f8f8136499daf79f0e0"
     private val imgBase = "https://image.tmdb.org/t/p"
-    private val UA = "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
 
     override val supportedTypes = setOf(
         TvType.Movie, TvType.TvSeries, TvType.Anime, TvType.AnimeMovie,
@@ -255,135 +252,37 @@ class StreamFlixProvider : MainAPI() {
         }
     }
 
-    // ═══════════════════════════════════════════
-    //  LOAD LINKS — EVERY vid source
-    // ═══════════════════════════════════════════
-    private val langNames = mapOf(
-        "en" to "English", "es" to "Spanish", "fr" to "French", "de" to "German", "it" to "Italian",
-        "pt" to "Portuguese", "ru" to "Russian", "ja" to "Japanese", "ko" to "Korean", "zh" to "Chinese",
-        "ar" to "Arabic", "hi" to "Hindi", "bn" to "Bengali", "tr" to "Turkish", "th" to "Thai",
-        "vi" to "Vietnamese", "id" to "Indonesian", "uk" to "Ukrainian", "el" to "Greek", "bg" to "Bulgarian",
-        "fa" to "Persian", "nl" to "Dutch", "sv" to "Swedish", "no" to "Norwegian", "pl" to "Polish"
-    )
-    private val emittedSubs = mutableSetOf<String>()
-
-    private fun emSub(url: String, raw: String?, sc: (SubtitleFile) -> Unit) {
-        if (url in emittedSubs) return; emittedSubs.add(url)
-        val c = raw?.trim()?.lowercase()?.substringBefore("-")?.takeIf { it.length in 2..3 } ?: "unknown"
-        sc(SubtitleFile(url, langNames[c] ?: c.uppercase()))
-    }
-
+    // ═══════════════════════════════════════════════════════════════
+    //  LOAD LINKS — every vid source, concurrent, no type discrimination
+    // ═══════════════════════════════════════════════════════════════
     override suspend fun loadLinks(data: String, isCasting: Boolean, sc: (SubtitleFile) -> Unit, cb: (ExtractorLink) -> Unit): Boolean {
-        emittedSubs.clear()
         val p = data.split("|"); if (p.size < 3) return false
         val tp = p[0]; if (tp != "movie" && tp != "tv") return false
-        val id = p[1]
-        val (sid, eid, t, y, imdb) = if (tp == "movie") {
-            listOf("1", "1", java.net.URLDecoder.decode(p.getOrElse(2) { "" }, "UTF-8"), p.getOrElse(3) { "" }, p.getOrElse(4) { "" })
-        } else {
-            listOf(p.getOrElse(2) { "1" }, p.getOrElse(3) { "1" }, java.net.URLDecoder.decode(p.getOrElse(4) { "" }, "UTF-8"), p.getOrElse(5) { "" }, p.getOrElse(6) { "" })
-        }
-        val sNum = sid.toIntOrNull() ?: 1
-        val eNum = eid.toIntOrNull() ?: 1
+        val tmdbId = p[1].toIntOrNull() ?: return false
+        val title: String; val year: Int?; val imdbId: String?; val season: Int?; val episode: Int?
 
-        // ── Build embed URL list (only ALIVE hosts, CORRECT patterns) ──
-        // Patterns verified 2026-07-12 against live hosts.
-        // Dead hosts removed: vidsrc.xyz (NXDOMAIN), vidnest.vip (NXDOMAIN),
-        //   embed.su (for-sale), nites.is (parked), smashy.stream (broken SSL).
-        val urls = mutableListOf<String>()
         if (tp == "movie") {
-            urls.add("https://vidsrc.to/embed/movie/$id")
-            urls.add("https://vidlink.pro/movie/$id")
-            urls.add("https://www.2embed.cc/embed/movie?id=$id")
-            urls.add("https://vidfast.pro/movie/$id")
-            urls.add("https://autoembed.co/movie/tmdb/$id")
-            urls.add("https://www.vidking.net/embed/movie/$id")
-            urls.add("https://vidsrc.cc/v2/embed/movie/$id")
-            if (imdb.isNotBlank()) {
-                urls.add("https://vidsrc.to/embed/movie/$imdb")
-                urls.add("https://www.2embed.cc/embed/movie?id=$imdb")
-                urls.add("https://autoembed.co/movie/imdb/$imdb")
-            }
+            title = java.net.URLDecoder.decode(p.getOrElse(2) { "" }, "UTF-8")
+            year = p.getOrElse(3) { "" }.toIntOrNull()
+            imdbId = p.getOrElse(4) { "" }.takeIf { it.isNotBlank() }
+            season = null; episode = null
         } else {
-            urls.add("https://vidsrc.to/embed/tv/$id/$sNum/$eNum")
-            urls.add("https://vidlink.pro/tv/$id/$sNum/$eNum")
-            urls.add("https://www.2embed.cc/embed/tv?id=$id&s=$sNum&e=$eNum")
-            urls.add("https://vidfast.pro/tv/$id/$sNum/$eNum")
-            urls.add("https://autoembed.co/tv/tmdb/$id-$sNum-$eNum")
-            urls.add("https://www.vidking.net/embed/tv/$id/$sNum/$eNum")
-            urls.add("https://vidsrc.cc/v2/embed/tv/$id/$sNum/$eNum")
-            if (imdb.isNotBlank()) {
-                urls.add("https://vidsrc.to/embed/tv/$imdb/$sNum/$eNum")
-                urls.add("https://www.2embed.cc/embed/tv?id=$imdb&s=$sNum&e=$eNum")
-                urls.add("https://autoembed.co/tv/imdb/$imdb-$sNum-$eNum")
-            }
+            season = p.getOrElse(2) { "1" }.toIntOrNull() ?: 1
+            episode = p.getOrElse(3) { "1" }.toIntOrNull() ?: 1
+            title = java.net.URLDecoder.decode(p.getOrElse(4) { "" }, "UTF-8")
+            year = p.getOrElse(5) { "" }.toIntOrNull()
+            imdbId = p.getOrElse(6) { "" }.takeIf { it.isNotBlank() }
         }
 
-        // ── Concurrent fetching with per-source error isolation ──
-        // Every embed + WingsDatabase (8 servers) loads in parallel; one slow
-        // or dead host can never block the others.
-        coroutineScope {
-            val tasks = urls.map { url ->
-                async {
-                    try { loadExtractor(url, mainUrl, sc, cb) }
-                    catch (e: Exception) { Log.w(name, "embed failed $url: ${e.message}") }
-                }
-            } + async {
-                try { wdb(tp, id, sid, eid, t, y, imdb, cb, sc) }
-                catch (e: Exception) { Log.w(name, "wdb failed: ${e.message}") }
-            }
-            tasks.awaitAll()
-        }
+        // ── Dispatch every source concurrently ──
+        // Vidlink + VidFast + Videasy(11 servers) + embed hosts (5+ TMDB, 3+ IMDB)
+        // All run in parallel via runLimitedAsync; each is error-isolated.
+        runLimitedAsync(
+            { invokeVideasy(title, tmdbId, imdbId, year, season, episode, sc, cb) },
+            { invokeVidlink(tmdbId, season, episode, sc, cb) },
+            { invokeVidFast(tmdbId, season, episode, sc, cb) },
+            { invokeEmbeds(tmdbId, imdbId, season, episode, sc, cb) }
+        )
         return true
-    }
-
-    // ── WingsDatabase 8-server extraction ──
-    // All 8 servers are queried in parallel; the Yoru (cdn) server is no
-    // longer skipped for TV/anime — every server is tried for every title.
-    private suspend fun wdb(mt: String, id: String, s: String, e: String, t: String, y: String, imdb: String, cb: (ExtractorLink) -> Unit, sc: (SubtitleFile) -> Unit) {
-        val servers = listOf("jett" to "Jett", "cdn" to "Yoru", "tejo" to "Tejo", "neon2" to "Neon", "ym" to "Sage", "downloader2" to "Cypher", "m4uhd" to "Breach", "hdmovie" to "Vyse")
-        val seed: String = try {
-            JSONObject(app.get("https://api.wingsdatabase.com/seed?mediaId=$id", timeout = 10000,
-                headers = mapOf("User-Agent" to UA, "Accept" to "application/json",
-                    "Referer" to "https://www.vidking.net/", "Origin" to "https://www.vidking.net")).text
-            ).str("seed") ?: return
-        } catch (_: Exception) { return }
-        val et = java.net.URLEncoder.encode(java.net.URLEncoder.encode(t, "UTF-8"), "UTF-8")
-
-        coroutineScope {
-            servers.map { (k, lb) ->
-                async {
-                    try {
-                        val q = listOf("title" to et, "mediaType" to mt, "year" to y,
-                            "episodeId" to e, "seasonId" to s, "tmdbId" to id,
-                            "imdbId" to imdb, "enc" to "2", "seed" to seed
-                        ).joinToString("&") { (key, value) -> "$key=${java.net.URLEncoder.encode(value, "UTF-8")}" }
-                        val enc = app.get("https://api.wingsdatabase.com/$k/sources-with-title?$q", timeout = 15000,
-                            headers = mapOf("User-Agent" to UA, "Accept" to "application/json, text/plain, */*",
-                                "Referer" to "https://www.vidking.net/", "Origin" to "https://www.vidking.net",
-                                "Cache-Control" to "no-cache")).text
-                        if (enc.isBlank() || enc.startsWith("{")) return@async
-                        val bd = JSONObject().apply { put("text", enc); put("id", id); put("seed", seed) }
-                        val rp = JSONObject(app.post("https://enc-dec.app/api/dec-videasy",
-                            requestBody = bd.toString().toRequestBody("application/json".toMediaTypeOrNull()), timeout = 20000,
-                            headers = mapOf("Content-Type" to "application/json")).text)
-                        if (rp.optInt("status", -1) != 200) return@async
-                        val obj = rp.optJSONObject("result") ?: return@async
-                        val srcs = obj.optJSONArray("sources") ?: return@async
-                        for (i in 0 until srcs.length()) {
-                            val src = srcs.getJSONObject(i)
-                            src.str("url")?.let { u ->
-                                cb(newExtractorLink("$name ($lb)", "$lb - ${src.str("quality") ?: "?"}", u) {
-                                    this.quality = getQualityFromName(src.str("quality") ?: "Unknown")
-                                })
-                            }
-                        }
-                        obj.optJSONArray("subtitles")?.let { subs ->
-                            for (i in 0 until subs.length()) { val sb = subs.getJSONObject(i); sb.str("url")?.let { emSub(it, sb.str("lang"), sc) } }
-                        }
-                    } catch (_: Exception) { }
-                }
-            }.awaitAll()
-        }
     }
 }
