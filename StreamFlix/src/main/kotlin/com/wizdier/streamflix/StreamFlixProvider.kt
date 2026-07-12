@@ -333,7 +333,7 @@ class StreamFlixProvider : MainAPI() {
             if (k == "cdn" && mt != "movie") continue
             try {
                 val q = listOf("title" to et, "mediaType" to mt, "year" to y, "episodeId" to e, "seasonId" to s, "tmdbId" to id, "imdbId" to imdb, "enc" to "2", "seed" to seed)
-                    .joinToString("&") { (kv, _) -> "$kv=${java.net.URLEncoder.encode(_, "UTF-8")}" }
+                    .joinToString("&") { (key, value) -> "$key=${java.net.URLEncoder.encode(value, "UTF-8")}" }
                 val enc = app.get("https://api.wingsdatabase.com/${k}/sources-with-title?$q", timeout = 15000,
                     headers = mapOf("User-Agent" to "Mozilla/5.0 (Linux; Android 14)", "Accept" to "application/json, text/plain, */*", "Referer" to "https://www.vidking.net/", "Origin" to "https://www.vidking.net", "Cache-Control" to "no-cache")).text
                 if (enc.isBlank() || enc.startsWith("{") || enc.length < 100) continue
