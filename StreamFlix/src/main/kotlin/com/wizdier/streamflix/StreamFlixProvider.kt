@@ -283,7 +283,7 @@ class StreamFlixProvider : MainAPI() {
             listOf(p.getOrElse(2) { "1" }, p.getOrElse(3) { "1" }, java.net.URLDecoder.decode(p.getOrElse(4) { "" }, "UTF-8"), p.getOrElse(5) { "" }, p.getOrElse(6) { "" })
         }
 
-        fun ld(u: String) { loadExtractor(u, mainUrl, sc, cb) }
+        suspend fun ld(u: String) { loadExtractor(u, mainUrl, sc, cb) }
 
         // ── ALL embed sources (13 total for movies, 14 for TV) — every vid source ──
         if (tp == "movie") {

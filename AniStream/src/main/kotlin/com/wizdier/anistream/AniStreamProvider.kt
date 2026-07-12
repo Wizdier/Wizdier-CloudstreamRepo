@@ -217,10 +217,10 @@ class AniStreamProvider : MainAPI() {
         val episodes = media.optInt("episodes", 0).takeIf { it > 0 }
         val duration = media.optInt("duration", 0).takeIf { it > 0 }
         val malId = media.optInt("idMal", 0).takeIf { it > 0 }
-        val status = media.str("status")
+        
 
         // Genres
-        val genres = media.optJSONArray("genres")?.let { a -> (0 until a.length()).mapNotNull { a.optString(it) } }
+        val genres = media.optJSONArray("genres")?.let { a -> (0 until a.length()).mapNotNull { a.optString(it, null as String?)?.takeIf { it.isNotBlank() } ?: a.getString(it).takeIf { it.isNotBlank() } } }
 
         // Studios
         val studios = media.optJSONObject("studios")?.optJSONArray("nodes")?.let { a ->
