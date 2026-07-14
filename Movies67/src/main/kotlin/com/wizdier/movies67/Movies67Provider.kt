@@ -8,6 +8,8 @@ import com.lagradost.api.Log
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
+import okhttp3.MediaType.Companion.toMediaTypeOrNull
+import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONObject
 import org.json.JSONArray
 
@@ -158,46 +160,95 @@ class Movies67Provider : MainAPI() {
         }
     }
 
-    // ── LOAD LINKS ──
-    private val langNames = mapOf("en" to "English", "es" to "Spanish", "fr" to "French", "de" to "German", "it" to "Italian",
-        "pt" to "Portuguese", "ru" to "Russian", "ja" to "Japanese", "ko" to "Korean", "zh" to "Chinese", "ar" to "Arabic",
-        "hi" to "Hindi", "tr" to "Turkish", "th" to "Thai", "vi" to "Vietnamese", "id" to "Indonesian", "nl" to "Dutch",
-        "sv" to "Swedish", "no" to "Norwegian", "pl" to "Polish", "bg" to "Bulgarian", "el" to "Greek", "fa" to "Persian")
-    private val emittedSubs = mutableSetOf<String>()
+    // ── LOAD LINKS (WingsDatabase direct + embed fallbacks) ──
+    private val subsSeen = mutableSetOf<String>()
 
     override suspend fun loadLinks(data: String, isCasting: Boolean, sc: (SubtitleFile) -> Unit, cb: (ExtractorLink) -> Unit): Boolean {
-        emittedSubs.clear()
-        val p = data.split("|"); if (p.size < 3) return false
-        val tp = p[0]; if (tp !in listOf("movie", "tv")) return false
+        subsSeen.clear()
+        val p = data.split("|")
+        if (p.size < 3) return false
+        val tp = p[0]
+        if (tp !in listOf("movie", "tv")) return false
         val id = p[1]
-        val (sid, eid, t, y, imdb) = if (tp == "movie") {
-            listOf("1", "1", java.net.URLDecoder.decode(p.getOrElse(2) { "" }, "UTF-8"), p.getOrElse(3) { "" }, p.getOrElse(4) { "" })
+        val t = java.net.URLDecoder.decode(if (tp == "movie") p.getOrElse(2) { "" } else p.getOrElse(4) { "" }, "UTF-8")
+        val y = if (tp == "movie") p.getOrElse(3) { "" } else p.getOrElse(5) { "" }
+        val imdb = if (tp == "movie") p.getOrElse(4) { "" } else p.getOrElse(6) { "" }
+        val sid = if (tp == "tv") p.getOrElse(2) { "1" } else "1"
+        val eid = if (tp == "tv") p.getOrElse(3) { "1" } else "1"
+        val mt = tp // "movie" or "tv"
+
+        // Layer 1: WingsDatabase 8-server direct sources (verified working)
+        fetchWingsDb(mt, id, sid, eid, t, y, imdb, cb, sc)
+
+        // Layer 2: Cloudstream extractors on popular embed providers
+        if (mt == "movie") {
+            loadExtractor("https://vidsrc.to/embed/movie/$id", mainUrl, sc, cb)
+            loadExtractor("https://vidsrc.cc/v2/embed/movie/$id", mainUrl, sc, cb)
+            loadExtractor("https://embed.su/embed/movie/$id", mainUrl, sc, cb)
         } else {
-            listOf(p.getOrElse(2) { "1" }, p.getOrElse(3) { "1" }, java.net.URLDecoder.decode(p.getOrElse(4) { "" }, "UTF-8"), p.getOrElse(5) { "" }, p.getOrElse(6) { "" })
-        }
-
-        suspend fun ld(u: String) { loadExtractor(u, mainUrl, sc, cb) }
-
-        // Primary: VidLove.cc (the site's actual player)
-        if (tp == "movie") ld("https://player.vidlove.cc/embed/movie/$id") else ld("https://player.vidlove.cc/embed/tv/$id/$sid/$eid")
-
-        // Fallback embed sources
-        if (tp == "movie") {
-            ld("https://vidsrc.to/embed/movie/$id"); ld("https://vidlink.pro/movie/$id")
-            ld("https://nites.is/embed/movie/$id"); ld("https://www.2embed.cc/embed/movie/$id")
-            ld("https://embed.su/embed/movie/$id"); ld("https://vidsrc.cc/v2/embed/movie/$id")
-        } else {
-            ld("https://vidsrc.to/embed/tv/$id/$sid/$eid"); ld("https://vidlink.pro/tv/$id/$sid/$eid")
-            ld("https://nites.is/embed/tv/$id/$sid/$eid"); ld("https://www.2embed.cc/embed/tv/$id/$sid/$eid")
-            ld("https://embed.su/embed/tv/$id/$sid/$eid"); ld("https://vidsrc.cc/v2/embed/tv/$id/$sid/$eid")
+            loadExtractor("https://vidsrc.to/embed/tv/$id/$sid/$eid", mainUrl, sc, cb)
+            loadExtractor("https://vidsrc.cc/v2/embed/tv/$id/$sid/$eid", mainUrl, sc, cb)
+            loadExtractor("https://embed.su/embed/tv/$id/$sid/$eid", mainUrl, sc, cb)
         }
 
         return true
     }
 
-    private fun emSub(url: String, raw: String?, sc: (SubtitleFile) -> Unit) {
-        if (url in emittedSubs) return; emittedSubs.add(url)
-        val c = raw?.trim()?.lowercase()?.substringBefore("-")?.takeIf { it.length in 2..3 } ?: "unknown"
-        sc(SubtitleFile(url, langNames[c] ?: c.uppercase()))
+    // ── WingsDatabase 8-server direct source extraction ──
+    private suspend fun fetchWingsDb(
+        mt: String, id: String, s: String, e: String,
+        title: String, year: String, imdb: String,
+        cb: (ExtractorLink) -> Unit, sc: (SubtitleFile) -> Unit
+    ) {
+        val servers = listOf("jett" to "Jett", "cdn" to "Yoru", "tejo" to "Tejo", "neon2" to "Neon",
+            "ym" to "Sage", "downloader2" to "Cypher", "m4uhd" to "Breach", "hdmovie" to "Vyse")
+        val seed: String
+        try {
+            seed = JSONObject(app.get("https://api.wingsdatabase.com/seed?mediaId=$id", timeout = 10000,
+                headers = mapOf("User-Agent" to "Mozilla/5.0 (Linux; Android 14)", "Accept" to "application/json",
+                    "Referer" to "https://www.vidking.net/", "Origin" to "https://www.vidking.net")).text
+            ).str("seed") ?: return
+        } catch (_: Exception) { return }
+
+        val encTitle = java.net.URLEncoder.encode(java.net.URLEncoder.encode(title, "UTF-8"), "UTF-8")
+        for ((key, label) in servers) {
+            if (key == "cdn" && mt != "movie") continue
+            try {
+                val qs = listOf("title" to encTitle, "mediaType" to mt, "year" to year,
+                    "episodeId" to e, "seasonId" to s, "tmdbId" to id, "imdbId" to imdb,
+                    "enc" to "2", "seed" to seed
+                ).joinToString("&") { (kv, vv) -> "$kv=${java.net.URLEncoder.encode(vv, "UTF-8")}" }
+                val enc = app.get("https://api.wingsdatabase.com/${key}/sources-with-title?$qs", timeout = 15000,
+                    headers = mapOf("User-Agent" to "Mozilla/5.0 (Linux; Android 14)",
+                        "Accept" to "application/json, text/plain, */*",
+                        "Referer" to "https://www.vidking.net/", "Origin" to "https://www.vidking.net",
+                        "Cache-Control" to "no-cache")).text
+                if (enc.isBlank() || enc.startsWith("{") || enc.length < 100) continue
+                val body = JSONObject().apply { put("text", enc); put("id", id); put("seed", seed) }
+                val rp = JSONObject(app.post("https://enc-dec.app/api/dec-videasy",
+                    requestBody = body.toString().toRequestBody("application/json".toMediaTypeOrNull()),
+                    timeout = 20000, headers = mapOf("Content-Type" to "application/json")).text)
+                if (rp.optInt("status", -1) != 200) continue
+                val obj = rp.optJSONObject("result") ?: continue
+                obj.optJSONArray("sources")?.let { srcs ->
+                    for (i in 0 until srcs.length()) {
+                        val src = srcs.getJSONObject(i)
+                        src.str("url")?.let { u ->
+                            cb(newExtractorLink("$name ($label)", "$label - ${src.str("quality") ?: "?"}", u) {
+                                this.quality = getQualityFromName(src.str("quality") ?: "Unknown")
+                            })
+                        }
+                    }
+                }
+                obj.optJSONArray("subtitles")?.let { subs ->
+                    for (i in 0 until subs.length()) {
+                        val sb = subs.getJSONObject(i)
+                        val su = sb.str("url") ?: continue
+                        val lang = sb.str("lang") ?: "unknown"
+                        if (su !in subsSeen) { subsSeen.add(su); sc(SubtitleFile(su, lang)) }
+                    }
+                }
+            } catch (_: Exception) { continue }
+        }
     }
 }
