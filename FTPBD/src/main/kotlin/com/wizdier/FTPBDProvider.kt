@@ -120,7 +120,7 @@ class FTPBD : MainAPI() {
     override val supportedTypes = setOf(TvType.Movie, TvType.TvSeries, TvType.AnimeMovie)
 
     private val headers = mapOf("User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36","Referer" to "$mainUrl/")
-    private val cache = FTPBDCore.TtlCache<String, List<SearchResponse>>(ttlMs=60*1000L)
+    private val cache = FTPBDCore.TtlCache<String, List<SearchResponse>>(ttl=60*1000L)
 
     override val mainPage = mainPageOf(
         "movie" to "Latest Movies",

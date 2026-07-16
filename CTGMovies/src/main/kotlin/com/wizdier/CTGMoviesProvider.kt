@@ -165,7 +165,7 @@ class CTGMovies(private val prefs: SharedPreferences? = null) : MainAPI() {
         CTGCore.retry{ app.get(url, headers=headers, timeout=12_000).text }?.let{return it}
         // fallback remote
         val remote=CTGCore.retry{ app.get("https://raw.githubusercontent.com/SaurabhKaperwan/Utils/refs/heads/main/urls.json", timeout=8000).text }?.let{ runCatching{ JSONObject(it) }.getOrNull() }
-        remote?.optString("ctgmovies","").takeIf{s->s.isNotBlank()}?.let{ fb->
+        remote?.optString("ctgmovies","")?.takeIf{s->s.isNotBlank()}?.let{ fb->
             val fbUrl="$fb$path${if(qs.isNotBlank()) "?$qs" else ""}"
             CTGCore.retry{ app.get(fbUrl, headers=headers, timeout=12_000).text }?.let{return it}
         }
@@ -278,11 +278,15 @@ class CTGMovies(private val prefs: SharedPreferences? = null) : MainAPI() {
         val title=obj.optString("title","Unknown")
         val meta=CTGCore.retry{ WizEnrichCTG.enrich(title, null, true) }
         val epsArr=obj.optJSONArray("episodes") ?: JSONArray()
-        val episodes=(0 until epsArr.length()).mapNotNull{ i->
+        val episodesRaw=(0 until epsArr.length()).mapNotNull{ i->
             val eObj=epsArr.optJSONObject(i) ?: return@mapNotNull null
             val links=extractLinks(eObj); val data=linksToData(links, meta)
             newEpisode(data){ name=eObj.optString("title","Episode ${i+1}"); season=1; episode=eObj.optInt("episode_number",i+1) }
-        }.ifEmpty{ listOf(newEpisode(linksToData(extractLinks(obj), meta)){ name=title; season=1; episode=1 }) }
+        }
+        val episodes=if(episodesRaw.isEmpty()){
+            val fallbackData=linksToData(extractLinks(obj), meta)
+            listOf(newEpisode(fallbackData){ name=title; season=1; episode=1 })
+        } else episodesRaw
         return newAnimeLoadResponse(meta?.optString("title")?.takeIf{it.isNotBlank()} ?: title, url, TvType.Anime, episodes){
             posterUrl=meta?.optString("poster") ?: meta?.optString("poster_path")?.let{"https://image.tmdb.org/t/p/w500$it"} ?: obj.optString("poster").takeIf{it.isNotBlank()}
             plot=meta?.optString("overview") ?: obj.optString("description")

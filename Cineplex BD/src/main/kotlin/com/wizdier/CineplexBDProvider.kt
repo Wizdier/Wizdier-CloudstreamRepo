@@ -275,12 +275,15 @@ class CineplexBD : MainAPI() {
         return newHomePageResponse(HomePageList(request.name, items), hasNext)
     }
 
+    private fun encodeQuery(s:String): String = URLEncoder.encode(s, "UTF-8")
+
     override suspend fun search(query:String): List<SearchResponse>{
         if(query.isBlank()) return emptyList()
         return coroutineScope{
             val q=query.trim()
-            val a=async{ runCatching{ searchOne("$mainUrl/search.php?q=${q.encodeUrl()}&page=1") }.getOrDefault(emptyList()) }
-            val b=async{ runCatching{ searchOne("$mainUrl/search.php?q=${q.encodeUrl()}&year[]=2025&page=1") }.getOrDefault(emptyList()) }
+            val enc=encodeQuery(q)
+            val a=async{ runCatching{ searchOne("$mainUrl/search.php?q=$enc&page=1") }.getOrDefault(emptyList()) }
+            val b=async{ runCatching{ searchOne("$mainUrl/search.php?q=$enc&year[]=2025&page=1") }.getOrDefault(emptyList()) }
             (a.await()+b.await()).distinctBy{it.url}
         }
     }
