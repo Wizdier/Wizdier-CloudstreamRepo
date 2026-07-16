@@ -1,482 +1,848 @@
 package com.wizdier
 
+import android.util.Log
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.LoadResponse.Companion.addAniListId
-import com.lagradost.cloudstream3.LoadResponse.Companion.addMalId
 import com.lagradost.cloudstream3.LoadResponse.Companion.addImdbId
-import com.lagradost.api.Log
+import com.lagradost.cloudstream3.LoadResponse.Companion.addKitsuId
+import com.lagradost.cloudstream3.LoadResponse.Companion.addMalId
+import com.lagradost.cloudstream3.LoadResponse.Companion.addSimklId
+import com.lagradost.cloudstream3.LoadResponse.Companion.addTrailer
+import com.lagradost.cloudstream3.Score
+import com.lagradost.cloudstream3.syncproviders.SyncIdName
 import com.lagradost.cloudstream3.utils.*
 import kotlinx.coroutines.*
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
+import okhttp3.MediaType.Companion.toMediaTypeOrNull
+import okhttp3.RequestBody.Companion.toRequestBody
+import org.json.JSONArray
 import org.json.JSONObject
+import java.net.URLEncoder
+import java.util.Collections
+import java.util.concurrent.ConcurrentHashMap
 
 /**
- * Wizstream-Anime — AniList-based Multi-Catalogue Provider
+ * WizstreamAnimeProvider — AniList catalog + multi-source resolver.
  *
- * Features:
- * • AniList (GraphQL) metadata for anime, movies, OVA, series
- * • Concurrent multi-source fetching from the user's 4 repo extensions
- * • Direct vid-source fallback extractors
- * • Robust caching, efficient concurrent loading, graceful degradation
+ * Catalogue:
+ *   • AniList GraphQL (Trending / Popular this season / Top rated / Upcoming
+ *     / All-time popular).
+ *   • Resolves TMDB/IMDb IDs through ani.zip so vid-src-family embeds that
+ *     prefer IMDB/TMDB IDs still get hit.
+ *
+ * Source resolution (same vid-host pool as WizstreamProvider, plus a few
+ * anime-specific mirrors):
+ *   • All VidSrc-family movie/tv embeds.
+ *   • 2embed / superembed / multiembed / gomo / databasegdrive / smashystream.
+ *   • Built-in Cloudstream `loadExtractor` fallbacks for every iframe URL so
+ *     Cloudstream's native extractors (VidPlay, FileMoon, RabbitStream, …)
+ *     also get a shot.
  */
 class WizstreamAnimeProvider : MainAPI() {
-    override var mainUrl = "https://graphql.anilist.co"
+
+    override var mainUrl = "https://anilist.co"
     override var name = "Wizstream-Anime"
     override var lang = "en"
     override val hasMainPage = true
-    override val hasDownloadSupport = true
     override val hasQuickSearch = true
+    override val hasDownloadSupport = true
     override val hasChromecastSupport = true
-
     override val supportedTypes = setOf(
         TvType.Anime,
         TvType.AnimeMovie,
         TvType.OVA,
         TvType.Cartoon,
-        TvType.AsianDrama
+        TvType.AsianDrama,
     )
-
     override val supportedSyncNames = setOfNotNull(
         SyncIdName.Anilist,
-        runCatching { SyncIdName.valueOf("MyAnimeList") }.getOrNull(),
+        SyncIdName.MyAnimeList,
         runCatching { SyncIdName.valueOf("Kitsu") }.getOrNull(),
-        runCatching { SyncIdName.valueOf("Simkl") }.getOrNull()
+        runCatching { SyncIdName.valueOf("Simkl") }.getOrNull(),
+        runCatching { SyncIdName.valueOf("Imdb") }.getOrNull(),
     )
+
+    companion object {
+        private const val TAG = "WizstreamAnime"
+        private const val ANILIST = "https://graphql.anilist.co"
+        private const val TMDB_API = "https://api.themoviedb.org/3"
+        private const val TMDB_KEY = "98ae14df2b8d8f8f8136499daf79f0e0"
+        private const val IMG = "https://image.tmdb.org/t/p"
+        private const val UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+
+        private val META_CACHE = ConcurrentHashMap<Int, Pair<Long, AniDetail>>()
+        private const val CACHE_TTL_MS = 10 * 60 * 1000L
+
+        private data class VidHost(
+            val label: String,
+            val movie: (String) -> String,
+            val tv: (String, Int, Int) -> String,
+        )
+
+        // Mirror pool. Any host that goes down is silently skipped.
+        private val VID_HOSTS: List<VidHost> = listOf(
+            VidHost("VidSrc",
+                { id -> "https://vidsrc.icu/embed/movie/$id" },
+                { id, s, e -> "https://vidsrc.icu/embed/tv/$id/$s/$e" }),
+            VidHost("VidSrc.to",
+                { id -> "https://vidsrc.to/embed/movie/$id" },
+                { id, s, e -> "https://vidsrc.to/embed/tv/$id/$s/$e" }),
+            VidHost("VidSrc.me",
+                { id -> "https://vidsrc.me/embed/movie?imdb=$id" },
+                { id, s, e -> "https://vidsrc.me/embed/tv?imdb=$id&season=$s&episode=$e" }),
+            VidHost("VidSrc.ru",
+                { id -> "https://vidsrc.xyz/embed/movie/$id" },
+                { id, s, e -> "https://vidsrc.xyz/embed/tv/$id/$s-$e" }),
+            VidHost("VidBinge",
+                { id -> "https://vidbinge.com/e/$id" },
+                { id, s, e -> "https://vidbinge.com/e/$id?s=$s&e=$e" }),
+            VidHost("VidJoy",
+                { id -> "https://vidjoy.to/embed/movie/$id" },
+                { id, s, e -> "https://vidjoy.to/embed/tv/$id/$s/$e" }),
+            VidHost("VidSrc.mov",
+                { id -> "https://vidsrc.mov/embed/movie/$id" },
+                { id, s, e -> "https://vidsrc.mov/embed/tv/$id/$s/$e" }),
+            VidHost("2Embed",
+                { id -> "https://www.2embed.cc/embed/$id" },
+                { id, s, e -> "https://www.2embed.cc/embedtv/$id&s=$s&e=$e" }),
+            VidHost("MultiEmbed",
+                { id -> "https://multiembed.mov/?video_id=$id&tmdb=1" },
+                { id, s, e -> "https://multiembed.mov/?video_id=$id&tmdb=1&s=$s&e=$e" }),
+            VidHost("SuperEmbed",
+                { id -> "https://getsuperembed.link/?video_id=$id" },
+                { id, s, e -> "https://getsuperembed.link/?video_id=$id&season=$s&episode=$e" }),
+            VidHost("Gomo",
+                { id -> "https://gomo.to/movie/$id" },
+                { id, s, e -> "https://gomo.to/tv/$id/$s/$e" }),
+            VidHost("DatabaseGdrive",
+                { id -> "https://databasegdriveplayer.co/player.php?imdb=$id" },
+                { id, s, e -> "https://databasegdriveplayer.co/player.php?type=series&imdb=$id&season=$s&episode=$e" }),
+            VidHost("SmashyStream",
+                { id -> "https://embed.smashystream.com/playere.php?imdb=$id" },
+                { id, s, e -> "https://embed.smashystream.com/playere.php?imdb=$id&season=$s&episode=$e" }),
+            VidHost("VidAPI",
+                { id -> "https://vidapi.ru/embed/movie/$id" },
+                { id, s, e -> "https://vidapi.ru/embed/tv/$id/$s/$e" }),
+            VidHost("VAPlayer",
+                { id -> "https://vaplayer.ru/embed/movie/$id" },
+                { id, s, e -> "https://vaplayer.ru/embed/tv/$id/$s/$e" }),
+            VidHost("ApiPlayer",
+                { id -> "https://apiplayer.ru/embed/movie/$id" },
+                { id, s, e -> "https://apiplayer.ru/embed/tv/$id/$s/$e" }),
+            VidHost("111Movies",
+                { id -> "https://111movies.com/movie/$id" },
+                { id, s, e -> "https://111movies.com/tv/$id/$s/$e" }),
+            VidHost("Remotestream",
+                { id -> "https://remotestre.am/movie/$id" },
+                { id, s, e -> "https://remotestre.am/tv/$id/$s/$e" }),
+            VidHost("AutoEmbe",
+                { id -> "https://autoembe.xyz/embed/movie?imdb=$id" },
+                { id, s, e -> "https://autoembe.xyz/embed/tv?imdb=$id&sea=$s&epi=$e" }),
+            // Anime-specific mirrors (accept AniList IDs directly when no IMDB/TMDB).
+            VidHost("AllManga",
+                { id -> "https://allmanga.to/manga/$id" },
+                { id, _, e -> "https://allmanga.to/streaming/anicdn.php?anime_id=$id&ep=$e" }),
+            VidHost("AnimeStream",
+                { id -> "https://anicdn.stream/anime/$id" },
+                { id, _, e -> "https://anicdn.stream/episode/$id-$e" }),
+            VidHost("ZoroAnime",
+                { id -> "https://hianime.to/search?keyword=$id" },
+                { id, _, e -> "https://hianime.to/ajax/v2/episode/sources?id=$id&ep=$e" }),
+        )
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  Main pages — AniList GraphQL queries
+    // ═══════════════════════════════════════════════════════════════════════
 
     override val mainPage = mainPageOf(
         "trending" to "Trending Anime",
-        "seasonal" to "This Season",
-        "popular" to "Popular",
-        "upcoming" to "Upcoming",
-        "completed" to "Completed Series"
+        "popular" to "Popular This Season",
+        "top" to "Top Rated Anime",
+        "upcoming" to "Upcoming (Next Season)",
+        "alltime" to "All-Time Popular",
     )
 
-    private val sourceExtensions = listOf(
-        "Cineplex BD",
-        "Circle FTP",
-        "CTGMovies",
-        "FTPBD"
-    )
+    override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
+        val perPage = 30
+        val (sort, season, seasonYear, status) = when (request.data) {
+            "trending" -> listOf("TRENDING_DESC") to null
+            "popular" -> listOf("POPULARITY_DESC") to currentSeasonFilter()
+            "top" -> listOf("SCORE_DESC") to null
+            "upcoming" -> listOf("POPULARITY_DESC") to nextSeasonFilter()
+            "alltime" -> listOf("POPULARITY_DESC") to null
+            else -> listOf("TRENDING_DESC") to null
+        }
+        val sortArr = JSONArray(sort.first)
+        val variables = JSONObject().apply {
+            put("page", page); put("perPage", perPage); put("sort", sortArr)
+            put("type", "ANIME")
+            season?.let { put("season", it); put("seasonYear", seasonYear) }
+            if (request.data == "upcoming") put("status", "NOT_YET_RELEASED")
+        }
+        val query = """
+            query (${'$'}page: Int, ${'$'}perPage: Int, ${'$'}sort: [MediaSort], ${'$'}season: MediaSeason, ${'$'}seasonYear: Int, ${'$'}status: MediaStatus, ${'$'}type: MediaType) {
+              Page(page: ${'$'}page, perPage: ${'$'}perPage) {
+                pageInfo { hasNextPage total }
+                media(sort: ${'$'}sort, season: ${'$'}season, seasonYear: ${'$'}seasonYear, status: ${'$'}status, type: ${'$'}type, isAdult: false) {
+                  id idMal title { romaji english native }
+                  coverImage { extraLarge large }
+                  bannerImage
+                  episodes format season seasonYear
+                  averageScore
+                  genres
+                  startDate { year }
+                  status
+                }
+              }
+            }
+        """.trimIndent()
+        val resp = anilistQuery(query, variables)
+        val media = resp?.optJSONObject("Page")?.optJSONArray("media") ?: JSONArray()
+        val hasNext = resp?.optJSONObject("Page")?.optJSONObject("pageInfo")?.optBoolean("hasNextPage") == true
+        val items = (0 until media.length()).mapNotNull { i ->
+            val m = media.optJSONObject(i) ?: return@mapNotNull null
+            mediaToSearch(m)
+        }
+        return newHomePageResponse(HomePageList(request.name, items, isHorizontalImages = false), hasNext)
+    }
 
-    // Vid-source fallback patterns (same as Wizstream for consistency)
-    private val vidDomains = listOf(
-        "vidsrc", "vidnest", "vidplay", "vidup", "vidrock", "vidfast", "videasy"
-    )
+    // ═══════════════════════════════════════════════════════════════════════
+    //  Search
+    // ═══════════════════════════════════════════════════════════════════════
+
+    override suspend fun quickSearch(query: String): List<SearchResponse> = search(query)
 
     override suspend fun search(query: String): List<SearchResponse> {
-        return try {
-            val results = mutableListOf<SearchResponse>()
-
-            // 1. Concurrent extension search
-            val extResults = coroutineScope {
-                sourceExtensions.map { extName ->
-                    async(Dispatchers.IO) {
-                        try {
-                            loadExtractor(
-                                "https://raw.githubusercontent.com/Wizdier/Wizdier-CloudstreamRepo/builds/repo.json"
-                            )?.search(query)?.mapNotNull {
-                                it.copy(url = "${it.url}|anime_source:$extName")
-                            } ?: emptyList()
-                        } catch (e: Exception) {
-                            Log.d("WizstreamAnime/search", "Ext $extName failed: ${e.message}")
-                            emptyList()
-                        }
-                    }
-                }.awaitAll()
+        val q = query.trim()
+        if (q.isBlank()) return emptyList()
+        val variables = JSONObject().apply {
+            put("page", 1); put("perPage", 30); put("search", q); put("type", "ANIME")
+        }
+        val gql = """
+            query (${'$'}page: Int, ${'$'}perPage: Int, ${'$'}search: String, ${'$'}type: MediaType) {
+              Page(page: ${'$'}page, perPage: ${'$'}perPage) {
+                media(search: ${'$'}search, type: ${'$'}type, isAdult: false) {
+                  id idMal title { romaji english native }
+                  coverImage { extraLarge large }
+                  bannerImage episodes format averageScore
+                  genres startDate { year } status
+                }
+              }
             }
-
-            extResults.flatten().groupBy { it.name }.map { (_, items) ->
-                items.sortedByDescending { it.quality }.first()
-            }.let { results.addAll(it) }
-
-            // 2. AniList direct search fallback
-            if (results.isEmpty() || results.size < 5) {
-                val anilistResults = fetchAniListSearch(query)
-                results.addAll(anilistResults)
-            }
-
-            results.sortedByDescending { it.quality ?: 0 }.take(30)
-        } catch (e: Exception) {
-            Log.d("WizstreamAnime/search", "Search error: ${e.message}")
-            emptyList()
+        """.trimIndent()
+        val resp = anilistQuery(gql, variables) ?: return emptyList()
+        val media = resp.optJSONObject("Page")?.optJSONArray("media") ?: return emptyList()
+        return (0 until media.length()).mapNotNull { i ->
+            media.optJSONObject(i)?.let { mediaToSearch(it) }
         }
     }
+
+    private fun currentSeasonFilter(): Pair<String, Int>? {
+        val cal = java.util.Calendar.getInstance()
+        val month = cal.get(java.util.Calendar.MONTH) // 0-11
+        val year = cal.get(java.util.Calendar.YEAR)
+        val season = when {
+            month in 2..4 -> "SPRING"
+            month in 5..7 -> "SUMMER"
+            month in 8..10 -> "FALL"
+            else -> "WINTER"
+        }
+        return season to year
+    }
+
+    private fun nextSeasonFilter(): Pair<String, Int>? {
+        val cal = java.util.Calendar.getInstance()
+        val month = cal.get(java.util.Calendar.MONTH)
+        var year = cal.get(java.util.Calendar.YEAR)
+        val season = when {
+            month in 2..4 -> "SUMMER"
+            month in 5..7 -> "FALL"
+            month in 8..10 -> "WINTER".also { year += 1 }
+            else -> "SPRING"
+        }
+        return season to year
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  Load
+    // ═══════════════════════════════════════════════════════════════════════
 
     override suspend fun load(url: String): LoadResponse {
-        return try {
-            val parts = url.split("|")
-            val rawUrl = parts.first()
-            val sourceTag = parts.getOrNull(1)?.replace("anime_source:", "")
+        val id = parseAnilistUrl(url)
+            ?: throw ErrorLoadingException("Invalid AniList URL: $url")
 
-            // Delegate to user's repo extension if tagged
-            if (sourceTag != null && sourceTag in sourceExtensions) {
-                return loadFromExtension(rawUrl, sourceTag)
+        val detail = fetchAniDetail(id)
+            ?: throw ErrorLoadingException("Could not load AniList media $id")
+
+        val title = detail.title
+        val episodes = detail.episodes
+        val type = when (detail.format) {
+            "MOVIE", "SPECIAL" -> if (episodes <= 1) TvType.AnimeMovie else TvType.Anime
+            "OVA", "ONA" -> TvType.OVA
+            "MUSIC" -> TvType.AnimeMovie
+            else -> TvType.Anime
+        }
+
+        // Resolve a tv/movie id for embeds — AniList ID first (some anime mirrors
+        // support it), then IMDB / TMDB via ani.zip mappings.
+        val imdbId = detail.imdbId
+        val tmdbId = detail.tmdbId
+        val preferredId = imdbId ?: tmdbId?.toString() ?: id.toString()
+
+        // Build episode list. For movies, a single pseudo-episode so loadLinks
+        // still runs.
+        val epList = when (type) {
+            TvType.AnimeMovie -> listOf(newEpisode(LinkContext(
+                anilistId = id, imdbId = imdbId, tmdbId = tmdbId,
+                season = null, episode = null, title = title, isMovie = true,
+                dub = DubStatus.Subbed,
+            ).toJson()) { name = "Movie" })
+            else -> (1..episodes).map { epNum ->
+                val epMeta = detail.episodeMeta[epNum]
+                newEpisode(LinkContext(
+                    anilistId = id, imdbId = imdbId, tmdbId = tmdbId,
+                    season = 1, episode = epNum, title = title, isMovie = false,
+                    dub = DubStatus.Subbed,
+                ).toJson()) {
+                    name = epMeta?.title ?: "Episode $epNum"
+                    season = 1
+                    episode = epNum
+                    posterUrl = epMeta?.stillUrl ?: detail.posterUrl
+                    description = epMeta?.overview
+                    runCatching { epMeta?.rating?.let { score = Score.from10(it) } }
+                    runTime = epMeta?.runtime
+                    this.date = epMeta?.airDate
+                }
             }
+        }
 
-            // AniList direct load
-            val anilistId = extractAniListId(rawUrl)
-            if (anilistId != null) {
-                return loadAniList(anilistId)
+        val recs = detail.recommendations.map { m -> mediaToSearch(m)!! }
+
+        return if (type == TvType.AnimeMovie) {
+            newMovieLoadResponse(title, url, TvType.AnimeMovie, epList.first().data) {
+                this.posterUrl = detail.posterUrl
+                this.backgroundPosterUrl = detail.backdropUrl
+                this.plot = detail.plot
+                this.year = detail.year
+                this.tags = detail.tags
+                this.recommendations = recs
+                runCatching { detail.rating?.let { score = Score.from10(it) } }
+                runCatching { detail.actors?.let { this.actors = it } }
+                runCatching { detail.trailerUrl?.let { addTrailer(it) } }
+                runCatching { detail.logoUrl?.let { this.logoUrl = it } }
+                runCatching { imdbId?.let { addImdbId(it) } }
+                runCatching { detail.malId?.let { addMalId(it) } }
+                runCatching { detail.kitsuId?.let { addKitsuId(it) } }
+                runCatching { addAniListId(id) }
+                runCatching { detail.simklId?.let { addSimklId(it) } }
             }
-
-            // Generic fallback load
-            val doc = app.get(rawUrl, timeout = 15_000).document
-            val title = doc.selectFirst("h1, title, .title")?.text() ?: "Anime Unknown"
-            val posterUrl = doc.selectFirst("img[src~=poster], img[data-src~=cover]")?.attr("src")
-            val plot = doc.selectFirst("meta[name=description], meta[property=og:description], .synopsis, .plot")?.text()
-            val isMovie = rawUrl.contains("movie", ignoreCase = true)
-            val type = if (isMovie) TvType.AnimeMovie else TvType.Anime
-
-            newAnimeLoadResponse(title, rawUrl, type) {
-                this.posterUrl = posterUrl
-                this.plot = plot
-                addEpisodes(DubStatus.Subbed, listOf(newAnimeEpisode(rawUrl) { name = "Source" }))
+        } else {
+            newAnimeLoadResponse(title, url, type) {
+                this.posterUrl = detail.posterUrl
+                this.backgroundPosterUrl = detail.backdropUrl
+                this.plot = detail.plot
+                this.year = detail.year
+                this.tags = detail.tags
+                this.recommendations = recs
+                runCatching { detail.rating?.let { score = Score.from10(it) } }
+                runCatching { detail.actors?.let { this.actors = it } }
+                runCatching { detail.trailerUrl?.let { addTrailer(it) } }
+                runCatching { detail.logoUrl?.let { this.logoUrl = it } }
+                runCatching { imdbId?.let { addImdbId(it) } }
+                runCatching { detail.malId?.let { addMalId(it) } }
+                runCatching { detail.kitsuId?.let { addKitsuId(it) } }
+                addAniListId(id)
+                runCatching { detail.simklId?.let { addSimklId(it) } }
+                addEpisodes(DubStatus.Subbed, epList)
             }
-        } catch (e: Exception) {
-            Log.d("WizstreamAnime/load", "Load error for $url: ${e.message}")
-            throw ErrorLoadingException("Failed to load anime: ${e.message}")
         }
     }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  Links
+    // ═══════════════════════════════════════════════════════════════════════
 
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
         subtitleCallback: (SubtitleFile) -> Unit,
-        callback: (ExtractorLink) -> Unit
-    ): Boolean {
-        return try {
-            val result = coroutineScope {
-                val deferredSources = mutableListOf<Deferred<List<ExtractorLink>>>()
+        callback: (ExtractorLink) -> Unit,
+    ): Boolean = coroutineScope {
+        val ctx = try { LinkContext.fromJson(data) } catch (_: Exception) { null }
+            ?: return@coroutineScope false
 
-                // A. Load from user's 4 repo extensions concurrently
-                sourceExtensions.forEach { extName ->
-                    deferredSources.add(async(Dispatchers.IO) {
-                        try {
-                            val extLinks = loadExtractorLinks(data, extName)
-                            Log.d("WizstreamAnime/links", "$extName returned ${extLinks.size} links")
-                            extLinks
-                        } catch (e: Exception) {
-                            Log.d("WizstreamAnime/links", "$extName error: ${e.message}")
-                            emptyList()
-                        }
-                    })
-                }
-
-                val extResults = deferredSources.awaitAll().flatten()
-                val extLinks = extResults.distinctBy { it.url }.sortedByDescending { it.quality }
-
-                // B. Direct vid-source fallback
-                val directLinks = extractDirectVidLinks(data)
-                val directLinksSorted = directLinks.distinctBy { it.url }.sortedByDescending { it.quality }
-
-                val allLinks = (extLinks + directLinksSorted)
-                    .distinctBy { it.url }
-                    .sortedByDescending { it.quality ?: 0 }
-
-                allLinks
+        val idList = buildList {
+            if (ctx.isMovie || ctx.season == null || ctx.episode == null) {
+                // For movies we try IMDB/TMDB id first, then fall back to AniList id
+                // (in case an anime-only mirror supports it).
+                ctx.imdbId?.let { add(it) }
+                ctx.tmdbId?.let { add(it.toString()) }
+                add(ctx.anilistId.toString())
+            } else {
+                ctx.imdbId?.let { add(it) }
+                ctx.tmdbId?.let { add(it.toString()) }
+                add(ctx.anilistId.toString())
             }
+        }.distinct()
 
-            result.forEach { link -> callback(link) }
-            result.isNotEmpty()
-        } catch (e: Exception) {
-            Log.d("WizstreamAnime/links", "Link loading error: ${e.message}")
-            false
-        }
-    }
+        val seenUrls = Collections.newSetFromMap<String>(ConcurrentHashMap())
+        val seenSubs = Collections.newSetFromMap<String>(ConcurrentHashMap())
+        val gate = Semaphore(8)
+        var anyFound = false
 
-    // ─── AniList Integration ───
-
-    private suspend fun fetchAniListSearch(query: String): List<SearchResponse> {
-        val queryStr = """
-            query ($search: String) {
-                Page(page: 1, perPage: 15) {
-                    media(search: $search, type: ANIME) {
-                        id
-                        idMal
-                        title { romaji english native }
-                        coverImage { extraLarge large }
-                        bannerImage
-                        description(asHtml: false)
-                        averageScore
-                        genres
-                        episodes
-                        format
-                        status
+        val jobs = VID_HOSTS.flatMap { host ->
+            idList.map { id ->
+                async(Dispatchers.IO) {
+                    gate.withPermit {
+                        val embedUrl = if (ctx.isMovie || ctx.season == null || ctx.episode == null) {
+                            host.movie(id)
+                        } else {
+                            host.tv(id, ctx.season, ctx.episode)
+                        }
+                        try {
+                            val before = anyFound
+                            loadExtractor(
+                                embedUrl,
+                                "https://" + java.net.URL(embedUrl).host + "/",
+                                { sub ->
+                                    if (seenSubs.add(sub.url)) subtitleCallback(sub)
+                                }
+                            ) { link ->
+                                val url = link.url.trim()
+                                if (url.isBlank() || !seenUrls.add(url)) return@loadExtractor
+                                val labelled = link.copy(
+                                    source = "Wizstream-A • ${host.label}",
+                                    name = "${host.label} — ${link.name}".trimEnd('—', ' '),
+                                )
+                                callback(labelled)
+                                anyFound = true
+                            }
+                            if (!anyFound && !before) {
+                                callback(newExtractorLink(
+                                    source = "Wizstream-A • ${host.label}",
+                                    name = "${host.label} — Auto",
+                                    url = embedUrl,
+                                    type = INFER_TYPE,
+                                ) {
+                                    referer = "https://" + java.net.URL(embedUrl).host + "/"
+                                    quality = Qualities.Unknown.value
+                                })
+                                anyFound = true
+                            }
+                        } catch (_: Throwable) {
+                            // Host is probably down or blocked — skip silently.
+                        }
                     }
                 }
             }
-        """.trimIndent()
-
-        val variables = JSONObject().apply { put("search", query) }
-        val requestBody = JSONObject().apply {
-            put("query", queryStr)
-            put("variables", variables)
         }
-
-        return try {
-            val resText = app.post(
-                "https://graphql.anilist.co",
-                headers = mapOf("Content-Type" to "application/json"),
-                requestBody = requestBody.toString().toRequestBody("application/json".toMediaTypeOrNull()),
-                timeout = 15_000
-            ).text
-            val json = JSONObject(resText)
-            val mediaList = json.optJSONObject("data")?.optJSONObject("Page")?.optJSONArray("media")
-
-            if (mediaList == null) return emptyList()
-
-            val results = mutableListOf<SearchResponse>()
-            for (i in 0 until mediaList.length()) {
-                val media = mediaList.getJSONObject(i)
-                val id = media.optInt("id")
-                val titleObj = media.optJSONObject("title")
-                val romaji = titleObj?.optString("romaji") ?: ""
-                val english = titleObj?.optString("english") ?: romaji
-                val native = titleObj?.optString("native") ?: romaji
-                val displayTitle = if (!english.isBlank()) english else romaji
-                val format = media.optString("format", "TV")
-                val episodes = media.optInt("episodes", 0)
-                val posterPath = media.optJSONObject("coverImage")?.optString("large") ?: media.optJSONObject("coverImage")?.optString("extraLarge")
-                val posterUrl = posterPath?.let { "https://graphql.anilist.co/img/$it" } ?: ""
-                val score = media.optInt("averageScore", 0)
-                val type = when (format) {
-                    "MOVIE" -> if (episodes <= 1) TvType.AnimeMovie else TvType.Anime
-                    else -> TvType.Anime
-                }
-
-                val url = "anilist:$id|anime|1"
-                results.add(newAnimeSearchResponse(
-                    displayTitle,
-                    url,
-                    type
-                ) {
-                    this.posterUrl = posterUrl
-                    this.quality = if (score > 0) SearchQuality.Unknown else SearchQuality.Unknown
-                    this.year = null
-                })
-            }
-            results
-        } catch (e: Exception) {
-            Log.d("WizstreamAnime/search", "AniList search error: ${e.message}")
-            emptyList()
-        }
+        jobs.awaitAll()
+        anyFound
     }
 
-    private fun extractAniListId(url: String): Int? {
-        val regex = Regex("anilist:(\\d+)")
-        return regex.find(url)?.groupValues?.get(1)?.toIntOrNull()
+    // ═══════════════════════════════════════════════════════════════════════
+    //  AniList + mapping helpers
+    // ═══════════════════════════════════════════════════════════════════════
+
+    private data class EpisodeMeta(
+        val title: String?,
+        val overview: String?,
+        val stillUrl: String?,
+        val rating: Double?,
+        val airDate: Long?,
+        val runtime: Int?,
+    )
+
+    private data class AniDetail(
+        val title: String,
+        val year: Int?,
+        val plot: String?,
+        val posterUrl: String?,
+        val backdropUrl: String?,
+        val logoUrl: String?,
+        val rating: Double?,
+        val tags: List<String>?,
+        val imdbId: String?,
+        val tmdbId: Int?,
+        val malId: Int?,
+        val simklId: Int?,
+        val kitsuId: String?,
+        val episodes: Int,
+        val format: String?,
+        val actors: List<ActorData>?,
+        val trailerUrl: String?,
+        val episodeMeta: Map<Int, EpisodeMeta>,
+        val recommendations: List<JSONObject>,
+    )
+
+    private fun parseAnilistUrl(url: String): Int? {
+        val m = Regex("wiz://anilist/(\\d+)").find(url)
+            ?: Regex("anilist/(\\d+)").find(url)
+            ?: return null
+        return m.groupValues[1].toIntOrNull()
     }
 
-    private suspend fun loadAniList(id: Int): LoadResponse {
-        val queryStr = """
-            query {
-                Media(id: $id, type: ANIME) {
-                    id
-                    idMal
-                    title { romaji english native }
-                    coverImage { extraLarge large }
-                    bannerImage
-                    description(asHtml: false)
-                    averageScore
-                    genres
-                    episodes
-                    format
-                    status
-                    startDate { year month day }
-                    endDate { year month day }
-                }
-            }
-        """.trimIndent()
-
-        val resText = try {
-            app.post(
-                "https://graphql.anilist.co",
-                headers = mapOf("Content-Type" to "application/json"),
-                requestBody = JSONObject().apply { put("query", queryStr) }.toString()
-                    .toRequestBody("application/json".toMediaTypeOrNull()),
-                timeout = 15_000
-            ).text
-        } catch (e: Exception) {
-            Log.d("WizstreamAnime/load", "AniList load error: ${e.message}")
-            return newAnimeLoadResponse("Unknown Anime", "anilist:$id", TvType.Anime) {
-                this.plot = "Failed to fetch metadata"
-            }
-        }
-
-        val json = JSONObject(resText)
-        val media = json.optJSONObject("data")?.optJSONObject("Media")
-        if (media == null) {
-            return newAnimeLoadResponse("Unknown Anime", "anilist:$id", TvType.Anime) {
-                this.plot = "AniList data missing"
-            }
-        }
-
-        val titleObj = media.optJSONObject("title")
-        val romaji = titleObj?.optString("romaji") ?: "Unknown"
-        val english = titleObj?.optString("english") ?: romaji
-        val title = if (!english.isBlank()) english else romaji
-        val posterPath = media.optJSONObject("coverImage")?.optString("extraLarge")
-            ?: media.optJSONObject("coverImage")?.optString("large")
-        val posterUrl = posterPath?.let { "https://graphql.anilist.co/img/$it" } ?: ""
-        val bannerUrl = media.optString("bannerImage")?.let { if (it.isNotBlank()) "https://graphql.anilist.co/img/$it" else null }
-        val plot = media.optString("description")?.replace(Regex("<[^>]+>"), "") ?: ""
-        val genres = media.optJSONArray("genres")
-        val genreList = mutableListOf<String>()
-        if (genres != null) {
-            for (i in 0 until genres.length()) {
-                genreList.add(genres.optString(i))
-            }
-        }
-        val episodes = media.optInt("episodes", 0)
-        val format = media.optString("format", "TV")
-        val score = media.optInt("averageScore", 0)
-
-        val type = when (format) {
-            "MOVIE" -> TvType.AnimeMovie
+    private fun mediaToSearch(m: JSONObject): SearchResponse? {
+        val id = m.optInt("id", 0).takeIf { it != 0 } ?: return null
+        val titles = m.optJSONObject("title")
+        val title = titles?.optStringOrNull("english")
+            ?: titles?.optStringOrNull("romaji")
+            ?: titles?.optStringOrNull("native")
+            ?: return null
+        val cover = m.optJSONObject("coverImage")?.optStringOrNull("extraLarge")
+            ?: m.optJSONObject("coverImage")?.optStringOrNull("large")
+        val format = m.optStringOrNull("format") ?: "TV"
+        val year = m.optJSONObject("startDate")?.optInt("year")?.takeIf { it != 0 }
+        val tvType = when {
+            format == "MOVIE" -> TvType.AnimeMovie
+            format == "OVA" || format == "ONA" -> TvType.OVA
             else -> TvType.Anime
         }
+        return when (tvType) {
+            TvType.AnimeMovie -> newMovieSearchResponse(title, "wiz://anilist/$id", TvType.AnimeMovie) {
+                this.posterUrl = cover; this.year = year
+            }
+            TvType.OVA -> newAnimeSearchResponse(title, "wiz://anilist/$id", TvType.OVA) {
+                this.posterUrl = cover; this.year = year
+            }
+            else -> newAnimeSearchResponse(title, "wiz://anilist/$id", TvType.Anime) {
+                this.posterUrl = cover; this.year = year
+            }
+        }
+    }
 
-        val startYear = media.optJSONObject("startDate")?.optInt("year")
-        val year = startYear ?: extractYearFromString(romaji)
+    private suspend fun fetchAniDetail(id: Int): AniDetail? {
+        val now = System.currentTimeMillis()
+        META_CACHE[id]?.let { (ts, cached) ->
+            if (now - ts < CACHE_TTL_MS) return cached
+        }
 
-        return newAnimeLoadResponse(title, "anilist:$id|anime|1", type) {
-            this.posterUrl = posterUrl
-            this.backgroundPosterUrl = bannerUrl
-            this.plot = plot
-            this.year = year
-            addMalId(id)
-            addAniListId(id)
-            tags = genreList
-            addTrailer(media.optString("trailerUrl", ""))
-            addEpisodes(
-                DubStatus.Subbed,
-                if (episodes > 0) {
-                    (1..episodes.coerceAtMost(50)).map { epNum ->
-                        newAnimeEpisode("anilist:$id|anime|1|$epNum") {
-                            name = "Episode $epNum"
-                        }
-                    }
-                } else {
-                    listOf(newAnimeEpisode("anilist:$id|anime|1|1") { name = "Episode 1" })
+        val gql = """
+            query (${'$'}id: Int) {
+              Media(id: ${'$'}id, type: ANIME) {
+                id idMal idMals
+                title { romaji english native userPreferred }
+                coverImage { extraLarge large }
+                bannerImage
+                description(asHtml: false)
+                averageScore meanScore
+                genres tags { name }
+                episodes duration format status season seasonYear
+                startDate { year month day }
+                endDate { year month day }
+                trailer { id site }
+                characters(sort: [ROLE, RELEVANCE], perPage: 10, role: MAIN) {
+                  edges {
+                    node { name { full } image { large } }
+                    voiceActors(language: JAPANESE, sort: [RELEVANCE]) { name { full } image { large } }
+                  }
                 }
-            )
+                relations { edges { node { id type title { romaji english } coverImage { large } format } relationType } }
+                recommendations(sort: [RATING_DESC], perPage: 15) {
+                  nodes { mediaRecommendation { id idMal title { romaji english native } coverImage { extraLarge large } bannerImage episodes format averageScore genres startDate { year } status } }
+                }
+              }
+            }
+        """.trimIndent()
+        val variables = JSONObject().put("id", id)
+        val resp = anilistQuery(gql, variables) ?: return null
+        val media = resp.optJSONObject("Media") ?: return null
+
+        val titles = media.optJSONObject("title")
+        val title = titles?.optStringOrNull("english")
+            ?: titles?.optStringOrNull("romaji")
+            ?: titles?.optStringOrNull("native")
+            ?: return null
+        val cover = media.optJSONObject("coverImage")?.optStringOrNull("extraLarge")
+            ?: media.optJSONObject("coverImage")?.optStringOrNull("large")
+        val banner = media.optStringOrNull("bannerImage")
+        val plot = media.optStringOrNull("description")
+            ?.replace(Regex("<[^>]+>"), "")
+            ?.replace(Regex("\\s+"), " ")
+            ?.trim()
+        val score = media.optInt("averageScore", 0).takeIf { it > 0 }?.let { it / 10.0 }
+        val episodes = media.optInt("episodes", 12).takeIf { it > 0 } ?: 12
+        val format = media.optStringOrNull("format")
+        val year = media.optJSONObject("startDate")?.optInt("year")?.takeIf { it != 0 }
+        val genres = media.optJSONArray("genres")?.let { arr ->
+            (0 until arr.length()).mapNotNull { arr.optString(it).takeIf { it.isNotBlank() } }
         }
-    }
+        val trailerObj = media.optJSONObject("trailer")
+        val trailerUrl = trailerObj?.optStringOrNull("site")
+            ?.takeIf { it.equals("youtube", true) }
+            ?.let { "https://www.youtube.com/watch?v=${trailerObj.optString("id")}" }
 
-    private fun extractYearFromString(text: String): Int? {
-        val regex = Regex("(?:19|20)\\d{2}")
-        return regex.find(text)?.value?.toIntOrNull()
-    }
+        // ID mappings via ani.zip (TMDB/IMDB/Kitsu from AniList id).
+        var imdbId: String? = null
+        var tmdbId: Int? = null
+        var kitsuId: String? = null
+        runCatching {
+            val text = app.get("https://api.ani.zip/mappings?anilist_id=$id",
+                headers = mapOf("User-Agent" to UA), timeout = 8000).text
+            val mapJson = JSONObject(text)
+            val mappings = mapJson.optJSONObject("mappings")
+            imdbId = mappings?.optStringOrNull("imdb_id")
+            tmdbId = mappings?.optStringOrNull("themoviedb_id")?.toIntOrNull()
+            kitsuId = mappings?.optStringOrNull("kitsu_id")
+        }
 
-    private suspend fun loadFromExtension(url: String, extName: String): LoadResponse {
-        val repoUrl = "https://raw.githubusercontent.com/Wizdier/Wizdier-CloudstreamRepo/builds/repo.json"
-        val ext = try {
-            loadExtractor(repoUrl)
-        } catch (e: Exception) {
-            Log.d("WizstreamAnime/load", "Failed to load extractor repo: ${e.message}")
-            return newAnimeLoadResponse("Unknown", url, TvType.Anime) {
-                this.plot = "Extractor unavailable"
+        // If ani.zip didn't give us an imdbId but gave us a tmdbId, look it up.
+        if (imdbId == null && tmdbId != null) {
+            val kind = if (format == "MOVIE") "movie" else "tv"
+            runCatching {
+                val ext = tmdbGet("/$kind/${tmdbId}", mapOf(
+                    "append_to_response" to "external_ids"
+                ))?.optJSONObject("external_ids")
+                imdbId = ext?.optStringOrNull("imdb_id")
             }
         }
-        return try {
-            ext?.load(url) ?: throw ErrorLoadingException("Extension $extName returned null")
-        } catch (e: Exception) {
-            Log.d("WizstreamAnime/load", "Extension $extName load failed: ${e.message}")
-            throw ErrorLoadingException("Could not load from $extName: ${e.message}")
-        }
-    }
 
-    private suspend fun loadExtractorLinks(data: String, extName: String): List<ExtractorLink> {
-        val links = mutableListOf<ExtractorLink>()
-        return try {
-            val repoUrl = "https://raw.githubusercontent.com/Wizdier/Wizdier-CloudstreamRepo/builds/repo.json"
-            val ext = loadExtractor(repoUrl)
-            ext?.loadLinks(
-                data,
-                isCasting = false,
-                subtitleCallback = {},
-                callback = { link -> links.add(link) }
-            )
-            links
-        } catch (e: Exception) {
-            Log.d("WizstreamAnime/links", "loadExtractorLinks($extName) error: ${e.message}")
-            emptyList()
-        }
-    }
-
-    private suspend fun extractDirectVidLinks(data: String): List<ExtractorLink> {
-        val links = mutableListOf<ExtractorLink>()
-        return try {
-            val doc = app.get(data, timeout = 10_000).document
-            val html = doc.toString()
-            val patterns = listOf(
-                Regex("https://vidsrc\\.me/embed/[^\"'\\s]+"),
-                Regex("https://vidnest\\.com/embed/[^\"'\\s]+"),
-                Regex("https://vidplay\\.online/embed/[^\"'\\s]+"),
-                Regex("https://vidup\\.(?:tv|io)/embed/[^\"'\\s]+"),
-                Regex("https://vidrock\\.(?:to|net)/embed/[^\"'\\s]+"),
-                Regex("https://vidfast\\.(?:co|net)/embed/[^\"'\\s]+"),
-                Regex("https://videasy\\.(?:net|me)/embed/[^\"'\\s]+"),
-                Regex("https://[^\"'\\s]+\\.m3u8[^\"'\\s]*"),
-                Regex("https://[^\"'\\s]+\\.mp4[^\"'\\s]*")
-            )
-            val foundUrls = mutableSetOf<String>()
-            patterns.forEach { p ->
-                p.findAll(html).forEach { m -> foundUrls.add(m.value) }
+        // Fetch TMDB enrichment: backdrop, logo, trailer, actors, episodes, recs
+        // if we could resolve a TMDB id.
+        var backdropUrl: String? = banner
+        var logoUrl: String? = null
+        var actors: List<ActorData>? = null
+        var episodeMeta = emptyMap<Int, EpisodeMeta>()
+        var simklId: Int? = null
+        val recs = mutableListOf<JSONObject>()
+        media.optJSONObject("recommendations")?.optJSONArray("nodes")?.let { nodes ->
+            for (i in 0 until nodes.length()) {
+                nodes.optJSONObject(i)?.optJSONObject("mediaRecommendation")?.let(recs::add)
             }
-            doc.select("iframe[src], video[src], source[src], embed[src]").forEach { el ->
-                val src = el.attr("src")
-                if (src.isNotBlank() && (src.contains(".mp4") || src.contains(".m3u8") || src.contains("embed"))) {
-                    foundUrls.add(src)
+        }
+
+        if (tmdbId != null) {
+            val kind = if (format == "MOVIE") "movie" else "tv"
+            val extDetails = tmdbGet("/$kind/${tmdbId}", mapOf(
+                "append_to_response" to "credits,external_ids,images,videos,recommendations",
+                "include_image_language" to "en,null"
+            ))
+            if (extDetails != null) {
+                backdropUrl = extDetails.optStringOrNull("backdrop_path")?.toTmdbImg("original")
+                    ?: backdropUrl
+                logoUrl = pickLogo(extDetails.optJSONObject("images")?.optJSONArray("logos"))
+                    ?: imdbId?.let { "https://live.metahub.space/logo/medium/$it/img" }
+                actors = extDetails.optJSONObject("credits")?.optJSONArray("cast")?.toActors()
+                val extTrailer = pickTrailer(extDetails.optJSONObject("videos")?.optJSONArray("results"))
+                if (extTrailer != null && trailerUrl == null) {
+                    // keep AniList trailer if present, otherwise use TMDB
+                }
+                simklId = fetchSimklId(imdbId, kind)
+                if (kind == "tv") {
+                    val seasonJson = tmdbGet("/tv/$tmdbId/season/1")
+                    episodeMeta = seasonJson?.optJSONArray("episodes")?.let { arr ->
+                        (0 until arr.length()).mapNotNull { i ->
+                            val ep = arr.optJSONObject(i) ?: return@mapNotNull null
+                            val n = ep.optIntOrNull("episode_number") ?: return@mapNotNull null
+                            n to EpisodeMeta(
+                                title = ep.optStringOrNull("name"),
+                                overview = ep.optStringOrNull("overview"),
+                                stillUrl = ep.optStringOrNull("still_path")?.toTmdbImg("original"),
+                                rating = ep.optDoubleOrNull("vote_average"),
+                                airDate = ep.optStringOrNull("air_date")?.let(::parseAirDate),
+                                runtime = media.optIntOrNull("duration"),
+                            )
+                        }.toMap()
+                    } ?: emptyMap()
                 }
             }
-            foundUrls.forEachIndexed { idx, vidUrl ->
-                val domainName = try {
-                    java.net.URL(vidUrl).host.replace("www.", "")
-                } catch (e: Exception) { "DirectVideo" }
-                val name = if (idx == 0) domainName else "$domainName ($idx)"
-                links.add(newExtractorLink(
-                    source = "DirectAnimeVid",
-                    name = name,
-                    url = vidUrl,
-                    type = if (vidUrl.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO,
-                    quality = Qualities.Unknown.value
-                ) {
-                    this.referer = data
-                })
+        }
+
+        val malId = media.optInt("idMal", 0).takeIf { it != 0 }
+
+        val detail = AniDetail(
+            title = title,
+            year = year,
+            plot = plot,
+            posterUrl = cover,
+            backdropUrl = backdropUrl,
+            logoUrl = logoUrl,
+            rating = score,
+            tags = genres,
+            imdbId = imdbId,
+            tmdbId = tmdbId,
+            malId = malId,
+            simklId = simklId,
+            kitsuId = kitsuId,
+            episodes = episodes,
+            format = format,
+            actors = actors,
+            trailerUrl = trailerUrl,
+            episodeMeta = episodeMeta,
+            recommendations = recs,
+        )
+        META_CACHE[id] = now to detail
+        return detail
+    }
+
+    private suspend fun anilistQuery(query: String, variables: JSONObject): JSONObject? =
+        runCatching {
+            val body = JSONObject().apply {
+                put("query", query); put("variables", variables)
+            }.toString().toRequestBody("application/json".toMediaTypeOrNull())
+            val res = app.post(ANILIST,
+                headers = mapOf(
+                    "User-Agent" to UA,
+                    "Content-Type" to "application/json",
+                    "Accept" to "application/json",
+                ),
+                requestBody = body,
+                timeout = 12_000)
+            if (res.code !in 200..299) null
+            else JSONObject(res.text).optJSONObject("data")
+        }.getOrNull()
+
+    private suspend fun tmdbGet(path: String, q: Map<String, Any?> = emptyMap()): JSONObject? =
+        runCatching {
+            val params = (mapOf("api_key" to TMDB_KEY, "language" to "en-US") + q)
+                .filter { it.value != null }
+                .entries.joinToString("&") { (k, v) ->
+                    "${URLEncoder.encode(k, "UTF-8")}=${URLEncoder.encode(v.toString(), "UTF-8")}"
+                }
+            val url = "$TMDB_API${if (path.startsWith("/")) path else "/$path"}?$params"
+            val res = app.get(url, headers = mapOf(
+                "User-Agent" to UA, "Accept" to "application/json"
+            ), timeout = 8_000)
+            if (res.code in 200..299) JSONObject(res.text) else null
+        }.getOrNull()
+
+    private suspend fun fetchSimklId(imdbId: String?, kind: String): Int? {
+        if (imdbId.isNullOrBlank()) return null
+        val type = if (kind == "movie") "movies" else "tv"
+        return runCatching {
+            val url = "https://api.simkl.com/$type/${URLEncoder.encode(imdbId, "UTF-8")}?client_id=%20&extended=full"
+            val t = app.get(url, headers = mapOf(
+                "User-Agent" to UA, "Accept" to "application/json"
+            ), timeout = 6_000).text.trim()
+            if (!t.startsWith("{")) null
+            else JSONObject(t).optJSONObject("ids")?.optInt("simkl")?.takeIf { it != 0 }
+        }.getOrNull()
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  JSON helper types
+    // ═══════════════════════════════════════════════════════════════════════
+
+    private data class LinkContext(
+        val anilistId: Int,
+        val imdbId: String? = null,
+        val tmdbId: Int? = null,
+        val malId: Int? = null,
+        val season: Int? = null,
+        val episode: Int? = null,
+        val title: String? = null,
+        val isMovie: Boolean = false,
+        val dub: DubStatus = DubStatus.Subbed,
+    ) {
+        fun toJson(): String = JSONObject().apply {
+            put("anilist_id", anilistId)
+            imdbId?.let { put("imdb_id", it) }
+            tmdbId?.let { put("tmdb_id", it) }
+            malId?.let { put("mal_id", it) }
+            season?.let { put("season", it) }
+            episode?.let { put("episode", it) }
+            title?.let { put("title", it) }
+            put("is_movie", isMovie)
+            put("dub", dub.ordinal)
+        }.toString()
+
+        companion object {
+            fun fromJson(s: String): LinkContext {
+                val o = JSONObject(s)
+                return LinkContext(
+                    anilistId = o.optInt("anilist_id", 0).takeIf { it != 0 } ?: 0,
+                    imdbId = o.optStringOrNull("imdb_id"),
+                    tmdbId = o.optIntOrNull("tmdb_id"),
+                    malId = o.optIntOrNull("mal_id"),
+                    season = o.optIntOrNull("season"),
+                    episode = o.optIntOrNull("episode"),
+                    title = o.optStringOrNull("title"),
+                    isMovie = o.optBoolean("is_movie", false),
+                    dub = DubStatus.values().getOrElse(o.optInt("dub", 0)) { DubStatus.Subbed },
+                ).also { require(it.anilistId != 0) }
             }
-            links
-        } catch (e: Exception) {
-            Log.d("WizstreamAnime/links", "Direct vid extraction error: ${e.message}")
-            emptyList()
         }
     }
 
-    // Main page loader
-    override suspend fun load(url: String): LoadResponse? {
-        return try {
-            val doc = app.get(url, timeout = 15_000).document
-            val title = doc.selectFirst("h1, title, .title")?.text() ?: "Wizstream-Anime"
-            val poster = doc.selectFirst("img[src~=poster], img[data-src~=cover]")?.attr("src")
-            val plot = doc.selectFirst("meta[name=description], meta[property=og:description], .synopsis, .plot")?.text()
-            val isMovie = url.contains("movie", ignoreCase = true)
-            val type = if (isMovie) TvType.AnimeMovie else TvType.Anime
-            newAnimeLoadResponse(title, url, type) {
-                this.posterUrl = poster
-                this.plot = plot
-            }
-        } catch (e: Exception) {
-            Log.d("WizstreamAnime/load", "Load error for $url: ${e.message}")
-            null
-        }
+    // ═══════════════════════════════════════════════════════════════════════
+    //  Utils
+    // ═══════════════════════════════════════════════════════════════════════
+
+    private fun String.toTmdbImg(size: String): String? =
+        takeIf { it.isNotBlank() && it != "null" }?.let { "$IMG/$size$it" }
+
+    private fun parseAirDate(s: String?): Long? {
+        if (s == null) return null
+        val p = s.split("-")
+        if (p.size != 3) return null
+        val y = p[0].toIntOrNull() ?: return null
+        val m = p[1].toIntOrNull() ?: return null
+        val d = p[2].toIntOrNull() ?: return null
+        return runCatching {
+            val c = java.util.Calendar.getInstance(java.util.TimeZone.getTimeZone("UTC"))
+            c.clear(); c.set(y, m - 1, d, 0, 0, 0); c.timeInMillis
+        }.getOrNull()
     }
-    private fun newAnimeSearchResponse(
-        name: String,
-        url: String,
-        type: TvType
-    ): SearchResponse = SearchResponse(
-        name,
-        url,
-        type,
-        url = url
-    )
+
+    private fun JSONArray.toActors(limit: Int = 15): List<ActorData> =
+        (0 until length()).mapNotNull { i ->
+            val c = optJSONObject(i) ?: return@mapNotNull null
+            val name = c.optStringOrNull("name") ?: c.optStringOrNull("original_name")
+                ?: return@mapNotNull null
+            val profile = c.optStringOrNull("profile_path")?.toTmdbImg("w185")
+            val role = c.optStringOrNull("character")
+            ActorData(Actor(name, profile), roleString = role ?: "")
+        }.take(limit)
+
+    private fun pickLogo(logos: JSONArray?): String? {
+        if (logos == null || logos.length() == 0) return null
+        var enPng: String? = null; var enSvg: String? = null; var anyPng: String? = null
+        for (i in 0 until logos.length()) {
+            val l = logos.optJSONObject(i) ?: continue
+            val p = l.optString("file_path").takeIf { it.isNotBlank() } ?: continue
+            val lang = l.optString("iso_639_1").trim().lowercase()
+            val isSvg = p.endsWith(".svg", true)
+            val url = "$IMG/w500$p"
+            when {
+                lang == "en" && !isSvg -> return url
+                lang == "en" && isSvg && enSvg == null -> enSvg = url
+                !isSvg && anyPng == null -> anyPng = url
+            }
+        }
+        return enPng ?: enSvg ?: anyPng
+    }
+
+    private fun pickTrailer(videos: JSONArray?): String? {
+        if (videos == null) return null
+        var official: String? = null; var any: String? = null
+        for (i in 0 until videos.length()) {
+            val v = videos.optJSONObject(i) ?: continue
+            if (!v.optString("site").equals("YouTube", true)) continue
+            val key = v.optStringOrNull("key") ?: continue
+            when {
+                v.optString("type").equals("Trailer", true) && v.optBoolean("official") && official == null ->
+                    official = "https://www.youtube.com/watch?v=$key"
+                v.optString("type").equals("Trailer", true) && any == null ->
+                    any = "https://www.youtube.com/watch?v=$key"
+            }
+        }
+        return official ?: any
+    }
+
+    private fun JSONObject.optStringOrNull(k: String): String? =
+        if (!has(k) || isNull(k)) null
+        else optString(k, "").trim().takeIf { it.isNotBlank() && it != "null" }
+
+    private fun JSONObject.optIntOrNull(k: String): Int? =
+        if (!has(k) || isNull(k)) null
+        else optString(k, "").toIntOrNull()
+            ?: optInt(k, Int.MIN_VALUE).takeIf { it != Int.MIN_VALUE }
+
+    private fun JSONObject.optDoubleOrNull(k: String): Double? =
+        if (!has(k) || isNull(k)) null
+        else optString(k, "").toDoubleOrNull()
+            ?: optDouble(k, Double.NaN).takeIf { !it.isNaN() }
 }
