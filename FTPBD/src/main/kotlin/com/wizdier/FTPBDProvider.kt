@@ -145,17 +145,97 @@ class FTPBD : MainAPI() {
         return newHomePageResponse(HomePageList(request.name, items), items.isNotEmpty())
     }
 
+    // Robust parse for FTPBD Elementor theme – finds all movie/tv links even if structure changes
     private fun parseCards(doc:org.jsoup.nodes.Document, expected:String): List<SearchResponse>{
-        return doc.select("article, div.card, div.post").mapNotNull{ el->
-            val a=el.selectFirst("a[href*=$expected]") ?: el.selectFirst("a") ?: return@mapNotNull null
-            val href=a.attr("href"); if(href.isBlank()) return@mapNotNull null
-            val title=el.selectFirst("h2,h3,.title")?.text()?.trim() ?: a.attr("title").ifBlank{a.text()}.trim(); if(title.isBlank()) return@mapNotNull null
-            val img=el.selectFirst("img")?.attr("data-src")?.ifBlank{el.selectFirst("img")?.attr("src")}
-            val poster=img?.let{if(it.startsWith("http")) it else "$mainUrl/${it.trimStart('/')}"}
+        val seen=LinkedHashMap<String, SearchResponse>()
+        // Primary: all anchors containing expected path
+        doc.select("a[href*=\"$expected\"]").forEach{ a->
+            var href=a.attr("href").trim()
+            if(href.isBlank()) return@forEach
+            // Filter out non-content links
+            if(href.contains("/page/") || href.contains("/movies_cat/") && !href.matches(Regex(".*/(movie|tv_shows)/[^/]+/?$")) && expected=="/movie/") {
+                // allow category pages themselves, but for movie list we only want content
+                // For category pages, expected is /movie/ but link is /movie/xxx – ok
+                // Skip pagination and category index links
+                if(href.endsWith("/movie/") || href.endsWith("/tv_shows/") || href.endsWith("/movies_cat/") || href.matches(Regex(".*/movies_cat/[^/]+/?$"))) {
+                    // This is actually category page itself if we're on homepage? But for mainPage we want content, so skip pure category links when expected is /movie/?
+                    // We skip only if href exactly matches category listing, not content
+                    if(href.trimEnd('/').endsWith("/movie") || href.trimEnd('/').endsWith("/tv_shows") || href.contains("/movies_cat/") && !href.contains("/movie/") && !href.contains("/tv_shows/")) {
+                        // For mainPage where cat is "movie", href /movie/ is the page itself, skip
+                        if(href.trimEnd('/').equals("$mainUrl/movie".trimEnd('/')) || href.trimEnd('/').equals("$mainUrl/tv_shows".trimEnd('/')) ) return@forEach
+                    }
+                }
+            }
+            // Ensure content link pattern: /movie/slug/ or /tv_shows/slug/
+            if(!href.matches(Regex(".*/(movie|tv_shows)/[^/]+/?$"))){
+                // Also allow /movie/slug without trailing slash already matched above
+                if(!(href.contains("/movie/") && href.count{it=='/'}>=4) && !(href.contains("/tv_shows/") && href.count{it=='/'}>=4)) {
+                    // Not a content link
+                    // But still try to keep if it's clearly a movie
+                    if(!href.contains("/movie/") && !href.contains("/tv_shows/")) return@forEach
+                }
+            }
+            if(href.startsWith("/")) href=mainUrl+href
+            if(seen.containsKey(href)) return@forEach
+            if(href==mainUrl || href=="$mainUrl/" || href.contains("/feed/")) return@forEach
+
+            // Title extraction – try multiple strategies
+            var title=a.attr("title").trim()
+            if(title.isBlank()){
+                // Try parent with video_title class
+                val parent=a.parents().firstOrNull{ it.hasClass("jws-post-item") || it.hasClass("movies-content") || it.hasClass("video_title") }
+                title=parent?.selectFirst(".video_title a, .video_title, h2, h3, .title")?.text()?.trim() ?: ""
+            }
+            if(title.isBlank()){
+                title=a.text().trim()
+            }
+            if(title.isBlank()){
+                // Try sibling
+                title=a.parent()?.selectFirst("h2, h3, .video_title")?.text()?.trim() ?: ""
+            }
+            if(title.isBlank() || title.length<2 || title.equals("Movies",true) || title.equals("TV Shows",true)) return@forEach
+
+            // Poster
+            val container=a.parents().firstOrNull{ it.selectFirst("img")!=null } ?: a.parent()?.parent()
+            val img=container?.selectFirst("img") ?: a.selectFirst("img")
+            val rawImg=img?.attr("data-src")?.ifBlank{ img.attr("src") }?.ifBlank{ img.attr("data-lazy-src") }
+            val poster=rawImg?.let{
+                when{
+                    it.startsWith("http")->it
+                    it.startsWith("//")->"https:$it"
+                    it.startsWith("/")->mainUrl+it
+                    else->"$mainUrl/${it.trimStart('/')}"
+                }
+            }
+
             val isSeries=href.contains("/tv_shows/")
-            val year=Regex("""\d{4}""").find(el.text())?.value?.toIntOrNull()
-            if(isSeries) newTvSeriesSearchResponse(title, href, TvType.TvSeries){ this.posterUrl=poster; this.year=year } else newMovieSearchResponse(title, href, TvType.Movie){ this.posterUrl=poster; this.year=year }
+            val year=Regex("""\b(19|20)\d{2}\b""").find(a.parents().joinToString(" "){ it.text() })?.value?.toIntOrNull()
+
+            val resp=if(isSeries){
+                newTvSeriesSearchResponse(title, href, TvType.TvSeries){ this.posterUrl=poster; this.year=year }
+            } else {
+                newMovieSearchResponse(title, href, TvType.Movie){ this.posterUrl=poster; this.year=year }
+            }
+            seen[href]=resp
         }
+
+        // Fallback: if still empty, try broader selector jws-post-item
+        if(seen.isEmpty()){
+            doc.select("div.jws-post-item, div.movies_advanced_content div.jws-post-item, div.movies-content").forEach{ el->
+                val a=el.selectFirst("a[href*=\"/movie/\"], a[href*=\"/tv_shows/\"]") ?: return@forEach
+                val href=a.attr("href").let{if(it.startsWith("/")) mainUrl+it else it}
+                if(href.isBlank() || seen.containsKey(href)) return@forEach
+                val title=el.selectFirst(".video_title a, .video_title, h2, h3")?.text()?.trim() ?: a.attr("title").ifBlank{a.text()}.trim()
+                if(title.isBlank()) return@forEach
+                val img=el.selectFirst("img")
+                val poster=img?.attr("data-src")?.ifBlank{img.attr("src")}?.let{if(it.startsWith("http")) it else mainUrl+it}
+                val isSeries=href.contains("/tv_shows/")
+                val resp=if(isSeries) newTvSeriesSearchResponse(title, href, TvType.TvSeries){ this.posterUrl=poster } else newMovieSearchResponse(title, href, TvType.Movie){ this.posterUrl=poster }
+                seen[href]=resp
+            }
+        }
+
+        return seen.values.toList()
     }
 
     override suspend fun search(query:String): List<SearchResponse>{
