@@ -2,6 +2,7 @@ package com.wizdier
 
 import android.content.SharedPreferences
 import com.lagradost.cloudstream3.*
+import com.lagradost.cloudstream3.DubStatus
 import com.lagradost.cloudstream3.LoadResponse.Companion.addAniListId
 import com.lagradost.cloudstream3.LoadResponse.Companion.addImdbId
 import com.lagradost.cloudstream3.LoadResponse.Companion.addMalId
@@ -287,7 +288,8 @@ class CTGMovies(private val prefs: SharedPreferences? = null) : MainAPI() {
             val fallbackData=linksToData(extractLinks(obj), meta)
             listOf(newEpisode(fallbackData){ name=title; season=1; episode=1 })
         } else episodesRaw
-        return newAnimeLoadResponse(meta?.optString("title")?.takeIf{it.isNotBlank()} ?: title, url, TvType.Anime, episodes){
+        return newAnimeLoadResponse(meta?.optString("title")?.takeIf{it.isNotBlank()} ?: title, url, TvType.Anime){
+            addEpisodes(DubStatus.Subbed, episodes)
             posterUrl=meta?.optString("poster") ?: meta?.optString("poster_path")?.let{"https://image.tmdb.org/t/p/w500$it"} ?: obj.optString("poster").takeIf{it.isNotBlank()}
             plot=meta?.optString("overview") ?: obj.optString("description")
             meta?.optInt("anilistId",0)?.takeIf{it!=0}?.let{ addAniListId(it) }

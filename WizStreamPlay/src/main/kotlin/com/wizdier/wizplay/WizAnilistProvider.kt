@@ -1,6 +1,7 @@
 package com.wizdier.wizplay
 
 import com.lagradost.cloudstream3.*
+import com.lagradost.cloudstream3.DubStatus
 import com.lagradost.cloudstream3.LoadResponse.Companion.addAniListId
 import com.lagradost.cloudstream3.LoadResponse.Companion.addImdbId
 import com.lagradost.cloudstream3.LoadResponse.Companion.addMalId
@@ -185,7 +186,7 @@ class WizAnilistProvider : MainAPI() {
 
         return if(isMovie){
             val linkData=LinkData(data.id, data.idMal, title, null, tmdbId, imdbId, null).toJson()
-            newAnimeLoadResponse(title, url, TvType.AnimeMovie, linkData){
+            newMovieLoadResponse(title, url, TvType.AnimeMovie, linkData){
                 this.posterUrl=poster ?: tmdbMeta?.poster
                 this.backgroundPosterUrl=banner ?: tmdbMeta?.backdrop
                 this.plot=desc ?: tmdbMeta?.plot
@@ -202,7 +203,8 @@ class WizAnilistProvider : MainAPI() {
                 val epData=LinkData(data.id, data.idMal, title, epNum, tmdbId, imdbId, 1).toJson()
                 newEpisode(epData){ name="Episode $epNum"; episode=epNum; season=1 }
             }
-            newAnimeLoadResponse(title, url, TvType.Anime, episodes){
+            newAnimeLoadResponse(title, url, TvType.Anime){
+                addEpisodes(DubStatus.Subbed, episodes)
                 this.posterUrl=poster ?: tmdbMeta?.poster
                 this.backgroundPosterUrl=banner ?: tmdbMeta?.backdrop
                 this.plot=desc ?: tmdbMeta?.plot
