@@ -116,24 +116,19 @@ private fun JSONObject.aOptDbl(k: String): Double? =
     else optString(k, "").toDoubleOrNull()
         ?: optDouble(k, Double.NaN).takeIf { !it.isNaN() }
 
-// Re-label an ExtractorLink using the builder (avoids the deprecated constructor).
-private fun ExtractorLink.aRelabel(newSource: String, newName: String): ExtractorLink {
-    val linkType = this.type ?: ExtractorLinkType.VIDEO
-    val originalQuality = this.quality ?: Qualities.Unknown.value
-    val originalReferer = this.headers["Referer"]
-        ?: this.headers["referer"]
-        ?: this.headers["Referrer"]
-        ?: ""
-    return newExtractorLink(
-        source = newSource,
-        name = newName,
-        url = this.url,
-        type = linkType,
-    ) {
-        this.referer = originalReferer
-        this.quality = originalQuality
+private fun ExtractorLink.aRelabel(newSource: String, newName: String): ExtractorLink =
+    kotlinx.coroutines.runBlocking {
+        newExtractorLink(
+            source = newSource,
+            name = newName,
+            url = this@aRelabel.url,
+            type = this@aRelabel.type,
+        ) {
+            this.referer = this@aRelabel.referer
+            this.quality = this@aRelabel.quality
+            this.headers = this@aRelabel.headers
+        }
     }
-}
 
 private fun currentSeasonFilter(): Pair<String, Int> {
     val cal = java.util.Calendar.getInstance()
@@ -255,6 +250,35 @@ class WizstreamAnimeProvider : MainAPI() {
             VidHost("AutoEmbe",
                 { id -> "https://autoembe.xyz/embed/movie?imdb=$id" },
                 { id, s, e -> "https://autoembe.xyz/embed/tv?imdb=$id&sea=$s&epi=$e" }),
+            // ── Vid[x] family (explicit) ────────────────────────────────────
+            // The user-requested Vid[x] sources: src / nest / play / up /
+            // rock / fast / easy. These complement the older VidSrc.icu /
+            // VidSrc.to / VidSrc.me / VidSrc.xyz entries above. Anime
+            // typically maps a season+episode to a single episode number
+            // via (s-1)*12 + e, but most vid[x] hosts ignore the season
+            // parameter for anime — so we pass s=1 and just use the
+            // absolute episode number to maximise hit rate.
+            VidHost("VidSrcX",
+                { id -> "https://vidsrc.xyz/embed/movie/$id" },
+                { id, s, e -> "https://vidsrc.xyz/embed/tv/$id/$s/$e" }),
+            VidHost("VidNest",
+                { id -> "https://vidnest.to/embed/movie/$id" },
+                { id, s, e -> "https://vidnest.to/embed/tv/$id/$s/$e" }),
+            VidHost("VidPlay",
+                { id -> "https://vidplay.site/embed/movie/$id" },
+                { id, s, e -> "https://vidplay.site/embed/tv/$id/$s/$e" }),
+            VidHost("VidUp",
+                { id -> "https://vidup.io/embed/movie/$id" },
+                { id, s, e -> "https://vidup.io/embed/tv/$id/$s/$e" }),
+            VidHost("VidRock",
+                { id -> "https://vidrock.to/embed/movie/$id" },
+                { id, s, e -> "https://vidrock.to/embed/tv/$id/$s/$e" }),
+            VidHost("VidFast",
+                { id -> "https://vidfast.co/embed/movie/$id" },
+                { id, s, e -> "https://vidfast.co/embed/tv/$id/$s/$e" }),
+            VidHost("VidEasy",
+                { id -> "https://videasy.co/embed/movie/$id" },
+                { id, s, e -> "https://videasy.co/embed/tv/$id/$s/$e" }),
             // Anime-specific
             VidHost("AllManga",
                 { id -> "https://allmanga.to/manga/$id" },
@@ -519,7 +543,38 @@ class WizstreamAnimeProvider : MainAPI() {
                 }
             }
         }
+
+        // ── Bundled BDIX source resolvers ────────────────────────────────
+        // AniList anime often has English-romaji titles that the BDIX
+        // sites (Cineplex BD / FTPBD / Circle FTP / CTGMovies) index
+        // reasonably well via their anime categories. WizstreamSources
+        // runs all 4 sites in parallel and emits any matches it finds.
+        val sourceJob = async(Dispatchers.IO) {
+            runCatching {
+                WizstreamSources.resolveAll(
+                    app = app,
+                    title = ctx.title ?: "",
+                    year = null,
+                    isMovie = ctx.isMovie,
+                    season = ctx.season,
+                    episode = ctx.episode,
+                    labelPrefix = "Wizstream-A",
+                    subtitleCallback = { sub ->
+                        if (seenSubs.add(sub.url)) subtitleCallback(sub)
+                    },
+                    callback = { link ->
+                        val normalized = link.url.trim()
+                        if (normalized.isNotBlank() && seenUrls.add(normalized)) {
+                            callback(link)
+                            anyFound = true
+                        }
+                    },
+                )
+            }.getOrDefault(false)
+        }
+
         jobs.awaitAll()
+        sourceJob.await()
         anyFound
     }
 

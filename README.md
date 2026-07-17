@@ -11,10 +11,37 @@ English, Korean, Japanese, Chinese and more.
 
 | Extension | Content | Sources |
 |-----------|---------|---------|
+| **Wizstream** *(unified)* | Movies, TV series, anime, OVA — TMDB + AniList catalogues in one plugin | Vid[x] family (vidsrc, vidnest, vidplay, vidup, vidrock, vidfast, videasy) + 4 BDIX sites bundled |
 | **Circle FTP** | Movies, TV series, anime, animation, documentaries, Asian dramas | `new.circleftp.net` |
 | **CTGMovies** | Movies, TV shows, anime | `ctgmovies.com` |
 | **Cineplex BD** | Movies, anime, web-series, cartoons | `cineplexbd.net` |
 | **FTPBD** | Movies, TV shows, anime movies | `ftpbd.net` |
+
+### 🆕 Wizstream — unified catalogue plugin
+
+A single `.cs3` plugin file that registers **two MainAPI providers** from one
+Cloudstream plugin (the "streamplay" pattern):
+
+1. **Wizstream** — TMDB catalogue (movies & TV). Trending / Popular / Top-Rated
+   / Upcoming / Now Playing / On The Air.
+2. **Wizstream-Anime** — AniList catalogue (anime / OVA / movies). Trending /
+   Popular This Season / Top Rated / Upcoming / All-Time Popular.
+
+Both providers share a single `WizstreamSources` resolver bundle, so every
+`loadLinks` call attempts **all** of these in parallel:
+
+- **Vid[x] family** (7 explicit hosts): `vidsrc`, `vidnest`, `vidplay`,
+  `vidup`, `vidrock`, `vidfast`, `videasy`.
+- **Extended VidSrc family** (12 more): VidSrc.icu / VidSrc.to / VidSrc.me /
+  VidSrc.xyz / VidSrc.mov / VidBinge / VidJoy / 2Embed / MultiEmbed /
+  SuperEmbed / Gomo / SmashyStream / VidAPI / VAPlayer / ApiPlayer /
+  111Movies / Remotestream / AutoEmbe.
+- **4 BDIX source sites** (bundled resolvers): Cineplex BD · FTPBD ·
+  Circle FTP · CTGMovies — each searched by title, best-matched, then
+  detail-page-scraped for direct media URLs + iframe embeds.
+- **Anime-specific** (Wizstream-Anime only): AllManga · AnimeStream · ZoroAnime.
+
+Duplicate URLs are de-duped globally across all sources.
 
 ## ✨ Features
 
@@ -31,6 +58,8 @@ English, Korean, Japanese, Chinese and more.
   integration where applicable.
 - 🎚️ **Quality detection** — sources are auto-tagged (4K / 1080p / WEB-DL / etc.)
   from filenames and metadata.
+- 🧩 **Unified plugin** — `Wizstream.cs3` ships both TMDB + AniList catalogues
+  in one file, mirroring phisher98's streamplay architecture.
 
 ## 🔧 Installation
 
@@ -47,12 +76,13 @@ https://raw.githubusercontent.com/Wizdier/Wizdier-CloudstreamRepo/builds/plugins
 ### Build from source
 
 ```bash
-# Requires JDK 17+ and Android SDK (compileSdk 35)
-./gradlew assembleDebug
+# Requires JDK 21+ and Android SDK (compileSdk 35)
+./gradlew make        # build all .cs3 files
+./gradlew :Wizstream:make   # build only the unified Wizstream plugin
 ```
 
-Built extensions (`.cs3` files) are output to each module's
-`build/outputs/apk/debug/` directory.
+Built extensions (`.cs3` files) are output to each module's `build/`
+directory (e.g. `Wizstream/build/Wizstream.cs3`).
 
 > **CTGMovies note:** some content requires authentication. Open the extension's
 > settings to enter an email/password (auto-login), a `ctg.token` / Bearer
@@ -70,13 +100,16 @@ Built extensions (`.cs3` files) are output to each module's
 
 ```
 Wizdier-CloudstreamRepo/
-├── Circle FTP/      # CircleFtpProvider + CircleFtpHttp (resilience layer)
-├── CTGMovies/       # CTGMovies + CTGConcurrent (concurrency/cache)
-├── Cineplex BD/     # CineplexBD + MetadataEnricher + CineplexConcurrent
-├── FTPBD/           # FTPBD + FTPBDConcurrent
-├── .github/         # GitHub Actions CI (build.yml)
-├── build.gradle.kts # Root config
-└── repo.json        # Repository manifest
+├── Wizstream/        # Unified plugin: WizstreamProvider (TMDB) +
+│                     # WizstreamAnimeProvider (AniList) + WizstreamSources
+│                     # (4 BDIX resolvers + Vid[x] family)
+├── Circle FTP/       # CircleFtpProvider + CircleFtpHttp (resilience layer)
+├── CTGMovies/        # CTGMovies + CTGConcurrent (concurrency/cache)
+├── Cineplex BD/      # CineplexBD + MetadataEnricher + CineplexConcurrent
+├── FTPBD/            # FTPBD + FTPBDConcurrent
+├── icons/            # WizstreamIcon.png + WizstreamAnimeIcon.png
+├── build.gradle.kts  # Root config
+└── repo.json         # Repository manifest
 ```
 
 ## 📄 License

@@ -130,24 +130,25 @@ private fun JSONObject.optDoubleOrNullWz(k: String): Double? =
 private fun String.normalizedWz(): String =
     lowercase().replace(Regex("[^a-z0-9]+"), " ").trim()
 
-// Re-label an ExtractorLink using the builder (avoids the deprecated constructor).
-private fun ExtractorLink.relabel(newSource: String, newName: String): ExtractorLink {
-    val linkType = this.type ?: ExtractorLinkType.VIDEO
-    val originalQuality = this.quality ?: Qualities.Unknown.value
-    val originalReferer = this.headers["Referer"]
-        ?: this.headers["referer"]
-        ?: this.headers["Referrer"]
-        ?: ""
-    return newExtractorLink(
-        source = newSource,
-        name = newName,
-        url = this.url,
-        type = linkType,
-    ) {
-        this.referer = originalReferer
-        this.quality = originalQuality
+// Re-label an ExtractorLink while preserving url/type/quality/headers.
+// The `ExtractorLink(...)` constructor is deprecated to ERROR level in the
+// latest cloudstream3 stubs ("Use newExtractorLink"), so we delegate to the
+// suspend `newExtractorLink` factory via `runBlocking`. The factory body
+// performs no IO so this is fast and safe to call from non-suspend
+// callbacks (e.g. inside `loadExtractor { link -> ... }`).
+private fun ExtractorLink.relabel(newSource: String, newName: String): ExtractorLink =
+    kotlinx.coroutines.runBlocking {
+        newExtractorLink(
+            source = newSource,
+            name = newName,
+            url = this@relabel.url,
+            type = this@relabel.type,
+        ) {
+            this.referer = this@relabel.referer
+            this.quality = this@relabel.quality
+            this.headers = this@relabel.headers
+        }
     }
-}
 
 private suspend fun <T, R> boundedParallelMapWz(
     items: List<T>,
@@ -252,6 +253,33 @@ class WizstreamProvider : MainAPI() {
             VidHost("AutoEmbe",
                 { id -> "https://autoembe.xyz/embed/movie?imdb=$id" },
                 { id, s, e -> "https://autoembe.xyz/embed/tv?imdb=$id&sea=$s&epi=$e" }),
+            // ── Vid[x] family (explicit) ────────────────────────────────────
+            // The user-requested Vid[x] sources: src / nest / play / up /
+            // rock / fast / easy. These complement the older VidSrc.icu /
+            // VidSrc.to / VidSrc.me / VidSrc.xyz entries above and are kept
+            // as their own labelled hosts so failures don't take each other
+            // down. All accept tmdb (preferred) or imdb ids in the path.
+            VidHost("VidSrcX",
+                { id -> "https://vidsrc.xyz/embed/movie/$id" },
+                { id, s, e -> "https://vidsrc.xyz/embed/tv/$id/$s/$e" }),
+            VidHost("VidNest",
+                { id -> "https://vidnest.to/embed/movie/$id" },
+                { id, s, e -> "https://vidnest.to/embed/tv/$id/$s/$e" }),
+            VidHost("VidPlay",
+                { id -> "https://vidplay.site/embed/movie/$id" },
+                { id, s, e -> "https://vidplay.site/embed/tv/$id/$s/$e" }),
+            VidHost("VidUp",
+                { id -> "https://vidup.io/embed/movie/$id" },
+                { id, s, e -> "https://vidup.io/embed/tv/$id/$s/$e" }),
+            VidHost("VidRock",
+                { id -> "https://vidrock.to/embed/movie/$id" },
+                { id, s, e -> "https://vidrock.to/embed/tv/$id/$s/$e" }),
+            VidHost("VidFast",
+                { id -> "https://vidfast.co/embed/movie/$id" },
+                { id, s, e -> "https://vidfast.co/embed/tv/$id/$s/$e" }),
+            VidHost("VidEasy",
+                { id -> "https://videasy.co/embed/movie/$id" },
+                { id, s, e -> "https://videasy.co/embed/tv/$id/$s/$e" }),
         )
 
         private val metaCache = ConcurrentHashMap<String, Pair<Long, TmdbDetail>>()
@@ -468,7 +496,37 @@ class WizstreamProvider : MainAPI() {
                 }
             }
         }
+
+        // ── Bundled BDIX source resolvers ────────────────────────────────
+        // Run the 4 source extensions' search+loadLinks in parallel with
+        // the Vid[x] embed family. WizstreamSources handles its own internal
+        // concurrency (4-way), so we just await the whole batch here.
+        val sourceJob = async(Dispatchers.IO) {
+            runCatching {
+                WizstreamSources.resolveAll(
+                    app = app,
+                    title = ctx.title ?: "",
+                    year = null,
+                    isMovie = ctx.isMovie,
+                    season = s,
+                    episode = e,
+                    labelPrefix = "Wizstream",
+                    subtitleCallback = { sub ->
+                        if (seenSubs.add(sub.url)) subtitleCallback(sub)
+                    },
+                    callback = { link ->
+                        val normalized = link.url.trim()
+                        if (normalized.isNotBlank() && seenUrls.add(normalized)) {
+                            callback(link)
+                            anyFound = true
+                        }
+                    },
+                )
+            }.getOrDefault(false)
+        }
+
         jobs.awaitAll()
+        sourceJob.await()
         anyFound
     }
 
