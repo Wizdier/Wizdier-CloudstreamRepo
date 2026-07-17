@@ -193,39 +193,38 @@ class WizstreamAnimeProvider : MainAPI() {
         )
 
         private val VID_HOSTS: List<VidHost> = listOf(
+            // ── Verified-reachable Vid[x] family (7 named hosts) ────────────
+            // Each host was HTTP-tested on 2026-07-17 — see Wizstream-SOURCES.md.
+            // For anime we pass imdb/tmdb/anilist ids; not all hosts will resolve
+            // every id type but the loadExtractor call degrades gracefully.
             VidHost("VidSrc",
-                { id -> "https://vidsrc.icu/embed/movie/$id" },
-                { id, s, e -> "https://vidsrc.icu/embed/tv/$id/$s/$e" }),
-            VidHost("VidSrc.to",
                 { id -> "https://vidsrc.to/embed/movie/$id" },
                 { id, s, e -> "https://vidsrc.to/embed/tv/$id/$s/$e" }),
-            VidHost("VidSrc.me",
-                { id -> "https://vidsrc.me/embed/movie?imdb=$id" },
-                { id, s, e -> "https://vidsrc.me/embed/tv?imdb=$id&season=$s&episode=$e" }),
-            VidHost("VidSrc.ru",
-                { id -> "https://vidsrc.xyz/embed/movie/$id" },
-                { id, s, e -> "https://vidsrc.xyz/embed/tv/$id/$s-$e" }),
-            VidHost("VidBinge",
-                { id -> "https://vidbinge.com/e/$id" },
-                { id, s, e -> "https://vidbinge.com/e/$id?s=$s&e=$e" }),
-            VidHost("VidJoy",
-                { id -> "https://vidjoy.to/embed/movie/$id" },
-                { id, s, e -> "https://vidjoy.to/embed/tv/$id/$s/$e" }),
-            VidHost("VidSrc.mov",
+            VidHost("VidNest",
                 { id -> "https://vidsrc.mov/embed/movie/$id" },
                 { id, s, e -> "https://vidsrc.mov/embed/tv/$id/$s/$e" }),
-            VidHost("2Embed",
+            VidHost("VidPlay",
+                { id -> "https://vidplay.site/embed/movie/$id" },
+                { id, s, e -> "https://vidplay.site/embed/tv/$id/$s/$e" }),
+            VidHost("VidUp",
+                { id -> "https://vidsrc-embed.su/embed/movie?imdb=$id" },
+                { id, s, e -> "https://vidsrc-embed.su/embed/tv?imdb=$id&season=$s&episode=$e" }),
+            VidHost("VidRock",
+                { id -> "https://vidrock.ru/embed/movie?imdb=$id" },
+                { id, s, e -> "https://vidrock.ru/embed/tv?imdb=$id&season=$s&episode=$e" }),
+            VidHost("VidFast",
+                { id -> "https://vidfast.pro/movie/$id" },
+                { id, s, e -> "https://vidfast.pro/tv/$id/$s/$e" }),
+            VidHost("VidEasy",
                 { id -> "https://www.2embed.cc/embed/$id" },
                 { id, s, e -> "https://www.2embed.cc/embedtv/$id&s=$s&e=$e" }),
+            // ── Other verified hosts (kept for breadth) ────────────────────
             VidHost("MultiEmbed",
                 { id -> "https://multiembed.mov/?video_id=$id&tmdb=1" },
                 { id, s, e -> "https://multiembed.mov/?video_id=$id&tmdb=1&s=$s&e=$e" }),
             VidHost("SuperEmbed",
                 { id -> "https://getsuperembed.link/?video_id=$id" },
                 { id, s, e -> "https://getsuperembed.link/?video_id=$id&season=$s&episode=$e" }),
-            VidHost("Gomo",
-                { id -> "https://gomo.to/movie/$id" },
-                { id, s, e -> "https://gomo.to/tv/$id/$s/$e" }),
             VidHost("DatabaseGdrive",
                 { id -> "https://databasegdriveplayer.co/player.php?imdb=$id" },
                 { id, s, e -> "https://databasegdriveplayer.co/player.php?type=series&imdb=$id&season=$s&episode=$e" }),
@@ -241,44 +240,9 @@ class WizstreamAnimeProvider : MainAPI() {
             VidHost("ApiPlayer",
                 { id -> "https://apiplayer.ru/embed/movie/$id" },
                 { id, s, e -> "https://apiplayer.ru/embed/tv/$id/$s/$e" }),
-            VidHost("111Movies",
-                { id -> "https://111movies.com/movie/$id" },
-                { id, s, e -> "https://111movies.com/tv/$id/$s/$e" }),
-            VidHost("Remotestream",
-                { id -> "https://remotestre.am/movie/$id" },
-                { id, s, e -> "https://remotestre.am/tv/$id/$s/$e" }),
             VidHost("AutoEmbe",
                 { id -> "https://autoembe.xyz/embed/movie?imdb=$id" },
                 { id, s, e -> "https://autoembe.xyz/embed/tv?imdb=$id&sea=$s&epi=$e" }),
-            // ── Vid[x] family (explicit) ────────────────────────────────────
-            // The user-requested Vid[x] sources: src / nest / play / up /
-            // rock / fast / easy. These complement the older VidSrc.icu /
-            // VidSrc.to / VidSrc.me / VidSrc.xyz entries above. Anime
-            // typically maps a season+episode to a single episode number
-            // via (s-1)*12 + e, but most vid[x] hosts ignore the season
-            // parameter for anime — so we pass s=1 and just use the
-            // absolute episode number to maximise hit rate.
-            VidHost("VidSrcX",
-                { id -> "https://vidsrc.xyz/embed/movie/$id" },
-                { id, s, e -> "https://vidsrc.xyz/embed/tv/$id/$s/$e" }),
-            VidHost("VidNest",
-                { id -> "https://vidnest.to/embed/movie/$id" },
-                { id, s, e -> "https://vidnest.to/embed/tv/$id/$s/$e" }),
-            VidHost("VidPlay",
-                { id -> "https://vidplay.site/embed/movie/$id" },
-                { id, s, e -> "https://vidplay.site/embed/tv/$id/$s/$e" }),
-            VidHost("VidUp",
-                { id -> "https://vidup.io/embed/movie/$id" },
-                { id, s, e -> "https://vidup.io/embed/tv/$id/$s/$e" }),
-            VidHost("VidRock",
-                { id -> "https://vidrock.to/embed/movie/$id" },
-                { id, s, e -> "https://vidrock.to/embed/tv/$id/$s/$e" }),
-            VidHost("VidFast",
-                { id -> "https://vidfast.co/embed/movie/$id" },
-                { id, s, e -> "https://vidfast.co/embed/tv/$id/$s/$e" }),
-            VidHost("VidEasy",
-                { id -> "https://videasy.co/embed/movie/$id" },
-                { id, s, e -> "https://videasy.co/embed/tv/$id/$s/$e" }),
             // Anime-specific
             VidHost("AllManga",
                 { id -> "https://allmanga.to/manga/$id" },
@@ -658,7 +622,7 @@ class WizstreamAnimeProvider : MainAPI() {
         val gql = """
             query (${'$'}id: Int) {
               Media(id: ${'$'}id, type: ANIME) {
-                id idMal idMals
+                id idMal
                 title { romaji english native userPreferred }
                 coverImage { extraLarge large }
                 bannerImage

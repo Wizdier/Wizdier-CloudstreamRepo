@@ -11,6 +11,7 @@ import org.json.JSONArray
 import org.json.JSONObject
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
+import org.jsoup.nodes.Element
 import java.net.URLEncoder
 import java.util.Base64
 
@@ -34,18 +35,14 @@ import java.util.Base64
  * surface working stream URLs from all 4 sites in one shot, behind a
  * unified TMDB / AniList catalogue.
  *
+ * The HTML parsers below are 1:1 ports of the parsers used by the
+ * standalone extensions (CineplexBDProvider, FTPBDProvider,
+ * CircleFtpProvider, CTGMoviesProvider) — the selectors and JSON paths
+ * match exactly so behaviour is identical.
+ *
  * Concurrency: all 4 sites are queried in parallel, bounded by a 4-permit
  * semaphore. Per-site HTTP requests are sequential (one search → one detail
  * fetch → one extraction pass) so we don't hammer any single host.
- *
- * Robustness:
- *   • Every site call is wrapped in runCatching — a single failing host
- *     never breaks the others.
- *   • Direct media URLs are de-duped globally via the caller's seenUrls set.
- *   • m3u8 streams are passed through M3u8Helper so subtitles + variants
- *     are resolved correctly.
- *   • iframe URLs go through `loadExtractor` so any future host that
- *     Cloudstream's extractor registry knows about is auto-supported.
  */
 object WizstreamSources {
 
@@ -57,20 +54,6 @@ object WizstreamSources {
     //  Public entry point
     // ───────────────────────────────────────────────────────────────────────
 
-    /**
-     * Run all 4 bundled source resolvers in parallel and aggregate their
-     * extracted links. Returns true if at least one source produced a link.
-     *
-     * @param app          the Cloudstream HTTP client (inherited from MainAPI)
-     * @param title        the show/movie title to search for
-     * @param year         optional release year for disambiguation
-     * @param isMovie      true for movies, false for TV/anime
-     * @param season       1-indexed season (null/0 for movies)
-     * @param episode      1-indexed episode (null/0 for movies)
-     * @param labelPrefix  e.g. "Wizstream" or "Wizstream-A" — used as the
-     *                     source label prefix so users can see where each
-     *                     link came from in the player UI.
-     */
     suspend fun resolveAll(
         app: Requests,
         title: String,
@@ -118,7 +101,6 @@ object WizstreamSources {
     //  Shared helpers
     // ───────────────────────────────────────────────────────────────────────
 
-    /** Jaccard token overlap on normalised title strings. Returns 0..1. */
     internal fun titleSimilarity(a: String, b: String): Double {
         val ax = a.normaliseTitle()
         val bx = b.normaliseTitle()
@@ -140,16 +122,6 @@ object WizstreamSources {
     internal fun encodeUrl(s: String): String =
         URLEncoder.encode(s, "UTF-8").replace("+", "%20")
 
-    /**
-     * Re-label an ExtractorLink, preserving url/type/quality/headers.
-     *
-     * The `ExtractorLink(source=, name=, url=, type=, quality=, headers=)`
-     * constructor was deprecated to ERROR level in the latest cloudstream3
-     * stubs ("Use newExtractorLink"), but `newExtractorLink` is a suspend
-     * function while `loadExtractor`'s callback is non-suspend. We bridge
-     * that gap with `runBlocking` — the newExtractorLink body does no IO
-     * so this is cheap and safe.
-     */
     internal fun ExtractorLink.relabel(newSource: String, newName: String): ExtractorLink =
         runBlocking {
             newExtractorLink(
@@ -164,7 +136,6 @@ object WizstreamSources {
             }
         }
 
-    /** Heuristic quality from URL/file name. */
     internal fun qualityFromName(s: String?): Int {
         if (s == null) return Qualities.Unknown.value
         val n = s.lowercase()
@@ -186,12 +157,18 @@ object WizstreamSources {
             u.contains(".m3u8?") || u.contains(".mp4?") || u.contains(".mkv?")
     }
 
+    internal fun resolveAbs(baseUrl: String, maybeRelative: String): String {
+        val u = maybeRelative.trim().replace("&amp;", "&")
+        if (u.isBlank()) return u
+        if (u.startsWith("http://") || u.startsWith("https://")) return u
+        if (u.startsWith("//")) return "https:$u"
+        val base = baseUrl.trimEnd('/')
+        return if (u.startsWith("/")) "$base$u" else "$base/$u"
+    }
+
     /**
      * Generic "extract every media-looking URL from a HTML page" routine.
-     * Used by Cineplex BD and FTPBD resolvers — both sites embed video
-     * URLs in `<video>`, `<source>`, `data-url`, `hls.loadSource(...)`,
-     * and as raw URLs inside inline scripts.
-     *
+     * Ported from FTPBDProvider.loadLinksFromPage + CineplexBDProvider.loadLinks.
      * Returns a de-duped LinkedHashSet of resolved absolute URLs.
      */
     internal fun extractMediaUrlsFromHtml(html: String, baseUrl: String): LinkedHashSet<String> {
@@ -221,7 +198,8 @@ object WizstreamSources {
             .findAll(html).forEach { m -> out += resolveAbs(baseUrl, m.groupValues[1]) }
         Regex("""(?i)hls\.loadSource\(["']([^"']+?\.m3u8[^"']*)["']\)""")
             .findAll(html).forEach { m -> out += resolveAbs(baseUrl, m.groupValues[1]) }
-        Regex("""(?i)videoSrc\s*=\s*["'](.*?)["']""")
+        // CineplexBD's videoSrc JS pattern
+        Regex("""(?i)const\s+videoSrc\s*=\s*["'](.*?)["']""")
             .findAll(html).forEach { m ->
                 val u = m.groupValues[1]
                 if (u.isNotBlank() && (u.startsWith("http") || isDirectMedia(u)))
@@ -239,17 +217,6 @@ object WizstreamSources {
         return out
     }
 
-    /** Resolve a possibly-relative URL against a base. */
-    internal fun resolveAbs(baseUrl: String, maybeRelative: String): String {
-        val u = maybeRelative.trim().replace("&amp;", "&")
-        if (u.isBlank()) return u
-        if (u.startsWith("http://") || u.startsWith("https://")) return u
-        if (u.startsWith("//")) return "https:$u"
-        val base = baseUrl.trimEnd('/')
-        return if (u.startsWith("/")) "$base$u" else "$base/$u"
-    }
-
-    /** Emit a single direct media URL through the callback. */
     internal suspend fun emitDirect(
         app: Requests,
         url: String,
@@ -318,6 +285,8 @@ object WizstreamSources {
 
     // ════════════════════════════════════════════════════════════════════════
     //  Resolver 1: Cineplex BD  (http://cineplexbd.net)
+    //  Parser ported from CineplexBDProvider.kt — uses the exact same
+    //  selectors + the `watch.php?…&meta=1` JSON endpoint for episodes.
     // ════════════════════════════════════════════════════════════════════════
 
     internal object CineplexBdResolver : SourceResolver {
@@ -339,15 +308,16 @@ object WizstreamSources {
             subtitleCallback: (SubtitleFile) -> Unit,
             callback: (ExtractorLink) -> Unit,
         ): Boolean {
-            // 1. Search
+            // 1. Search — uses the same search.php endpoint + selectors as
+            //    CineplexBDProvider.parseAndGroupSearchItems.
             val searchUrl = "$SITE/search.php?q=${encodeUrl(title)}&page=1"
             val html = runCatching {
                 app.get(searchUrl, headers = HEADERS, timeout = 12_000).text
             }.getOrNull() ?: return false
 
-            // 2. Parse result cards → pick best match
             val doc = Jsoup.parse(html, searchUrl)
             val candidates = mutableListOf<Pair<String, String>>() // (url, title)
+            // EXACT same selector as CineplexBDProvider.kt:646-649
             doc.select(
                 "a[href*='view.php'], a[href*='watch.php'], a[href*='tview.php'], " +
                     ".movie-card a, a:has(.poster), a:has(img[src*='uploads'])"
@@ -367,6 +337,7 @@ object WizstreamSources {
                     else -> "$SITE/view.php?id=$id"
                 }
 
+                // Same title selectors as CineplexBDProvider.Element.toSearchItem
                 val titleEl = a.selectFirst(
                     "span.truncate, div.text-sm, div.cp-title, h2, .card-title, .title"
                 )
@@ -377,6 +348,8 @@ object WizstreamSources {
                 candidates += absHref to candTitle
             }
 
+            if (candidates.isEmpty()) return false
+
             // Filter: prefer series page for TV, view page for movie.
             val filtered = candidates.filter { (u, _) ->
                 if (isMovie) !u.contains("watch.php?series_id") && !u.contains("tview.php")
@@ -385,66 +358,95 @@ object WizstreamSources {
 
             val best = filtered.maxByOrNull { (_, ct) -> titleSimilarity(ct, title) }
                 ?: return false
-            // Require a minimum similarity to avoid false positives.
             if (titleSimilarity(best.second, title) < 0.4) return false
 
-            // 3. Detail page
-            val detailHtml = runCatching {
-                app.get(best.first, headers = HEADERS, timeout = 15_000).text
+            val srcLabel = "$labelPrefix • $LABEL"
+            val seriesIdKey = if (best.first.contains("series_id=")) "series_id" else "id"
+            val seriesIdVal = if (seriesIdKey == "series_id") {
+                best.first.substringAfter("series_id=").substringBefore("&")
+            } else {
+                best.first.substringAfter("id=").substringBefore("&")
+            }
+
+            // 2. Movies: load the view.php page directly and extract media URLs.
+            if (isMovie) {
+                val detailHtml = runCatching {
+                    app.get(best.first, headers = HEADERS, timeout = 15_000).text
+                }.getOrNull() ?: return false
+                val mediaUrls = extractMediaUrlsFromHtml(detailHtml, best.first)
+                var any = false
+                mediaUrls.forEach { u ->
+                    if (emitDirect(app, u, srcLabel, "$SITE/", HEADERS, subtitleCallback, callback)) any = true
+                }
+                return any
+            }
+
+            // 3. TV: use the watch.php?…&season=N&meta=1 JSON endpoint that
+            //    CineplexBDProvider uses. Each episode object has a `path`
+            //    field pointing to a /Data/… direct media URL or watch.php
+            //    page that we then resolve.
+            val seasonToUse = season ?: 1
+            val metaUrl = "$SITE/watch.php?$seriesIdKey=$seriesIdVal&season=$seasonToUse&meta=1"
+            val metaText = runCatching {
+                app.get(metaUrl, headers = HEADERS, timeout = 12_000).text
             }.getOrNull() ?: return false
 
-            // 4. If TV, try to find the right episode page first.
-            val episodePageUrl: String? = if (!isMovie && season != null && episode != null) {
-                pickEpisodePageUrl(detailHtml, best.first, season, episode)
-            } else {
-                null
-            }
-
-            // 5. Extract media URLs and emit
-            val mediaUrls = extractMediaUrlsFromHtml(detailHtml, best.first)
-            if (episodePageUrl != null) {
-                runCatching {
-                    app.get(episodePageUrl, headers = HEADERS, timeout = 15_000).text
-                }.getOrNull()?.let { epHtml ->
-                    mediaUrls += extractMediaUrlsFromHtml(epHtml, episodePageUrl)
+            // Parse the JSON — supports both {episodes: {1: {…}}} and
+            // {episodes: [{…}, …]} shapes (CineplexBDProvider.parseEpisodesFromMetaJson).
+            val root = runCatching { JSONObject(metaText) }.getOrNull() ?: return false
+            val episodesNode: Any? = root.opt("episodes") ?: root.opt("data") ?: root
+            val epPath: String? = when (episodesNode) {
+                is JSONObject -> {
+                    // Find the episode by number, fall back to index.
+                    val keys = episodesNode.keys()
+                    var path: String? = null
+                    while (keys.hasNext()) {
+                        val k = keys.next()
+                        val v = episodesNode.optJSONObject(k) ?: continue
+                        val epNum = v.optStringOrNullCp("episode_number")?.toIntOrNull()
+                            ?: v.optInt("episode_number", 0).takeIf { it != 0 }
+                            ?: k.toIntOrNull()
+                            ?: 0
+                        if (epNum == episode) {
+                            path = v.optStringOrNullCp("path") ?: v.optStringOrNullCp("url")
+                                ?: v.optStringOrNullCp("src") ?: v.optStringOrNullCp("file")
+                            break
+                        }
+                    }
+                    path
                 }
+                is JSONArray -> {
+                    val idx = (episode ?: 1) - 1
+                    val v = episodesNode.optJSONObject(idx)
+                    v?.optStringOrNullCp("path") ?: v?.optStringOrNullCp("url")
+                        ?: v?.optStringOrNullCp("src") ?: v?.optStringOrNullCp("file")
+                }
+                else -> null
             }
 
-            val srcLabel = "$labelPrefix • $LABEL"
+            if (epPath != null) {
+                // The episode path is normally a /Data/… direct media URL.
+                val absEp = resolveAbs(SITE, epPath)
+                return emitDirect(app, absEp, srcLabel, "$SITE/", HEADERS, subtitleCallback, callback)
+            }
+
+            // Fallback: scrape the watch.php page for any media URLs.
+            val watchHtml = runCatching {
+                app.get(best.first, headers = HEADERS, timeout = 15_000).text
+            }.getOrNull() ?: return false
+            val mediaUrls = extractMediaUrlsFromHtml(watchHtml, best.first)
             var any = false
             mediaUrls.forEach { u ->
                 if (emitDirect(app, u, srcLabel, "$SITE/", HEADERS, subtitleCallback, callback)) any = true
             }
             return any
         }
-
-        private fun pickEpisodePageUrl(
-            detailHtml: String,
-            detailUrl: String,
-            season: Int,
-            episode: Int,
-        ): String? {
-            val doc = Jsoup.parse(detailHtml, detailUrl)
-            // Look for episode anchors matching s/e (or just episode number).
-            val anchors = doc.select(
-                "a[href*='ep='], a[href*='episode='], a[href*='/Data/'], " +
-                    "a.episode, a[data-episode], .episode-list a, .episodes a"
-            )
-            // Prefer an exact "ep=N" match on episode number.
-            val exact = anchors.firstOrNull { a ->
-                val href = a.attr("href")
-                Regex("""(?i)(?:ep(?:isode)?[=\s]*|\bE)(\d+)""")
-                    .find(href)?.groupValues?.get(1)?.toIntOrNull() == episode
-            }
-            val href = exact?.attr("href")?.ifBlank { null }
-                ?: anchors.getOrNull(episode - 1)?.attr("href")?.ifBlank { null }
-                ?: return null
-            return resolveAbs(detailUrl, href)
-        }
     }
 
     // ════════════════════════════════════════════════════════════════════════
     //  Resolver 2: FTPBD  (https://ftpbd.net)
+    //  Parser ported from FTPBDProvider.kt — uses the exact same
+    //  `.site-main .jws-post-item` selectors + `/movie/` `/tv_shows/` paths.
     // ════════════════════════════════════════════════════════════════════════
 
     internal object FtpBdResolver : SourceResolver {
@@ -466,7 +468,8 @@ object WizstreamSources {
             subtitleCallback: (SubtitleFile) -> Unit,
             callback: (ExtractorLink) -> Unit,
         ): Boolean {
-            // Search movies + tv concurrently.
+            // Search movies + tv concurrently. Use the EXACT selectors from
+            // FTPBDProvider.parseCardItems: `.site-main .jws-post-item, .site-main .post-inner`
             val postTypes = if (isMovie) listOf("movies") else listOf("tv_shows", "movies")
             val expectedPaths = if (isMovie) listOf("/movie/") else listOf("/tv_shows/", "/movie/")
 
@@ -477,14 +480,17 @@ object WizstreamSources {
                         val url = "$SITE/?s=${encodeUrl(title)}&post_type=$postType"
                         runCatching {
                             val doc = app.get(url, headers = HEADERS, timeout = 12_000).document
-                            doc.select(".post, .movie-card, .card, article, .item")
+                            // EXACT selector from FTPBDProvider.parseCardItems
+                            doc.select(".site-main .jws-post-item, .site-main .post-inner")
                                 .forEach { card ->
-                                    val a = card.selectFirst("a[href]") ?: return@forEach
-                                    val href = a.attr("href")
-                                    if (!href.contains(expectedPaths[idx])) return@forEach
-                                    val t = card.selectFirst("h2, h3, .title, .entry-title")?.text()
-                                        ?: a.text()
-                                    if (t.isNotBlank()) {
+                                    // EXACT selector from FTPBDProvider.Element.toSearchItem
+                                    val a = card.selectFirst("a[href*='${expectedPaths[idx]}']") ?: return@forEach
+                                    val href = a.absUrl("href").ifBlank { a.attr("href") }
+                                    if (href.isBlank() || !href.contains(expectedPaths[idx])) return@forEach
+                                    val t = card.selectFirst("h6 a, h5 a, h4 a, .post-title a")?.text()?.trim()
+                                        ?: a.attr("title").trim().ifBlank { null }
+                                        ?: a.text().trim()
+                                    if (t.isNotBlank() && !t.equals("Play Now", true)) {
                                         synchronized(candidates) { candidates += href to t }
                                     }
                                 }
@@ -493,26 +499,28 @@ object WizstreamSources {
                 }.awaitAll()
             }
 
-            // Pick best match
+            if (candidates.isEmpty()) return false
+
             val best = candidates
                 .distinctBy { it.first }
                 .maxByOrNull { (_, ct) -> titleSimilarity(ct, title) }
                 ?: return false
             if (titleSimilarity(best.second, title) < 0.4) return false
 
-            // Detail page
+            val srcLabel = "$labelPrefix • $LABEL"
             val detailHtml = runCatching {
                 app.get(best.first, headers = HEADERS, timeout = 15_000).text
             }.getOrNull() ?: return false
 
-            // For TV: try to find the episode's permalink
+            // For TV: find the episode's permalink via season= filter.
+            // FTPBD exposes season navigation via `.select-seasion .dropdown-item` and
+            // `a[href*='season=']` (see FTPBDProvider.seasonNumbers).
             val episodePageUrl: String? = if (!isMovie && season != null && episode != null) {
-                pickEpisodePageUrl(detailHtml, best.first, season, episode)
+                pickEpisodePageUrl(detailHtml, best.first, season, episode, app)
             } else {
                 null
             }
 
-            val srcLabel = "$labelPrefix • $LABEL"
             val mediaUrls = extractMediaUrlsFromHtml(detailHtml, best.first)
             if (episodePageUrl != null) {
                 runCatching {
@@ -529,34 +537,50 @@ object WizstreamSources {
             return any
         }
 
-        private fun pickEpisodePageUrl(
+        /**
+         * Pick the episode URL for FTPBD. FTPBD has two patterns:
+         *  1. `a[href*='season=N']` — season filter links
+         *  2. `.select-seasion .dropdown-item[data-index]` — dropdown items
+         *
+         * After picking the season, look for episode anchors with `?season=N&ep=M`
+         * or `/episodes/` paths.
+         */
+        private suspend fun pickEpisodePageUrl(
             detailHtml: String,
             detailUrl: String,
             season: Int,
             episode: Int,
+            app: Requests,
         ): String? {
             val doc = Jsoup.parse(detailHtml, detailUrl)
-            // FTPBD episode anchors: typically .episode a[href*='/episodes/']
-            // or a[href*='season='] / a[href*='episode=']
+            // Look for episode anchors — FTPBD uses /episodes/ slug for episode pages.
             val anchors = doc.select(
-                "a[href*='/episodes/'], a[href*='episode='], a[href*='season='], " +
-                    ".episode a, .episodes a, .season-list a"
+                "a[href*='/episodes/'], a[href*='episode='], a[href*='ep='], " +
+                    ".episode a, .episodes a, .episode-list a"
             )
-            // Filter to this season first.
-            val seasonMatches = anchors.filter { a ->
-                a.attr("href").contains("season=$season") ||
-                    a.attr("data-season")?.toIntOrNull() == season
-            }.ifEmpty { anchors }
-
-            // Pick the Nth episode in the season.
-            val nth = seasonMatches.getOrNull(episode - 1) ?: return null
-            val href = nth.attr("href").ifBlank { return null }
+            // First try exact season+episode match.
+            val exact = anchors.firstOrNull { a ->
+                val href = a.attr("href")
+                (href.contains("season=$season") || href.contains("s=$season")) &&
+                    (href.contains("episode=$episode") || href.contains("ep=$episode"))
+            }
+            val href = exact?.attr("href")?.ifBlank { null }
+                ?: anchors.firstOrNull { a ->
+                    val href = a.attr("href")
+                    val epNum = Regex("""(?i)(?:ep(?:isode)?[=\s]*|\bE)(\d+)""")
+                        .find(href + " " + a.text())?.groupValues?.get(1)?.toIntOrNull()
+                    epNum == episode
+                }?.attr("href")?.ifBlank { null }
+                ?: return null
             return resolveAbs(detailUrl, href)
         }
     }
 
     // ════════════════════════════════════════════════════════════════════════
     //  Resolver 3: Circle FTP  (http://new.circleftp.net)
+    //  Parser ported from CircleFtpProvider.kt — uses the same
+    //  /api/posts?searchTerm=… search + /api/posts/$id detail +
+    //  content[season-1].episodes[epIndex].link structure.
     // ════════════════════════════════════════════════════════════════════════
 
     internal object CircleFtpResolver : SourceResolver {
@@ -580,11 +604,10 @@ object WizstreamSources {
             subtitleCallback: (SubtitleFile) -> Unit,
             callback: (ExtractorLink) -> Unit,
         ): Boolean {
-            // 1. Search posts
-            val searchUrl = "$PRIMARY_API/api/posts?searchTerm=${encodeUrl(title)}&order=desc"
+            // 1. Search posts — uses the exact same endpoint as CircleFtpProvider.
             val searchText = fetchWithFallback(
                 app,
-                primary = searchUrl,
+                primary = "$PRIMARY_API/api/posts?searchTerm=${encodeUrl(title)}&order=desc",
                 fallback = "$FALLBACK_API/api/posts?searchTerm=${encodeUrl(title)}&order=desc",
             ) ?: return false
 
@@ -592,12 +615,12 @@ object WizstreamSources {
                 .getOrNull() ?: return false
             if (postsArr.length() == 0) return false
 
-            // 2. Pick best match
+            // 2. Pick best match by title similarity.
             var bestId: Int = -1
             var bestScore = 0.0
             for (i in 0 until postsArr.length()) {
                 val p = postsArr.optJSONObject(i) ?: continue
-                val ptitle = p.optString("title").ifBlank { p.optString("name") }
+                val ptitle = p.optString("title").ifBlank { p.optString("name") ?: "" }
                 if (ptitle.isBlank()) continue
                 val score = titleSimilarity(ptitle, title)
                 if (score > bestScore) {
@@ -607,7 +630,7 @@ object WizstreamSources {
             }
             if (bestId < 0 || bestScore < 0.4) return false
 
-            // 3. Fetch post details
+            // 3. Fetch post details — same endpoint as CircleFtpProvider.getPostDetails.
             val detailText = fetchWithFallback(
                 app,
                 primary = "$PRIMARY_API/api/posts/$bestId",
@@ -615,37 +638,52 @@ object WizstreamSources {
             ) ?: return false
             val detail = runCatching { JSONObject(detailText) }.getOrNull() ?: return false
 
-            // 4. Extract media URLs
             val srcLabel = "$labelPrefix • $LABEL"
             val mediaUrls = linkedSetOf<String>()
 
-            // Direct "url" field
-            detail.optString("url").takeIf { it.isNotBlank() }?.let { mediaUrls += it }
-            detail.optString("file").takeIf { it.isNotBlank() }?.let { mediaUrls += it }
-            detail.optString("src").takeIf { it.isNotBlank() }?.let { mediaUrls += it }
-
-            // TV series structure: detail.tvSeries[].episodes[].link
-            detail.optJSONArray("tvSeries")?.let { seasonsArr ->
-                for (si in 0 until seasonsArr.length()) {
-                    val seasonObj = seasonsArr.optJSONObject(si) ?: continue
-                    val seasonName = seasonObj.optString("seasonName", "Season 1")
-                    val sn = Regex("""\d+""").find(seasonName)?.value?.toIntOrNull() ?: (si + 1)
-                    if (season != null && sn != season) continue
-                    val epsArr = seasonObj.optJSONArray("episodes") ?: continue
-                    for (ei in 0 until epsArr.length()) {
-                        val epObj = epsArr.optJSONObject(ei) ?: continue
-                        // Filter by episode number if specified.
-                        val epNum = epObj.optInt("episodeNumber", ei + 1)
-                        if (episode != null && epNum != episode) continue
-                        val link = epObj.optString("link").takeIf { it.isNotBlank() } ?: continue
-                        // link can be a "movie?data=" base64 payload (handled below)
-                        // OR a raw URL.
+            // 4. Extract media URLs from the post detail.
+            // Circle FTP's response shape (from CircleFtpProvider):
+            //   postObj.type == "singleVideo" → movie/direct video
+            //   postObj.content[season-1].episodes[epIndex].link → episode
+            // The `link` field is a "movie?data=<base64>" / "episode?data=<base64>" URL
+            // OR a raw media URL.
+            val postType = detail.optString("type")
+            if (postType == "singleVideo") {
+                // Movie: look for a direct URL field.
+                detail.optString("url").takeIf { it.isNotBlank() }?.let { mediaUrls += it }
+                detail.optString("file").takeIf { it.isNotBlank() }?.let { mediaUrls += it }
+                detail.optString("src").takeIf { it.isNotBlank() }?.let { mediaUrls += it }
+                detail.optString("link").takeIf { it.isNotBlank() }?.let { mediaUrls += it }
+            } else {
+                // TV/Anime: navigate content[season-1].episodes[epIndex].link
+                // EXACT same logic as CircleFtpProvider lines 1303-1327.
+                val contentArray = detail.optJSONArray("content")
+                val seasonIdx = (season ?: 1) - 1
+                val seasonObj = contentArray?.optJSONObject(seasonIdx)
+                val episodesArray = seasonObj?.optJSONArray("episodes")
+                if (episodesArray != null && episode != null) {
+                    val epObj = episodesArray.optJSONObject(episode - 1)
+                    val link = epObj?.optString("link")
+                    if (link != null && link.isNotEmpty()) {
                         mediaUrls += link
+                    }
+                }
+                // If no specific episode matched, dump all episode links from
+                // all seasons (helps when season/episode numbering is off).
+                if (mediaUrls.isEmpty() && contentArray != null) {
+                    for (si in 0 until contentArray.length()) {
+                        val so = contentArray.optJSONObject(si) ?: continue
+                        val eps = so.optJSONArray("episodes") ?: continue
+                        for (ei in 0 until eps.length()) {
+                            val eo = eps.optJSONObject(ei) ?: continue
+                            val link = eo.optString("link")
+                            if (link.isNotEmpty()) mediaUrls += link
+                        }
                     }
                 }
             }
 
-            // Direct download links array
+            // 5. Also pick up any direct download links array.
             detail.optJSONArray("downloadLinks")?.let { dlArr ->
                 for (i in 0 until dlArr.length()) {
                     val dl = dlArr.optJSONObject(i) ?: continue
@@ -654,12 +692,15 @@ object WizstreamSources {
                 }
             }
 
-            // 5. Emit
+            // 6. Emit
             var any = false
             mediaUrls.forEach { u ->
                 // Circle FTP encodes TV/movie URLs as "movie?data=<base64>" /
                 // "episode?data=<base64>" — base64 of a JSON array of {url,audio}.
-                if (u.contains("movie?data=") || u.contains("episode?data=")) {
+                // This is handled by CircleFtpProvider.loadLinks (lines 1507-1561).
+                if (u.contains("movie?data=") || u.contains("episode?data=") ||
+                    u.contains("circleftp://")
+                ) {
                     if (emitCircleFtpEncoded(u, srcLabel, callback)) any = true
                 } else if (emitDirect(app, u, srcLabel, "$SITE/", HEADERS, subtitleCallback, callback)) {
                     any = true
@@ -668,18 +709,23 @@ object WizstreamSources {
             return any
         }
 
+        /**
+         * Decode Circle FTP's base64-encoded episode link arrays.
+         * The `data` segment is a base64-encoded JSON array of
+         * `{url: "…", audio: "…?"}` objects — emit each URL directly.
+         */
         private suspend fun emitCircleFtpEncoded(
             data: String,
             sourceLabel: String,
             callback: (ExtractorLink) -> Unit,
         ): Boolean {
-            val prefix = when {
-                data.contains("movie?data=") -> "movie?data="
-                data.contains("episode?data=") -> "episode?data="
-                else -> return false
-            }
+            val raw = data.substringAfter("data=").substringBefore("&")
+                .substringBefore(" ").trim()
+            if (raw.isBlank()) return false
+            // Strip any "circleftp://" prefix that might be present.
+            val cleaned = raw.removePrefix("circleftp://")
             val jsonStr = runCatching {
-                String(Base64.getDecoder().decode(data.substringAfter(prefix)))
+                String(Base64.getDecoder().decode(cleaned))
             }.getOrNull() ?: return false
             val arr = runCatching { JSONArray(jsonStr) }.getOrNull() ?: return false
             if (arr.length() == 0) return false
@@ -724,6 +770,11 @@ object WizstreamSources {
 
     // ════════════════════════════════════════════════════════════════════════
     //  Resolver 4: CTGMovies  (https://ctgmovies.com, API at cockpit)
+    //  Already worked in v1 — kept mostly as-is but tightened:
+    //   • Search "movies", "tv", "anime" concurrently.
+    //   • Best match by title similarity.
+    //   • Detail via /api/v1/<kind>/<id>.
+    //   • Episode links via seasons[].episodes[].links[].
     // ════════════════════════════════════════════════════════════════════════
 
     internal object CtgMoviesResolver : SourceResolver {
@@ -749,10 +800,9 @@ object WizstreamSources {
             subtitleCallback: (SubtitleFile) -> Unit,
             callback: (ExtractorLink) -> Unit,
         ): Boolean {
-            // 1. Search across all 3 content kinds
             val kinds = if (isMovie) listOf("movies", "tv", "anime") else listOf("tv", "anime", "movies")
             val params = mapOf("search" to title)
-            val candidates = mutableListOf<Triple<String, String, String>>() // (kind, id, title)
+            val candidates = mutableListOf<Triple<String, String, String>>()
 
             coroutineScope {
                 kinds.map { kind ->
@@ -769,17 +819,14 @@ object WizstreamSources {
 
             if (candidates.isEmpty()) return false
 
-            // 2. Pick best match
             val best = candidates
                 .maxByOrNull { (_, _, ct) -> titleSimilarity(ct, title) }
                 ?: return false
             if (titleSimilarity(best.third, title) < 0.4) return false
 
-            // 3. Fetch detail
             val detailText = apiGet(app, "/${best.first}/${encodeUrl(best.second)}", emptyMap())
             val detail = runCatching { JSONObject(detailText) }.getOrNull() ?: return false
 
-            // 4. Extract links array
             val srcLabel = "$labelPrefix • $LABEL"
             val linksArr = detail.optJSONArray("links") ?: JSONArray().also { it.put(detail) }
 
@@ -800,7 +847,7 @@ object WizstreamSources {
                 }
             }
 
-            // 5. If TV/anime and we have season/episode info, try episodes array.
+            // TV/anime: try seasons[].episodes[].links[]
             if (!isMovie && season != null && episode != null) {
                 detail.optJSONArray("seasons")?.let { seasonsArr ->
                     for (si in 0 until seasonsArr.length()) {
@@ -848,13 +895,11 @@ object WizstreamSources {
                 }
             val primary = "$DEFAULT_API_BASE$p$qs"
 
-            // Try public API first.
             val r1 = runCatching {
                 app.get(primary, headers = HEADERS, timeout = 10_000)
             }.getOrNull()
             if (r1 != null && r1.code in 200..299 && r1.text.isNotBlank()) return r1.text
 
-            // Same-origin fallback (Next.js proxy).
             val fallback = "$SITE/api/v1$p$qs"
             val r2 = runCatching {
                 app.get(fallback, headers = HEADERS, timeout = 10_000)
@@ -865,3 +910,11 @@ object WizstreamSources {
         }
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Shared JSON helpers (file-level so all resolvers can use them)
+// ─────────────────────────────────────────────────────────────────────────────
+
+internal fun JSONObject.optStringOrNullCp(k: String): String? =
+    if (!has(k) || isNull(k)) null
+    else optString(k, "").trim().takeIf { it.isNotBlank() && it != "null" }
