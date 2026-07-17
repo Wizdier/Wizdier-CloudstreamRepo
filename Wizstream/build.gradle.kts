@@ -1,7 +1,14 @@
-version = 3
+version = 7
 
 cloudstream {
-    description = "Wizstream — TMDB catalogue (movies/TV) with multi-source video resolution from the VidSrc family (vidsrc, vidnest, vidplay, vidup, vidrock, vidfast, videasy, 2embed, multiembed, superembed, gomo, smashystream, vaplayer, 111movies, etc.) and BDIX extension lookups."
+    description = "Wizstream — unified TMDB + AniList catalogue in one plugin. " +
+        "Two providers share a single source resolver: the TMDB catalogue " +
+        "(Wizstream) covers movies & TV; the AniList catalogue (Wizstream-Anime) " +
+        "covers anime / OVA / movies. Both fetch links from the Vid[x] family " +
+        "(vidsrc, vidnest, vidplay, vidup, vidrock, vidfast, videasy) plus the " +
+        "extended VidSrc/2Embed/MultiEmbed/SuperEmbed/Gomo/SmashyStream/VAPlayer " +
+        "embeds and bundled BDIX source lookups (Cineplex BD, FTPBD, Circle FTP, " +
+        "CTGMovies) with MAL / AniList / Kitsu / Simkl tracking."
     authors = listOf("Wizdier")
     status = 1
     tvTypes = listOf(
@@ -9,7 +16,13 @@ cloudstream {
         "TvSeries",
         "AsianDrama",
         "Cartoon",
+        "Anime",
+        "AnimeMovie",
+        "OVA",
     )
+    // TMDB catalogue icon — the AniList catalogue reuses the same .cs3
+    // icon space; Cloudstream picks the icon from the first registered
+    // provider's source file. Users see two catalogue entries in-app.
     iconUrl = "https://raw.githubusercontent.com/Wizdier/Wizdier-CloudstreamRepo/main/icons/WizstreamIcon.png"
 }
 
