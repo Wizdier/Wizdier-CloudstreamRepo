@@ -130,16 +130,23 @@ private fun JSONObject.optDoubleOrNullWz(k: String): Double? =
 private fun String.normalizedWz(): String =
     lowercase().replace(Regex("[^a-z0-9]+"), " ").trim()
 
-// Re-label an ExtractorLink while preserving url/type/quality/headers.
+// Re-label an ExtractorLink using the builder (avoids the deprecated constructor).
 private fun ExtractorLink.relabel(newSource: String, newName: String): ExtractorLink {
-    return ExtractorLink(
+    val linkType = this.type ?: ExtractorLinkType.VIDEO
+    val originalQuality = this.quality ?: Qualities.Unknown.value
+    val originalReferer = this.headers["Referer"]
+        ?: this.headers["referer"]
+        ?: this.headers["Referrer"]
+        ?: ""
+    return newExtractorLink(
         source = newSource,
         name = newName,
         url = this.url,
-        type = this.type,
-        quality = this.quality,
-        headers = this.headers,
-    )
+        type = linkType,
+    ) {
+        this.referer = originalReferer
+        this.quality = originalQuality
+    }
 }
 
 private suspend fun <T, R> boundedParallelMapWz(

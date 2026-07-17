@@ -116,15 +116,23 @@ private fun JSONObject.aOptDbl(k: String): Double? =
     else optString(k, "").toDoubleOrNull()
         ?: optDouble(k, Double.NaN).takeIf { !it.isNaN() }
 
+// Re-label an ExtractorLink using the builder (avoids the deprecated constructor).
 private fun ExtractorLink.aRelabel(newSource: String, newName: String): ExtractorLink {
-    return ExtractorLink(
+    val linkType = this.type ?: ExtractorLinkType.VIDEO
+    val originalQuality = this.quality ?: Qualities.Unknown.value
+    val originalReferer = this.headers["Referer"]
+        ?: this.headers["referer"]
+        ?: this.headers["Referrer"]
+        ?: ""
+    return newExtractorLink(
         source = newSource,
         name = newName,
         url = this.url,
-        type = this.type,
-        quality = this.quality,
-        headers = this.headers,
-    )
+        type = linkType,
+    ) {
+        this.referer = originalReferer
+        this.quality = originalQuality
+    }
 }
 
 private fun currentSeasonFilter(): Pair<String, Int> {
