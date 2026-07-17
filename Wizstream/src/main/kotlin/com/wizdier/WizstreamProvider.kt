@@ -25,16 +25,137 @@ import java.util.concurrent.ConcurrentHashMap
  *     Top-Rated / Upcoming / Now Playing / On The Air (TV).
  *
  * Source resolution (all tried concurrently, per-episode):
- *   1. Vid-src family embeds (vidsrc.icu / vidsrc.to / vidsrc.mov / vidsrc.me /
- *      vidbinge.com / vidjoy.to) — movie/{imdbOrTmdb} + tv/{imdbOrTmdb}/{s}/{e}.
- *   2. Two-embed / 2embed.cc & multiembed / moviesapi / superembed / ezvidapi.
- *   3. DatabaseGdriveplayer / gomo / vidsrc.net variants.
- *   4. Auto-extract via Cloudstream's built-in `loadExtractor` against every
- *      resolved iframe so any future host is still picked up.
+ *   • Vid-src family embeds (vidsrc.icu / vidsrc.to / vidsrc.mov / vidsrc.me /
+ *     vidbinge.com / vidjoy.to) — movie/{imdbOrTmdb} + tv/{imdbOrTmdb}/{s}/{e}.
+ *   • Two-embed / 2embed.cc & multiembed / moviesapi / superembed / ezvidapi.
+ *   • DatabaseGdriveplayer / gomo / vidsrc.net variants.
+ *   • Auto-extract via Cloudstream's built-in `loadExtractor` against every
+ *     resolved iframe so any future host is still picked up.
  *
  * Sources are added per-embed with unique labels so duplicates are de-duped
  * by URL at the end.
  */
+
+// ─── File-level constants & helpers (visible to companion objects & lambdas) ───
+private const val TMDB_API = "https://api.themoviedb.org/3"
+private const val TMDB_KEY = "98ae14df2b8d8f8f8136499daf79f0e0"
+private const val IMG = "https://image.tmdb.org/t/p"
+private const val WZ_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+
+private fun String?.toTmdbImg(size: String): String? =
+    this?.takeIf { it.isNotBlank() && it != "null" }?.let { "$IMG/$size$it" }
+
+private fun yearFromDate(d: String?): Int? =
+    d?.let { Regex("""\d{4}""").find(it)?.value?.toIntOrNull() }
+
+private fun parseAirDateWz(s: String?): Long? {
+    if (s == null) return null
+    val parts = s.split("-")
+    if (parts.size != 3) return null
+    val y = parts[0].toIntOrNull() ?: return null
+    val m = parts[1].toIntOrNull() ?: return null
+    val d = parts[2].toIntOrNull() ?: return null
+    return runCatching {
+        val c = java.util.Calendar.getInstance(java.util.TimeZone.getTimeZone("UTC"))
+        c.clear(); c.set(y, m - 1, d, 0, 0, 0); c.timeInMillis
+    }.getOrNull()
+}
+
+private fun JSONArray.toStringListWz(key: String): List<String> =
+    (0 until length()).mapNotNull { i ->
+        optJSONObject(i)?.optStringOrNullWz(key)
+    }.distinct()
+
+private fun JSONArray.toActorsWz(limit: Int = 20): List<ActorData> =
+    (0 until length()).mapNotNull { i ->
+        val c = optJSONObject(i) ?: return@mapNotNull null
+        val name = c.optStringOrNullWz("name") ?: c.optStringOrNullWz("original_name")
+            ?: return@mapNotNull null
+        val profile = c.optStringOrNullWz("profile_path").toTmdbImg("w185")
+        val role = c.optStringOrNullWz("character")
+        ActorData(Actor(name, profile), roleString = role ?: "")
+    }.take(limit)
+
+private fun pickLogoWz(logos: JSONArray?): String? {
+    if (logos == null || logos.length() == 0) return null
+    var enSvg: String? = null; var anyPng: String? = null
+    for (i in 0 until logos.length()) {
+        val l = logos.optJSONObject(i) ?: continue
+        val p = l.optString("file_path").takeIf { it.isNotBlank() } ?: continue
+        val lang = l.optString("iso_639_1").trim().lowercase()
+        val isSvg = p.endsWith(".svg", true)
+        val url = "$IMG/w500$p"
+        when {
+            lang == "en" && !isSvg -> return url
+            lang == "en" && isSvg && enSvg == null -> enSvg = url
+            !isSvg && anyPng == null -> anyPng = url
+        }
+    }
+    return enSvg ?: anyPng
+}
+
+private fun pickTrailerWz(videos: JSONArray?): String? {
+    if (videos == null) return null
+    var official: String? = null; var anyTrailer: String? = null
+    for (i in 0 until videos.length()) {
+        val v = videos.optJSONObject(i) ?: continue
+        if (!v.optString("site").equals("YouTube", true)) continue
+        val key = v.optStringOrNullWz("key") ?: continue
+        val type = v.optString("type")
+        when {
+            type.equals("Trailer", true) && v.optBoolean("official", false) && official == null ->
+                official = "https://www.youtube.com/watch?v=$key"
+            type.equals("Trailer", true) && anyTrailer == null ->
+                anyTrailer = "https://www.youtube.com/watch?v=$key"
+        }
+    }
+    return official ?: anyTrailer
+}
+
+private fun JSONObject.optStringOrNullWz(k: String): String? =
+    if (!has(k) || isNull(k)) null
+    else optString(k, "").trim().takeIf { it.isNotBlank() && it != "null" }
+
+private fun JSONObject.optIntOrNullWz(k: String): Int? =
+    if (!has(k) || isNull(k)) null
+    else optString(k, "").toIntOrNull()
+        ?: optInt(k, Int.MIN_VALUE).takeIf { it != Int.MIN_VALUE }
+
+private fun JSONObject.optDoubleOrNullWz(k: String): Double? =
+    if (!has(k) || isNull(k)) null
+    else optString(k, "").toDoubleOrNull()
+        ?: optDouble(k, Double.NaN).takeIf { !it.isNaN() }
+
+private fun String.normalizedWz(): String =
+    lowercase().replace(Regex("[^a-z0-9]+"), " ").trim()
+
+// Re-label an ExtractorLink while preserving url/type/quality/headers.
+private fun ExtractorLink.relabel(newSource: String, newName: String): ExtractorLink {
+    return ExtractorLink(
+        source = newSource,
+        name = newName,
+        url = this.url,
+        type = this.type,
+        quality = this.quality,
+        headers = this.headers,
+    )
+}
+
+private suspend fun <T, R> boundedParallelMapWz(
+    items: List<T>,
+    concurrency: Int = 6,
+    block: suspend (T) -> R,
+): List<R> {
+    if (items.isEmpty()) return emptyList()
+    val gate = Semaphore(concurrency)
+    return coroutineScope {
+        items.map { item ->
+            async { gate.withPermit { block(item) } }
+        }.awaitAll()
+    }
+}
+
 class WizstreamProvider : MainAPI() {
 
     override var mainUrl = "https://www.themoviedb.org"
@@ -58,23 +179,7 @@ class WizstreamProvider : MainAPI() {
 
     companion object {
         private const val TAG = "Wizstream"
-        private const val TMDB_API = "https://api.themoviedb.org/3"
-        // Public v3 read-only key (mirrors the one used elsewhere in this repo
-        // and by dozens of community CS plugins; 40 req/10s per IP).
-        private const val TMDB_KEY = "98ae14df2b8d8f8f8136499daf79f0e0"
-        private const val IMG = "https://image.tmdb.org/t/p"
-        private const val UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
-            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 
-        // ------------------------------------------------------------------
-        // Vid-src family endpoints. Every entry accepts both IMDb (tt-prefixed)
-        // and TMDB numeric IDs; movies use /movie/{id}, episodes use
-        // /tv/{id}/{season}/{episode} (with minor per-host variations handled
-        // at build-time).
-        //
-        // Mirrors are intentional — individual hosts get blocked/moved
-        // regularly; fanning out means at least one will resolve.
-        // ------------------------------------------------------------------
         private data class VidHost(
             val label: String,
             val movie: (String) -> String,
@@ -83,7 +188,6 @@ class WizstreamProvider : MainAPI() {
         )
 
         private val VID_HOSTS: List<VidHost> = listOf(
-            // vidsrc.icu is the most reliable "vidsrc" endpoint at time of writing
             VidHost("VidSrc",
                 { id -> "https://vidsrc.icu/embed/movie/$id" },
                 { id, s, e -> "https://vidsrc.icu/embed/tv/$id/$s/$e" }),
@@ -123,8 +227,6 @@ class WizstreamProvider : MainAPI() {
             VidHost("SmashyStream",
                 { id -> "https://embed.smashystream.com/playere.php?imdb=$id" },
                 { id, s, e -> "https://embed.smashystream.com/playere.php?imdb=$id&season=$s&episode=$e" }),
-            // Extra mirrors (kept after the primary list so they're tried
-            // concurrently but label-prefixed if they succeed).
             VidHost("VidAPI",
                 { id -> "https://vidapi.ru/embed/movie/$id" },
                 { id, s, e -> "https://vidapi.ru/embed/tv/$id/$s/$e" }),
@@ -145,7 +247,6 @@ class WizstreamProvider : MainAPI() {
                 { id, s, e -> "https://autoembe.xyz/embed/tv?imdb=$id&sea=$s&epi=$e" }),
         )
 
-        // In-memory TTL metadata cache.
         private val metaCache = ConcurrentHashMap<String, Pair<Long, TmdbDetail>>()
         private const val CACHE_TTL_MS = 10 * 60 * 1000L
     }
@@ -193,21 +294,15 @@ class WizstreamProvider : MainAPI() {
         val q = query.trim()
         if (q.isBlank()) return emptyList()
 
-        return coroutineScope {
-            val tmdbDef = async(Dispatchers.IO) {
-                runCatching { tmdbSearch(q) }.getOrDefault(emptyList())
-            }
-            val results = tmdbDef.await().toMutableList()
+        val results = runCatching { tmdbSearch(q) }.getOrDefault(emptyList()).toMutableList()
 
-            // De-dupe by normalized title + year.
-            results.distinctBy { sr ->
-                val year = when (sr) {
-                    is MovieSearchResponse -> sr.year
-                    is TvSeriesSearchResponse -> sr.year
-                    else -> null
-                }
-                "${sr.name.normalized()}|$year|${sr.type.name}"
+        return results.distinctBy { sr ->
+            val year = when (sr) {
+                is MovieSearchResponse -> sr.year
+                is TvSeriesSearchResponse -> sr.year
+                else -> null
             }
+            "${sr.name.normalizedWz()}|$year|${sr.type?.name ?: ""}"
         }
     }
 
@@ -279,9 +374,8 @@ class WizstreamProvider : MainAPI() {
                 runCatching { simklId?.let { addSimklId(it) } }
             }
         } else {
-            // TV: fetch all seasons' episodes concurrently (bounded).
             val seasons = detail.seasons.ifEmpty { listOf(1) }
-            val episodesAll = boundedParallelMap(seasons, 6) { s ->
+            val episodesAll = boundedParallelMapWz(seasons, 6) { s ->
                 fetchSeasonEpisodes(tmdbId, s, title, detail)
             }.flatten().distinctBy { (it.season ?: 1) to (it.episode ?: 0) }
                 .sortedWith(compareBy({ it.season ?: 1 }, { it.episode ?: 0 }))
@@ -304,7 +398,7 @@ class WizstreamProvider : MainAPI() {
     }
 
     // ═══════════════════════════════════════════════════════════════════════
-    //  Links — fan out to vid-src family + built-in extractors concurrently
+    //  Links
     // ═══════════════════════════════════════════════════════════════════════
 
     override suspend fun loadLinks(
@@ -320,10 +414,9 @@ class WizstreamProvider : MainAPI() {
         val s = ctx.season
         val e = ctx.episode
 
-        // Seen set to avoid pushing duplicate stream URLs.
         val seenUrls = Collections.newSetFromMap<String>(ConcurrentHashMap())
         val seenSubs = Collections.newSetFromMap<String>(ConcurrentHashMap())
-        val gate = Semaphore(8) // cap concurrent embed fetches
+        val gate = Semaphore(8)
         var anyFound = false
 
         val jobs = VID_HOSTS.map { host ->
@@ -345,19 +438,12 @@ class WizstreamProvider : MainAPI() {
                         ) { link ->
                             val normalized = link.url.trim()
                             if (normalized.isBlank() || !seenUrls.add(normalized)) return@loadExtractor
-                            // Re-label with Wizstream prefix + host label so users can
-                            // tell mirrors apart; keep original quality tag.
-                            val labelled = link.copy(
-                                source = "Wizstream • ${host.label}",
-                                name = "${host.label} — ${link.name}".trimEnd('—', ' '),
-                            )
-                            callback(labelled)
+                            val newSource = "Wizstream • ${host.label}"
+                            val newName = "${host.label} — ${link.name}".trimEnd('—', ' ')
+                            callback(link.relabel(newSource, newName))
                             anyFound = true
                         }
                         if (!anyFound && !before) {
-                            // Fallback: if loadExtractor didn't produce links directly,
-                            // pass the iframe itself as an INFER_TYPE link so the app
-                            // can try its built-in resolvers against it.
                             callback(newExtractorLink(
                                 source = "Wizstream • ${host.label}",
                                 name = "${host.label} — Auto",
@@ -384,7 +470,6 @@ class WizstreamProvider : MainAPI() {
     // ═══════════════════════════════════════════════════════════════════════
 
     private fun parseTmdbUrl(url: String): Pair<Int, String>? {
-        // wiz://tmdb/{type}/{id}
         val u = url.trim()
         val m = Regex("wiz://tmdb/(movie|tv)/(\\d+)").find(u)
             ?: Regex("tmdb/(movie|tv)/(\\d+)").find(u)
@@ -436,17 +521,6 @@ class WizstreamProvider : MainAPI() {
         val recommendations: List<SearchResponse>,
     )
 
-    private data class TmdbEpisodeLite(
-        val season: Int,
-        val episode: Int,
-        val name: String?,
-        val overview: String?,
-        val stillUrl: String?,
-        val rating: Double?,
-        val airDate: Long?,
-        val runtime: Int?,
-    )
-
     private suspend fun fetchDetail(mediaType: String, tmdbId: Int): TmdbDetail? {
         val cacheKey = "$mediaType:$tmdbId"
         val now = System.currentTimeMillis()
@@ -461,34 +535,34 @@ class WizstreamProvider : MainAPI() {
         )) ?: return null
 
         val title = if (mediaType == "movie") {
-            detail.optStringOrNull("title") ?: detail.optStringOrNull("original_title")
+            detail.optStringOrNullWz("title") ?: detail.optStringOrNullWz("original_title")
         } else {
-            detail.optStringOrNull("name") ?: detail.optStringOrNull("original_name")
+            detail.optStringOrNullWz("name") ?: detail.optStringOrNullWz("original_name")
         } ?: return null
 
         val dateKey = if (mediaType == "movie") "release_date" else "first_air_date"
-        val year = yearFromDate(detail.optStringOrNull(dateKey))
-        val runtime = if (mediaType == "movie") detail.optIntOrNull("runtime")
+        val year = yearFromDate(detail.optStringOrNullWz(dateKey))
+        val runtime = if (mediaType == "movie") detail.optIntOrNullWz("runtime")
         else detail.optJSONArray("episode_run_time")?.optInt(0)?.takeIf { it > 0 }
-        val tags = detail.optJSONArray("genres")?.toStringList("name")
-        val posterUrl = detail.optStringOrNull("poster_path")?.toTmdbImg("w780")
-        val backdropUrl = detail.optStringOrNull("backdrop_path")?.toTmdbImg("original")
-        val logoUrl = pickLogo(detail.optJSONObject("images")?.optJSONArray("logos"))
-            ?: detail.optJSONObject("external_ids")?.optStringOrNull("imdb_id")?.let {
+        val tags = detail.optJSONArray("genres")?.toStringListWz("name")
+        val posterUrl = detail.optStringOrNullWz("poster_path").toTmdbImg("w780")
+        val backdropUrl = detail.optStringOrNullWz("backdrop_path").toTmdbImg("original")
+        val logoUrl = pickLogoWz(detail.optJSONObject("images")?.optJSONArray("logos"))
+            ?: detail.optJSONObject("external_ids")?.optStringOrNullWz("imdb_id")?.let {
                 "https://live.metahub.space/logo/medium/$it/img"
             }
-        val rating = detail.optDoubleOrNull("vote_average")
-        val plot = detail.optStringOrNull("overview")
-        val trailerUrl = pickTrailer(detail.optJSONObject("videos")?.optJSONArray("results"))
-        val imdbId = detail.optJSONObject("external_ids")?.optStringOrNull("imdb_id")
+        val rating = detail.optDoubleOrNullWz("vote_average")
+        val plot = detail.optStringOrNullWz("overview")
+        val trailerUrl = pickTrailerWz(detail.optJSONObject("videos")?.optJSONArray("results"))
+        val imdbId = detail.optJSONObject("external_ids")?.optStringOrNullWz("imdb_id")
             ?.takeIf { it.startsWith("tt") }
         val simklId = fetchSimklId(imdbId, mediaType)
-        val actors = detail.optJSONObject("credits")?.optJSONArray("cast")?.toActors()
+        val actors = detail.optJSONObject("credits")?.optJSONArray("cast")?.toActorsWz()
         val seasons = if (mediaType == "tv") {
             detail.optJSONArray("seasons")
                 ?.let { arr ->
                     (0 until arr.length()).mapNotNull { i ->
-                        arr.optJSONObject(i)?.optIntOrNull("season_number")?.takeIf { it > 0 }
+                        arr.optJSONObject(i)?.optIntOrNullWz("season_number")?.takeIf { it > 0 }
                     }
                 }
                 .orEmpty()
@@ -546,14 +620,14 @@ class WizstreamProvider : MainAPI() {
         val arr = json.optJSONArray("episodes") ?: return emptyList()
         return (0 until arr.length()).mapNotNull { i ->
             val ep = arr.optJSONObject(i) ?: return@mapNotNull null
-            val epNum = ep.optIntOrNull("episode_number") ?: return@mapNotNull null
-            val name = ep.optStringOrNull("name") ?: "Episode $epNum"
-            val overview = ep.optStringOrNull("overview")
-            val stillUrl = ep.optStringOrNull("still_path")?.toTmdbImg("original")
-            val epRating = ep.optDoubleOrNull("vote_average")
-            val airDate = ep.optStringOrNull("air_date")?.let(::parseAirDate)
-            val epRuntime = ep.optIntOrNull("runtime")
-                ?: ep.optIntOrNull("episode_run_time")
+            val epNum = ep.optIntOrNullWz("episode_number") ?: return@mapNotNull null
+            val name = ep.optStringOrNullWz("name") ?: "Episode $epNum"
+            val overview = ep.optStringOrNullWz("overview")
+            val stillUrl = ep.optStringOrNullWz("still_path").toTmdbImg("original")
+            val epRating = ep.optDoubleOrNullWz("vote_average")
+            val airDate = ep.optStringOrNullWz("air_date")?.let(::parseAirDateWz)
+            val epRuntime = ep.optIntOrNullWz("runtime")
+                ?: ep.optIntOrNullWz("episode_run_time")
                 ?: detail.runtime
             newEpisode(LinkContext(
                 imdbId = detail.imdbId,
@@ -583,7 +657,7 @@ class WizstreamProvider : MainAPI() {
             }
             val url = "$TMDB_API${if (path.startsWith("/")) path else "/$path"}?$params"
             val res = app.get(url, headers = mapOf(
-                "User-Agent" to UA,
+                "User-Agent" to WZ_UA,
                 "Accept" to "application/json",
             ), timeout = 10_000)
             if (res.code in 200..299) JSONObject(res.text) else null
@@ -596,7 +670,7 @@ class WizstreamProvider : MainAPI() {
         return runCatching {
             val url = "https://api.simkl.com/$type/${URLEncoder.encode(imdbId, "UTF-8")}?client_id=%20&extended=full"
             val text = app.get(url, headers = mapOf(
-                "User-Agent" to UA, "Accept" to "application/json"
+                "User-Agent" to WZ_UA, "Accept" to "application/json"
             ), timeout = 8_000).text.trim()
             if (!text.startsWith("{")) null
             else JSONObject(text).optJSONObject("ids")?.optInt("simkl")?.takeIf { it != 0 }
@@ -604,7 +678,7 @@ class WizstreamProvider : MainAPI() {
     }
 
     // ═══════════════════════════════════════════════════════════════════════
-    //  JSON helpers & LinkContext
+    //  LinkContext
     // ═══════════════════════════════════════════════════════════════════════
 
     private data class LinkContext(
@@ -628,119 +702,14 @@ class WizstreamProvider : MainAPI() {
             fun fromJson(s: String): LinkContext {
                 val o = JSONObject(s)
                 return LinkContext(
-                    imdbId = o.optStringOrNull("imdb_id"),
-                    tmdbId = o.optIntOrNull("tmdb_id"),
-                    season = o.optIntOrNull("season"),
-                    episode = o.optIntOrNull("episode"),
-                    title = o.optStringOrNull("title"),
+                    imdbId = o.optStringOrNullWz("imdb_id"),
+                    tmdbId = o.optIntOrNullWz("tmdb_id"),
+                    season = o.optIntOrNullWz("season"),
+                    episode = o.optIntOrNullWz("episode"),
+                    title = o.optStringOrNullWz("title"),
                     isMovie = o.optBoolean("is_movie", false),
                 )
             }
         }
     }
-
-    // ═══════════════════════════════════════════════════════════════════════
-    //  Misc utils
-    // ═══════════════════════════════════════════════════════════════════════
-
-    private suspend fun <T, R> boundedParallelMap(
-        items: List<T>,
-        concurrency: Int = 6,
-        block: suspend (T) -> R,
-    ): List<R> {
-        if (items.isEmpty()) return emptyList()
-        val gate = Semaphore(concurrency)
-        return coroutineScope {
-            items.map { item ->
-                async { gate.withPermit { block(item) } }
-            }.awaitAll()
-        }
-    }
-
-    private fun String.toTmdbImg(size: String): String? =
-        takeIf { it.isNotBlank() && it != "null" }?.let { "$IMG/$size$it" }
-
-    private fun yearFromDate(d: String?): Int? =
-        d?.let { Regex("""\d{4}""").find(it)?.value?.toIntOrNull() }
-
-    private fun parseAirDate(s: String?): Long? {
-        if (s == null) return null
-        val parts = s.split("-")
-        if (parts.size != 3) return null
-        val y = parts[0].toIntOrNull() ?: return null
-        val m = parts[1].toIntOrNull() ?: return null
-        val d = parts[2].toIntOrNull() ?: return null
-        return runCatching {
-            val c = java.util.Calendar.getInstance(java.util.TimeZone.getTimeZone("UTC"))
-            c.clear(); c.set(y, m - 1, d, 0, 0, 0); c.timeInMillis
-        }.getOrNull()
-    }
-
-    private fun JSONArray.toStringList(key: String): List<String> =
-        (0 until length()).mapNotNull { i ->
-            optJSONObject(i)?.optStringOrNull(key)
-        }.distinct()
-
-    private fun JSONArray.toActors(limit: Int = 20): List<ActorData> =
-        (0 until length()).mapNotNull { i ->
-            val c = optJSONObject(i) ?: return@mapNotNull null
-            val name = c.optStringOrNull("name") ?: c.optStringOrNull("original_name")
-                ?: return@mapNotNull null
-            val profile = c.optStringOrNull("profile_path")?.toTmdbImg("w185")
-            val role = c.optStringOrNull("character")
-            ActorData(Actor(name, profile), roleString = role ?: "")
-        }.take(limit)
-
-    private fun pickLogo(logos: JSONArray?): String? {
-        if (logos == null || logos.length() == 0) return null
-        var enPng: String? = null; var enSvg: String? = null; var anyPng: String? = null
-        for (i in 0 until logos.length()) {
-            val l = logos.optJSONObject(i) ?: continue
-            val p = l.optString("file_path").takeIf { it.isNotBlank() } ?: continue
-            val lang = l.optString("iso_639_1").trim().lowercase()
-            val isSvg = p.endsWith(".svg", true)
-            val url = "$IMG/w500$p"
-            when {
-                lang == "en" && !isSvg -> return url
-                lang == "en" && isSvg && enSvg == null -> enSvg = url
-                !isSvg && anyPng == null -> anyPng = url
-            }
-        }
-        return enPng ?: enSvg ?: anyPng
-    }
-
-    private fun pickTrailer(videos: JSONArray?): String? {
-        if (videos == null) return null
-        var official: String? = null; var anyTrailer: String? = null
-        for (i in 0 until videos.length()) {
-            val v = videos.optJSONObject(i) ?: continue
-            if (!v.optString("site").equals("YouTube", true)) continue
-            val key = v.optStringOrNull("key") ?: continue
-            val type = v.optString("type")
-            when {
-                type.equals("Trailer", true) && v.optBoolean("official", false) && official == null ->
-                    official = "https://www.youtube.com/watch?v=$key"
-                type.equals("Trailer", true) && anyTrailer == null ->
-                    anyTrailer = "https://www.youtube.com/watch?v=$key"
-            }
-        }
-        return official ?: anyTrailer
-    }
-
-    private fun JSONObject.optStringOrNull(k: String): String? =
-        if (!has(k) || isNull(k)) null
-        else optString(k, "").trim().takeIf { it.isNotBlank() && it != "null" }
-
-    private fun JSONObject.optIntOrNull(k: String): Int? =
-        if (!has(k) || isNull(k)) null
-        else optString(k, "").toIntOrNull()
-            ?: optInt(k, Int.MIN_VALUE).takeIf { it != Int.MIN_VALUE }
-
-    private fun JSONObject.optDoubleOrNull(k: String): Double? =
-        if (!has(k) || isNull(k)) null
-        else optString(k, "").toDoubleOrNull()
-            ?: optDouble(k, Double.NaN).takeIf { !it.isNaN() }
-
-    private fun String.normalized(): String =
-        lowercase().replace(Regex("[^a-z0-9]+"), " ").trim()
 }
