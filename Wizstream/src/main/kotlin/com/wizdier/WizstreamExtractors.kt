@@ -471,3 +471,127 @@ class VidFastExtractor : ExtractorApi() {
         }.onFailure { Log.d("VidFast", "getUrl failed for $url: ${it.message}") }
     }
 }
+
+// ════════════════════════════════════════════════════════════════════════
+//  VidLink.pro — Next.js app. Replaces the old VidUp (vsembed.ru) which
+//  was Cloudflare-blocked from most networks.
+//
+//  vidlink.pro fetches video sources via /api/b/{movie|tv}/<id>[/<s>/<e>]
+//  which returns an encrypted response that needs WebAssembly to decode.
+//  Without running the JS, we can't decode the API response. Our extractor
+//  falls back to scanning the page HTML for any direct m3u8/mp4 URLs that
+//  might be present in the __NEXT_DATA__ blob.
+// ════════════════════════════════════════════════════════════════════════
+
+class VidLinkExtractor : ExtractorApi() {
+    override val name = "VidLink"
+    override val mainUrl = "https://vidlink.pro"
+    override val requiresReferer = true
+
+    private val UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+
+    override suspend fun getUrl(
+        url: String,
+        referer: String?,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit,
+    ) {
+        runCatching {
+            val headers = mapOf(
+                "User-Agent" to UA,
+                "Referer" to (referer ?: mainUrl),
+                "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            )
+            val res = app.get(url, headers = headers, timeout = 20_000)
+            if (res.code !in 200..299) return@runCatching
+            val html = res.text
+
+            // Scan __NEXT_DATA__ + entire HTML for any direct m3u8/mp4 URLs.
+            Regex("""https?://[^\s"'<>]+(?:\.m3u8|\.mp4|\.mkv)(?:\?[^\s"'<>]*)?""",
+                RegexOption.IGNORE_CASE)
+                .findAll(html).forEach { m ->
+                    val u = m.value
+                    if (u.contains(".m3u8", true)) {
+                        M3u8Helper.generateM3u8(
+                            source = "VidLink",
+                            streamUrl = u,
+                            referer = url,
+                            headers = mapOf("User-Agent" to UA, "Referer" to url),
+                        ).forEach(callback)
+                    } else {
+                        callback(
+                            newExtractorLink(
+                                source = "VidLink",
+                                name = "VidLink - Direct",
+                                url = u,
+                                type = ExtractorLinkType.VIDEO,
+                            ) {
+                                this.referer = url
+                            }
+                        )
+                    }
+                }
+
+            // Look for JWPlayer sources in inline scripts.
+            val doc = Jsoup.parse(html, url)
+            doc.select("script:containsData(sources:)").forEach { script ->
+                val data = script.data()
+                Regex("""sources\s*:\s*(\[[\s\S]*?\])""")
+                    .find(data)?.groupValues?.getOrNull(1)?.let { arrStr ->
+                        runCatching {
+                            val arr = JSONArray(arrStr)
+                            for (i in 0 until arr.length()) {
+                                val o = arr.optJSONObject(i) ?: continue
+                                val file = o.optString("file").ifBlank { o.optString("src") }
+                                if (file.isBlank()) continue
+                                val label = o.optString("label").ifBlank { o.optString("type") }
+                                if (file.contains(".m3u8", true)) {
+                                    M3u8Helper.generateM3u8(
+                                        source = "VidLink",
+                                        streamUrl = file,
+                                        referer = url,
+                                        headers = mapOf("User-Agent" to UA, "Referer" to url),
+                                    ).forEach(callback)
+                                } else {
+                                    callback(
+                                        newExtractorLink(
+                                            source = "VidLink",
+                                            name = "VidLink${if (label.isNotBlank()) " — $label" else ""}",
+                                            url = file,
+                                            type = ExtractorLinkType.VIDEO,
+                                        ) {
+                                            this.referer = url
+                                        }
+                                    )
+                                }
+                            }
+                        }
+                    }
+            }
+
+            // hls.loadSource("….m3u8")
+            Regex("""hls\.loadSource\(["']([^"']+\.m3u8[^"']*)["']\)""")
+                .findAll(html).forEach { m ->
+                    M3u8Helper.generateM3u8(
+                        source = "VidLink",
+                        streamUrl = m.groupValues[1],
+                        referer = url,
+                        headers = mapOf("User-Agent" to UA, "Referer" to url),
+                    ).forEach(callback)
+                }
+
+            // Recurse into any iframes.
+            doc.select("iframe[src]").forEach { el ->
+                val src = el.attr("src")
+                if (src.isNotBlank() && (src.startsWith("http") || src.startsWith("//"))) {
+                    val abs = if (src.startsWith("//")) "https:$src" else src
+                    runCatching {
+                        loadExtractor(abs, url, subtitleCallback, callback)
+                    }
+                }
+            }
+        }.onFailure { Log.d("VidLink", "getUrl failed for $url: ${it.message}") }
+    }
+}
+

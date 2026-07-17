@@ -38,5 +38,6 @@ class WizstreamPlugin : BasePlugin() {
         registerExtractorAPI(TwoEmbedCcExtractor())
         registerExtractorAPI(SmashyStreamExtractor())
         registerExtractorAPI(VidFastExtractor())
+        registerExtractorAPI(VidLinkExtractor())
     }
 }

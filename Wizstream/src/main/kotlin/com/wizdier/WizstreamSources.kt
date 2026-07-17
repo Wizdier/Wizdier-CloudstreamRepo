@@ -610,6 +610,103 @@ object WizstreamSources {
             "Referer" to "$SITE/",
         )
 
+        /**
+         * Map of CDN hostname → raw IP. Ported 1:1 from
+         * CircleFtpProvider.cdnHostToIp (lines 1479-1496).
+         *
+         * Circle FTP serves media from `*.circleftp.net` hostnames that
+         * only resolve on BDIX networks. When the user is on BDIX, the
+         * hostname DNS lookup fails but the underlying IP is reachable.
+         * We swap the hostname for the IP in the URL so the request goes
+         * through. (Matches CircleFtpProvider.linkToIp behaviour.)
+         */
+        private val cdnHostToIp: List<Pair<String, String>> = listOf(
+            "index.circleftp.net"  to "15.1.4.2",
+            "index2.circleftp.net" to "15.1.4.5",
+            "index1.circleftp.net" to "15.1.4.9",
+            "ftp3.circleftp.net"   to "15.1.4.7",
+            "ftp4.circleftp.net"   to "15.1.1.5",
+            "ftp5.circleftp.net"   to "15.1.1.15",
+            "ftp6.circleftp.net"   to "15.1.2.3",
+            "ftp7.circleftp.net"   to "15.1.4.8",
+            "ftp8.circleftp.net"   to "15.1.2.2",
+            "ftp9.circleftp.net"   to "15.1.2.12",
+            "ftp10.circleftp.net"  to "15.1.4.3",
+            "ftp11.circleftp.net"  to "15.1.2.6",
+            "ftp12.circleftp.net"  to "15.1.2.1",
+            "ftp13.circleftp.net"  to "15.1.1.18",
+            "ftp15.circleftp.net"  to "15.1.4.12",
+            "ftp17.circleftp.net"  to "15.1.3.8",
+        )
+
+        /** Swap any *.circleftp.net hostname in the URL for its BDIX IP. */
+        private fun linkToIp(data: String?): String {
+            if (data.isNullOrEmpty()) return ""
+            for ((host, ip) in cdnHostToIp) {
+                if (host in data) return data.replace(host, ip)
+            }
+            return data
+        }
+
+        /**
+         * Detect whether a Circle FTP post is anime (vs regular TV/movie).
+         * Ported from CircleFtpProvider.isPostAnime (lines 980-996).
+         */
+        private fun isPostAnime(categoriesArr: org.json.JSONArray?, postTitle: String): Boolean {
+            val titleLower = postTitle.lowercase()
+            if (titleLower.contains("anime") || titleLower.contains("animation") ||
+                titleLower.contains("cartoon")
+            ) return true
+            if (categoriesArr != null) {
+                for (i in 0 until categoriesArr.length()) {
+                    val catObj = categoriesArr.optJSONObject(i) ?: continue
+                    val catId = catObj.optInt("id")
+                    val catName = catObj.optString("name", "").lowercase()
+                    if (catId == 21 || catId == 1 || catName.contains("anime") ||
+                        catName.contains("animation") || catName.contains("cartoon")
+                    ) return true
+                }
+            }
+            return false
+        }
+
+        /**
+         * Clean a Circle FTP post title to extract the base anime/show name
+         * + any audio tag. Ported from CircleFtpProvider.cleanFtpTitle.
+         *
+         * Returns (cleanedTitle, audioTag?) — e.g.
+         *   "One Piece [Hindi Dubbed]" → ("One Piece", "HINDI DUBBED")
+         *   "Naruto Season 2"          → ("Naruto Season 2", null)
+         */
+        private fun cleanFtpTitle(postName: String?, postTitle: String): Pair<String, String?> {
+            val audioRegex = Regex("(?i)\\b(dual[- ]?audio|multi[- ]?audio|dubbed|hindi[- ]?dubbed|eng[- ]?sub|bengali|hindi|dual|multi)\\b")
+            val audioMatches = audioRegex.findAll(postTitle).map { it.value.trim() }.toList()
+            val audioTag = if (audioMatches.isNotEmpty()) {
+                audioMatches.joinToString(" ").uppercase()
+            } else null
+
+            var cleaned = postName?.trim().orEmpty()
+            if (cleaned.isEmpty() || cleaned.equals("null", ignoreCase = true)) {
+                cleaned = postTitle.replace(Regex("\\.[a-zA-Z0-9]{2,4}$"), "")
+                    .replace(".", " ")
+                    .replace("_", " ")
+                    .replace("-", " ")
+                    .replace(Regex("\\b(19|20)\\d{2}\\b"), "")
+                    .trim()
+            }
+            cleaned = cleaned.split(" ").joinToString(" ") {
+                it.replaceFirstChar { c -> c.uppercase() }
+            }
+            return Pair(cleaned, audioTag)
+        }
+
+        /** Normalised title for grouping. Ported from CircleFtpProvider.normalizedGroupTitle. */
+        private fun normalizedGroupTitle(title: String): String =
+            title.lowercase()
+                .replace(Regex("[^a-z0-9]+"), " ")
+                .trim()
+                .replace(Regex("\\s+"), " ")
+
         override suspend fun resolve(
             app: Requests,
             title: String,
@@ -621,6 +718,7 @@ object WizstreamSources {
             subtitleCallback: (SubtitleFile) -> Unit,
             callback: (ExtractorLink) -> Unit,
         ): Boolean {
+            // 1. Search posts — fetch all results, not just the best one.
             val searchText = fetchWithFallback(
                 app,
                 primary = "$PRIMARY_API/api/posts?searchTerm=${encodeUrl(title)}&order=desc",
@@ -631,87 +729,165 @@ object WizstreamSources {
                 .getOrNull() ?: return false
             if (postsArr.length() == 0) return false
 
-            var bestId: Int = -1
-            var bestScore = 0.0
+            // 2. Collect ALL posts whose title is a strong match for the
+            //    query. This handles BOTH multi-season cases:
+            //      • One post with content[N] for season N  (e.g. "One Piece" with 15 seasons)
+            //      • Separate posts per season              (e.g. "One Piece S2", "One Piece S3")
+            //    By collecting all matching posts we cover both, just like
+            //    CircleFtpProvider.groupAndMapPosts groups all same-named posts.
+            val qNorm = title.normaliseTitle()
+            val matchingPostIds = mutableListOf<Pair<Int, String>>() // (id, title)
             for (i in 0 until postsArr.length()) {
                 val p = postsArr.optJSONObject(i) ?: continue
                 val ptitle = p.optString("title").ifBlank { p.optString("name") ?: "" }
                 if (ptitle.isBlank()) continue
+                val pNorm = ptitle.normaliseTitle()
+                // Exact normalised match: include always.
+                if (pNorm == qNorm) {
+                    matchingPostIds += p.optInt("id", -1) to ptitle
+                    continue
+                }
+                // Title contains query (e.g. "One Piece Season 2" contains "one piece")
+                // AND similarity ≥ 0.5 — include as a season-specific post.
                 val score = titleSimilarity(ptitle, title)
-                if (score > bestScore) {
-                    bestScore = score
-                    bestId = p.optInt("id", -1)
+                if (score >= 0.5 && pNorm.contains(qNorm)) {
+                    matchingPostIds += p.optInt("id", -1) to ptitle
                 }
             }
-            if (bestId < 0 || bestScore < 0.4) return false
-
-            val detailText = fetchWithFallback(
-                app,
-                primary = "$PRIMARY_API/api/posts/$bestId",
-                fallback = "$FALLBACK_API/api/posts/$bestId",
-            ) ?: return false
-            val detail = runCatching { JSONObject(detailText) }.getOrNull() ?: return false
+            if (matchingPostIds.isEmpty()) return false
 
             val srcLabel = "$labelPrefix • $LABEL"
             val mediaUrls = linkedSetOf<String>()
 
-            val postType = detail.optString("type")
-            if (postType == "singleVideo") {
+            // 3. Fetch ALL matching post details concurrently. Each post's
+            //    detail JSON contains:
+            //      • type == "singleVideo"  → movie/direct video
+            //      • type != "singleVideo"  → content[season-1].episodes[ep-1].link
+            //    We aggregate links from EVERY matching post so users get
+            //    multiple audio variants (subbed/dual/hindi) for the same ep.
+            val postDetails = coroutineScope {
+                matchingPostIds.distinctBy { it.first }.map { (id, _) ->
+                    async(Dispatchers.IO) {
+                        if (id < 0) return@async null
+                        val text = fetchWithFallback(
+                            app,
+                            primary = "$PRIMARY_API/api/posts/$id",
+                            fallback = "$FALLBACK_API/api/posts/$id",
+                        ) ?: return@async null
+                        runCatching { JSONObject(text) }.getOrNull()
+                    }
+                }.awaitAll().filterNotNull()
+            }
+            if (postDetails.isEmpty()) return false
+
+            // 4. Determine if this is a movie or TV/anime based on the
+            //    primary post's type. If ANY post is singleVideo, treat as
+            //    movie and collect direct URLs from all of them.
+            val isMoviePath = postDetails.any { it.optString("type") == "singleVideo" }
+
+            if (isMoviePath) {
                 // ── MOVIE PATH ──────────────────────────────────────────────
                 // postObj.optString("content") returns the direct media URL
                 // as a STRING. (Matches CircleFtpProvider line 1230.)
-                val movieUrl = detail.optString("content").takeIf { it.isNotBlank() }
-                if (movieUrl != null) mediaUrls += movieUrl
-                // Also check common alternative field names.
-                detail.optString("url").takeIf { it.isNotBlank() }?.let { mediaUrls += it }
-                detail.optString("file").takeIf { it.isNotBlank() }?.let { mediaUrls += it }
-                detail.optString("src").takeIf { it.isNotBlank() }?.let { mediaUrls += it }
+                postDetails.forEach { detail ->
+                    detail.optString("content").takeIf { it.isNotBlank() }?.let { mediaUrls += it }
+                    detail.optString("url").takeIf { it.isNotBlank() }?.let { mediaUrls += it }
+                    detail.optString("file").takeIf { it.isNotBlank() }?.let { mediaUrls += it }
+                    detail.optString("src").takeIf { it.isNotBlank() }?.let { mediaUrls += it }
+                }
             } else {
                 // ── TV/ANIME PATH ───────────────────────────────────────────
-                // content[season-1].episodes[episode-1].link
-                val contentArray = detail.optJSONArray("content")
-                val seasonIdx = (season ?: 1) - 1
-                val seasonObj = contentArray?.optJSONObject(seasonIdx)
-                val episodesArray = seasonObj?.optJSONArray("episodes")
-                if (episodesArray != null && episode != null) {
-                    val epObj = episodesArray.optJSONObject(episode - 1)
-                    val link = epObj?.optString("link")
-                    if (link != null && link.isNotEmpty()) {
-                        mediaUrls += link
+                // Each post has content[seasonIndex].episodes[epIndex].link
+                // We collect links from ALL matching posts for the requested
+                // (season, episode) — this gives the user multiple audio
+                // variants (subbed/dual/hindi-dubbed) just like the
+                // standalone CircleFtpProvider does.
+                //
+                // Multi-season handling:
+                //   • If a post has content[N] where N >= season, use
+                //     content[season-1].episodes[episode-1].link
+                //   • If a post is a season-specific separate post (e.g.
+                //     "One Piece Season 2"), its content[] array usually
+                //     has just 1 entry for that season — we use content[0]
+                //     as the requested season's episodes.
+                val seasonToUse = season ?: 1
+                val episodeToUse = episode ?: 1
+
+                postDetails.forEach { detail ->
+                    val contentArray = detail.optJSONArray("content")
+                    if (contentArray == null || contentArray.length() == 0) return@forEach
+
+                    // Try content[season-1] first (standard multi-season layout).
+                    var seasonObj = contentArray.optJSONObject(seasonToUse - 1)
+                    var episodesArray = seasonObj?.optJSONArray("episodes")
+
+                    // Fallback: if content[season-1] doesn't exist or has no
+                    // episodes, try content[0] — this handles separate-post-
+                    // per-season where the post's only season is at index 0.
+                    if (episodesArray == null || episodesArray.length() == 0) {
+                        seasonObj = contentArray.optJSONObject(0)
+                        episodesArray = seasonObj?.optJSONArray("episodes")
+                    }
+
+                    if (episodesArray != null && episodeToUse in 1..episodesArray.length()) {
+                        val epObj = episodesArray.optJSONObject(episodeToUse - 1)
+                        val link = epObj?.optString("link")
+                        if (link != null && link.isNotEmpty()) {
+                            mediaUrls += link
+                        }
                     }
                 }
-                // Fallback: if no specific episode matched, dump all episode
-                // links from all seasons.
-                if (mediaUrls.isEmpty() && contentArray != null) {
-                    for (si in 0 until contentArray.length()) {
-                        val so = contentArray.optJSONObject(si) ?: continue
-                        val eps = so.optJSONArray("episodes") ?: continue
-                        for (ei in 0 until eps.length()) {
-                            val eo = eps.optJSONObject(ei) ?: continue
-                            val link = eo.optString("link")
-                            if (link.isNotEmpty()) mediaUrls += link
+
+                // Last-resort fallback: if no exact episode matched across
+                // all posts, dump ALL episode links from ALL seasons of ALL
+                // posts. The user will see a long list of episode links but
+                // at least something will play.
+                if (mediaUrls.isEmpty()) {
+                    postDetails.forEach { detail ->
+                        val contentArray = detail.optJSONArray("content") ?: return@forEach
+                        for (si in 0 until contentArray.length()) {
+                            val so = contentArray.optJSONObject(si) ?: return@forEach
+                            val eps = so.optJSONArray("episodes") ?: return@forEach
+                            for (ei in 0 until eps.length()) {
+                                val eo = eps.optJSONObject(ei) ?: continue
+                                val link = eo.optString("link")
+                                if (link.isNotEmpty()) mediaUrls += link
+                            }
                         }
                     }
                 }
             }
 
-            // Direct download links array (sometimes present).
-            detail.optJSONArray("downloadLinks")?.let { dlArr ->
-                for (i in 0 until dlArr.length()) {
-                    val dl = dlArr.optJSONObject(i) ?: continue
-                    val u = dl.optString("url").ifBlank { dl.optString("link") }
-                    if (u.isNotBlank()) mediaUrls += u
+            // 5. Also pick up any direct download links arrays.
+            postDetails.forEach { detail ->
+                detail.optJSONArray("downloadLinks")?.let { dlArr ->
+                    for (i in 0 until dlArr.length()) {
+                        val dl = dlArr.optJSONObject(i) ?: continue
+                        val u = dl.optString("url").ifBlank { dl.optString("link") }
+                        if (u.isNotBlank()) mediaUrls += u
+                    }
                 }
             }
 
+            // 6. Emit. Apply linkToIp to swap *.circleftp.net hostnames
+            //    for BDIX IPs so media URLs are reachable on BDIX networks.
             var any = false
             mediaUrls.forEach { u ->
+                // Circle FTP encodes TV/movie URLs as
+                // "circleftp://movie?data=<base64>" or
+                // "circleftp://episode?data=<base64>" — base64 of a JSON
+                // array of {url, audio?} objects. (Handled by
+                // CircleFtpProvider.loadLinks lines 1507-1561.)
                 if (u.contains("movie?data=") || u.contains("episode?data=") ||
                     u.contains("circleftp://")
                 ) {
                     if (emitCircleFtpEncoded(u, srcLabel, callback)) any = true
-                } else if (emitDirect(app, u, srcLabel, "$SITE/", HEADERS, subtitleCallback, callback)) {
-                    any = true
+                } else {
+                    // Apply linkToIp for raw URLs containing circleftp.net hosts.
+                    val resolvedUrl = linkToIp(u)
+                    if (emitDirect(app, resolvedUrl, srcLabel, "$SITE/", HEADERS, subtitleCallback, callback)) {
+                        any = true
+                    }
                 }
             }
             return any
@@ -736,16 +912,19 @@ object WizstreamSources {
                 val o = arr.optJSONObject(i) ?: continue
                 val u = o.optString("url").ifBlank { o.optString("link") }
                 if (u.isBlank()) continue
+                // Apply linkToIp — the encoded URL may contain a
+                // circleftp.net hostname that needs BDIX IP swap.
+                val resolvedUrl = linkToIp(u)
                 val audio = o.optString("audio").takeIf { it.isNotBlank() }
                 val name = if (audio != null) "$sourceLabel [$audio]" else sourceLabel
                 val link = newExtractorLink(
                     source = sourceLabel,
                     name = name,
-                    url = u,
+                    url = resolvedUrl,
                     type = INFER_TYPE,
                 ) {
                     this.referer = SITE
-                    this.quality = qualityFromName(u)
+                    this.quality = qualityFromName(resolvedUrl)
                 }
                 callback(link)
                 any = true
