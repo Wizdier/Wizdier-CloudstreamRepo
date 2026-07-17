@@ -15,10 +15,13 @@ import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
  * FTPBD, Circle FTP, CTGMovies) AND the Vid[x] embed family
  * (vidsrc, vidnest, vidplay, vidup, vidrock, vidfast, videasy) in
  * parallel. Duplicates are de-duped by URL.
+<<<<<<< HEAD
  *
  * Custom extractors (WizstreamExtractors.kt) are registered here so
  * `loadExtractor` can dispatch to them when a vid embed URL is encountered
  * that Cloudstream's built-in extractor registry doesn't cover.
+=======
+>>>>>>> FETCH_HEAD
  */
 @CloudstreamPlugin
 class WizstreamPlugin : BasePlugin() {
@@ -26,6 +29,7 @@ class WizstreamPlugin : BasePlugin() {
         // Register both catalogue providers.
         registerMainAPI(WizstreamProvider())
         registerMainAPI(WizstreamAnimeProvider())
+<<<<<<< HEAD
 
         // Register custom vid-embed extractors. These complement
         // Cloudstream's built-in extractor registry — when loadExtractor
@@ -38,5 +42,7 @@ class WizstreamPlugin : BasePlugin() {
         registerExtractorAPI(TwoEmbedCcExtractor())
         registerExtractorAPI(SmashyStreamExtractor())
         registerExtractorAPI(VidFastExtractor())
+=======
+>>>>>>> FETCH_HEAD
     }
 }
