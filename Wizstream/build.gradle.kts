@@ -1,8 +1,4 @@
-<<<<<<< HEAD
 version = 7
-=======
-version = 6
->>>>>>> FETCH_HEAD
 
 cloudstream {
     description = "Wizstream — unified TMDB + AniList catalogue in one plugin. " +
