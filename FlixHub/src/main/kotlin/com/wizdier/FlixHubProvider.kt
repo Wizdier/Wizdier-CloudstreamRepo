@@ -34,7 +34,7 @@ import java.net.URLEncoder
 class FlixHubProvider : MainAPI() {
     override var mainUrl = "https://flixhub.net"
     override var name = "FlixHub"
-    override var lang = "en"
+    override var lang = "bn"
     override val hasMainPage = true
     override val hasQuickSearch = false
     override val hasDownloadSupport = true
@@ -124,12 +124,10 @@ class FlixHubProvider : MainAPI() {
         val meta = extractMetadata(doc)
         val genres = extractGenres(doc)
 
-        // TMDB enrichment — use site poster as PRIMARY (not TMDB) because
-        // the site's data-poster is what the user sees in their browser and
-        // is guaranteed to be the correct movie. TMDB poster is fallback only.
+        // TMDB enrichment — use TMDB poster as PRIMARY (user preference)
         val tmdbData = fetchTmdbByTitle(title, meta.year, if (isSeries) "tv" else "movie")
 
-        val finalPoster = poster ?: tmdbData?.posterUrl
+        val finalPoster = tmdbData?.posterUrl ?: poster
         val finalBackdrop = tmdbData?.backdropUrl
         val finalPlot = tmdbData?.plot ?: plot
         val finalGenres = tmdbData?.genres ?: genres

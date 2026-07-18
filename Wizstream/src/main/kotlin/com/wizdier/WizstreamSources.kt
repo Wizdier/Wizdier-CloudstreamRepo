@@ -8,6 +8,8 @@ import com.lagradost.nicehttp.Requests
 import kotlinx.coroutines.*
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
+import okhttp3.MediaType.Companion.toMediaTypeOrNull
+import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
 import org.jsoup.Jsoup
@@ -47,6 +49,7 @@ object WizstreamSources {
             CircleFtpResolver,
             CtgMoviesResolver,
             FlixHubResolver,
+            CinebyResolver,
         )
 
         val gate = Semaphore(4)
@@ -139,6 +142,7 @@ object WizstreamSources {
     internal object FlixHubResolver : SourceResolver {
         private const val SITE = "https://flixhub.net"
         private const val LABEL = "FlixHub"
+        private val cfKiller = CloudflareKiller()
         private val HEADERS = mapOf(
             "User-Agent" to UA,
             "Referer" to "$SITE/",
@@ -158,10 +162,10 @@ object WizstreamSources {
         ): Boolean {
             val srcLabel = "$labelPrefix • $LABEL"
 
-            // 1. Search FlixHub
+            // 1. Search FlixHub (needs CloudflareKiller)
             val searchUrl = "$SITE/search?q=${encodeUrl(title)}"
             val html = runCatching {
-                app.get(searchUrl, headers = HEADERS, timeout = 15_000).text
+                app.get(searchUrl, headers = HEADERS, interceptor = cfKiller, timeout = 20_000).text
             }.getOrNull() ?: return false
 
             val doc = Jsoup.parse(html, searchUrl)
@@ -194,7 +198,7 @@ object WizstreamSources {
 
             // 3. Fetch the watch page to find stream URL
             val watchHtml = runCatching {
-                app.get(bestUrl, headers = HEADERS, timeout = 15_000).text
+                app.get(bestUrl, headers = HEADERS, interceptor = cfKiller, timeout = 20_000).text
             }.getOrNull() ?: return false
             val watchDoc = Jsoup.parse(watchHtml, bestUrl)
 
@@ -272,6 +276,203 @@ object WizstreamSources {
 
                 return found
             }
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    //  Resolver 6: Cineby  (https://www.cineby.at)
+    //  Uses api.speedracelight.com + enc-dec.app decryption.
+    //  Flow: search TMDB → get tmdbId → fetch seed → fetch encrypted sources →
+    //        decrypt via enc-dec.app → emit m3u8/mp4 URLs
+    // ════════════════════════════════════════════════════════════════════════
+
+    internal object CinebyResolver : SourceResolver {
+        private const val SITE = "https://www.cineby.at"
+        private const val API_BASE = "https://api.speedracelight.com"
+        private const val DEC_API = "https://enc-dec.app/api/dec-videasy"
+        private const val TMDB_API = "https://api.themoviedb.org/3"
+        private const val TMDB_KEY = "98ae14df2b8d8f8f8136499daf79f0e0"
+        private const val LABEL = "Cineby"
+        private val HEADERS = mapOf(
+            "User-Agent" to UA,
+            "Referer" to "$SITE/",
+            "Origin" to SITE,
+            "Accept" to "application/json, text/plain, */*",
+        )
+
+        // Cineby servers (from CinebyExtractor.kt)
+        private val SERVERS = listOf(
+            Triple("neon2", "Cineby-Neon", null as String?),
+            Triple("cdn", "Cineby-CDN", null),
+            Triple("m4uhd", "Cineby-Breach", null),
+            Triple("hdmovie", "Cineby-Vyse", "English"),
+            Triple("hdmovie", "Cineby-Fade", "Hindi"),
+            Triple("meine", "Cineby-Killjoy", "german"),
+            Triple("lamovie", "Cineby-Omen", null),
+            Triple("superflix", "Cineby-Raze", null),
+        )
+
+        override suspend fun resolve(
+            app: Requests,
+            title: String,
+            year: Int?,
+            isMovie: Boolean,
+            season: Int?,
+            episode: Int?,
+            labelPrefix: String,
+            subtitleCallback: (SubtitleFile) -> Unit,
+            callback: (ExtractorLink) -> Unit,
+        ): Boolean {
+            val srcLabel = "$labelPrefix • $LABEL"
+            val mediaType = if (isMovie) "movie" else "tv"
+
+            // 1. Search TMDB for the title to get tmdbId
+            val tmdbId = fetchTmdbId(app, title, year, mediaType) ?: return false
+
+            // 2. For each enabled server, fetch + decrypt sources
+            var found = false
+            for ((serverPath, serverLabel, qualityFilter) in SERVERS) {
+                runCatching {
+                    val result = fetchCinebySources(app, serverPath, tmdbId, title, year, isMovie, season, episode, qualityFilter)
+                    if (result != null) {
+                        val sourcesArr = result.optJSONArray("sources")
+                        if (sourcesArr != null) {
+                            for (i in 0 until sourcesArr.length()) {
+                                val src = sourcesArr.optJSONObject(i) ?: continue
+                                val url = src.optString("url").ifBlank { src.optString("file") }
+                                if (url.isBlank()) continue
+                                val quality = src.optString("quality") ?: ""
+
+                                if (url.contains(".m3u8", true)) {
+                                    M3u8Helper.generateM3u8(
+                                        source = "$srcLabel • $serverLabel",
+                                        streamUrl = url,
+                                        referer = SITE,
+                                        headers = HEADERS,
+                                    ).forEach { el ->
+                                        callback(el)
+                                        found = true
+                                    }
+                                } else {
+                                    callback(
+                                        newExtractorLink(
+                                            source = "$srcLabel • $serverLabel",
+                                            name = "$srcLabel • $serverLabel - $quality",
+                                            url = url,
+                                            type = INFER_TYPE,
+                                        ) {
+                                            this.referer = SITE
+                                            this.quality = qualityFromName(quality)
+                                        }
+                                    )
+                                    found = true
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            return found
+        }
+
+        private suspend fun fetchTmdbId(app: Requests, title: String, year: Int?, mediaType: String): Int? {
+            val params = mapOf(
+                "api_key" to TMDB_KEY,
+                "query" to title,
+                "language" to "en-US",
+            ).let { m ->
+                if (year != null) m + ("year" to year.toString()) else m
+            }
+            val url = "$TMDB_API/search/$mediaType?" + params.entries.joinToString("&") { (k, v) ->
+                "${encodeUrl(k)}=${encodeUrl(v)}"
+            }
+            val res = runCatching {
+                app.get(url, headers = mapOf("Accept" to "application/json"), timeout = 10_000)
+            }.getOrNull() ?: return null
+            if (res.code !in 200..299) return null
+            val json = runCatching { JSONObject(res.text) }.getOrNull() ?: return null
+            val results = json.optJSONArray("results") ?: return null
+            return results.optJSONObject(0)?.optInt("id", 0)?.takeIf { it > 0 }
+        }
+
+        private suspend fun fetchCinebySources(
+            app: Requests,
+            server: String,
+            tmdbId: Int,
+            title: String,
+            year: Int?,
+            isMovie: Boolean,
+            season: Int?,
+            episode: Int?,
+            qualityFilter: String?,
+        ): JSONObject? {
+            val mediaType = if (isMovie) "movie" else "tv"
+            val seasonId = if (isMovie) "1" else (season ?: 1).toString()
+            val episodeId = if (isMovie) "1" else (episode ?: 1).toString()
+
+            // Step 1: Fetch seed
+            val seedUrl = "$API_BASE/seed?mediaId=$tmdbId"
+            val seedRes = runCatching {
+                app.get(seedUrl, headers = HEADERS, timeout = 15_000)
+            }.getOrNull() ?: return null
+            val seed = runCatching {
+                JSONObject(seedRes.text).optString("seed", "")
+            }.getOrDefault("")
+
+            // Step 2: Fetch encrypted sources
+            val doubleEncodedTitle = encodeUrl(encodeUrl(title))
+            val sourcesUrl = "$API_BASE/$server/sources-with-title" +
+                "?title=$doubleEncodedTitle" +
+                "&mediaType=$mediaType" +
+                "&year=${year ?: ""}" +
+                "&episodeId=$episodeId" +
+                "&seasonId=$seasonId" +
+                "&tmdbId=$tmdbId" +
+                "&enc=2" +
+                (if (seed.isNotBlank()) "&seed=$seed" else "") +
+                (if (qualityFilter != null) "&language=$qualityFilter" else "")
+
+            val encRes = runCatching {
+                app.get(sourcesUrl, headers = HEADERS, timeout = 15_000)
+            }.getOrNull() ?: return null
+            val encText = encRes.text
+            if (encText.isBlank() || encText.startsWith("{\"error")) return null
+
+            // Step 3: Decrypt via enc-dec.app
+            val decBody = JSONObject().apply {
+                put("text", encText)
+                put("id", tmdbId.toString())
+                if (seed.isNotBlank()) put("seed", seed)
+            }.toString()
+            val decRes = runCatching {
+                app.post(
+                    DEC_API,
+                    headers = mapOf("Content-Type" to "application/json", "Accept" to "application/json"),
+                    requestBody = decBody.toRequestBody("application/json".toMediaTypeOrNull()),
+                    timeout = 15_000,
+                )
+            }.getOrNull() ?: return null
+            val decJson = runCatching { JSONObject(decRes.text) }.getOrNull() ?: return null
+            val result = decJson.optJSONObject("result") ?: return null
+
+            // Apply quality filter if needed
+            if (qualityFilter != null) {
+                val sources = result.optJSONArray("sources")
+                if (sources != null) {
+                    val filtered = JSONArray()
+                    for (i in 0 until sources.length()) {
+                        val s = sources.optJSONObject(i) ?: continue
+                        if (s.optString("quality", "").equals(qualityFilter, ignoreCase = true)) {
+                            filtered.put(s)
+                        }
+                    }
+                    return JSONObject().apply {
+                        put("sources", filtered)
+                        put("subtitles", result.optJSONArray("subtitles") ?: JSONArray())
+                    }
+                }
+            }
+            return result
         }
     }
 
@@ -755,10 +956,9 @@ object WizstreamSources {
         private const val PRIMARY_API = "http://new.circleftp.net:5000"
         private const val FALLBACK_API = "http://15.1.1.50:5000"
         private const val LABEL = "CircleFTP"
-        private val HEADERS = mapOf(
-            "User-Agent" to UA,
-            "Referer" to "$SITE/",
-        )
+        // No custom headers — the standalone CircleFTP extension doesn't use any.
+        // Passing custom headers (especially Referer from a different origin)
+        // can cause the API to reject requests.
 
         /**
          * Map of CDN hostname → raw IP. Ported 1:1 from
@@ -1035,7 +1235,7 @@ object WizstreamSources {
                 } else {
                     // Apply linkToIp for raw URLs containing circleftp.net hosts.
                     val resolvedUrl = linkToIp(u)
-                    if (emitDirect(app, resolvedUrl, srcLabel, "$SITE/", HEADERS, subtitleCallback, callback)) {
+                    if (emitDirect(app, resolvedUrl, srcLabel, "$SITE/", emptyMap(), subtitleCallback, callback)) {
                         any = true
                     }
                 }
@@ -1087,27 +1287,24 @@ object WizstreamSources {
             primary: String,
             fallback: String,
         ): String? {
-            // Try primary API with longer timeout (BDIX can be slow)
-            val a = runCatching {
-                app.get(primary, headers = HEADERS, timeout = 20_000)
-            }.getOrNull()
-            if (a != null && a.code in 200..299 && a.text.isNotBlank()) return a.text
-
-            // Try fallback API
-            val b = runCatching {
-                app.get(fallback, headers = HEADERS, timeout = 20_000)
-            }.getOrNull()
-            if (b != null && b.code in 200..299 && b.text.isNotBlank()) return b.text
-
-            // Last resort: try the website itself (not the API port)
-            val webUrl = primary.replace(":5000", "").replace("/api/", "/")
-            if (webUrl != primary) {
-                val c = runCatching {
-                    app.get(webUrl, headers = HEADERS, timeout = 15_000)
-                }.getOrNull()
-                if (c != null && c.code in 200..299 && c.text.isNotBlank()) return c.text
+            // Match the standalone CircleFtpHttp.fetchWithFallback:
+            // - No custom headers (the API doesn't expect any)
+            // - verify = false (disables SSL verification for BDIX IPs)
+            // - cacheTime = 60 (enables Cloudstream's HTTP cache)
+            // - retries = 2 per mirror with jittered backoff
+            for (mirror in listOf(primary, fallback)) {
+                repeat(2) { attempt ->
+                    val result = runCatching {
+                        app.get(mirror, verify = false, cacheTime = 60, timeout = 20_000L)
+                    }.getOrNull()
+                    if (result != null && result.code in 200..299 && result.text.isNotBlank()) {
+                        return result.text
+                    }
+                    if (attempt < 1) {
+                        kotlinx.coroutines.delay(300L * (1 shl attempt))
+                    }
+                }
             }
-
             return null
         }
     }

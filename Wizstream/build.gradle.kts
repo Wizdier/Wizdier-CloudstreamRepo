@@ -1,4 +1,4 @@
-version = 9
+version = 10
 
 cloudstream {
     description = "Wizstream — unified TMDB + AniList catalogue in one plugin. " +

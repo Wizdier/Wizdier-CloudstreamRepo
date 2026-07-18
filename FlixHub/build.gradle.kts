@@ -1,4 +1,4 @@
-version = 1
+version = 2
 
 cloudstream {
     description = "FlixHub — Stream movies and TV series. BDIX-accessible source with Hollywood, Bollywood, South Indian content plus anime and animation categories."
