@@ -2,9 +2,9 @@ package com.wizdier
 
 import android.util.Log
 import com.lagradost.cloudstream3.*
+import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.utils.*
 import com.lagradost.cloudstream3.network.CloudflareKiller
-import com.lagradost.nicehttp.Requests
 import kotlinx.coroutines.*
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
@@ -31,7 +31,6 @@ object WizstreamSources {
         "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 
     suspend fun resolveAll(
-        app: Requests,
         title: String,
         year: Int?,
         isMovie: Boolean,
@@ -58,7 +57,6 @@ object WizstreamSources {
                 gate.withPermit {
                     runCatching {
                         src.resolve(
-                            app = app,
                             title = title,
                             year = year,
                             isMovie = isMovie,
@@ -150,7 +148,6 @@ object WizstreamSources {
         )
 
         override suspend fun resolve(
-            app: Requests,
             title: String,
             year: Int?,
             isMovie: Boolean,
@@ -313,7 +310,6 @@ object WizstreamSources {
         )
 
         override suspend fun resolve(
-            app: Requests,
             title: String,
             year: Int?,
             isMovie: Boolean,
@@ -327,13 +323,13 @@ object WizstreamSources {
             val mediaType = if (isMovie) "movie" else "tv"
 
             // 1. Search TMDB for the title to get tmdbId
-            val tmdbId = fetchTmdbId(app, title, year, mediaType) ?: return false
+            val tmdbId = fetchTmdbId( title, year, mediaType) ?: return false
 
             // 2. For each enabled server, fetch + decrypt sources
             var found = false
             for ((serverPath, serverLabel, qualityFilter) in SERVERS) {
                 runCatching {
-                    val result = fetchCinebySources(app, serverPath, tmdbId, title, year, isMovie, season, episode, qualityFilter)
+                    val result = fetchCinebySources( serverPath, tmdbId, title, year, isMovie, season, episode, qualityFilter)
                     if (result != null) {
                         val sourcesArr = result.optJSONArray("sources")
                         if (sourcesArr != null) {
@@ -375,7 +371,7 @@ object WizstreamSources {
             return found
         }
 
-        private suspend fun fetchTmdbId(app: Requests, title: String, year: Int?, mediaType: String): Int? {
+        private suspend fun fetchTmdbId( title: String, year: Int?, mediaType: String): Int? {
             val params = mapOf(
                 "api_key" to TMDB_KEY,
                 "query" to title,
@@ -396,7 +392,6 @@ object WizstreamSources {
         }
 
         private suspend fun fetchCinebySources(
-            app: Requests,
             server: String,
             tmdbId: Int,
             title: String,
@@ -559,7 +554,6 @@ object WizstreamSources {
     }
 
     internal suspend fun emitDirect(
-        app: Requests,
         url: String,
         sourceLabel: String,
         referer: String,
@@ -608,7 +602,6 @@ object WizstreamSources {
 
     internal interface SourceResolver {
         suspend fun resolve(
-            app: Requests,
             title: String,
             year: Int?,
             isMovie: Boolean,
@@ -635,7 +628,6 @@ object WizstreamSources {
         )
 
         override suspend fun resolve(
-            app: Requests,
             title: String,
             year: Int?,
             isMovie: Boolean,
@@ -713,7 +705,7 @@ object WizstreamSources {
                 val mediaUrls = extractMediaUrlsFromHtml(playerHtml, playerUrl)
                 var any = false
                 mediaUrls.forEach { u ->
-                    if (emitDirect(app, u, srcLabel, playerUrl, HEADERS, subtitleCallback, callback)) any = true
+                    if (emitDirect(u, srcLabel, playerUrl, HEADERS, subtitleCallback, callback)) any = true
                 }
                 // Also try the view.php page itself (sometimes the player is inline).
                 if (!any) {
@@ -722,7 +714,7 @@ object WizstreamSources {
                     }.getOrNull()?.let { viewHtml ->
                         val urls2 = extractMediaUrlsFromHtml(viewHtml, best.first)
                         urls2.forEach { u ->
-                            if (emitDirect(app, u, srcLabel, best.first, HEADERS, subtitleCallback, callback)) any = true
+                            if (emitDirect(u, srcLabel, best.first, HEADERS, subtitleCallback, callback)) any = true
                         }
                     }
                 }
@@ -792,7 +784,7 @@ object WizstreamSources {
             val absPath = resolveAbs(SITE, matchPath)
             return when {
                 isDirectMedia(absPath) ->
-                    emitDirect(app, absPath, srcLabel, "$SITE/", HEADERS, subtitleCallback, callback)
+                    emitDirect(absPath, srcLabel, "$SITE/", HEADERS, subtitleCallback, callback)
                 absPath.contains("player.php") || absPath.contains("view.php") -> {
                     val playerHtml = runCatching {
                         app.get(absPath, headers = HEADERS, timeout = 15_000).text
@@ -800,11 +792,11 @@ object WizstreamSources {
                     val mediaUrls = extractMediaUrlsFromHtml(playerHtml, absPath)
                     var any = false
                     mediaUrls.forEach { u ->
-                        if (emitDirect(app, u, srcLabel, absPath, HEADERS, subtitleCallback, callback)) any = true
+                        if (emitDirect(u, srcLabel, absPath, HEADERS, subtitleCallback, callback)) any = true
                     }
                     any
                 }
-                else -> emitDirect(app, absPath, srcLabel, "$SITE/", HEADERS, subtitleCallback, callback)
+                else -> emitDirect(absPath, srcLabel, "$SITE/", HEADERS, subtitleCallback, callback)
             }
         }
     }
@@ -824,7 +816,6 @@ object WizstreamSources {
         )
 
         override suspend fun resolve(
-            app: Requests,
             title: String,
             year: Int?,
             isMovie: Boolean,
@@ -904,7 +895,7 @@ object WizstreamSources {
 
             var any = false
             mediaUrls.forEach { u ->
-                if (emitDirect(app, u, srcLabel, "$SITE/", HEADERS, subtitleCallback, callback)) any = true
+                if (emitDirect(u, srcLabel, "$SITE/", HEADERS, subtitleCallback, callback)) any = true
             }
             return any
         }
@@ -1058,7 +1049,6 @@ object WizstreamSources {
                 .replace(Regex("\\s+"), " ")
 
         override suspend fun resolve(
-            app: Requests,
             title: String,
             year: Int?,
             isMovie: Boolean,
@@ -1070,7 +1060,6 @@ object WizstreamSources {
         ): Boolean {
             // 1. Search posts — fetch all results, not just the best one.
             val searchText = fetchWithFallback(
-                app,
                 primary = "$PRIMARY_API/api/posts?searchTerm=${encodeUrl(title)}&order=desc",
                 fallback = "$FALLBACK_API/api/posts?searchTerm=${encodeUrl(title)}&order=desc",
             ) ?: return false
@@ -1120,7 +1109,6 @@ object WizstreamSources {
                     async(Dispatchers.IO) {
                         if (id < 0) return@async null
                         val text = fetchWithFallback(
-                            app,
                             primary = "$PRIMARY_API/api/posts/$id",
                             fallback = "$FALLBACK_API/api/posts/$id",
                         ) ?: return@async null
@@ -1235,7 +1223,7 @@ object WizstreamSources {
                 } else {
                     // Apply linkToIp for raw URLs containing circleftp.net hosts.
                     val resolvedUrl = linkToIp(u)
-                    if (emitDirect(app, resolvedUrl, srcLabel, "$SITE/", emptyMap(), subtitleCallback, callback)) {
+                    if (emitDirect(resolvedUrl, srcLabel, "$SITE/", emptyMap(), subtitleCallback, callback)) {
                         any = true
                     }
                 }
@@ -1283,7 +1271,6 @@ object WizstreamSources {
         }
 
         private suspend fun fetchWithFallback(
-            app: Requests,
             primary: String,
             fallback: String,
         ): String? {
@@ -1327,7 +1314,6 @@ object WizstreamSources {
         )
 
         override suspend fun resolve(
-            app: Requests,
             title: String,
             year: Int?,
             isMovie: Boolean,
@@ -1345,7 +1331,7 @@ object WizstreamSources {
                 kinds.map { kind ->
                     async(Dispatchers.IO) {
                         runCatching {
-                            val text = apiGet(app, "/$kind", params)
+                            val text = apiGet( "/$kind", params)
                             parseSearchResults(text, kind)?.let { list ->
                                 synchronized(candidates) { candidates.addAll(list) }
                             }
@@ -1361,7 +1347,7 @@ object WizstreamSources {
                 ?: return false
             if (titleSimilarity(best.third, title) < 0.4) return false
 
-            val detailText = apiGet(app, "/${best.first}/${encodeUrl(best.second)}", emptyMap())
+            val detailText = apiGet( "/${best.first}/${encodeUrl(best.second)}", emptyMap())
             val detail = runCatching { JSONObject(detailText) }.getOrNull() ?: return false
 
             val srcLabel = "$labelPrefix • $LABEL"
@@ -1379,7 +1365,7 @@ object WizstreamSources {
                     link.optString("link")
                 }.ifBlank { continue }
 
-                if (emitDirect(app, rawUrl, srcLabel, "$SITE/", HEADERS, subtitleCallback, callback)) {
+                if (emitDirect(rawUrl, srcLabel, "$SITE/", HEADERS, subtitleCallback, callback)) {
                     any = true
                 }
             }
@@ -1398,7 +1384,7 @@ object WizstreamSources {
                             val u = link.optString("url").ifBlank { link.optString("file") }
                                 .ifBlank { link.optString("src") }
                             if (u.isNotBlank() &&
-                                emitDirect(app, u, srcLabel, "$SITE/", HEADERS, subtitleCallback, callback)
+                                emitDirect(u, srcLabel, "$SITE/", HEADERS, subtitleCallback, callback)
                             ) any = true
                         }
                     }
@@ -1422,7 +1408,7 @@ object WizstreamSources {
             return out
         }
 
-        private suspend fun apiGet(app: Requests, path: String, query: Map<String, Any?>): String {
+        private suspend fun apiGet( path: String, query: Map<String, Any?>): String {
             val p = if (path.startsWith("/")) path else "/$path"
             val qs = if (query.isEmpty()) "" else "?" + query.entries
                 .filter { it.value != null }
