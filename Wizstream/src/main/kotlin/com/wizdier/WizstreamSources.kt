@@ -513,8 +513,15 @@ object WizstreamSources {
         if (u.isBlank()) return u
         if (u.startsWith("http://") || u.startsWith("https://")) return u
         if (u.startsWith("//")) return "https:$u"
-        val base = baseUrl.trimEnd('/')
-        return if (u.startsWith("/")) "$base$u" else "$base/$u"
+        // A player URL normally contains a filename and query string (for
+        // example player.php?id=42). Appending a relative media path to that
+        // URL produces player.php?id=42/uploads/file.mkv: a valid-looking but
+        // broken source. URI.resolve follows browser URL resolution rules.
+        return runCatching { java.net.URI(baseUrl).resolve(u).toString() }
+            .getOrElse {
+                val origin = baseUrl.substringBefore("/", baseUrl.substringBefore("?"))
+                if (u.startsWith("/")) "$origin$u" else "$baseUrl/${u.trimStart('/')}"
+            }
     }
 
     internal fun extractMediaUrlsFromHtml(html: String, baseUrl: String): LinkedHashSet<String> {
@@ -775,6 +782,23 @@ object WizstreamSources {
                             }
                         }
                     }
+                }
+
+                // The current movie player is Quetta-backed: its HTML only
+                // exposes data-quetta-video-id, not a media src. Its official
+                // download endpoint is the stable media redirect, so emit it
+                // directly when no inline source was available.
+                if (!any) {
+                    callback(newExtractorLink(
+                        source = srcLabel,
+                        name = "$srcLabel - Download",
+                        url = "$SITE/download.php?id=$id",
+                        type = ExtractorLinkType.VIDEO,
+                    ) {
+                        this.referer = playerUrl
+                        this.quality = Qualities.Unknown.value
+                    })
+                    any = true
                 }
 
                 // Approach 2: Try the view.php page itself
@@ -1052,11 +1076,12 @@ object WizstreamSources {
 
         /** Swap any *.circleftp.net hostname in the URL for its BDIX IP. */
         private fun linkToIp(data: String?): String {
-            if (data.isNullOrEmpty()) return ""
-            for ((host, ip) in cdnHostToIp) {
-                if (host in data) return data.replace(host, ip)
-            }
-            return data
+            // The content page supplied by Circle uses virtual CDN hostnames
+            // (for example index2.circleftp.net). They must be preserved:
+            // replacing them with an IP loses the Host header and newer CDN
+            // nodes return an invalid/default response. This intentionally
+            // mirrors the standalone extension when opened from a content URL.
+            return data.orEmpty()
         }
 
         /**
@@ -1149,19 +1174,19 @@ object WizstreamSources {
             for (i in 0 until postsArr.length()) {
                 val p = postsArr.optJSONObject(i) ?: continue
                 val ptitle = p.optString("title").ifBlank { p.optString("name") ?: "" }
+                val displayName = p.optString("name")
                 if (ptitle.isBlank()) continue
-                val pNorm = ptitle.normaliseTitle()
-                // Exact normalised match: include always.
-                if (pNorm == qNorm) {
-                    matchingPostIds += p.optInt("id", -1) to ptitle
-                    continue
+                // Circle's API often stores a release filename in `title` and
+                // the catalogue title in `name`. Match both after stripping
+                // audio/season/release tags; otherwise movie posts and
+                // separately-uploaded anime seasons are silently discarded.
+                val names = listOf(ptitle, displayName).filter { it.isNotBlank() }
+                val matches = names.any { candidate ->
+                    val pNorm = candidate.normaliseTitle()
+                    pNorm == qNorm || pNorm.contains(qNorm) ||
+                        titleSimilarity(candidate, title) >= 0.55
                 }
-                // Title contains query (e.g. "One Piece Season 2" contains "one piece")
-                // AND similarity ≥ 0.5 — include as a season-specific post.
-                val score = titleSimilarity(ptitle, title)
-                if (score >= 0.5 && pNorm.contains(qNorm)) {
-                    matchingPostIds += p.optInt("id", -1) to ptitle
-                }
+                if (matches) matchingPostIds += p.optInt("id", -1) to ptitle
             }
             if (matchingPostIds.isEmpty()) return false
 
@@ -1199,10 +1224,27 @@ object WizstreamSources {
                 // as a STRING. (Matches CircleFtpProvider line 1230.)
                 // Apply linkToIp to swap *.circleftp.net hostnames for BDIX IPs.
                 postDetails.forEach { detail ->
-                    detail.optString("content").takeIf { it.isNotBlank() }?.let { mediaUrls += linkToIp(it) }
-                    detail.optString("url").takeIf { it.isNotBlank() }?.let { mediaUrls += linkToIp(it) }
-                    detail.optString("file").takeIf { it.isNotBlank() }?.let { mediaUrls += linkToIp(it) }
-                    detail.optString("src").takeIf { it.isNotBlank() }?.let { mediaUrls += linkToIp(it) }
+                    // Depending on upload age, content is either a plain URL,
+                    // a JSON object/array, or one of these alternate fields.
+                    // Flatten all forms before emitting so standalone movie and
+                    // AnimeMovie posts use the same payload handling.
+                    fun collect(value: Any?) {
+                        when (value) {
+                            is String -> {
+                                val text = value.trim()
+                                if (text.startsWith("{") || text.startsWith("[")) {
+                                    runCatching { JSONObject(text) }.getOrNull()?.let(::collect)
+                                    runCatching { JSONArray(text) }.getOrNull()?.let(::collect)
+                                } else if (text.isNotBlank()) mediaUrls += linkToIp(text)
+                            }
+                            is JSONObject -> listOf("url", "link", "file", "src", "video", "videoUrl", "download")
+                                .forEach { key -> collect(value.opt(key)) }
+                            is JSONArray -> for (index in 0 until value.length()) collect(value.opt(index))
+                        }
+                    }
+                    collect(detail.opt("content"))
+                    listOf("url", "link", "file", "src", "video", "videoUrl", "download")
+                        .forEach { key -> collect(detail.opt(key)) }
                 }
             } else {
                 // ── TV/ANIME PATH ───────────────────────────────────────────

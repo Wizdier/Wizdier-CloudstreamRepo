@@ -587,6 +587,25 @@ class CineplexBD : MainAPI() {
                 }
             }
 
+        // Current movie pages are Quetta-backed and only expose a
+        // data-quetta-video-id. The official download endpoint is the stable
+        // media redirect; player.php itself is never emitted as a video URL.
+        if (!found && url.contains("player.php")) {
+            val id = url.substringAfter("id=", "").substringBefore("&")
+            if (id.isNotBlank()) {
+                val downloadUrl = "$mainUrl/download.php?id=$id"
+                callback.invoke(newExtractorLink(
+                    source = explicitSourceName,
+                    name = "$explicitSourceName - Download",
+                    url = downloadUrl,
+                    type = ExtractorLinkType.VIDEO,
+                ) {
+                    this.referer = url
+                    this.quality = getQualityFromName(downloadUrl)
+                })
+                found = true
+            }
+        }
         return found
     }
 
@@ -948,11 +967,15 @@ class CineplexBD : MainAPI() {
             .replace(Regex("\\s+"), " ")
             .trim()
 
-    private fun String.toAbsoluteMediaUrl(baseUrl: String = mainUrl): String = when {
-        startsWith("//") -> baseUrl.substringBefore("://", "http") + ":$this"
-        startsWith("http", ignoreCase = true) -> this
-        startsWith("/") -> mainUrl + this
-        else -> baseUrl.substringBeforeLast("/", mainUrl).trimEnd('/') + "/${trimStart('/')}"
+    private fun String.toAbsoluteMediaUrl(baseUrl: String = mainUrl): String {
+        val value = trim().replace("\\/", "/").replace("&amp;", "&")
+        if (value.isBlank()) return value
+        if (value.startsWith("//")) return baseUrl.substringBefore("://", "http") + ":$value"
+        if (value.startsWith("http", ignoreCase = true)) return value
+        // Resolve against the document URL rather than string-appending. This
+        // is essential for movie player.php?id=… pages with relative sources.
+        return runCatching { java.net.URI(baseUrl).resolve(value).toString() }
+            .getOrElse { if (value.startsWith("/")) mainUrl + value else mainUrl + "/" + value }
     }
 
     private fun String.isDirectVideoUrl(): Boolean {
