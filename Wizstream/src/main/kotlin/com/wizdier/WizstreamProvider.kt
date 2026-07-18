@@ -168,7 +168,7 @@ class WizstreamProvider : MainAPI() {
 
     override var mainUrl = "https://www.themoviedb.org"
     override var name = "Wizstream"
-    override var lang = "bn"
+    override var lang = "en"
     override val hasMainPage = true
     override val hasQuickSearch = true
     override val hasDownloadSupport = true
@@ -417,39 +417,60 @@ class WizstreamProvider : MainAPI() {
 
         val seenUrls = Collections.newSetFromMap<String>(ConcurrentHashMap())
         val seenSubs = Collections.newSetFromMap<String>(ConcurrentHashMap())
+        val gate = Semaphore(8)
         var anyFound = false
 
-        // ── Yoru (vidsrc.to → vsembed.ru) ──────────────────────────────
-        // The only vid source. Uses VsEmbedExtractor (registered in
-        // WizstreamPlugin) which handles Cloudflare via CloudflareKiller.
-        val yoruJob = async(Dispatchers.IO) {
-            val embedUrl = if (ctx.isMovie || s == null || e == null) {
-                "https://vidsrc.to/embed/movie/$id"
-            } else {
-                "https://vidsrc.to/embed/tv/$id/$s/$e"
-            }
-            try {
-                loadExtractor(
-                    embedUrl,
-                    "https://vidsrc.to/",
-                    { sub ->
-                        if (seenSubs.add(sub.url)) subtitleCallback(sub)
-                    },
-                ) { link ->
-                    val normalized = link.url.trim()
-                    if (normalized.isBlank() || !seenUrls.add(normalized)) return@loadExtractor
-                    callback(link.relabel("Wizstream • Yoru", "Yoru — ${link.name}"))
-                    anyFound = true
+        val jobs = VID_HOSTS.map { host ->
+            async(Dispatchers.IO) {
+                gate.withPermit {
+                    val embedUrl = if (ctx.isMovie || s == null || e == null) {
+                        host.movie(id)
+                    } else {
+                        host.tv(id, s, e)
+                    }
+                    try {
+                        val before = anyFound
+                        loadExtractor(
+                            embedUrl,
+                            host.referer.ifBlank { embedUrl.substringBeforeLast("/") },
+                            { sub ->
+                                if (seenSubs.add(sub.url)) subtitleCallback(sub)
+                            }
+                        ) { link ->
+                            val normalized = link.url.trim()
+                            if (normalized.isBlank() || !seenUrls.add(normalized)) return@loadExtractor
+                            val newSource = "Wizstream • ${host.label}"
+                            val newName = "${host.label} — ${link.name}".trimEnd('—', ' ')
+                            callback(link.relabel(newSource, newName))
+                            anyFound = true
+                        }
+                        if (!anyFound && !before) {
+                            callback(newExtractorLink(
+                                source = "Wizstream • ${host.label}",
+                                name = "${host.label} — Auto",
+                                url = embedUrl,
+                                type = INFER_TYPE,
+                            ) {
+                                referer = host.referer.ifBlank { "https://" }
+                                quality = Qualities.Unknown.value
+                            })
+                            anyFound = true
+                        }
+                    } catch (t: Throwable) {
+                        Log.d(TAG, "Host ${host.label} failed: ${t.message}")
+                    }
                 }
-            } catch (t: Throwable) {
-                Log.d(TAG, "Yoru failed: ${t.message}")
             }
         }
 
-        // ── BDIX + Cineby source resolvers ────────────────────────────
+        // ── Bundled BDIX source resolvers ────────────────────────────────
+        // Run the 4 source extensions' search+loadLinks in parallel with
+        // the Vid[x] embed family. WizstreamSources handles its own internal
+        // concurrency (4-way), so we just await the whole batch here.
         val sourceJob = async(Dispatchers.IO) {
             runCatching {
                 WizstreamSources.resolveAll(
+                    app = app,
                     title = ctx.title ?: "",
                     year = null,
                     isMovie = ctx.isMovie,
@@ -470,7 +491,7 @@ class WizstreamProvider : MainAPI() {
             }.getOrDefault(false)
         }
 
-        yoruJob.await()
+        jobs.awaitAll()
         sourceJob.await()
         anyFound
     }

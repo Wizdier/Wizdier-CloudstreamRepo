@@ -1,4 +1,4 @@
-version = 16
+version = 10
 
 cloudstream {
     description = "Wizstream — unified TMDB + AniList catalogue in one plugin. " +
@@ -7,8 +7,10 @@ cloudstream {
         "covers anime / OVA / movies. Both fetch links from the Vid[x] family " +
         "(vidsrc, vidnest, vidplay, vidup, vidrock, vidfast, videasy) plus the " +
         "extended VidSrc/2Embed/MultiEmbed/SuperEmbed/Gomo/SmashyStream/VAPlayer " +
-        "embeds and bundled BDIX source lookups (Cineplex BD, FTPBD, Circle FTP, " +
-        "CTGMovies) with MAL / AniList / Kitsu / Simkl tracking."
+        "embeds, bundled BDIX source lookups (Cineplex BD, FTPBD, Circle FTP, " +
+        "CTGMovies), and dedicated anime streaming sources (AniZone, Mkissa via " +
+        "AllAnime API, Miruro secure-pipe, AniChi via mapper.nekostream.site) " +
+        "with MAL / AniList / Kitsu / Simkl tracking."
     authors = listOf("Wizdier")
     status = 1
     tvTypes = listOf(

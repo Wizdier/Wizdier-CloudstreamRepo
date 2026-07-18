@@ -160,7 +160,7 @@ class WizstreamAnimeProvider : MainAPI() {
 
     override var mainUrl = "https://anilist.co"
     override var name = "Wizstream-Anime"
-    override var lang = "bn"
+    override var lang = "en"
     override val hasMainPage = true
     override val hasQuickSearch = true
     override val hasDownloadSupport = true
@@ -369,14 +369,14 @@ class WizstreamAnimeProvider : MainAPI() {
 
         val epList = when (type) {
             TvType.AnimeMovie -> listOf(newEpisode(LinkContext(
-                anilistId = id, imdbId = imdbId, tmdbId = tmdbId,
+                anilistId = id, imdbId = imdbId, tmdbId = tmdbId, malId = detail.malId,
                 season = null, episode = null, title = title, isMovie = true,
                 dub = DubStatus.Subbed,
             ).toJson()) { name = "Movie" })
             else -> (1..episodes).map { epNum ->
                 val epMeta = detail.episodeMeta[epNum]
                 newEpisode(LinkContext(
-                    anilistId = id, imdbId = imdbId, tmdbId = tmdbId,
+                    anilistId = id, imdbId = imdbId, tmdbId = tmdbId, malId = detail.malId,
                     season = 1, episode = epNum, title = title, isMovie = false,
                     dub = DubStatus.Subbed,
                 ).toJson()) {
@@ -450,41 +450,73 @@ class WizstreamAnimeProvider : MainAPI() {
         val idList = buildList {
             ctx.imdbId?.let { add(it) }
             ctx.tmdbId?.let { add(it.toString()) }
+            add(ctx.anilistId.toString())
         }.distinct()
 
         val seenUrls = Collections.newSetFromMap<String>(ConcurrentHashMap())
         val seenSubs = Collections.newSetFromMap<String>(ConcurrentHashMap())
+        val gate = Semaphore(8)
         var anyFound = false
 
-        // ── Yoru (vidsrc.to → vsembed.ru) ──────────────────────────────
-        val yoruJob = async(Dispatchers.IO) {
-            for (id in idList) {
-                val embedUrl = if (ctx.isMovie || ctx.season == null || ctx.episode == null) {
-                    "https://vidsrc.to/embed/movie/$id"
-                } else {
-                    "https://vidsrc.to/embed/tv/$id/${ctx.season}/${ctx.episode}"
-                }
-                try {
-                    loadExtractor(
-                        embedUrl,
-                        "https://vidsrc.to/",
-                        { sub ->
-                            if (seenSubs.add(sub.url)) subtitleCallback(sub)
-                        },
-                    ) { link ->
-                        val urlStr = link.url.trim()
-                        if (urlStr.isBlank() || !seenUrls.add(urlStr)) return@loadExtractor
-                        callback(link.aRelabel("Wizstream-A • Yoru", "Yoru — ${link.name}"))
-                        anyFound = true
+        val jobs = VID_HOSTS.flatMap { host ->
+            idList.map { id ->
+                async(Dispatchers.IO) {
+                    gate.withPermit {
+                        val embedUrl = if (ctx.isMovie || ctx.season == null || ctx.episode == null) {
+                            host.movie(id)
+                        } else {
+                            host.tv(id, ctx.season, ctx.episode)
+                        }
+                        try {
+                            val before = anyFound
+                            val embedReferer = runCatching {
+                                "https://" + java.net.URL(embedUrl).host + "/"
+                            }.getOrDefault("https://")
+                            loadExtractor(
+                                embedUrl,
+                                embedReferer,
+                                { sub ->
+                                    if (seenSubs.add(sub.url)) subtitleCallback(sub)
+                                }
+                            ) { link ->
+                                val urlStr = link.url.trim()
+                                if (urlStr.isBlank() || !seenUrls.add(urlStr)) return@loadExtractor
+                                val newSource = "Wizstream-A • ${host.label}"
+                                val newName = "${host.label} — ${link.name}".trimEnd('—', ' ')
+                                callback(link.aRelabel(newSource, newName))
+                                anyFound = true
+                            }
+                            if (!anyFound && !before) {
+                                callback(newExtractorLink(
+                                    source = "Wizstream-A • ${host.label}",
+                                    name = "${host.label} — Auto",
+                                    url = embedUrl,
+                                    type = INFER_TYPE,
+                                ) {
+                                    referer = runCatching {
+                                        "https://" + java.net.URL(embedUrl).host + "/"
+                                    }.getOrDefault("https://")
+                                    quality = Qualities.Unknown.value
+                                })
+                                anyFound = true
+                            }
+                        } catch (_: Throwable) {
+                            // Host is probably down or blocked — skip silently.
+                        }
                     }
-                } catch (_: Throwable) {}
+                }
             }
         }
 
-        // ── BDIX + Cineby source resolvers ────────────────────────────
+        // ── Bundled BDIX source resolvers ────────────────────────────────
+        // AniList anime often has English-romaji titles that the BDIX
+        // sites (Cineplex BD / FTPBD / Circle FTP / CTGMovies) index
+        // reasonably well via their anime categories. WizstreamSources
+        // runs all 4 sites in parallel and emits any matches it finds.
         val sourceJob = async(Dispatchers.IO) {
             runCatching {
                 WizstreamSources.resolveAll(
+                    app = app,
                     title = ctx.title ?: "",
                     year = null,
                     isMovie = ctx.isMovie,
@@ -505,8 +537,39 @@ class WizstreamAnimeProvider : MainAPI() {
             }.getOrDefault(false)
         }
 
-        yoruJob.await()
+        // ── Anime-focused source resolvers ──────────────────────────────
+        // AniZone, Mkissa (via AllAnime API), Miruro (secure pipe), AniChi
+        // (via mapper.nekostream.site). These are dedicated anime streaming
+        // sites that complement the BDIX sources above. AniChi uses the MAL
+        // ID directly via the mapper API — no search needed.
+        val animeSourceJob = async(Dispatchers.IO) {
+            runCatching {
+                WizstreamAnimeSources.resolveAnime(
+                    app = app,
+                    title = ctx.title ?: "",
+                    anilistId = ctx.anilistId,
+                    malId = ctx.malId,
+                    isMovie = ctx.isMovie,
+                    season = ctx.season,
+                    episode = ctx.episode,
+                    labelPrefix = "Wizstream-A",
+                    subtitleCallback = { sub ->
+                        if (seenSubs.add(sub.url)) subtitleCallback(sub)
+                    },
+                    callback = { link ->
+                        val normalized = link.url.trim()
+                        if (normalized.isNotBlank() && seenUrls.add(normalized)) {
+                            callback(link)
+                            anyFound = true
+                        }
+                    },
+                )
+            }.getOrDefault(false)
+        }
+
+        jobs.awaitAll()
         sourceJob.await()
+        animeSourceJob.await()
         anyFound
     }
 

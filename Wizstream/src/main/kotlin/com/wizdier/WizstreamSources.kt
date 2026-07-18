@@ -2,14 +2,12 @@ package com.wizdier
 
 import android.util.Log
 import com.lagradost.cloudstream3.*
-import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.utils.*
 import com.lagradost.cloudstream3.network.CloudflareKiller
+import com.lagradost.nicehttp.Requests
 import kotlinx.coroutines.*
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
-import okhttp3.MediaType.Companion.toMediaTypeOrNull
-import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
 import org.jsoup.Jsoup
@@ -31,6 +29,7 @@ object WizstreamSources {
         "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 
     suspend fun resolveAll(
+        app: Requests,
         title: String,
         year: Int?,
         isMovie: Boolean,
@@ -47,8 +46,6 @@ object WizstreamSources {
             FtpBdResolver,
             CircleFtpResolver,
             CtgMoviesResolver,
-            FlixHubResolver,
-            CinebyResolver,
         )
 
         val gate = Semaphore(4)
@@ -57,6 +54,7 @@ object WizstreamSources {
                 gate.withPermit {
                     runCatching {
                         src.resolve(
+                            app = app,
                             title = title,
                             year = year,
                             isMovie = isMovie,
@@ -130,363 +128,6 @@ object WizstreamSources {
             }
         }
 
-    // ════════════════════════════════════════════════════════════════════════
-    //  Resolver 5: FlixHub  (https://flixhub.net)
-    //  BDIX-accessible streaming site with movies and TV series.
-    //  Stream URL: https://flixhub.net/stream/movie/<slug> or
-    //              https://flixhub.net/stream/episode/<slug>
-    // ════════════════════════════════════════════════════════════════════════
-
-    internal object FlixHubResolver : SourceResolver {
-        private const val SITE = "https://flixhub.net"
-        private const val LABEL = "FlixHub"
-        private val cfKiller = CloudflareKiller()
-        private val HEADERS = mapOf(
-            "User-Agent" to UA,
-            "Referer" to "$SITE/",
-            "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        )
-
-        override suspend fun resolve(
-            title: String,
-            year: Int?,
-            isMovie: Boolean,
-            season: Int?,
-            episode: Int?,
-            labelPrefix: String,
-            subtitleCallback: (SubtitleFile) -> Unit,
-            callback: (ExtractorLink) -> Unit,
-        ): Boolean {
-            val srcLabel = "$labelPrefix • $LABEL"
-
-            // 1. Search FlixHub — try without CloudflareKiller first
-            // (FlixHub may not challenge residential/BDIX IPs), then with it.
-            val searchUrl = "$SITE/search?q=${encodeUrl(title)}"
-            var html = runCatching {
-                app.get(searchUrl, headers = HEADERS, timeout = 15_000).text
-            }.getOrNull()
-            if (html.isNullOrBlank() || html.contains("Just a moment")) {
-                html = runCatching {
-                    app.get(searchUrl, headers = HEADERS, interceptor = cfKiller, timeout = 20_000).text
-                }.getOrNull()
-            }
-            if (html.isNullOrBlank()) return false
-
-            val doc = Jsoup.parse(html, searchUrl)
-            val cards = doc.select("article.movie-card-final, article[data-watch-url]")
-
-            // 2. Find the best matching card
-            var bestUrl: String? = null
-            var bestScore = 0.0
-            for (card in cards) {
-                val watchUrl = card.attr("data-watch-url")
-                    .ifBlank { card.selectFirst("a[href*=/watch/]")?.attr("href") }
-                    ?: continue
-                val cardTitle = card.selectFirst(".movie-card-browse-title, .movie-title, .card-overlay p")?.text()
-                    ?: card.selectFirst("a[aria-label]")?.attr("aria-label")
-                    ?: continue
-
-                // Check if it's the right type (movie vs series)
-                val isSeries = watchUrl.contains("/watch/series/")
-                if (isMovie && isSeries) continue
-                if (!isMovie && !isSeries) continue
-
-                val score = titleSimilarity(cardTitle, title)
-                if (score > bestScore) {
-                    bestScore = score
-                    bestUrl = watchUrl
-                }
-            }
-
-            if (bestUrl == null || bestScore < 0.4) return false
-
-            // 3. Fetch the watch page to find stream URL
-            var watchHtml = runCatching {
-                app.get(bestUrl, headers = HEADERS, timeout = 15_000).text
-            }.getOrNull()
-            if (watchHtml.isNullOrBlank() || watchHtml.contains("Just a moment")) {
-                watchHtml = runCatching {
-                    app.get(bestUrl, headers = HEADERS, interceptor = cfKiller, timeout = 20_000).text
-                }.getOrNull()
-            }
-            if (watchHtml.isNullOrBlank()) return false
-            val watchDoc = Jsoup.parse(watchHtml, bestUrl)
-
-            if (isMovie) {
-                // Movie: extract data-download-url or construct stream URL
-                val slug = bestUrl.substringAfter("/watch/movie/")
-                val streamUrl = watchDoc.selectFirst("[data-download-url]")?.attr("data-download-url")
-                    ?: "$SITE/stream/movie/$slug"
-
-                callback(
-                    newExtractorLink(
-                        source = srcLabel,
-                        name = srcLabel,
-                        url = streamUrl,
-                        type = INFER_TYPE,
-                    ) {
-                        this.referer = SITE
-                        this.quality = qualityFromName(streamUrl)
-                    }
-                )
-                return true
-            } else {
-                // TV Series: find episode links
-                val epLinks = watchDoc.select("a[href*=/watch/episode/]")
-                val seenSlugs = mutableSetOf<String>()
-                var found = false
-
-                for (link in epLinks) {
-                    val href = link.attr("href")
-                    val epSlug = href.substringAfter("/episode/").substringBefore("?").substringBefore("#")
-                    if (epSlug.isBlank() || epSlug in seenSlugs) continue
-                    seenSlugs.add(epSlug)
-
-                    val epText = link.text().trim()
-                    val epNum = Regex("""(?:Episode\s*)?(\d+)""", RegexOption.IGNORE_CASE)
-                        .find(epText)?.groupValues?.getOrNull(1)?.toIntOrNull()
-                        ?: seenSlugs.size
-
-                    if (epNum == (episode ?: 1)) {
-                        val streamUrl = "$SITE/stream/episode/$epSlug"
-                        callback(
-                            newExtractorLink(
-                                source = srcLabel,
-                                name = "$srcLabel - Episode $epNum",
-                                url = streamUrl,
-                                type = INFER_TYPE,
-                            ) {
-                                this.referer = SITE
-                                this.quality = qualityFromName(streamUrl)
-                            }
-                        )
-                        found = true
-                    }
-                }
-
-                // Fallback: use the current episode from the player
-                if (!found) {
-                    val currentEpSlug = watchDoc.selectFirst("#theaterPlayer")?.attr("data-episode-slug")
-                    if (currentEpSlug != null && currentEpSlug.isNotBlank()) {
-                        val streamUrl = "$SITE/stream/episode/$currentEpSlug"
-                        callback(
-                            newExtractorLink(
-                                source = srcLabel,
-                                name = srcLabel,
-                                url = streamUrl,
-                                type = INFER_TYPE,
-                            ) {
-                                this.referer = SITE
-                                this.quality = qualityFromName(streamUrl)
-                            }
-                        )
-                        found = true
-                    }
-                }
-
-                return found
-            }
-        }
-    }
-
-    // ════════════════════════════════════════════════════════════════════════
-    //  Resolver 6: Cineby  (https://www.cineby.at)
-    //  Uses api.speedracelight.com + enc-dec.app decryption.
-    //  Flow: search TMDB → get tmdbId → fetch seed → fetch encrypted sources →
-    //        decrypt via enc-dec.app → emit m3u8/mp4 URLs
-    // ════════════════════════════════════════════════════════════════════════
-
-    internal object CinebyResolver : SourceResolver {
-        private const val SITE = "https://www.cineby.at"
-        private const val API_BASE = "https://api.speedracelight.com"
-        private const val DEC_API = "https://enc-dec.app/api/dec-videasy"
-        private const val TMDB_API = "https://api.themoviedb.org/3"
-        private const val TMDB_KEY = "98ae14df2b8d8f8f8136499daf79f0e0"
-        private const val LABEL = "Cineby"
-        private val HEADERS = mapOf(
-            "User-Agent" to UA,
-            "Referer" to "$SITE/",
-            "Origin" to SITE,
-            "Accept" to "application/json, text/plain, */*",
-        )
-
-        // Cineby servers (from CinebyExtractor.kt)
-        private val SERVERS = listOf(
-            Triple("neon2", "Cineby-Neon", null as String?),
-            Triple("cdn", "Cineby-CDN", null),
-            Triple("m4uhd", "Cineby-Breach", null),
-            Triple("hdmovie", "Cineby-Vyse", "English"),
-            Triple("hdmovie", "Cineby-Fade", "Hindi"),
-            Triple("meine", "Cineby-Killjoy", "german"),
-            Triple("lamovie", "Cineby-Omen", null),
-            Triple("superflix", "Cineby-Raze", null),
-        )
-
-        override suspend fun resolve(
-            title: String,
-            year: Int?,
-            isMovie: Boolean,
-            season: Int?,
-            episode: Int?,
-            labelPrefix: String,
-            subtitleCallback: (SubtitleFile) -> Unit,
-            callback: (ExtractorLink) -> Unit,
-        ): Boolean {
-            val srcLabel = "$labelPrefix • $LABEL"
-            val mediaType = if (isMovie) "movie" else "tv"
-
-            // 1. Search TMDB for the title to get tmdbId
-            val tmdbId = fetchTmdbId( title, year, mediaType) ?: return false
-
-            // 2. For each enabled server, fetch + decrypt sources
-            var found = false
-            for ((serverPath, serverLabel, qualityFilter) in SERVERS) {
-                runCatching {
-                    val result = fetchCinebySources( serverPath, tmdbId, title, year, isMovie, season, episode, qualityFilter)
-                    if (result != null) {
-                        val sourcesArr = result.optJSONArray("sources")
-                        if (sourcesArr != null) {
-                            for (i in 0 until sourcesArr.length()) {
-                                val src = sourcesArr.optJSONObject(i) ?: continue
-                                val url = src.optString("url").ifBlank { src.optString("file") }
-                                if (url.isBlank()) continue
-                                val quality = src.optString("quality") ?: ""
-
-                                if (url.contains(".m3u8", true)) {
-                                    M3u8Helper.generateM3u8(
-                                        source = "$srcLabel • $serverLabel",
-                                        streamUrl = url,
-                                        referer = SITE,
-                                        headers = HEADERS,
-                                    ).forEach { el ->
-                                        callback(el)
-                                        found = true
-                                    }
-                                } else {
-                                    callback(
-                                        newExtractorLink(
-                                            source = "$srcLabel • $serverLabel",
-                                            name = "$srcLabel • $serverLabel - $quality",
-                                            url = url,
-                                            type = INFER_TYPE,
-                                        ) {
-                                            this.referer = SITE
-                                            this.quality = qualityFromName(quality)
-                                        }
-                                    )
-                                    found = true
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            return found
-        }
-
-        private suspend fun fetchTmdbId( title: String, year: Int?, mediaType: String): Int? {
-            val params = mapOf(
-                "api_key" to TMDB_KEY,
-                "query" to title,
-                "language" to "en-US",
-            ).let { m ->
-                if (year != null) m + ("year" to year.toString()) else m
-            }
-            val url = "$TMDB_API/search/$mediaType?" + params.entries.joinToString("&") { (k, v) ->
-                "${encodeUrl(k)}=${encodeUrl(v)}"
-            }
-            val res = runCatching {
-                app.get(url, headers = mapOf("Accept" to "application/json"), timeout = 10_000)
-            }.getOrNull() ?: return null
-            if (res.code !in 200..299) return null
-            val json = runCatching { JSONObject(res.text) }.getOrNull() ?: return null
-            val results = json.optJSONArray("results") ?: return null
-            return results.optJSONObject(0)?.optInt("id", 0)?.takeIf { it > 0 }
-        }
-
-        private suspend fun fetchCinebySources(
-            server: String,
-            tmdbId: Int,
-            title: String,
-            year: Int?,
-            isMovie: Boolean,
-            season: Int?,
-            episode: Int?,
-            qualityFilter: String?,
-        ): JSONObject? {
-            val mediaType = if (isMovie) "movie" else "tv"
-            val seasonId = if (isMovie) "1" else (season ?: 1).toString()
-            val episodeId = if (isMovie) "1" else (episode ?: 1).toString()
-
-            // Step 1: Fetch seed
-            val seedUrl = "$API_BASE/seed?mediaId=$tmdbId"
-            val seedRes = runCatching {
-                app.get(seedUrl, headers = HEADERS, timeout = 15_000)
-            }.getOrNull() ?: return null
-            val seed = runCatching {
-                JSONObject(seedRes.text).optString("seed", "")
-            }.getOrDefault("")
-
-            // Step 2: Fetch encrypted sources
-            val doubleEncodedTitle = encodeUrl(encodeUrl(title))
-            val sourcesUrl = "$API_BASE/$server/sources-with-title" +
-                "?title=$doubleEncodedTitle" +
-                "&mediaType=$mediaType" +
-                "&year=${year ?: ""}" +
-                "&episodeId=$episodeId" +
-                "&seasonId=$seasonId" +
-                "&tmdbId=$tmdbId" +
-                "&enc=2" +
-                (if (seed.isNotBlank()) "&seed=$seed" else "") +
-                (if (qualityFilter != null) "&language=$qualityFilter" else "")
-
-            val encRes = runCatching {
-                app.get(sourcesUrl, headers = HEADERS, timeout = 15_000)
-            }.getOrNull() ?: return null
-            val encText = encRes.text
-            if (encText.isBlank() || encText.startsWith("{\"error")) return null
-
-            // Step 3: Decrypt via enc-dec.app
-            val decBody = JSONObject().apply {
-                put("text", encText)
-                put("id", tmdbId.toString())
-                if (seed.isNotBlank()) put("seed", seed)
-            }.toString()
-            val decRes = runCatching {
-                app.post(
-                    DEC_API,
-                    headers = mapOf("Content-Type" to "application/json", "Accept" to "application/json"),
-                    requestBody = decBody.toRequestBody("application/json".toMediaTypeOrNull()),
-                    timeout = 15_000,
-                )
-            }.getOrNull() ?: return null
-            val decJson = runCatching { JSONObject(decRes.text) }.getOrNull() ?: return null
-            val result = decJson.optJSONObject("result") ?: return null
-
-            // Apply quality filter if needed
-            if (qualityFilter != null) {
-                val sources = result.optJSONArray("sources")
-                if (sources != null) {
-                    val filtered = JSONArray()
-                    for (i in 0 until sources.length()) {
-                        val s = sources.optJSONObject(i) ?: continue
-                        if (s.optString("quality", "").equals(qualityFilter, ignoreCase = true)) {
-                            filtered.put(s)
-                        }
-                    }
-                    return JSONObject().apply {
-                        put("sources", filtered)
-                        put("subtitles", result.optJSONArray("subtitles") ?: JSONArray())
-                    }
-                }
-            }
-            return result
-        }
-    }
-
-
-    // ─────────────────────────────────────────────────────────────────────────────
-
     internal fun qualityFromName(s: String?): Int {
         if (s == null) return Qualities.Unknown.value
         val n = s.lowercase()
@@ -513,15 +154,8 @@ object WizstreamSources {
         if (u.isBlank()) return u
         if (u.startsWith("http://") || u.startsWith("https://")) return u
         if (u.startsWith("//")) return "https:$u"
-        // A player URL normally contains a filename and query string (for
-        // example player.php?id=42). Appending a relative media path to that
-        // URL produces player.php?id=42/uploads/file.mkv: a valid-looking but
-        // broken source. URI.resolve follows browser URL resolution rules.
-        return runCatching { java.net.URI(baseUrl).resolve(u).toString() }
-            .getOrElse {
-                val origin = baseUrl.substringBefore("/", baseUrl.substringBefore("?"))
-                if (u.startsWith("/")) "$origin$u" else "$baseUrl/${u.trimStart('/')}"
-            }
+        val base = baseUrl.trimEnd('/')
+        return if (u.startsWith("/")) "$base$u" else "$base/$u"
     }
 
     internal fun extractMediaUrlsFromHtml(html: String, baseUrl: String): LinkedHashSet<String> {
@@ -574,6 +208,7 @@ object WizstreamSources {
     }
 
     internal suspend fun emitDirect(
+        app: Requests,
         url: String,
         sourceLabel: String,
         referer: String,
@@ -622,6 +257,7 @@ object WizstreamSources {
 
     internal interface SourceResolver {
         suspend fun resolve(
+            app: Requests,
             title: String,
             year: Int?,
             isMovie: Boolean,
@@ -648,6 +284,7 @@ object WizstreamSources {
         )
 
         override suspend fun resolve(
+            app: Requests,
             title: String,
             year: Int?,
             isMovie: Boolean,
@@ -715,100 +352,76 @@ object WizstreamSources {
             // CineplexBDProvider.load() builds the data URL as
             //   /player.php?id=$id
             // then loadLinks fetches /player.php?id=$id which contains the
-            // actual video embed (HLS player sources).
+            // actual video embed. The player page may use one of:
+            //   • Old style:  const videoSrc = "….m3u8|mp4|mkv"
+            //   • Legacy:     <source src="…">
+            //   • Quetta:     data-quetta-video-id="qv_xxx_xxx" (loaded via JS)
+            //
+            // We capture cookies from the response and forward them as a
+            // Cookie header — this is required for protected video URLs and
+            // matches the Aniyomi CineplexBD extension's pattern.
             if (isMovie) {
                 val id = best.first.substringAfter("id=").substringBefore("&")
                 val playerUrl = "$SITE/player.php?id=$id"
+                val playerResp = runCatching {
+                    app.get(playerUrl, headers = HEADERS, timeout = 15_000)
+                }.getOrNull() ?: return false
+                val playerHtml = playerResp.text
 
-                // Approach 1: Fetch player.php and extract media URLs from HTML
-                val playerHtml = runCatching {
-                    app.get(playerUrl, headers = HEADERS, timeout = 15_000).text
-                }.getOrNull()
+                // Forward Set-Cookie values + Referer to downstream requests.
+                // NiceResponse.cookies is a Map<String, String> of cookie
+                // name → value, already deduplicated by the cookie jar.
+                val cookieHeader = try {
+                    playerResp.cookies.entries.joinToString("; ") { "${it.key}=${it.value}" }
+                } catch (_: Throwable) { "" }
+                val videoHeaders = HEADERS.toMutableMap().apply {
+                    if (cookieHeader.isNotBlank()) put("Cookie", cookieHeader)
+                    put("Referer", playerUrl)
+                }.toMap()
+
+                val mediaUrls = extractMediaUrlsFromHtml(playerHtml, playerUrl)
                 var any = false
-                if (playerHtml != null) {
-                    // Look for const videoSrc = "..." (CineplexBD's JS pattern)
-                    Regex("""(?:const|var)\s+videoSrc\s*=\s*["'](.*?)["']""")
-                        .find(playerHtml)?.groupValues?.getOrNull(1)?.let { src ->
-                            if (src.isNotBlank()) {
-                                val absSrc = resolveAbs(playerUrl, src)
-                                if (emitDirect(absSrc, srcLabel, playerUrl, HEADERS, subtitleCallback, callback)) any = true
-                            }
-                        }
-
-                    // Look for m3u8/mp4/mkv URLs
-                    val mediaUrls = extractMediaUrlsFromHtml(playerHtml, playerUrl)
-                    mediaUrls.forEach { u ->
-                        if (emitDirect(u, srcLabel, playerUrl, HEADERS, subtitleCallback, callback)) any = true
-                    }
-
-                    // Look for data-quetta-video-id (Quetta player)
-                    // The Quetta player loads video via JS — try the download.php endpoint
-                    if (!any) {
-                        val downloadUrl = "$SITE/download.php?id=$id"
-                        // download.php typically redirects to the actual .mkv file
-                        runCatching {
-                            val dlRes = app.get(downloadUrl, headers = HEADERS, timeout = 15_000)
-                            val finalUrl = dlRes.url ?: downloadUrl
-                            if (isDirectMedia(finalUrl)) {
-                                callback(
-                                    newExtractorLink(
-                                        source = srcLabel,
-                                        name = "$srcLabel - Direct",
-                                        url = finalUrl,
-                                        type = ExtractorLinkType.VIDEO,
-                                    ) {
-                                        this.referer = "$SITE/"
-                                        this.quality = qualityFromName(finalUrl)
-                                    }
-                                )
-                                any = true
-                            } else {
-                                // Check response body for media URLs
-                                val dlHtml = dlRes.text
-                                val dlUrls = extractMediaUrlsFromHtml(dlHtml, downloadUrl)
-                                dlUrls.forEach { u ->
-                                    if (emitDirect(u, srcLabel, downloadUrl, HEADERS, subtitleCallback, callback)) any = true
-                                }
-                            }
-                        }
-                    }
-
-                    // Try loadExtractor on the player URL as a last resort
-                    if (!any) {
-                        runCatching {
-                            loadExtractor(playerUrl, "$SITE/", subtitleCallback) { link ->
-                                callback(link.relabel(srcLabel, "$srcLabel — ${link.name}"))
-                                any = true
-                            }
-                        }
-                    }
+                mediaUrls.forEach { u ->
+                    if (emitDirect(app, u, srcLabel, playerUrl, videoHeaders, subtitleCallback, callback)) any = true
                 }
 
-                // The current movie player is Quetta-backed: its HTML only
-                // exposes data-quetta-video-id, not a media src. Its official
-                // download endpoint is the stable media redirect, so emit it
-                // directly when no inline source was available.
+                // ── Quetta player extraction ──────────────────────────────
+                // If no direct sources were found but the page contains a
+                // data-quetta-video-id, try the Quetta API endpoints.
                 if (!any) {
-                    callback(newExtractorLink(
-                        source = srcLabel,
-                        name = "$srcLabel - Download",
-                        url = "$SITE/download.php?id=$id",
-                        type = ExtractorLinkType.VIDEO,
-                    ) {
-                        this.referer = playerUrl
-                        this.quality = Qualities.Unknown.value
-                    })
-                    any = true
+                    val quettaId: String? = Regex(
+                        """data-quetta-video-id=["']?(qv_[a-z0-9_]+)["']?""",
+                        RegexOption.IGNORE_CASE
+                    ).find(playerHtml)?.groupValues?.getOrNull(1)
+                    if (quettaId != null && quettaId.isNotBlank()) {
+                        if (emitQuettaVideo(app, quettaId, playerUrl, videoHeaders, srcLabel, subtitleCallback, callback)) {
+                            any = true
+                        }
+                    }
                 }
 
-                // Approach 2: Try the view.php page itself
+                // ── download.php fallback ─────────────────────────────────
+                // /download.php?id=<id> often has a direct <a href="/Data/…">
+                // link we can scrape.
+                if (!any) {
+                    val dlUrl = "$SITE/download.php?id=$id"
+                    runCatching {
+                        val dlHtml = app.get(dlUrl, headers = videoHeaders, timeout = 15_000).text
+                        val dlUrls = extractMediaUrlsFromHtml(dlHtml, dlUrl)
+                        dlUrls.forEach { u ->
+                            if (emitDirect(app, u, srcLabel, dlUrl, videoHeaders, subtitleCallback, callback)) any = true
+                        }
+                    }
+                }
+
+                // Also try the view.php page itself (sometimes the player is inline).
                 if (!any) {
                     runCatching {
                         app.get(best.first, headers = HEADERS, timeout = 15_000).text
                     }.getOrNull()?.let { viewHtml ->
                         val urls2 = extractMediaUrlsFromHtml(viewHtml, best.first)
                         urls2.forEach { u ->
-                            if (emitDirect(u, srcLabel, best.first, HEADERS, subtitleCallback, callback)) any = true
+                            if (emitDirect(app, u, srcLabel, best.first, HEADERS, subtitleCallback, callback)) any = true
                         }
                     }
                 }
@@ -875,23 +488,135 @@ object WizstreamSources {
             // The path can be:
             //   • /Data/…/movie.mkv  → direct media URL
             //   • /view.php?id=… or /player.php?id=… → indirection page
+            //   • Quetta player page → data-quetta-video-id="qv_…"
             val absPath = resolveAbs(SITE, matchPath)
             return when {
                 isDirectMedia(absPath) ->
-                    emitDirect(absPath, srcLabel, "$SITE/", HEADERS, subtitleCallback, callback)
+                    emitDirect(app, absPath, srcLabel, "$SITE/", HEADERS, subtitleCallback, callback)
                 absPath.contains("player.php") || absPath.contains("view.php") -> {
-                    val playerHtml = runCatching {
-                        app.get(absPath, headers = HEADERS, timeout = 15_000).text
+                    val playerResp = runCatching {
+                        app.get(absPath, headers = HEADERS, timeout = 15_000)
                     }.getOrNull() ?: return false
+                    val playerHtml = playerResp.text
+
+                    // Forward cookies + Referer to downstream video requests.
+                    val cookieHeader = try {
+                        playerResp.cookies.entries.joinToString("; ") { "${it.key}=${it.value}" }
+                    } catch (_: Throwable) { "" }
+                    val videoHeaders = HEADERS.toMutableMap().apply {
+                        if (cookieHeader.isNotBlank()) put("Cookie", cookieHeader)
+                        put("Referer", absPath)
+                    }.toMap()
+
                     val mediaUrls = extractMediaUrlsFromHtml(playerHtml, absPath)
                     var any = false
                     mediaUrls.forEach { u ->
-                        if (emitDirect(u, srcLabel, absPath, HEADERS, subtitleCallback, callback)) any = true
+                        if (emitDirect(app, u, srcLabel, absPath, videoHeaders, subtitleCallback, callback)) any = true
+                    }
+
+                    // Quetta player fallback for TV episodes.
+                    if (!any) {
+                        val quettaId: String? = Regex(
+                            """data-quetta-video-id=["']?(qv_[a-z0-9_]+)["']?""",
+                            RegexOption.IGNORE_CASE
+                        ).find(playerHtml)?.groupValues?.getOrNull(1)
+                        if (quettaId != null && quettaId.isNotBlank()) {
+                            if (emitQuettaVideo(app, quettaId, absPath, videoHeaders, srcLabel, subtitleCallback, callback)) {
+                                any = true
+                            }
+                        }
+                    }
+
+                    // download.php fallback for TV episodes.
+                    if (!any && absPath.contains("player.php")) {
+                        val id = absPath.substringAfter("id=", "").substringBefore("&")
+                        if (id.isNotBlank()) {
+                            val dlUrl = "$SITE/download.php?id=$id"
+                            runCatching {
+                                val dlHtml = app.get(dlUrl, headers = videoHeaders, timeout = 15_000).text
+                                val dlUrls = extractMediaUrlsFromHtml(dlHtml, dlUrl)
+                                dlUrls.forEach { u ->
+                                    if (emitDirect(app, u, srcLabel, dlUrl, videoHeaders, subtitleCallback, callback)) any = true
+                                }
+                            }
+                        }
                     }
                     any
                 }
-                else -> emitDirect(absPath, srcLabel, "$SITE/", HEADERS, subtitleCallback, callback)
+                else -> emitDirect(app, absPath, srcLabel, "$SITE/", HEADERS, subtitleCallback, callback)
             }
+        }
+
+        /**
+         * Try multiple candidate Quetta API endpoints to resolve a
+         * `data-quetta-video-id` to a playable URL.
+         *
+         * The actual Quetta API endpoint is embedded in a JS file loaded by
+         * player.php and isn't publicly documented. We try the most common
+         * shapes used by similar player frameworks.
+         */
+        private suspend fun emitQuettaVideo(
+            app: Requests,
+            quettaId: String,
+            playerUrl: String,
+            videoHeaders: Map<String, String>,
+            sourceLabel: String,
+            subtitleCallback: (SubtitleFile) -> Unit,
+            callback: (ExtractorLink) -> Unit,
+        ): Boolean {
+            val candidates = listOf(
+                "https://vidquettaplayer.com/api/?id=$quettaId",
+                "https://vidquettaplayer.com/api/source/$quettaId",
+                "https://vidquettaplayer.com/Quetta/?id=$quettaId",
+                "https://quetta.com/api/?id=$quettaId",
+                "https://api.quetta.io/v1/video/$quettaId",
+                "$SITE/api/quetta/?id=$quettaId",
+                "$SITE/Quetta/api/?id=$quettaId",
+            )
+            for (apiUrl in candidates) {
+                val resp = runCatching {
+                    app.get(apiUrl, headers = videoHeaders, timeout = 10_000)
+                }.getOrNull() ?: continue
+                if (resp.code !in 200..299 || resp.text.isBlank()) continue
+                // Skip HTML responses (likely 404 pages or CF challenge pages).
+                if (resp.text.startsWith("<") || resp.text.contains("<!DOCTYPE", true)) continue
+                val json = runCatching { JSONObject(resp.text) }.getOrNull() ?: continue
+                val mediaUrls = linkedSetOf<String>()
+                // Try common JSON shapes.
+                json.optJSONObject("data")?.let { dataObj ->
+                    dataObj.optStringOrNullCp("src")?.let { mediaUrls += it }
+                    dataObj.optStringOrNullCp("url")?.let { mediaUrls += it }
+                    dataObj.optStringOrNullCp("file")?.let { mediaUrls += it }
+                    dataObj.optJSONArray("sources")?.let { arr ->
+                        for (i in 0 until arr.length()) {
+                            val s = arr.optJSONObject(i) ?: continue
+                            s.optStringOrNullCp("file")?.let { mediaUrls += it }
+                            s.optStringOrNullCp("src")?.let { mediaUrls += it }
+                            s.optStringOrNullCp("url")?.let { mediaUrls += it }
+                        }
+                    }
+                }
+                json.optStringOrNullCp("url")?.let { mediaUrls += it }
+                json.optStringOrNullCp("src")?.let { mediaUrls += it }
+                json.optJSONArray("sources")?.let { arr ->
+                    for (i in 0 until arr.length()) {
+                        val s = arr.optJSONObject(i) ?: continue
+                        s.optStringOrNullCp("file")?.let { mediaUrls += it }
+                        s.optStringOrNullCp("src")?.let { mediaUrls += it }
+                        s.optStringOrNullCp("url")?.let { mediaUrls += it }
+                    }
+                }
+                if (mediaUrls.isEmpty()) continue
+                var any = false
+                for (u in mediaUrls) {
+                    val abs = if (u.startsWith("http")) u else "$SITE/${u.trimStart('/')}"
+                    if (emitDirect(app, abs, sourceLabel, playerUrl, videoHeaders, subtitleCallback, callback)) {
+                        any = true
+                    }
+                }
+                if (any) return true
+            }
+            return false
         }
     }
 
@@ -910,6 +635,7 @@ object WizstreamSources {
         )
 
         override suspend fun resolve(
+            app: Requests,
             title: String,
             year: Int?,
             isMovie: Boolean,
@@ -989,7 +715,7 @@ object WizstreamSources {
 
             var any = false
             mediaUrls.forEach { u ->
-                if (emitDirect(u, srcLabel, "$SITE/", HEADERS, subtitleCallback, callback)) any = true
+                if (emitDirect(app, u, srcLabel, "$SITE/", HEADERS, subtitleCallback, callback)) any = true
             }
             return any
         }
@@ -1041,9 +767,10 @@ object WizstreamSources {
         private const val PRIMARY_API = "http://new.circleftp.net:5000"
         private const val FALLBACK_API = "http://15.1.1.50:5000"
         private const val LABEL = "CircleFTP"
-        // No custom headers — the standalone CircleFTP extension doesn't use any.
-        // Passing custom headers (especially Referer from a different origin)
-        // can cause the API to reject requests.
+        private val HEADERS = mapOf(
+            "User-Agent" to UA,
+            "Referer" to "$SITE/",
+        )
 
         /**
          * Map of CDN hostname → raw IP. Ported 1:1 from
@@ -1076,12 +803,11 @@ object WizstreamSources {
 
         /** Swap any *.circleftp.net hostname in the URL for its BDIX IP. */
         private fun linkToIp(data: String?): String {
-            // The content page supplied by Circle uses virtual CDN hostnames
-            // (for example index2.circleftp.net). They must be preserved:
-            // replacing them with an IP loses the Host header and newer CDN
-            // nodes return an invalid/default response. This intentionally
-            // mirrors the standalone extension when opened from a content URL.
-            return data.orEmpty()
+            if (data.isNullOrEmpty()) return ""
+            for ((host, ip) in cdnHostToIp) {
+                if (host in data) return data.replace(host, ip)
+            }
+            return data
         }
 
         /**
@@ -1144,6 +870,7 @@ object WizstreamSources {
                 .replace(Regex("\\s+"), " ")
 
         override suspend fun resolve(
+            app: Requests,
             title: String,
             year: Int?,
             isMovie: Boolean,
@@ -1155,8 +882,9 @@ object WizstreamSources {
         ): Boolean {
             // 1. Search posts — fetch all results, not just the best one.
             val searchText = fetchWithFallback(
-                primary = "$PRIMARY_API/api/posts?searchTerm=$title&order=desc",
-                fallback = "$FALLBACK_API/api/posts?searchTerm=$title&order=desc",
+                app,
+                primary = "$PRIMARY_API/api/posts?searchTerm=${encodeUrl(title)}&order=desc",
+                fallback = "$FALLBACK_API/api/posts?searchTerm=${encodeUrl(title)}&order=desc",
             ) ?: return false
 
             val postsArr = runCatching { JSONObject(searchText).optJSONArray("posts") }
@@ -1174,19 +902,19 @@ object WizstreamSources {
             for (i in 0 until postsArr.length()) {
                 val p = postsArr.optJSONObject(i) ?: continue
                 val ptitle = p.optString("title").ifBlank { p.optString("name") ?: "" }
-                val displayName = p.optString("name")
                 if (ptitle.isBlank()) continue
-                // Circle's API often stores a release filename in `title` and
-                // the catalogue title in `name`. Match both after stripping
-                // audio/season/release tags; otherwise movie posts and
-                // separately-uploaded anime seasons are silently discarded.
-                val names = listOf(ptitle, displayName).filter { it.isNotBlank() }
-                val matches = names.any { candidate ->
-                    val pNorm = candidate.normaliseTitle()
-                    pNorm == qNorm || pNorm.contains(qNorm) ||
-                        titleSimilarity(candidate, title) >= 0.55
+                val pNorm = ptitle.normaliseTitle()
+                // Exact normalised match: include always.
+                if (pNorm == qNorm) {
+                    matchingPostIds += p.optInt("id", -1) to ptitle
+                    continue
                 }
-                if (matches) matchingPostIds += p.optInt("id", -1) to ptitle
+                // Title contains query (e.g. "One Piece Season 2" contains "one piece")
+                // AND similarity ≥ 0.5 — include as a season-specific post.
+                val score = titleSimilarity(ptitle, title)
+                if (score >= 0.5 && pNorm.contains(qNorm)) {
+                    matchingPostIds += p.optInt("id", -1) to ptitle
+                }
             }
             if (matchingPostIds.isEmpty()) return false
 
@@ -1204,6 +932,7 @@ object WizstreamSources {
                     async(Dispatchers.IO) {
                         if (id < 0) return@async null
                         val text = fetchWithFallback(
+                            app,
                             primary = "$PRIMARY_API/api/posts/$id",
                             fallback = "$FALLBACK_API/api/posts/$id",
                         ) ?: return@async null
@@ -1222,29 +951,11 @@ object WizstreamSources {
                 // ── MOVIE PATH ──────────────────────────────────────────────
                 // postObj.optString("content") returns the direct media URL
                 // as a STRING. (Matches CircleFtpProvider line 1230.)
-                // Apply linkToIp to swap *.circleftp.net hostnames for BDIX IPs.
                 postDetails.forEach { detail ->
-                    // Depending on upload age, content is either a plain URL,
-                    // a JSON object/array, or one of these alternate fields.
-                    // Flatten all forms before emitting so standalone movie and
-                    // AnimeMovie posts use the same payload handling.
-                    fun collect(value: Any?) {
-                        when (value) {
-                            is String -> {
-                                val text = value.trim()
-                                if (text.startsWith("{") || text.startsWith("[")) {
-                                    runCatching { JSONObject(text) }.getOrNull()?.let(::collect)
-                                    runCatching { JSONArray(text) }.getOrNull()?.let(::collect)
-                                } else if (text.isNotBlank()) mediaUrls += linkToIp(text)
-                            }
-                            is JSONObject -> listOf("url", "link", "file", "src", "video", "videoUrl", "download")
-                                .forEach { key -> collect(value.opt(key)) }
-                            is JSONArray -> for (index in 0 until value.length()) collect(value.opt(index))
-                        }
-                    }
-                    collect(detail.opt("content"))
-                    listOf("url", "link", "file", "src", "video", "videoUrl", "download")
-                        .forEach { key -> collect(detail.opt(key)) }
+                    detail.optString("content").takeIf { it.isNotBlank() }?.let { mediaUrls += it }
+                    detail.optString("url").takeIf { it.isNotBlank() }?.let { mediaUrls += it }
+                    detail.optString("file").takeIf { it.isNotBlank() }?.let { mediaUrls += it }
+                    detail.optString("src").takeIf { it.isNotBlank() }?.let { mediaUrls += it }
                 }
             } else {
                 // ── TV/ANIME PATH ───────────────────────────────────────────
@@ -1327,32 +1038,17 @@ object WizstreamSources {
                 // Circle FTP encodes TV/movie URLs as
                 // "circleftp://movie?data=<base64>" or
                 // "circleftp://episode?data=<base64>" — base64 of a JSON
-                // array of {url, audio?} objects.
+                // array of {url, audio?} objects. (Handled by
+                // CircleFtpProvider.loadLinks lines 1507-1561.)
                 if (u.contains("movie?data=") || u.contains("episode?data=") ||
                     u.contains("circleftp://")
                 ) {
                     if (emitCircleFtpEncoded(u, srcLabel, callback)) any = true
                 } else {
-                    // Raw URL — emit directly as a video link.
+                    // Apply linkToIp for raw URLs containing circleftp.net hosts.
                     val resolvedUrl = linkToIp(u)
-                    if (isDirectMedia(resolvedUrl) || resolvedUrl.contains("/Data/")) {
-                        callback(
-                            newExtractorLink(
-                                source = srcLabel,
-                                name = srcLabel,
-                                url = resolvedUrl,
-                                type = if (resolvedUrl.contains(".m3u8", true)) ExtractorLinkType.M3U8
-                                       else ExtractorLinkType.VIDEO,
-                            ) {
-                                this.referer = SITE
-                                this.quality = qualityFromName(resolvedUrl)
-                            }
-                        )
+                    if (emitDirect(app, resolvedUrl, srcLabel, "$SITE/", HEADERS, subtitleCallback, callback)) {
                         any = true
-                    } else {
-                        if (emitDirect(resolvedUrl, srcLabel, "$SITE/", emptyMap(), subtitleCallback, callback)) {
-                            any = true
-                        }
                     }
                 }
             }
@@ -1399,27 +1095,18 @@ object WizstreamSources {
         }
 
         private suspend fun fetchWithFallback(
+            app: Requests,
             primary: String,
             fallback: String,
         ): String? {
-            // Match the standalone CircleFtpHttp.fetchWithFallback:
-            // - No custom headers (the API doesn't expect any)
-            // - verify = false (disables SSL verification for BDIX IPs)
-            // - cacheTime = 60 (enables Cloudstream's HTTP cache)
-            // - retries = 2 per mirror with jittered backoff
-            for (mirror in listOf(primary, fallback)) {
-                repeat(2) { attempt ->
-                    val result = runCatching {
-                        app.get(mirror, verify = false, cacheTime = 60, timeout = 20_000L)
-                    }.getOrNull()
-                    if (result != null && result.code in 200..299 && result.text.isNotBlank()) {
-                        return result.text
-                    }
-                    if (attempt < 1) {
-                        kotlinx.coroutines.delay(300L * (1 shl attempt))
-                    }
-                }
-            }
+            val a = runCatching {
+                app.get(primary, headers = HEADERS, timeout = 10_000)
+            }.getOrNull()
+            if (a != null && a.code in 200..299 && a.text.isNotBlank()) return a.text
+            val b = runCatching {
+                app.get(fallback, headers = HEADERS, timeout = 10_000)
+            }.getOrNull()
+            if (b != null && b.code in 200..299 && b.text.isNotBlank()) return b.text
             return null
         }
     }
@@ -1442,6 +1129,7 @@ object WizstreamSources {
         )
 
         override suspend fun resolve(
+            app: Requests,
             title: String,
             year: Int?,
             isMovie: Boolean,
@@ -1459,7 +1147,7 @@ object WizstreamSources {
                 kinds.map { kind ->
                     async(Dispatchers.IO) {
                         runCatching {
-                            val text = apiGet( "/$kind", params)
+                            val text = apiGet(app, "/$kind", params)
                             parseSearchResults(text, kind)?.let { list ->
                                 synchronized(candidates) { candidates.addAll(list) }
                             }
@@ -1475,7 +1163,7 @@ object WizstreamSources {
                 ?: return false
             if (titleSimilarity(best.third, title) < 0.4) return false
 
-            val detailText = apiGet( "/${best.first}/${encodeUrl(best.second)}", emptyMap())
+            val detailText = apiGet(app, "/${best.first}/${encodeUrl(best.second)}", emptyMap())
             val detail = runCatching { JSONObject(detailText) }.getOrNull() ?: return false
 
             val srcLabel = "$labelPrefix • $LABEL"
@@ -1493,7 +1181,7 @@ object WizstreamSources {
                     link.optString("link")
                 }.ifBlank { continue }
 
-                if (emitDirect(rawUrl, srcLabel, "$SITE/", HEADERS, subtitleCallback, callback)) {
+                if (emitDirect(app, rawUrl, srcLabel, "$SITE/", HEADERS, subtitleCallback, callback)) {
                     any = true
                 }
             }
@@ -1512,7 +1200,7 @@ object WizstreamSources {
                             val u = link.optString("url").ifBlank { link.optString("file") }
                                 .ifBlank { link.optString("src") }
                             if (u.isNotBlank() &&
-                                emitDirect(u, srcLabel, "$SITE/", HEADERS, subtitleCallback, callback)
+                                emitDirect(app, u, srcLabel, "$SITE/", HEADERS, subtitleCallback, callback)
                             ) any = true
                         }
                     }
@@ -1536,7 +1224,7 @@ object WizstreamSources {
             return out
         }
 
-        private suspend fun apiGet( path: String, query: Map<String, Any?>): String {
+        private suspend fun apiGet(app: Requests, path: String, query: Map<String, Any?>): String {
             val p = if (path.startsWith("/")) path else "/$path"
             val qs = if (query.isEmpty()) "" else "?" + query.entries
                 .filter { it.value != null }
