@@ -333,8 +333,18 @@ object WizstreamSources {
             if (candidates.isEmpty()) return false
 
             // Filter: prefer series page for TV, view page for movie.
+            //
+            // FIX (v12): For movies, ONLY include /view.php URLs — NOT
+            // /watch.php URLs. /watch.php?id=X is a SERIES page (for series
+            // that use `id` instead of `series_id`), not a movie page. The
+            // old filter `!u.contains("watch.php?series_id")` still allowed
+            // /watch.php?id=X, which caused the title matcher to pick a
+            // series page as the "best match" for a movie query. The resolver
+            // then fetched /player.php?id=<series_id>, which returned a
+            // series episode page instead of a movie player — extraction
+            // failed and no links were emitted.
             val filtered = candidates.filter { (u, _) ->
-                if (isMovie) !u.contains("watch.php?series_id") && !u.contains("tview.php")
+                if (isMovie) u.contains("view.php") && !u.contains("watch")
                 else u.contains("watch.php") || u.contains("tview.php")
             }.ifEmpty { candidates }
 
@@ -361,7 +371,14 @@ object WizstreamSources {
             // Cookie header — this is required for protected video URLs and
             // matches the Aniyomi CineplexBD extension's pattern.
             if (isMovie) {
+                // Defensive check: if the best match is NOT a /view.php URL
+                // (e.g. it's a /watch.php series page), bail out — fetching
+                // /player.php?id=<series_id> would return a series page, not
+                // a movie player, and extraction would fail silently.
+                if (!best.first.contains("view.php")) return false
+
                 val id = best.first.substringAfter("id=").substringBefore("&")
+                if (id.isBlank()) return false
                 val playerUrl = "$SITE/player.php?id=$id"
                 val playerResp = runCatching {
                     app.get(playerUrl, headers = HEADERS, timeout = 15_000)
@@ -896,26 +913,24 @@ object WizstreamSources {
             //      • One post with content[N] for season N  (e.g. "One Piece" with 15 seasons)
             //      • Separate posts per season              (e.g. "One Piece S2", "One Piece S3")
             //
-            //    FIX (v11): When the user asks for an anime (isMovie=false),
-            //    we must NOT include movie posts (type=singleVideo) in the
-            //    matching set. A movie like "One Piece Film Gold" would
-            //    otherwise flip `isMoviePath=true` and short-circuit the
-            //    TV/anime path, returning zero playable links. We also strip
-            //    "Season N" / "S<N>" / "Season<N>" from the post title before
-            //    comparing so that season-specific posts match the base query.
+            //    NOTE: The CircleFTP search API (/api/posts?searchTerm=…)
+            //    does NOT include the `type` field in each post object —
+            //    only the detail API (/api/posts/$id) returns `type`. So we
+            //    CANNOT filter by type here. We collect ALL title-matching
+            //    posts now and filter by type AFTER fetching details in
+            //    step 4. (Filtering here was the v11 regression that broke
+            //    movies — `pType` was always empty so every post was
+            //    skipped for isMovie=true.)
+            //
+            //    We also strip "Season N" / "S<N>" from the post title
+            //    before comparing so that season-specific posts match the
+            //    base query.
             val qNorm = title.normaliseTitle()
             val matchingPostIds = mutableListOf<Pair<Int, String>>() // (id, title)
             for (i in 0 until postsArr.length()) {
                 val p = postsArr.optJSONObject(i) ?: continue
                 val ptitle = p.optString("title").ifBlank { p.optString("name") ?: "" }
                 if (ptitle.isBlank()) continue
-                val pType = p.optString("type", "")
-                // If the user wants a TV/anime, skip singleVideo (movie)
-                // posts. If the user wants a movie, skip TV/anime posts.
-                // This prevents the movie-vs-anime mismatch that broke
-                // multi-season anime resolution.
-                if (isMovie && pType != "singleVideo") continue
-                if (!isMovie && pType == "singleVideo") continue
 
                 val pNorm = ptitle.normaliseTitle()
                 // Exact normalised match: include always.
@@ -966,21 +981,31 @@ object WizstreamSources {
             }
             if (postDetails.isEmpty()) return false
 
-            // 4. Route to movie or TV/anime path based on the user's request.
-            //    (We already filtered posts by type in step 2, so all posts
-            //    here match the user's intent.)
-            val isMoviePath = isMovie && postDetails.all { it.optString("type") == "singleVideo" }
+            // 4. Filter posts by type NOW (after fetching details, where
+            //    `type` is available). This is the correct place to filter:
+            //      • isMovie=true  → keep only singleVideo posts
+            //      • isMovie=false → keep only non-singleVideo posts (TV/anime)
+            //    This prevents a movie post (e.g. "One Piece Film Gold")
+            //    from polluting the TV/anime path, AND prevents TV/anime
+            //    posts from polluting the movie path.
+            val filteredDetails = postDetails.filter { detail ->
+                val pType = detail.optString("type", "")
+                if (isMovie) pType == "singleVideo" else pType != "singleVideo"
+            }
+            if (filteredDetails.isEmpty()) return false
 
-            if (isMoviePath) {
+            // 5. Route to movie or TV/anime path based on the user's request.
+            if (isMovie) {
                 // ── MOVIE PATH ──────────────────────────────────────────────
                 // postObj.optString("content") returns the direct media URL
                 // as a STRING for singleVideo posts. (Matches
                 // CircleFtpProvider line 1230.)
                 //
-                // FIX (v11): Skip posts whose `content` field is a JSON array
-                // (those are TV/anime posts mis-typed as singleVideo, or
-                // posts where content is empty). Only emit real movie URLs.
-                postDetails.forEach { detail ->
+                // We use `detail.opt("content")` and check `is String`
+                // to avoid emitting JSON-array-as-string garbage (which
+                // happens if a post is mis-typed as singleVideo but has
+                // a content array).
+                filteredDetails.forEach { detail ->
                     val contentField = detail.opt("content")
                     if (contentField is String) {
                         contentField.takeIf { it.isNotBlank() }?.let { mediaUrls += it }
@@ -1013,7 +1038,7 @@ object WizstreamSources {
                 val seasonToUse = season ?: 1
                 val episodeToUse = episode ?: 1
 
-                postDetails.forEach { detail ->
+                filteredDetails.forEach { detail ->
                     val contentArray = detail.optJSONArray("content")
                     if (contentArray == null || contentArray.length() == 0) return@forEach
 
@@ -1056,7 +1081,7 @@ object WizstreamSources {
                 // posts. The user will see a long list of episode links but
                 // at least something will play.
                 if (mediaUrls.isEmpty()) {
-                    postDetails.forEach { detail ->
+                    filteredDetails.forEach { detail ->
                         val contentArray = detail.optJSONArray("content") ?: return@forEach
                         for (si in 0 until contentArray.length()) {
                             val so = contentArray.optJSONObject(si) ?: continue
@@ -1071,8 +1096,8 @@ object WizstreamSources {
                 }
             }
 
-            // 5. Also pick up any direct download links arrays.
-            postDetails.forEach { detail ->
+            // 6. Also pick up any direct download links arrays.
+            filteredDetails.forEach { detail ->
                 detail.optJSONArray("downloadLinks")?.let { dlArr ->
                     for (i in 0 until dlArr.length()) {
                         val dl = dlArr.optJSONObject(i) ?: continue
@@ -1082,7 +1107,7 @@ object WizstreamSources {
                 }
             }
 
-            // 6. Emit. Apply linkToIp to swap *.circleftp.net hostnames
+            // 7. Emit. Apply linkToIp to swap *.circleftp.net hostnames
             //    for BDIX IPs so media URLs are reachable on BDIX networks.
             var any = false
             mediaUrls.forEach { u ->
