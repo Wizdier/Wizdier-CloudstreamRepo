@@ -46,6 +46,7 @@ object WizstreamSources {
             FtpBdResolver,
             CircleFtpResolver,
             CtgMoviesResolver,
+            FlixHubResolver,
         )
 
         val gate = Semaphore(4)
@@ -127,6 +128,155 @@ object WizstreamSources {
                 this.headers = this@relabel.headers
             }
         }
+
+    // ════════════════════════════════════════════════════════════════════════
+    //  Resolver 5: FlixHub  (https://flixhub.net)
+    //  BDIX-accessible streaming site with movies and TV series.
+    //  Stream URL: https://flixhub.net/stream/movie/<slug> or
+    //              https://flixhub.net/stream/episode/<slug>
+    // ════════════════════════════════════════════════════════════════════════
+
+    internal object FlixHubResolver : SourceResolver {
+        private const val SITE = "https://flixhub.net"
+        private const val LABEL = "FlixHub"
+        private val HEADERS = mapOf(
+            "User-Agent" to UA,
+            "Referer" to "$SITE/",
+            "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        )
+
+        override suspend fun resolve(
+            app: Requests,
+            title: String,
+            year: Int?,
+            isMovie: Boolean,
+            season: Int?,
+            episode: Int?,
+            labelPrefix: String,
+            subtitleCallback: (SubtitleFile) -> Unit,
+            callback: (ExtractorLink) -> Unit,
+        ): Boolean {
+            val srcLabel = "$labelPrefix • $LABEL"
+
+            // 1. Search FlixHub
+            val searchUrl = "$SITE/search?q=${encodeUrl(title)}"
+            val html = runCatching {
+                app.get(searchUrl, headers = HEADERS, timeout = 15_000).text
+            }.getOrNull() ?: return false
+
+            val doc = Jsoup.parse(html, searchUrl)
+            val cards = doc.select("article.movie-card-final, article[data-watch-url]")
+
+            // 2. Find the best matching card
+            var bestUrl: String? = null
+            var bestScore = 0.0
+            for (card in cards) {
+                val watchUrl = card.attr("data-watch-url")
+                    .ifBlank { card.selectFirst("a[href*=/watch/]")?.attr("href") }
+                    ?: continue
+                val cardTitle = card.selectFirst(".movie-card-browse-title, .movie-title, .card-overlay p")?.text()
+                    ?: card.selectFirst("a[aria-label]")?.attr("aria-label")
+                    ?: continue
+
+                // Check if it's the right type (movie vs series)
+                val isSeries = watchUrl.contains("/watch/series/")
+                if (isMovie && isSeries) continue
+                if (!isMovie && !isSeries) continue
+
+                val score = titleSimilarity(cardTitle, title)
+                if (score > bestScore) {
+                    bestScore = score
+                    bestUrl = watchUrl
+                }
+            }
+
+            if (bestUrl == null || bestScore < 0.4) return false
+
+            // 3. Fetch the watch page to find stream URL
+            val watchHtml = runCatching {
+                app.get(bestUrl, headers = HEADERS, timeout = 15_000).text
+            }.getOrNull() ?: return false
+            val watchDoc = Jsoup.parse(watchHtml, bestUrl)
+
+            if (isMovie) {
+                // Movie: extract data-download-url or construct stream URL
+                val slug = bestUrl.substringAfter("/watch/movie/")
+                val streamUrl = watchDoc.selectFirst("[data-download-url]")?.attr("data-download-url")
+                    ?: "$SITE/stream/movie/$slug"
+
+                callback(
+                    newExtractorLink(
+                        source = srcLabel,
+                        name = srcLabel,
+                        url = streamUrl,
+                        type = INFER_TYPE,
+                    ) {
+                        this.referer = SITE
+                        this.quality = qualityFromName(streamUrl)
+                    }
+                )
+                return true
+            } else {
+                // TV Series: find episode links
+                val epLinks = watchDoc.select("a[href*=/watch/episode/]")
+                val seenSlugs = mutableSetOf<String>()
+                var found = false
+
+                for (link in epLinks) {
+                    val href = link.attr("href")
+                    val epSlug = href.substringAfter("/episode/").substringBefore("?").substringBefore("#")
+                    if (epSlug.isBlank() || epSlug in seenSlugs) continue
+                    seenSlugs.add(epSlug)
+
+                    val epText = link.text().trim()
+                    val epNum = Regex("""(?:Episode\s*)?(\d+)""", RegexOption.IGNORE_CASE)
+                        .find(epText)?.groupValues?.getOrNull(1)?.toIntOrNull()
+                        ?: seenSlugs.size
+
+                    if (epNum == (episode ?: 1)) {
+                        val streamUrl = "$SITE/stream/episode/$epSlug"
+                        callback(
+                            newExtractorLink(
+                                source = srcLabel,
+                                name = "$srcLabel - Episode $epNum",
+                                url = streamUrl,
+                                type = INFER_TYPE,
+                            ) {
+                                this.referer = SITE
+                                this.quality = qualityFromName(streamUrl)
+                            }
+                        )
+                        found = true
+                    }
+                }
+
+                // Fallback: use the current episode from the player
+                if (!found) {
+                    val currentEpSlug = watchDoc.selectFirst("#theaterPlayer")?.attr("data-episode-slug")
+                    if (currentEpSlug != null && currentEpSlug.isNotBlank()) {
+                        val streamUrl = "$SITE/stream/episode/$currentEpSlug"
+                        callback(
+                            newExtractorLink(
+                                source = srcLabel,
+                                name = srcLabel,
+                                url = streamUrl,
+                                type = INFER_TYPE,
+                            ) {
+                                this.referer = SITE
+                                this.quality = qualityFromName(streamUrl)
+                            }
+                        )
+                        found = true
+                    }
+                }
+
+                return found
+            }
+        }
+    }
+
+
+    // ─────────────────────────────────────────────────────────────────────────────
 
     internal fun qualityFromName(s: String?): Int {
         if (s == null) return Qualities.Unknown.value
@@ -937,14 +1087,27 @@ object WizstreamSources {
             primary: String,
             fallback: String,
         ): String? {
+            // Try primary API with longer timeout (BDIX can be slow)
             val a = runCatching {
-                app.get(primary, headers = HEADERS, timeout = 10_000)
+                app.get(primary, headers = HEADERS, timeout = 20_000)
             }.getOrNull()
             if (a != null && a.code in 200..299 && a.text.isNotBlank()) return a.text
+
+            // Try fallback API
             val b = runCatching {
-                app.get(fallback, headers = HEADERS, timeout = 10_000)
+                app.get(fallback, headers = HEADERS, timeout = 20_000)
             }.getOrNull()
             if (b != null && b.code in 200..299 && b.text.isNotBlank()) return b.text
+
+            // Last resort: try the website itself (not the API port)
+            val webUrl = primary.replace(":5000", "").replace("/api/", "/")
+            if (webUrl != primary) {
+                val c = runCatching {
+                    app.get(webUrl, headers = HEADERS, timeout = 15_000)
+                }.getOrNull()
+                if (c != null && c.code in 200..299 && c.text.isNotBlank()) return c.text
+            }
+
             return null
         }
     }

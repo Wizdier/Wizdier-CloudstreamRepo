@@ -124,10 +124,12 @@ class FlixHubProvider : MainAPI() {
         val meta = extractMetadata(doc)
         val genres = extractGenres(doc)
 
-        // TMDB enrichment
+        // TMDB enrichment — use site poster as PRIMARY (not TMDB) because
+        // the site's data-poster is what the user sees in their browser and
+        // is guaranteed to be the correct movie. TMDB poster is fallback only.
         val tmdbData = fetchTmdbByTitle(title, meta.year, if (isSeries) "tv" else "movie")
 
-        val finalPoster = tmdbData?.posterUrl ?: poster
+        val finalPoster = poster ?: tmdbData?.posterUrl
         val finalBackdrop = tmdbData?.backdropUrl
         val finalPlot = tmdbData?.plot ?: plot
         val finalGenres = tmdbData?.genres ?: genres
@@ -393,12 +395,17 @@ class FlixHubProvider : MainAPI() {
     }
 
     private fun extractPoster(doc: Document): String? {
-        // data-poster on <video> (TMDB URL)
+        // data-poster on <video> — this is the poster image from the site.
+        // It uses TMDB's image CDN (image.tmdb.org) but with /original/ size
+        // which is very large. Convert to /w500/ for faster loading.
         val dataPoster = doc.selectFirst("video[data-poster]")?.attr("data-poster")
-        if (!dataPoster.isNullOrBlank() && dataPoster.startsWith("http")) return dataPoster
-        // TMDB img
-        val tmdbImg = doc.selectFirst("img[src*=image.tmdb.org]")?.attr("src")
-        if (!tmdbImg.isNullOrBlank()) return tmdbImg
+        if (!dataPoster.isNullOrBlank() && dataPoster.startsWith("http")) {
+            // Convert /original/ to /w500/ for smaller, faster-loading poster
+            return dataPoster.replace("/original/", "/w500/")
+        }
+        // TMDB img with src
+        val tmdbImgEl = doc.selectFirst("img[src*=image.tmdb.org]")?.attr("src")
+        if (!tmdbImgEl.isNullOrBlank()) return tmdbImgEl
         return null
     }
 
