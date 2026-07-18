@@ -699,15 +699,72 @@ object WizstreamSources {
             if (isMovie) {
                 val id = best.first.substringAfter("id=").substringBefore("&")
                 val playerUrl = "$SITE/player.php?id=$id"
+
+                // Approach 1: Fetch player.php and extract media URLs from HTML
                 val playerHtml = runCatching {
                     app.get(playerUrl, headers = HEADERS, timeout = 15_000).text
-                }.getOrNull() ?: return false
-                val mediaUrls = extractMediaUrlsFromHtml(playerHtml, playerUrl)
+                }.getOrNull()
                 var any = false
-                mediaUrls.forEach { u ->
-                    if (emitDirect(u, srcLabel, playerUrl, HEADERS, subtitleCallback, callback)) any = true
+                if (playerHtml != null) {
+                    // Look for const videoSrc = "..." (CineplexBD's JS pattern)
+                    Regex("""(?:const|var)\s+videoSrc\s*=\s*["'](.*?)["']""")
+                        .find(playerHtml)?.groupValues?.getOrNull(1)?.let { src ->
+                            if (src.isNotBlank()) {
+                                val absSrc = resolveAbs(playerUrl, src)
+                                if (emitDirect(absSrc, srcLabel, playerUrl, HEADERS, subtitleCallback, callback)) any = true
+                            }
+                        }
+
+                    // Look for m3u8/mp4/mkv URLs
+                    val mediaUrls = extractMediaUrlsFromHtml(playerHtml, playerUrl)
+                    mediaUrls.forEach { u ->
+                        if (emitDirect(u, srcLabel, playerUrl, HEADERS, subtitleCallback, callback)) any = true
+                    }
+
+                    // Look for data-quetta-video-id (Quetta player)
+                    // The Quetta player loads video via JS — try the download.php endpoint
+                    if (!any) {
+                        val downloadUrl = "$SITE/download.php?id=$id"
+                        // download.php typically redirects to the actual .mkv file
+                        runCatching {
+                            val dlRes = app.get(downloadUrl, headers = HEADERS, timeout = 15_000)
+                            val finalUrl = dlRes.url ?: downloadUrl
+                            if (isDirectMedia(finalUrl)) {
+                                callback(
+                                    newExtractorLink(
+                                        source = srcLabel,
+                                        name = "$srcLabel - Direct",
+                                        url = finalUrl,
+                                        type = ExtractorLinkType.VIDEO,
+                                    ) {
+                                        this.referer = "$SITE/"
+                                        this.quality = qualityFromName(finalUrl)
+                                    }
+                                )
+                                any = true
+                            } else {
+                                // Check response body for media URLs
+                                val dlHtml = dlRes.text
+                                val dlUrls = extractMediaUrlsFromHtml(dlHtml, downloadUrl)
+                                dlUrls.forEach { u ->
+                                    if (emitDirect(u, srcLabel, downloadUrl, HEADERS, subtitleCallback, callback)) any = true
+                                }
+                            }
+                        }
+                    }
+
+                    // Try loadExtractor on the player URL as a last resort
+                    if (!any) {
+                        runCatching {
+                            loadExtractor(playerUrl, "$SITE/", subtitleCallback) { link ->
+                                callback(link.relabel(srcLabel, "$srcLabel — ${link.name}"))
+                                any = true
+                            }
+                        }
+                    }
                 }
-                // Also try the view.php page itself (sometimes the player is inline).
+
+                // Approach 2: Try the view.php page itself
                 if (!any) {
                     runCatching {
                         app.get(best.first, headers = HEADERS, timeout = 15_000).text
@@ -1127,11 +1184,12 @@ object WizstreamSources {
                 // ── MOVIE PATH ──────────────────────────────────────────────
                 // postObj.optString("content") returns the direct media URL
                 // as a STRING. (Matches CircleFtpProvider line 1230.)
+                // Apply linkToIp to swap *.circleftp.net hostnames for BDIX IPs.
                 postDetails.forEach { detail ->
-                    detail.optString("content").takeIf { it.isNotBlank() }?.let { mediaUrls += it }
-                    detail.optString("url").takeIf { it.isNotBlank() }?.let { mediaUrls += it }
-                    detail.optString("file").takeIf { it.isNotBlank() }?.let { mediaUrls += it }
-                    detail.optString("src").takeIf { it.isNotBlank() }?.let { mediaUrls += it }
+                    detail.optString("content").takeIf { it.isNotBlank() }?.let { mediaUrls += linkToIp(it) }
+                    detail.optString("url").takeIf { it.isNotBlank() }?.let { mediaUrls += linkToIp(it) }
+                    detail.optString("file").takeIf { it.isNotBlank() }?.let { mediaUrls += linkToIp(it) }
+                    detail.optString("src").takeIf { it.isNotBlank() }?.let { mediaUrls += linkToIp(it) }
                 }
             } else {
                 // ── TV/ANIME PATH ───────────────────────────────────────────
@@ -1214,17 +1272,32 @@ object WizstreamSources {
                 // Circle FTP encodes TV/movie URLs as
                 // "circleftp://movie?data=<base64>" or
                 // "circleftp://episode?data=<base64>" — base64 of a JSON
-                // array of {url, audio?} objects. (Handled by
-                // CircleFtpProvider.loadLinks lines 1507-1561.)
+                // array of {url, audio?} objects.
                 if (u.contains("movie?data=") || u.contains("episode?data=") ||
                     u.contains("circleftp://")
                 ) {
                     if (emitCircleFtpEncoded(u, srcLabel, callback)) any = true
                 } else {
-                    // Apply linkToIp for raw URLs containing circleftp.net hosts.
+                    // Raw URL — emit directly as a video link.
                     val resolvedUrl = linkToIp(u)
-                    if (emitDirect(resolvedUrl, srcLabel, "$SITE/", emptyMap(), subtitleCallback, callback)) {
+                    if (isDirectMedia(resolvedUrl) || resolvedUrl.contains("/Data/")) {
+                        callback(
+                            newExtractorLink(
+                                source = srcLabel,
+                                name = srcLabel,
+                                url = resolvedUrl,
+                                type = if (resolvedUrl.contains(".m3u8", true)) ExtractorLinkType.M3U8
+                                       else ExtractorLinkType.VIDEO,
+                            ) {
+                                this.referer = SITE
+                                this.quality = qualityFromName(resolvedUrl)
+                            }
+                        )
                         any = true
+                    } else {
+                        if (emitDirect(resolvedUrl, srcLabel, "$SITE/", emptyMap(), subtitleCallback, callback)) {
+                            any = true
+                        }
                     }
                 }
             }
