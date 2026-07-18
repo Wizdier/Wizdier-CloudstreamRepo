@@ -895,17 +895,41 @@ object WizstreamSources {
             //    query. This handles BOTH multi-season cases:
             //      • One post with content[N] for season N  (e.g. "One Piece" with 15 seasons)
             //      • Separate posts per season              (e.g. "One Piece S2", "One Piece S3")
-            //    By collecting all matching posts we cover both, just like
-            //    CircleFtpProvider.groupAndMapPosts groups all same-named posts.
+            //
+            //    FIX (v11): When the user asks for an anime (isMovie=false),
+            //    we must NOT include movie posts (type=singleVideo) in the
+            //    matching set. A movie like "One Piece Film Gold" would
+            //    otherwise flip `isMoviePath=true` and short-circuit the
+            //    TV/anime path, returning zero playable links. We also strip
+            //    "Season N" / "S<N>" / "Season<N>" from the post title before
+            //    comparing so that season-specific posts match the base query.
             val qNorm = title.normaliseTitle()
             val matchingPostIds = mutableListOf<Pair<Int, String>>() // (id, title)
             for (i in 0 until postsArr.length()) {
                 val p = postsArr.optJSONObject(i) ?: continue
                 val ptitle = p.optString("title").ifBlank { p.optString("name") ?: "" }
                 if (ptitle.isBlank()) continue
+                val pType = p.optString("type", "")
+                // If the user wants a TV/anime, skip singleVideo (movie)
+                // posts. If the user wants a movie, skip TV/anime posts.
+                // This prevents the movie-vs-anime mismatch that broke
+                // multi-season anime resolution.
+                if (isMovie && pType != "singleVideo") continue
+                if (!isMovie && pType == "singleVideo") continue
+
                 val pNorm = ptitle.normaliseTitle()
                 // Exact normalised match: include always.
                 if (pNorm == qNorm) {
+                    matchingPostIds += p.optInt("id", -1) to ptitle
+                    continue
+                }
+                // Strip "Season N" / "S<N>" from the post title and re-compare.
+                // "One Piece Season 2" → "one piece" which matches "one piece".
+                val pNormStripped = ptitle
+                    .replace(Regex("(?i)\\bseason\\s*\\d+\\b"), " ")
+                    .replace(Regex("(?i)\\bs\\s*\\d+\\b"), " ")
+                    .normaliseTitle()
+                if (pNormStripped == qNorm) {
                     matchingPostIds += p.optInt("id", -1) to ptitle
                     continue
                 }
@@ -942,20 +966,29 @@ object WizstreamSources {
             }
             if (postDetails.isEmpty()) return false
 
-            // 4. Determine if this is a movie or TV/anime based on the
-            //    primary post's type. If ANY post is singleVideo, treat as
-            //    movie and collect direct URLs from all of them.
-            val isMoviePath = postDetails.any { it.optString("type") == "singleVideo" }
+            // 4. Route to movie or TV/anime path based on the user's request.
+            //    (We already filtered posts by type in step 2, so all posts
+            //    here match the user's intent.)
+            val isMoviePath = isMovie && postDetails.all { it.optString("type") == "singleVideo" }
 
             if (isMoviePath) {
                 // ── MOVIE PATH ──────────────────────────────────────────────
                 // postObj.optString("content") returns the direct media URL
-                // as a STRING. (Matches CircleFtpProvider line 1230.)
+                // as a STRING for singleVideo posts. (Matches
+                // CircleFtpProvider line 1230.)
+                //
+                // FIX (v11): Skip posts whose `content` field is a JSON array
+                // (those are TV/anime posts mis-typed as singleVideo, or
+                // posts where content is empty). Only emit real movie URLs.
                 postDetails.forEach { detail ->
-                    detail.optString("content").takeIf { it.isNotBlank() }?.let { mediaUrls += it }
-                    detail.optString("url").takeIf { it.isNotBlank() }?.let { mediaUrls += it }
-                    detail.optString("file").takeIf { it.isNotBlank() }?.let { mediaUrls += it }
-                    detail.optString("src").takeIf { it.isNotBlank() }?.let { mediaUrls += it }
+                    val contentField = detail.opt("content")
+                    if (contentField is String) {
+                        contentField.takeIf { it.isNotBlank() }?.let { mediaUrls += it }
+                    }
+                    // Some posts put the URL in `url` / `file` / `src` instead.
+                    detail.optStringOrNullCp("url")?.let { mediaUrls += it }
+                    detail.optStringOrNullCp("file")?.let { mediaUrls += it }
+                    detail.optStringOrNullCp("src")?.let { mediaUrls += it }
                 }
             } else {
                 // ── TV/ANIME PATH ───────────────────────────────────────────
@@ -965,13 +998,18 @@ object WizstreamSources {
                 // variants (subbed/dual/hindi-dubbed) just like the
                 // standalone CircleFtpProvider does.
                 //
-                // Multi-season handling:
+                // Multi-season handling (FIX v11):
                 //   • If a post has content[N] where N >= season, use
                 //     content[season-1].episodes[episode-1].link
                 //   • If a post is a season-specific separate post (e.g.
                 //     "One Piece Season 2"), its content[] array usually
-                //     has just 1 entry for that season — we use content[0]
-                //     as the requested season's episodes.
+                //     has just 1 entry for that season. We use content[0]
+                //     ONLY IF the post title's season number matches the
+                //     requested season — otherwise we'd return the wrong
+                //     season's episode.
+                //   • If the post title has no "Season N" / "S<N>" marker
+                //     AND content[season-1] doesn't exist, fall back to
+                //     content[0] (single-season anime case).
                 val seasonToUse = season ?: 1
                 val episodeToUse = episode ?: 1
 
@@ -979,21 +1017,34 @@ object WizstreamSources {
                     val contentArray = detail.optJSONArray("content")
                     if (contentArray == null || contentArray.length() == 0) return@forEach
 
+                    // Determine the post's season number from its title.
+                    // "One Piece Season 2" → 2; "One Piece S3" → 3; "One Piece" → null.
+                    val postTitleStr = detail.optString("title", "")
+                        .ifBlank { detail.optString("name", "") }
+                    val titleSeasonNum = extractSeasonFromTitle(postTitleStr)
+
                     // Try content[season-1] first (standard multi-season layout).
                     var seasonObj = contentArray.optJSONObject(seasonToUse - 1)
                     var episodesArray = seasonObj?.optJSONArray("episodes")
 
                     // Fallback: if content[season-1] doesn't exist or has no
-                    // episodes, try content[0] — this handles separate-post-
-                    // per-season where the post's only season is at index 0.
+                    // episodes, try content[0] — but ONLY when:
+                    //   • The post title explicitly says "Season N" matching
+                    //     the requested season (so content[0] IS the
+                    //     requested season), OR
+                    //   • The post title has no "Season N" marker (so this
+                    //     is likely a single-season post).
                     if (episodesArray == null || episodesArray.length() == 0) {
-                        seasonObj = contentArray.optJSONObject(0)
-                        episodesArray = seasonObj?.optJSONArray("episodes")
+                        val canFallbackToContent0 = titleSeasonNum == null || titleSeasonNum == seasonToUse
+                        if (canFallbackToContent0) {
+                            seasonObj = contentArray.optJSONObject(0)
+                            episodesArray = seasonObj?.optJSONArray("episodes")
+                        }
                     }
 
                     if (episodesArray != null && episodeToUse in 1..episodesArray.length()) {
                         val epObj = episodesArray.optJSONObject(episodeToUse - 1)
-                        val link = epObj?.optString("link")
+                        val link = epObj?.optStringOrNullCp("link")
                         if (link != null && link.isNotEmpty()) {
                             mediaUrls += link
                         }
@@ -1008,11 +1059,11 @@ object WizstreamSources {
                     postDetails.forEach { detail ->
                         val contentArray = detail.optJSONArray("content") ?: return@forEach
                         for (si in 0 until contentArray.length()) {
-                            val so = contentArray.optJSONObject(si) ?: return@forEach
-                            val eps = so.optJSONArray("episodes") ?: return@forEach
+                            val so = contentArray.optJSONObject(si) ?: continue
+                            val eps = so.optJSONArray("episodes") ?: continue
                             for (ei in 0 until eps.length()) {
                                 val eo = eps.optJSONObject(ei) ?: continue
-                                val link = eo.optString("link")
+                                val link = eo.optStringOrNullCp("link") ?: continue
                                 if (link.isNotEmpty()) mediaUrls += link
                             }
                         }
@@ -1025,8 +1076,8 @@ object WizstreamSources {
                 detail.optJSONArray("downloadLinks")?.let { dlArr ->
                     for (i in 0 until dlArr.length()) {
                         val dl = dlArr.optJSONObject(i) ?: continue
-                        val u = dl.optString("url").ifBlank { dl.optString("link") }
-                        if (u.isNotBlank()) mediaUrls += u
+                        val u = dl.optStringOrNullCp("url") ?: dl.optStringOrNullCp("link")
+                        if (u != null && u.isNotBlank()) mediaUrls += u
                     }
                 }
             }
@@ -1053,6 +1104,29 @@ object WizstreamSources {
                 }
             }
             return any
+        }
+
+        /**
+         * Extract a season number from a post title.
+         * Returns null if the title has no season marker.
+         *
+         * Examples:
+         *   "One Piece Season 2" → 2
+         *   "One Piece S3"       → 3
+         *   "One Piece Season 2 [Hindi Dubbed]" → 2
+         *   "One Piece"          → null
+         */
+        private fun extractSeasonFromTitle(title: String): Int? {
+            // Match "Season N" or "SeasonN" (case-insensitive).
+            Regex("(?i)\\bseason\\s*(\\d+)\\b").find(title)?.let {
+                return it.groupValues.getOrNull(1)?.toIntOrNull()
+            }
+            // Match "S<N>" but not "S" alone or "s03e15" (which is episode).
+            // We require a word boundary before S and the number to be 1-2 digits.
+            Regex("(?i)\\bS(\\d{1,2})\\b").find(title)?.let {
+                return it.groupValues.getOrNull(1)?.toIntOrNull()
+            }
+            return null
         }
 
         private suspend fun emitCircleFtpEncoded(
