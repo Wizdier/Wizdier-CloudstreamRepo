@@ -159,11 +159,18 @@ object WizstreamSources {
         ): Boolean {
             val srcLabel = "$labelPrefix • $LABEL"
 
-            // 1. Search FlixHub (needs CloudflareKiller)
+            // 1. Search FlixHub — try without CloudflareKiller first
+            // (FlixHub may not challenge residential/BDIX IPs), then with it.
             val searchUrl = "$SITE/search?q=${encodeUrl(title)}"
-            val html = runCatching {
-                app.get(searchUrl, headers = HEADERS, interceptor = cfKiller, timeout = 20_000).text
-            }.getOrNull() ?: return false
+            var html = runCatching {
+                app.get(searchUrl, headers = HEADERS, timeout = 15_000).text
+            }.getOrNull()
+            if (html.isNullOrBlank() || html.contains("Just a moment")) {
+                html = runCatching {
+                    app.get(searchUrl, headers = HEADERS, interceptor = cfKiller, timeout = 20_000).text
+                }.getOrNull()
+            }
+            if (html.isNullOrBlank()) return false
 
             val doc = Jsoup.parse(html, searchUrl)
             val cards = doc.select("article.movie-card-final, article[data-watch-url]")
@@ -194,9 +201,15 @@ object WizstreamSources {
             if (bestUrl == null || bestScore < 0.4) return false
 
             // 3. Fetch the watch page to find stream URL
-            val watchHtml = runCatching {
-                app.get(bestUrl, headers = HEADERS, interceptor = cfKiller, timeout = 20_000).text
-            }.getOrNull() ?: return false
+            var watchHtml = runCatching {
+                app.get(bestUrl, headers = HEADERS, timeout = 15_000).text
+            }.getOrNull()
+            if (watchHtml.isNullOrBlank() || watchHtml.contains("Just a moment")) {
+                watchHtml = runCatching {
+                    app.get(bestUrl, headers = HEADERS, interceptor = cfKiller, timeout = 20_000).text
+                }.getOrNull()
+            }
+            if (watchHtml.isNullOrBlank()) return false
             val watchDoc = Jsoup.parse(watchHtml, bestUrl)
 
             if (isMovie) {
@@ -1117,8 +1130,8 @@ object WizstreamSources {
         ): Boolean {
             // 1. Search posts — fetch all results, not just the best one.
             val searchText = fetchWithFallback(
-                primary = "$PRIMARY_API/api/posts?searchTerm=${encodeUrl(title)}&order=desc",
-                fallback = "$FALLBACK_API/api/posts?searchTerm=${encodeUrl(title)}&order=desc",
+                primary = "$PRIMARY_API/api/posts?searchTerm=$title&order=desc",
+                fallback = "$FALLBACK_API/api/posts?searchTerm=$title&order=desc",
             ) ?: return false
 
             val postsArr = runCatching { JSONObject(searchText).optJSONArray("posts") }
