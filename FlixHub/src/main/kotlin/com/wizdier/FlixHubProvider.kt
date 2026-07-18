@@ -1,39 +1,35 @@
 package com.wizdier
 
 import android.util.Log
-
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.LoadResponse.Companion.addTrailer
-
-import com.lagradost.cloudstream3.utils.*
 import com.lagradost.cloudstream3.network.CloudflareKiller
+import com.lagradost.cloudstream3.utils.*
 import kotlinx.coroutines.*
 import org.json.JSONObject
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
-import org.jsoup.nodes.Element
 import java.net.URLEncoder
 
 /**
  * FlixHub — Cloudstream extension for flixhub.net
  *
  * BDIX-accessible streaming site with movies and TV series.
- * Categories: Hollywood, Bollywood, South Indian, Drama, Action, Comedy, etc.
  *
- * URL patterns:
- *   • Movies:    https://flixhub.net/movies?category=<cat>&sort=<sort>&page=<n>
- *   • TV Series: https://flixhub.net/tv-series?category=<cat>&sort=<sort>&page=<n>
- *   • Watch:     https://flixhub.net/watch/movie/<slug>
- *                https://flixhub.net/watch/series/<slug>
- *   • Episodes:  https://flixhub.net/watch/episode/<episode-slug>
- *   • Stream:    https://flixhub.net/stream/episode/<episode-slug>
+ * Page structure (from HTML analysis):
+ *   • Watch movie:  /watch/movie/<slug>
+ *   • Watch series: /watch/series/<slug>
+ *   • Watch episode: /watch/episode/<episode-slug>
+ *   • Stream URL:   data-download-url attribute on the Download button
+ *                   = https://flixhub.net/stream/movie/<slug>
+ *                   = https://flixhub.net/stream/episode/<episode-slug>
+ *   • Video element: <source type="video/x-matroska"> (no src — loaded via JS)
+ *   • Poster:       data-poster on <video> = TMDB image URL
+ *   • Metadata:     player-mobile-info-title section has "Title Rating · Year · Runtime · Genre"
+ *   • Synopsis:     player-mobile-synopsis-wrap section
  *
- * Video sources:
- *   The watch page has a <video> element with a <source type="video/x-matroska">.
- *   The actual video URL is loaded via JS from /stream/episode/<slug> or
- *   /stream/movie/<slug> — we fetch that URL and extract the direct media URL.
- *
- * The site also uses TMDB for poster images (data-poster attribute).
+ * TMDB enrichment uses the same API key as Wizstream (98ae14df2b8d8f8f8136499daf79f0e0)
+ * to fetch posters, backdrops, logos, trailers, genres, cast, and recommendations.
  */
 class FlixHubProvider : MainAPI() {
     override var mainUrl = "https://flixhub.net"
@@ -61,6 +57,14 @@ class FlixHubProvider : MainAPI() {
     )
 
     // ═══════════════════════════════════════════════════════════════════════
+    //  TMDB constants
+    // ═══════════════════════════════════════════════════════════════════════
+
+    private val tmdbApiKey = "98ae14df2b8d8f8f8136499daf79f0e0"
+    private val tmdbApi = "https://api.themoviedb.org/3"
+    private val tmdbImg = "https://image.tmdb.org/t/p"
+
+    // ═══════════════════════════════════════════════════════════════════════
     //  Main pages
     // ═══════════════════════════════════════════════════════════════════════
 
@@ -73,14 +77,14 @@ class FlixHubProvider : MainAPI() {
         "movies?category=Animation" to "Animation",
         "tv-series?sort=latest" to "Latest TV Series",
         "tv-series?sort=popular" to "Popular TV Series",
-        "movies?category=Drama" to "Drama Movies",
-        "movies?category=Action" to "Action Movies",
-        "movies?category=Comedy" to "Comedy Movies",
-        "movies?category=Horror" to "Horror Movies",
-        "movies?category=Romance" to "Romance Movies",
-        "movies?category=Thriller" to "Thriller Movies",
-        "movies?category=Adventure" to "Adventure Movies",
-        "movies?category=Family" to "Family Movies",
+        "movies?category=Drama" to "Drama",
+        "movies?category=Action" to "Action",
+        "movies?category=Comedy" to "Comedy",
+        "movies?category=Horror" to "Horror",
+        "movies?category=Romance" to "Romance",
+        "movies?category=Thriller" to "Thriller",
+        "movies?category=Adventure" to "Adventure",
+        "movies?category=Family" to "Family",
     )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
@@ -117,25 +121,54 @@ class FlixHubProvider : MainAPI() {
         val title = doc.selectFirst("h1")?.text()?.trim() ?: "Unknown"
         val poster = extractPoster(doc)
         val plot = extractSynopsis(doc)
+        val meta = extractMetadata(doc)
         val genres = extractGenres(doc)
-        val year = extractYear(doc)
+
+        // TMDB enrichment
+        val tmdbData = fetchTmdbByTitle(title, meta.year, if (isSeries) "tv" else "movie")
+
+        val finalPoster = tmdbData?.posterUrl ?: poster
+        val finalBackdrop = tmdbData?.backdropUrl
+        val finalPlot = tmdbData?.plot ?: plot
+        val finalGenres = tmdbData?.genres ?: genres
+        val finalRating = tmdbData?.rating ?: meta.rating
+        val finalYear = tmdbData?.year ?: meta.year
+        val finalRuntime = tmdbData?.runtime ?: meta.runtime
+        val finalLogo = tmdbData?.logoUrl
+        val finalTrailer = tmdbData?.trailerUrl
+        val finalActors = tmdbData?.actors
+        val finalRecs = tmdbData?.recommendations
 
         return if (isSeries) {
             val episodes = parseEpisodes(doc)
             newTvSeriesLoadResponse(title, url, TvType.TvSeries, episodes) {
-                this.posterUrl = poster
-                this.plot = plot
-                this.year = year
-                this.tags = genres
+                this.posterUrl = finalPoster
+                this.backgroundPosterUrl = finalBackdrop
+                this.plot = finalPlot
+                this.year = finalYear
+                this.tags = finalGenres
+                this.duration = finalRuntime
+                runCatching { finalRating?.let { score = Score.from10(it) } }
+                runCatching { finalActors?.let { this.actors = it } }
+                runCatching { finalLogo?.let { this.logoUrl = it } }
+                runCatching { finalTrailer?.let { addTrailer(it) } }
+                runCatching { finalRecs?.let { if (it.isNotEmpty()) this.recommendations = it } }
             }
         } else {
-            val slug = url.substringAfter("/watch/movie/")
-            val data = FlixHubLink(slug = slug, isMovie = true).toJson()
-            newMovieLoadResponse(title, url, TvType.Movie, data) {
-                this.posterUrl = poster
-                this.plot = plot
-                this.year = year
-                this.tags = genres
+            val slug = url.substringAfter("/watch/movie/").substringBefore("?").substringBefore("#")
+            val streamUrl = extractStreamUrl(doc, slug, isMovie = true)
+            newMovieLoadResponse(title, url, TvType.Movie, streamUrl ?: slug) {
+                this.posterUrl = finalPoster
+                this.backgroundPosterUrl = finalBackdrop
+                this.plot = finalPlot
+                this.year = finalYear
+                this.tags = finalGenres
+                this.duration = finalRuntime
+                runCatching { finalRating?.let { score = Score.from10(it) } }
+                runCatching { finalActors?.let { this.actors = it } }
+                runCatching { finalLogo?.let { this.logoUrl = it } }
+                runCatching { finalTrailer?.let { addTrailer(it) } }
+                runCatching { finalRecs?.let { if (it.isNotEmpty()) this.recommendations = it } }
             }
         }
     }
@@ -150,58 +183,40 @@ class FlixHubProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit,
     ): Boolean {
-        val link = try { FlixHubLink.fromJson(data) } catch (_: Exception) { null } ?: return false
-
-        val streamUrl = if (link.isMovie) {
-            "$mainUrl/stream/movie/${link.slug}"
+        // data is either:
+        //   • A full stream URL (https://flixhub.net/stream/movie/<slug>)
+        //   • A slug (fallback — we'll construct the stream URL)
+        val streamUrl = if (data.startsWith("http")) {
+            data
+        } else if (data.startsWith("/stream/")) {
+            "$mainUrl$data"
         } else {
-            "$mainUrl/stream/episode/${link.slug}"
+            // It's a slug — try both movie and episode
+            "$mainUrl/stream/movie/$data"
         }
 
-        // Fetch the stream page — it should redirect to or contain the direct video URL
         return try {
+            // The stream URL redirects to or returns the actual video file.
+            // Fetch it with redirects followed to get the final URL.
             val res = app.get(streamUrl, headers = headers, timeout = 15_000)
-            val body = res.text
             val finalUrl = res.url ?: streamUrl
+            val body = res.text
 
-            // Check if it's a direct media URL
-            if (finalUrl.endsWith(".mkv") || finalUrl.endsWith(".mp4") ||
-                finalUrl.contains(".mkv?") || finalUrl.contains(".mp4?")
-            ) {
-                callback(
-                    newExtractorLink(
-                        source = "FlixHub",
-                        name = "FlixHub - Direct",
-                        url = finalUrl,
-                        type = ExtractorLinkType.VIDEO,
-                    ) {
-                        this.referer = mainUrl
-                        this.quality = getQualityFromUrl(finalUrl)
-                    }
-                )
+            // Check if the final URL is a direct media file
+            if (isDirectMedia(finalUrl)) {
+                emitDirectLink(finalUrl, callback)
                 return true
             }
 
-            // Check if the response body has a direct media URL
+            // Check if the response body contains a direct media URL
             val mediaUrls = extractMediaUrls(body, streamUrl)
             var found = false
             for (u in mediaUrls) {
-                callback(
-                    newExtractorLink(
-                        source = "FlixHub",
-                        name = "FlixHub - Direct",
-                        url = u,
-                        type = if (u.contains(".m3u8", true)) ExtractorLinkType.M3U8
-                               else ExtractorLinkType.VIDEO,
-                    ) {
-                        this.referer = mainUrl
-                        this.quality = getQualityFromUrl(u)
-                    }
-                )
+                emitDirectLink(u, callback)
                 found = true
             }
 
-            // If no direct URL found, try loadExtractor on the stream URL
+            // Try loadExtractor on the stream URL
             if (!found) {
                 runCatching {
                     loadExtractor(streamUrl, mainUrl, subtitleCallback) { link ->
@@ -211,49 +226,21 @@ class FlixHubProvider : MainAPI() {
                 }
             }
 
-            // Also try fetching the watch page and extracting from the <source> tag
+            // Last resort: fetch the watch page and extract data-download-url
             if (!found) {
-                val watchUrl = if (link.isMovie) {
-                    "$mainUrl/watch/movie/${link.slug}"
-                } else {
-                    "$mainUrl/watch/episode/${link.slug}"
-                }
+                val watchUrl = streamUrl.replace("/stream/", "/watch/")
                 val watchDoc = fetchDocument(watchUrl)
                 if (watchDoc != null) {
-                    val sourceTag = watchDoc.selectFirst("video source[src]")
-                    if (sourceTag != null) {
-                        val src = sourceTag.attr("src")
-                        if (src.isNotBlank()) {
-                            callback(
-                                newExtractorLink(
-                                    source = "FlixHub",
-                                    name = "FlixHub - Direct",
-                                    url = src,
-                                    type = ExtractorLinkType.VIDEO,
-                                ) {
-                                    this.referer = mainUrl
-                                    this.quality = getQualityFromUrl(src)
-                                }
-                            )
-                            found = true
-                        }
+                    val dlUrl = watchDoc.selectFirst("[data-download-url]")?.attr("data-download-url")
+                    if (dlUrl != null && dlUrl.isNotBlank()) {
+                        emitDirectLink(dlUrl, callback)
+                        found = true
                     }
-                    // Extract any media URLs from the watch page HTML
-                    val watchHtml = watchDoc.outerHtml()
-                    val urls = extractMediaUrls(watchHtml, watchUrl)
+                    // Also try extracting from the HTML
+                    val html = watchDoc.outerHtml()
+                    val urls = extractMediaUrls(html, watchUrl)
                     for (u in urls) {
-                        callback(
-                            newExtractorLink(
-                                source = "FlixHub",
-                                name = "FlixHub - Direct",
-                                url = u,
-                                type = if (u.contains(".m3u8", true)) ExtractorLinkType.M3U8
-                                       else ExtractorLinkType.VIDEO,
-                            ) {
-                                this.referer = mainUrl
-                                this.quality = getQualityFromUrl(u)
-                            }
-                        )
+                        emitDirectLink(u, callback)
                         found = true
                     }
                 }
@@ -263,6 +250,31 @@ class FlixHubProvider : MainAPI() {
         } catch (e: Exception) {
             Log.d("FlixHub", "loadLinks failed: ${e.message}")
             false
+        }
+    }
+
+    private suspend fun emitDirectLink(url: String, callback: (ExtractorLink) -> Unit) {
+        val u = url.trim()
+        if (u.isBlank()) return
+        if (u.contains(".m3u8", true)) {
+            M3u8Helper.generateM3u8(
+                source = "FlixHub",
+                streamUrl = u,
+                referer = mainUrl,
+                headers = headers,
+            ).forEach(callback)
+        } else {
+            callback(
+                newExtractorLink(
+                    source = "FlixHub",
+                    name = "FlixHub",
+                    url = u,
+                    type = ExtractorLinkType.VIDEO,
+                ) {
+                    this.referer = mainUrl
+                    this.quality = getQualityFromUrl(u)
+                }
+            )
         }
     }
 
@@ -289,25 +301,13 @@ class FlixHubProvider : MainAPI() {
             val title = card.selectFirst(".movie-card-browse-title, .movie-title, .card-overlay p")?.text()
                 ?: card.selectFirst("a[aria-label]")?.attr("aria-label")
                 ?: return@mapNotNull null
-            val poster = card.selectFirst("img")?.let { img ->
-                // Images use CSS background-image or data URIs; try to get a real URL
-                val style = img.attr("style")
-                val bgMatch = Regex("""background-image:url\(([^)]+)\)""").find(style)
-                bgMatch?.groupValues?.get(1)?.replace("'", "")?.replace("\"", "")
-                    ?: img.attr("data-src").ifBlank { null }
-                    ?: img.attr("src").takeIf { it.startsWith("http") }
-            }
             val isSeries = watchUrl.contains("/watch/series/")
             val type = if (isSeries) TvType.TvSeries else TvType.Movie
 
             if (isSeries) {
-                newTvSeriesSearchResponse(title, watchUrl, type) {
-                    this.posterUrl = poster
-                }
+                newTvSeriesSearchResponse(title, watchUrl, type) {}
             } else {
-                newMovieSearchResponse(title, watchUrl, type) {
-                    this.posterUrl = poster
-                }
+                newMovieSearchResponse(title, watchUrl, type) {}
             }
         }
     }
@@ -316,8 +316,8 @@ class FlixHubProvider : MainAPI() {
         val episodes = mutableListOf<Episode>()
         val seenSlugs = mutableSetOf<String>()
 
-        // Episode links: /watch/episode/<slug> or /stream/episode/<slug>
-        val epLinks = doc.select("a[href*=/watch/episode/], a[href*=/stream/episode/]")
+        // Episode links: /watch/episode/<slug>
+        val epLinks = doc.select("a[href*=/watch/episode/]")
         for (link in epLinks) {
             val href = link.attr("href")
             val slug = href.substringAfter("/episode/").substringBefore("?").substringBefore("#")
@@ -327,31 +327,21 @@ class FlixHubProvider : MainAPI() {
             val epText = link.text().trim()
             val epNum = Regex("""(?:Episode\s*)?(\d+)""", RegexOption.IGNORE_CASE)
                 .find(epText)?.groupValues?.getOrNull(1)?.toIntOrNull()
-                ?: (seenSlugs.size)
+                ?: seenSlugs.size
 
-            // Extract episode title if available
-            val titleEl = link.selectFirst(".episode-title, .player-mobile-episode-title")
-            val epTitle = titleEl?.text()?.takeIf { it.isNotBlank() }
-
-            episodes.add(newEpisode(FlixHubLink(slug = slug, isMovie = false).toJson()) {
-                this.name = if (epTitle != null) "Episode $epNum: $epTitle" else "Episode $epNum"
+            val streamUrl = "$mainUrl/stream/episode/$slug"
+            episodes.add(newEpisode(streamUrl) {
+                this.name = "Episode $epNum"
                 this.episode = epNum
-                this.season = 1 // Will be updated if season info is available
+                this.season = 1
             })
         }
 
-        // Also check for season tabs
-        val seasonTabs = doc.select(".season-tab, .player-mobile-season-tab, [data-season]")
-        if (seasonTabs.isNotEmpty()) {
-            // If there are multiple seasons, try to assign episodes to seasons
-            // For now, all episodes go to season 1 unless the page structure changes
-        }
-
         return episodes.ifEmpty {
-            // Fallback: if no episode links found, try the data-episode-slug attribute
+            // Fallback: use data-episode-slug from the player
             val epSlug = doc.selectFirst("#theaterPlayer")?.attr("data-episode-slug")
             if (epSlug != null && epSlug.isNotBlank()) {
-                listOf(newEpisode(FlixHubLink(slug = epSlug, isMovie = false).toJson()) {
+                listOf(newEpisode("$mainUrl/stream/episode/$epSlug") {
                     this.name = "Episode 1"
                     this.episode = 1
                     this.season = 1
@@ -362,20 +352,32 @@ class FlixHubProvider : MainAPI() {
         }
     }
 
+    /**
+     * Extract the stream URL from the watch page.
+     * The Download button has data-download-url=https://flixhub.net/stream/movie/<slug>
+     */
+    private fun extractStreamUrl(doc: Document, slug: String, isMovie: Boolean): String? {
+        // Try data-download-url attribute on the Download button
+        val dlUrl = doc.selectFirst("[data-download-url]")?.attr("data-download-url")
+        if (dlUrl != null && dlUrl.isNotBlank()) return dlUrl
+
+        // Try <a href*="/stream/">
+        val streamLink = doc.selectFirst("a[href*=/stream/]")?.attr("href")
+        if (streamLink != null && streamLink.isNotBlank()) return streamLink
+
+        // Construct the URL from the slug
+        val path = if (isMovie) "/stream/movie/$slug" else "/stream/episode/$slug"
+        return "$mainUrl$path"
+    }
+
     private fun extractPoster(doc: Document): String? {
-        // Try data-poster on the video element (TMDB URL)
+        // data-poster on <video> (TMDB URL)
         val dataPoster = doc.selectFirst("video[data-poster]")?.attr("data-poster")
         if (!dataPoster.isNullOrBlank() && dataPoster.startsWith("http")) return dataPoster
-
-        // Try img with TMDB src
+        // TMDB img
         val tmdbImg = doc.selectFirst("img[src*=image.tmdb.org]")?.attr("src")
         if (!tmdbImg.isNullOrBlank()) return tmdbImg
-
-        // Try poster class
-        val posterImg = doc.selectFirst(".movie-card-poster img, .poster img")?.let { img ->
-            img.attr("data-src").ifBlank { null } ?: img.attr("src").takeIf { it.startsWith("http") }
-        }
-        return posterImg
+        return null
     }
 
     private fun extractSynopsis(doc: Document): String? {
@@ -384,32 +386,186 @@ class FlixHubProvider : MainAPI() {
         return synopsis?.takeIf { it.isNotBlank() }
     }
 
+    data class PageMeta(val rating: Double?, val year: Int?, val runtime: Int?, val genre: String?)
+
+    private fun extractMetadata(doc: Document): PageMeta {
+        // The info section has text like: "Evil Dead Burn 7.1 · 2026 · 1h 50m · Horror"
+        val infoText = doc.selectFirst(".player-mobile-info-title")?.text()
+            ?: doc.selectFirst(".movie-info")?.text()
+            ?: ""
+        val rating = Regex("""(\d+(?:\.\d+)?)\s*·""").find(infoText)?.groupValues?.getOrNull(1)?.toDoubleOrNull()
+        val year = Regex("""·\s*((?:19|20)\d{2})\s*·""").find(infoText)?.groupValues?.getOrNull(1)?.toIntOrNull()
+        val runtime = Regex("""(\d+)h\s*(\d+)?m""").find(infoText)?.let { m ->
+            val h = m.groupValues[1].toIntOrNull() ?: 0
+            val min = m.groupValues.getOrNull(2)?.toIntOrNull() ?: 0
+            (h * 60 + min).takeIf { it > 0 }
+        }
+        val genre = Regex("""·\s*([A-Za-z]+)\s*(?:See more|$)""").find(infoText)?.groupValues?.getOrNull(1)
+        return PageMeta(rating, year, runtime, genre)
+    }
+
     private fun extractGenres(doc: Document): List<String>? {
         val genres = doc.select("a[href*=category=]").mapNotNull { el ->
-            val href = el.attr("href")
-            val cat = href.substringAfter("category=").substringBefore("&")
             val name = el.text().trim()
-            name.takeIf { it.isNotBlank() && cat !in listOf("hollywood", "bollywood", "south-indian") }
+            name.takeIf { it.isNotBlank() && it.lowercase() !in listOf("hollywood", "bollywood", "south-indian") }
         }.distinct()
         return genres.takeIf { it.isNotEmpty() }
     }
 
-    private fun extractYear(doc: Document): Int? {
-        val text = doc.text()
-        return Regex("""\b(?:19|20)\d{2}\b""").find(text)?.value?.toIntOrNull()
+    // ═══════════════════════════════════════════════════════════════════════
+    //  TMDB enrichment
+    // ═══════════════════════════════════════════════════════════════════════
+
+    private data class TmdbData(
+        val posterUrl: String?,
+        val backdropUrl: String?,
+        val logoUrl: String?,
+        val plot: String?,
+        val rating: Double?,
+        val year: Int?,
+        val runtime: Int?,
+        val genres: List<String>?,
+        val actors: List<ActorData>?,
+        val trailerUrl: String?,
+        val recommendations: List<SearchResponse>?,
+    )
+
+    private suspend fun fetchTmdbByTitle(title: String, year: Int?, type: String): TmdbData? {
+        return try {
+            // Step 1: Search TMDB
+            val searchParams = mapOf(
+                "api_key" to tmdbApiKey,
+                "query" to title,
+                "year" to year?.toString(),
+                "language" to "en-US",
+            ).filter { it.value != null }
+
+            val searchUrl = "$tmdbApi/search/${if (type == "tv") "tv" else "movie"}?" +
+                searchParams.entries.joinToString("&") { (k, v) ->
+                    "${URLEncoder.encode(k, "UTF-8")}=${URLEncoder.encode(v.toString(), "UTF-8")}"
+                }
+
+            val searchRes = app.get(searchUrl, headers = mapOf("Accept" to "application/json"), timeout = 10_000)
+            if (searchRes.code !in 200..299) return null
+
+            val searchJson = JSONObject(searchRes.text)
+            val results = searchJson.optJSONArray("results") ?: return null
+            if (results.length() == 0) return null
+
+            // Pick the first result (most relevant)
+            val tmdbId = results.optJSONObject(0)?.optInt("id", 0) ?: return null
+            if (tmdbId == 0) return null
+
+            // Step 2: Fetch detailed info
+            val detailParams = mapOf(
+                "api_key" to tmdbApiKey,
+                "append_to_response" to "credits,images,videos,recommendations,external_ids",
+                "include_image_language" to "en,null",
+                "language" to "en-US",
+            )
+            val detailUrl = "$tmdbApi/$type/$tmdbId?" +
+                detailParams.entries.joinToString("&") { (k, v) ->
+                    "${URLEncoder.encode(k, "UTF-8")}=${URLEncoder.encode(v, "UTF-8")}"
+                }
+
+            val detailRes = app.get(detailUrl, headers = mapOf("Accept" to "application/json"), timeout = 10_000)
+            if (detailRes.code !in 200..299) return null
+
+            val d = JSONObject(detailRes.text)
+
+            val posterUrl = d.optString("poster_path").takeIf { it.isNotBlank() }?.let { "$tmdbImg/w780$it" }
+            val backdropUrl = d.optString("backdrop_path").takeIf { it.isNotBlank() }?.let { "$tmdbImg/original$it" }
+            val plot = d.optString("overview").takeIf { it.isNotBlank() }
+            val rating = d.optDouble("vote_average", 0.0).takeIf { it > 0 }
+            val dateStr = if (type == "movie") d.optString("release_date") else d.optString("first_air_date")
+            val yr = Regex("""\d{4}""").find(dateStr)?.value?.toIntOrNull()
+            val runtime = if (type == "movie") d.optInt("runtime", 0).takeIf { it > 0 }
+                else d.optJSONArray("episode_run_time")?.optInt(0)?.takeIf { it > 0 }
+            val genres = d.optJSONArray("genres")?.let { arr ->
+                (0 until arr.length()).mapNotNull { arr.optJSONObject(it)?.optString("name")?.takeIf { s -> s.isNotBlank() } }
+            }
+
+            // Logo
+            val logoUrl = d.optJSONObject("images")?.optJSONArray("logos")?.let { logos ->
+                (0 until logos.length()).mapNotNull { i ->
+                    val l = logos.optJSONObject(i) ?: return@mapNotNull null
+                    val p = l.optString("file_path").takeIf { it.isNotBlank() } ?: return@mapNotNull null
+                    val lang = l.optString("iso_639_1").lowercase()
+                    if (lang == "en" && !p.endsWith(".svg")) "$tmdbImg/w500$p" else null
+                }.firstOrNull()
+            }
+
+            // Cast
+            val actors = d.optJSONObject("credits")?.optJSONArray("cast")?.let { cast ->
+                (0 until minOf(cast.length(), 15)).mapNotNull { i ->
+                    val c = cast.optJSONObject(i) ?: return@mapNotNull null
+                    val name = c.optString("name").takeIf { it.isNotBlank() } ?: return@mapNotNull null
+                    val profile = c.optString("profile_path").takeIf { it.isNotBlank() }?.let { "$tmdbImg/w185$it" }
+                    val role = c.optString("character").takeIf { it.isNotBlank() }
+                    ActorData(Actor(name, profile), roleString = role ?: "")
+                }
+            }
+
+            // Trailer
+            val trailerUrl = d.optJSONObject("videos")?.optJSONArray("results")?.let { vids ->
+                (0 until vids.length()).mapNotNull { i ->
+                    val v = vids.optJSONObject(i) ?: return@mapNotNull null
+                    if (v.optString("site") == "YouTube" && v.optString("type") == "Trailer") {
+                        "https://www.youtube.com/watch?v=${v.optString("key")}"
+                    } else null
+                }.firstOrNull()
+            }
+
+            // Recommendations
+            val recs = d.optJSONObject("recommendations")?.optJSONArray("results")?.let { arr ->
+                (0 until minOf(arr.length(), 15)).mapNotNull { i ->
+                    val r = arr.optJSONObject(i) ?: return@mapNotNull null
+                    val rTitle = if (type == "movie") r.optString("title") else r.optString("name")
+                    if (rTitle.isBlank()) return@mapNotNull null
+                    val rId = r.optInt("id", 0)
+                    if (rId == 0) return@mapNotNull null
+                    val rPoster = r.optString("poster_path").takeIf { it.isNotBlank() }?.let { "$tmdbImg/w500$it" }
+                    val rDateStr = if (type == "movie") r.optString("release_date") else r.optString("first_air_date")
+                    val rYear = Regex("""\d{4}""").find(rDateStr)?.value?.toIntOrNull()
+
+                    if (type == "movie") {
+                        newMovieSearchResponse(rTitle, "$mainUrl/watch/movie/${rTitle.lowercase().replace(" ", "-")}", TvType.Movie) {
+                            this.posterUrl = rPoster
+                            this.year = rYear
+                        }
+                    } else {
+                        newTvSeriesSearchResponse(rTitle, "$mainUrl/watch/series/${rTitle.lowercase().replace(" ", "-")}", TvType.TvSeries) {
+                            this.posterUrl = rPoster
+                            this.year = rYear
+                        }
+                    }
+                }
+            }
+
+            TmdbData(posterUrl, backdropUrl, logoUrl, plot, rating, yr, runtime, genres, actors, trailerUrl, recs)
+        } catch (e: Exception) {
+            Log.d("FlixHub", "TMDB enrichment failed: ${e.message}")
+            null
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  Media URL helpers
+    // ═══════════════════════════════════════════════════════════════════════
+
+    private fun isDirectMedia(url: String): Boolean {
+        val u = url.lowercase()
+        return u.endsWith(".mkv") || u.endsWith(".mp4") || u.endsWith(".webm") ||
+            u.endsWith(".m3u8") || u.contains(".mkv?") || u.contains(".mp4?") ||
+            u.contains(".m3u8?")
     }
 
     private fun extractMediaUrls(html: String, baseUrl: String): LinkedHashSet<String> {
         val out = linkedSetOf<String>()
-        // Direct media URLs
         Regex("""https?://[^\s"'<>]+(?:\.m3u8|\.mp4|\.mkv|\.webm)(?:\?[^\s"'<>]*)?""", RegexOption.IGNORE_CASE)
             .findAll(html).forEach { m -> out.add(m.value.replace("&amp;", "&")) }
-        // Relative URLs
         Regex("""["'](/(?:stream|storage|Data|video)/[^"']+\.(?:m3u8|mp4|mkv|webm)[^"']*)["']""", RegexOption.IGNORE_CASE)
-            .findAll(html).forEach { m ->
-                val u = m.groupValues[1]
-                out.add("$mainUrl$u")
-            }
+            .findAll(html).forEach { m -> out.add("$mainUrl${m.groupValues[1]}") }
         return out
     }
 
@@ -423,30 +579,6 @@ class FlixHubProvider : MainAPI() {
             "480" in n -> Qualities.P480.value
             "360" in n -> Qualities.P360.value
             else -> Qualities.Unknown.value
-        }
-    }
-
-    // ═══════════════════════════════════════════════════════════════════════
-    //  Link data
-    // ═══════════════════════════════════════════════════════════════════════
-
-    private data class FlixHubLink(
-        val slug: String,
-        val isMovie: Boolean,
-    ) {
-        fun toJson(): String = JSONObject().apply {
-            put("slug", slug)
-            put("is_movie", isMovie)
-        }.toString()
-
-        companion object {
-            fun fromJson(s: String): FlixHubLink {
-                val o = JSONObject(s)
-                return FlixHubLink(
-                    slug = o.optString("slug"),
-                    isMovie = o.optBoolean("is_movie"),
-                )
-            }
         }
     }
 }
