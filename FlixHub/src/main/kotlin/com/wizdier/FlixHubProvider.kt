@@ -183,74 +183,96 @@ class FlixHubProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit,
     ): Boolean {
-        // data is either:
-        //   • A full stream URL (https://flixhub.net/stream/movie/<slug>)
-        //   • A slug (fallback — we'll construct the stream URL)
+        // The stream URL IS the direct .mkv video file.
+        // FlixHub's /stream/movie/<slug> and /stream/episode/<slug> endpoints
+        // serve the actual Matroska file directly — no need to fetch and parse.
+        // We emit it directly as an ExtractorLink and Cloudstream's player
+        // handles the rest.
         val streamUrl = if (data.startsWith("http")) {
             data
         } else if (data.startsWith("/stream/")) {
             "$mainUrl$data"
         } else {
-            // It's a slug — try both movie and episode
+            // It's a slug — construct the stream URL
             "$mainUrl/stream/movie/$data"
         }
 
-        return try {
-            // The stream URL redirects to or returns the actual video file.
-            // Fetch it with redirects followed to get the final URL.
-            val res = app.get(streamUrl, headers = headers, timeout = 15_000)
-            val finalUrl = res.url ?: streamUrl
-            val body = res.text
-
-            // Check if the final URL is a direct media file
-            if (isDirectMedia(finalUrl)) {
-                emitDirectLink(finalUrl, callback)
-                return true
+        // Emit the stream URL directly as a video link.
+        // The .mkv file will be played directly by Cloudstream's player.
+        callback(
+            newExtractorLink(
+                source = "FlixHub",
+                name = "FlixHub",
+                url = streamUrl,
+                type = ExtractorLinkType.VIDEO,
+            ) {
+                this.referer = mainUrl
+                this.quality = getQualityFromUrl(streamUrl)
             }
+        )
 
-            // Check if the response body contains a direct media URL
-            val mediaUrls = extractMediaUrls(body, streamUrl)
-            var found = false
-            for (u in mediaUrls) {
-                emitDirectLink(u, callback)
-                found = true
-            }
+        // Also try fetching the watch page to find any additional sources
+        // (multiple quality options, backup mirrors, etc.)
+        runCatching {
+            val watchUrl = streamUrl.replace("/stream/", "/watch/")
+            val doc = fetchDocument(watchUrl)
+            if (doc != null) {
+                // Find data-download-url (the primary stream URL — might differ from what we have)
+                val dlUrl = doc.selectFirst("[data-download-url]")?.attr("data-download-url")
+                if (dlUrl != null && dlUrl.isNotBlank() && dlUrl != streamUrl) {
+                    callback(
+                        newExtractorLink(
+                            source = "FlixHub",
+                            name = "FlixHub (Download)",
+                            url = dlUrl,
+                            type = ExtractorLinkType.VIDEO,
+                        ) {
+                            this.referer = mainUrl
+                            this.quality = getQualityFromUrl(dlUrl)
+                        }
+                    )
+                }
 
-            // Try loadExtractor on the stream URL
-            if (!found) {
-                runCatching {
-                    loadExtractor(streamUrl, mainUrl, subtitleCallback) { link ->
-                        callback(link)
-                        found = true
+                // Find any additional <source> tags with src attributes
+                doc.select("video source[src], source[src]").forEach { el ->
+                    val src = el.attr("src")
+                    if (src.isNotBlank() && src.startsWith("http") && src != streamUrl) {
+                        callback(
+                            newExtractorLink(
+                                source = "FlixHub",
+                                name = "FlixHub (Alt)",
+                                url = src,
+                                type = if (src.contains(".m3u8", true)) ExtractorLinkType.M3U8
+                                       else ExtractorLinkType.VIDEO,
+                            ) {
+                                this.referer = mainUrl
+                                this.quality = getQualityFromUrl(src)
+                            }
+                        )
+                    }
+                }
+
+                // Find any <a> tags pointing to /stream/ URLs
+                doc.select("a[href*=/stream/]").forEach { el ->
+                    val href = el.attr("href")
+                    if (href.isNotBlank() && href != streamUrl && href != dlUrl) {
+                        callback(
+                            newExtractorLink(
+                                source = "FlixHub",
+                                name = "FlixHub (Mirror)",
+                                url = href,
+                                type = ExtractorLinkType.VIDEO,
+                            ) {
+                                this.referer = mainUrl
+                                this.quality = getQualityFromUrl(href)
+                            }
+                        )
                     }
                 }
             }
-
-            // Last resort: fetch the watch page and extract data-download-url
-            if (!found) {
-                val watchUrl = streamUrl.replace("/stream/", "/watch/")
-                val watchDoc = fetchDocument(watchUrl)
-                if (watchDoc != null) {
-                    val dlUrl = watchDoc.selectFirst("[data-download-url]")?.attr("data-download-url")
-                    if (dlUrl != null && dlUrl.isNotBlank()) {
-                        emitDirectLink(dlUrl, callback)
-                        found = true
-                    }
-                    // Also try extracting from the HTML
-                    val html = watchDoc.outerHtml()
-                    val urls = extractMediaUrls(html, watchUrl)
-                    for (u in urls) {
-                        emitDirectLink(u, callback)
-                        found = true
-                    }
-                }
-            }
-
-            found
-        } catch (e: Exception) {
-            Log.d("FlixHub", "loadLinks failed: ${e.message}")
-            false
         }
+
+        return true
     }
 
     private suspend fun emitDirectLink(url: String, callback: (ExtractorLink) -> Unit) {
