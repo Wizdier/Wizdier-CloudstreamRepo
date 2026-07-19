@@ -925,52 +925,29 @@ object WizstreamSources {
                 .getOrNull() ?: return false
             if (postsArr.length() == 0) return false
 
-            // 2. Collect ALL posts whose title is a strong match for the
-            //    query. This handles BOTH multi-season cases:
-            //      • One post with content[N] for season N  (e.g. "One Piece" with 15 seasons)
-            //      • Separate posts per season              (e.g. "One Piece S2", "One Piece S3")
+            // 2. Collect ALL posts returned by the search API.
             //
-            //    NOTE: The CircleFTP search API (/api/posts?searchTerm=…)
-            //    does NOT include the `type` field in each post object —
-            //    only the detail API (/api/posts/$id) returns `type`. So we
-            //    CANNOT filter by type here. We collect ALL title-matching
-            //    posts now and filter by type AFTER fetching details in
-            //    step 4. (Filtering here was the v11 regression that broke
-            //    movies — `pType` was always empty so every post was
-            //    skipped for isMovie=true.)
+            //    FIX (v17): The previous code filtered posts by title similarity
+            //    (score >= 0.5 AND pNorm.contains(qNorm)) which was TOO STRICT.
+            //    This caused short-titled movies like "Dune", "Joker", "Inception"
+            //    to be rejected because their post titles often have extra words
+            //    (year, quality, "Extended Edition") that diluted the Jaccard
+            //    similarity score. Only long titles like "Lord of the Rings:
+            //    The Return of the King" had enough tokens to pass the filter.
             //
-            //    We also strip "Season N" / "S<N>" from the post title
-            //    before comparing so that season-specific posts match the
-            //    base query.
-            val qNorm = title.normaliseTitle()
+            //    The standalone CircleFtpProvider does NOT filter by similarity
+            //    at all — it groups ALL posts returned by the search API and
+            //    lets the user pick. We now do the same: collect every post
+            //    the API returns, then filter by `type` after fetching details.
+            //
+            //    The search API itself does the relevance filtering server-side,
+            //    so we trust its results. If the API returns 0 posts, we bail.
             val matchingPostIds = mutableListOf<Pair<Int, String>>() // (id, title)
             for (i in 0 until postsArr.length()) {
                 val p = postsArr.optJSONObject(i) ?: continue
                 val ptitle = p.optString("title").ifBlank { p.optString("name") ?: "" }
                 if (ptitle.isBlank()) continue
-
-                val pNorm = ptitle.normaliseTitle()
-                // Exact normalised match: include always.
-                if (pNorm == qNorm) {
-                    matchingPostIds += p.optInt("id", -1) to ptitle
-                    continue
-                }
-                // Strip "Season N" / "S<N>" from the post title and re-compare.
-                // "One Piece Season 2" → "one piece" which matches "one piece".
-                val pNormStripped = ptitle
-                    .replace(Regex("(?i)\\bseason\\s*\\d+\\b"), " ")
-                    .replace(Regex("(?i)\\bs\\s*\\d+\\b"), " ")
-                    .normaliseTitle()
-                if (pNormStripped == qNorm) {
-                    matchingPostIds += p.optInt("id", -1) to ptitle
-                    continue
-                }
-                // Title contains query (e.g. "One Piece Season 2" contains "one piece")
-                // AND similarity ≥ 0.5 — include as a season-specific post.
-                val score = titleSimilarity(ptitle, title)
-                if (score >= 0.5 && pNorm.contains(qNorm)) {
-                    matchingPostIds += p.optInt("id", -1) to ptitle
-                }
+                matchingPostIds += p.optInt("id", -1) to ptitle
             }
             if (matchingPostIds.isEmpty()) return false
 
@@ -1008,11 +985,29 @@ object WizstreamSources {
             //        risks excluding valid posts. The TV path already
             //        handles both singleVideo and non-singleVideo posts
             //        gracefully (it checks content JSONArray vs String).
-            val filteredDetails = if (isMovie) {
+            val typeFiltered = if (isMovie) {
                 postDetails.filter { it.optString("type", "") == "singleVideo" }
             } else {
                 postDetails
             }
+            if (typeFiltered.isEmpty()) return false
+
+            // 4b. Light relevance filter: drop posts whose cleaned title has
+            //     ZERO token overlap with the query. This prevents emitting
+            //     links for completely unrelated posts that the search API
+            //     returned as loose matches. We use a very low threshold
+            //     (≥1 shared token) so we don't reintroduce the v16 bug
+            //     where short titles like "Dune" got filtered out.
+            val qTokens = title.normaliseTitle().split(Regex("\\s+")).filter { it.length > 2 }.toSet()
+            val filteredDetails = if (qTokens.isEmpty()) {
+                typeFiltered
+            } else {
+                typeFiltered.filter { detail ->
+                    val ptitle = detail.optString("title", "").ifBlank { detail.optString("name", "") }
+                    val pTokens = ptitle.normaliseTitle().split(Regex("\\s+")).filter { it.length > 2 }.toSet()
+                    pTokens.intersect(qTokens).isNotEmpty()
+                }
+            }.ifEmpty { typeFiltered } // fallback: keep all if filter is too aggressive
             if (filteredDetails.isEmpty()) return false
 
             // 5. Route to movie or TV/anime path based on the user's request.
@@ -1549,6 +1544,17 @@ object WizstreamSources {
             subtitleCallback: (SubtitleFile) -> Unit,
             callback: (ExtractorLink) -> Unit,
         ): Boolean {
+            // Index each server as its own source group in the picker.
+            // This gives the user a clean hierarchy:
+            //   Wizstream • Cineby · Neon
+            //     ├── 1080p · Original audio
+            //     └── 720p · Original audio
+            //   Wizstream • Cineby · Yoru
+            //     ├── 2160p · 4K · Original audio
+            //     └── 1080p · Original audio
+            //   ...
+            val serverSourceLabel = "$srcLabel · ${server.displayName}"
+
             // Step 1 (seed) is already done by the caller — reuse the same
             // seed for all 8 servers to avoid 8x rate-limit on the seed endpoint.
 
@@ -1605,8 +1611,16 @@ object WizstreamSources {
                     val s = subtitles.optJSONObject(i) ?: continue
                     val subUrl = s.optStringOrNullCp("url") ?: s.optStringOrNullCp("file")
                         ?: s.optStringOrNullCp("src") ?: continue
-                    val subLabel = s.optStringOrNullCp("language") ?: s.optStringOrNullCp("label")
+                    val rawSubLabel = s.optStringOrNullCp("language") ?: s.optStringOrNullCp("label")
                         ?: s.optStringOrNullCp("lang") ?: s.optStringOrNullCp("name") ?: "Subtitle"
+                    // Prefix subtitle label with the server name so the user
+                    // can see which subtitles came from which server. This is
+                    // important because Cloudstream merges ALL subtitles from
+                    // ALL sources into one list — without the prefix the user
+                    // can't tell which subtitle matches their chosen source.
+                    // Example: "[Neon] English", "[Neon] Japanese",
+                    //           "[Yoru] English", "[Killjoy] German"
+                    val subLabel = "[${server.displayName}] $rawSubLabel"
                     subtitleCallback(SubtitleFile(subLabel, subUrl))
                 }
             }
@@ -1635,14 +1649,14 @@ object WizstreamSources {
                         // Use M3u8Helper to expand master playlist → per-quality links.
                         // CRITICAL: pass Referer+Origin headers to prevent 2004.
                         M3u8Helper.generateM3u8(
-                            source = srcLabel,
+                            source = serverSourceLabel,
                             streamUrl = safeUrl,
                             referer = "$SITE/",
                             headers = API_HEADERS,
                         ).forEach { link ->
                             callback(
                                 newExtractorLink(
-                                    source = srcLabel,
+                                    source = serverSourceLabel,
                                     name = name,
                                     url = link.url,
                                     type = ExtractorLinkType.M3U8,
@@ -1660,7 +1674,7 @@ object WizstreamSources {
                     ) {
                         callback(
                             newExtractorLink(
-                                source = srcLabel,
+                                source = serverSourceLabel,
                                 name = name,
                                 url = safeUrl,
                                 type = ExtractorLinkType.VIDEO,
@@ -1674,7 +1688,7 @@ object WizstreamSources {
                     } else if (safeUrl.contains(".mpd", true)) {
                         callback(
                             newExtractorLink(
-                                source = srcLabel,
+                                source = serverSourceLabel,
                                 name = name,
                                 url = safeUrl,
                                 type = ExtractorLinkType.DASH,
@@ -1698,14 +1712,14 @@ object WizstreamSources {
                     val name = buildLabel(server, "Auto", srcLabel)
                     if (safeUrl.contains(".m3u8", true)) {
                         M3u8Helper.generateM3u8(
-                            source = srcLabel,
+                            source = serverSourceLabel,
                             streamUrl = safeUrl,
                             referer = "$SITE/",
                             headers = API_HEADERS,
                         ).forEach { link ->
                             callback(
                                 newExtractorLink(
-                                    source = srcLabel,
+                                    source = serverSourceLabel,
                                     name = name,
                                     url = link.url,
                                     type = ExtractorLinkType.M3U8,
@@ -1733,14 +1747,14 @@ object WizstreamSources {
                             val name = buildLabel(server, q, srcLabel)
                             if (safeUrl.contains(".m3u8", true)) {
                                 M3u8Helper.generateM3u8(
-                                    source = srcLabel,
+                                    source = serverSourceLabel,
                                     streamUrl = safeUrl,
                                     referer = "$SITE/",
                                     headers = API_HEADERS,
                                 ).forEach { link ->
                                     callback(
                                         newExtractorLink(
-                                            source = srcLabel,
+                                            source = serverSourceLabel,
                                             name = name,
                                             url = link.url,
                                             type = ExtractorLinkType.M3U8,
@@ -1755,7 +1769,7 @@ object WizstreamSources {
                             } else {
                                 callback(
                                     newExtractorLink(
-                                        source = srcLabel,
+                                        source = serverSourceLabel,
                                         name = name,
                                         url = safeUrl,
                                         type = INFER_TYPE,
@@ -1774,15 +1788,34 @@ object WizstreamSources {
             return any
         }
 
+        /**
+         * Build the link NAME (not source) for a Cineby ExtractorLink.
+         * The `source` field is set to `serverSourceLabel` (e.g.,
+         * "Wizstream • Cineby · Neon") which groups all links from the
+         * same server together. The `name` field only contains quality +
+         * audio info, so the picker shows a clean hierarchy:
+         *
+         *   Wizstream • Cineby · Neon
+         *     ├── 1080p · Original audio
+         *     └── 720p · Original audio
+         */
         private fun buildLabel(server: CinebyServer, quality: String, srcLabel: String): String {
-            val parts = mutableListOf(srcLabel, server.displayName)
-            // Skip quality if it's just the language name (avoid duplicate).
+            val parts = mutableListOf<String>()
+            // Skip quality if it's just the language name (avoid duplicate
+            // with the audioLabel below).
             val isLangQuality = quality.equals(server.audioLabel, ignoreCase = true) ||
                 (server.qualityFilter != null && quality.equals(server.qualityFilter, ignoreCase = true))
             if (!isLangQuality && quality.isNotBlank() && quality != "Auto") {
                 parts += quality
             }
+            // If quality is "Auto" or a language name, show "Auto" as fallback
+            // so the user sees something useful.
+            if (parts.isEmpty() && (quality == "Auto" || isLangQuality)) {
+                parts += "Auto"
+            }
             server.audioLabel?.let { parts += "$it audio" }
+            // If we have no parts at all, return a minimal label.
+            if (parts.isEmpty()) parts += "Stream"
             return parts.joinToString(" · ")
         }
 
