@@ -1475,29 +1475,70 @@ object WizstreamSources {
             val imdbIdStr = imdbId?.takeIf { it.isNotBlank() }
                 ?: fetchImdbId(app, tmdbId, mediaType) ?: ""
 
-            // Hit all eligible servers in parallel.
+            // ── Fetch the seed ONCE per media item ──────────────────────────
+            // The seed URL is the same for ALL servers (same apiBase + mediaId),
+            // so fetching it 8 times (once per server) is wasteful and triggers
+            // rate-limiting on api.speedracelight.com. Fetch it once and reuse.
+            // The seed has a 30-second TTL — plenty for 8 sequential server calls.
+            val seed = fetchSeed(app, tmdbId)
+            if (seed.isBlank()) {
+                Log.d(TAG, "Cineby: seed fetch failed for tmdbId=$tmdbId")
+                return false
+            }
+
+            // Hit all eligible servers in parallel, but with bounded concurrency
+            // (3 at a time) to avoid rate-limiting on api.speedracelight.com.
+            // The "first works, rest fail" bug was caused by firing 24 requests
+            // (8 seeds + 8 sources + 8 decrypts) simultaneously — the backend
+            // rate-limited the IP after the first batch.
             val eligible = SERVERS.filter { !it.movieOnly || isMovie }
+            val gate = Semaphore(3)
             var any = false
             coroutineScope {
                 eligible.map { server ->
                     async(Dispatchers.IO) {
-                        runCatching {
-                            resolveOneServer(
-                                app, server, tmdbId, title, yearStr, imdbIdStr,
-                                mediaType, seasonId, episodeId,
-                                srcLabel, subtitleCallback, callback,
-                            )
-                        }.getOrDefault(false)
+                        gate.withPermit {
+                            runCatching {
+                                resolveOneServer(
+                                    app, server, tmdbId, seed, title, yearStr, imdbIdStr,
+                                    mediaType, seasonId, episodeId,
+                                    srcLabel, subtitleCallback, callback,
+                                )
+                            }.onFailure {
+                                Log.d(TAG, "Cineby: server ${server.displayName} failed: ${it.message}")
+                            }.getOrDefault(false)
+                        }
                     }
                 }.awaitAll().forEach { if (it) any = true }
             }
+            if (!any) {
+                Log.d(TAG, "Cineby: all servers failed for tmdbId=$tmdbId title=$title")
+            }
             return any
+        }
+
+        /**
+         * Fetch the seed ONCE per media item. The seed is valid for 30 seconds
+         * and is the same for all 8 servers (same apiBase + mediaId).
+         * Uses cacheTime=0 to prevent Cloudstream from caching the seed
+         * response across different media items.
+         */
+        private suspend fun fetchSeed(app: Requests, tmdbId: Int): String {
+            val seedUrl = "$API_BASE/seed?mediaId=$tmdbId"
+            val resp = runCatching {
+                app.get(seedUrl, headers = API_HEADERS, cacheTime = 0, timeout = 10_000)
+            }.getOrNull() ?: return ""
+            if (resp.code !in 200..299 || resp.text.isBlank()) return ""
+            return runCatching {
+                JSONObject(resp.text).optString("seed", "")
+            }.getOrDefault("")
         }
 
         private suspend fun resolveOneServer(
             app: Requests,
             server: CinebyServer,
             tmdbId: Int,
+            seed: String,
             title: String,
             yearStr: String,
             imdbIdStr: String,
@@ -1508,15 +1549,8 @@ object WizstreamSources {
             subtitleCallback: (SubtitleFile) -> Unit,
             callback: (ExtractorLink) -> Unit,
         ): Boolean {
-            // Step 1: Fetch seed.
-            val seedUrl = "$API_BASE/seed?mediaId=$tmdbId"
-            val seedResp = runCatching {
-                app.get(seedUrl, headers = API_HEADERS, timeout = 10_000)
-            }.getOrNull() ?: return false
-            if (seedResp.code !in 200..299 || seedResp.text.isBlank()) return false
-            val seed = runCatching {
-                JSONObject(seedResp.text).optString("seed", "")
-            }.getOrDefault("").ifBlank { return false }
+            // Step 1 (seed) is already done by the caller — reuse the same
+            // seed for all 8 servers to avoid 8x rate-limit on the seed endpoint.
 
             // Step 2: Fetch encrypted sources.
             val titleDoubled = doubleEncode(title)
@@ -1534,7 +1568,7 @@ object WizstreamSources {
                 server.language?.let { append("&language=").append(it) }
             }
             val srcResp = runCatching {
-                app.get(srcUrl, headers = API_HEADERS, timeout = 15_000)
+                app.get(srcUrl, headers = API_HEADERS, cacheTime = 0, timeout = 15_000)
             }.getOrNull() ?: return false
             if (srcResp.code !in 200..299 || srcResp.text.isBlank()) return false
             val encryptedText = srcResp.text
@@ -1556,6 +1590,7 @@ object WizstreamSources {
                     DECRYPT_API,
                     headers = API_HEADERS + ("Content-Type" to "application/json"),
                     requestBody = decBody.toRequestBody("application/json".toMediaTypeOrNull()),
+                    cacheTime = 0,
                     timeout = 15_000,
                 )
             }.getOrNull() ?: return false
@@ -1757,7 +1792,7 @@ object WizstreamSources {
             // Try the keyless proxy first.
             val proxyUrl = "$TMDB_PROXY/$mediaType/$tmdbId?language=en-US"
             val proxyResp = runCatching {
-                app.get(proxyUrl, headers = API_HEADERS, timeout = 8_000)
+                app.get(proxyUrl, headers = API_HEADERS, cacheTime = 0, timeout = 8_000)
             }.getOrNull()
             if (proxyResp != null && proxyResp.code in 200..299 && proxyResp.text.isNotBlank()) {
                 val json = runCatching { JSONObject(proxyResp.text) }.getOrNull()
@@ -1773,7 +1808,7 @@ object WizstreamSources {
             // Fall back to TMDB direct with API key.
             val directUrl = "https://api.themoviedb.org/3/$mediaType/$tmdbId?api_key=$TMDB_KEY&language=en-US"
             val directResp = runCatching {
-                app.get(directUrl, headers = API_HEADERS, timeout = 8_000)
+                app.get(directUrl, headers = API_HEADERS, cacheTime = 0, timeout = 8_000)
             }.getOrNull() ?: return null
             if (directResp.code !in 200..299 || directResp.text.isBlank()) return null
             val json = runCatching { JSONObject(directResp.text) }.getOrNull() ?: return null
@@ -1789,7 +1824,7 @@ object WizstreamSources {
             // Try the keyless proxy with append_to_response=external_ids.
             val proxyUrl = "$TMDB_PROXY/$mediaType/$tmdbId?append_to_response=external_ids&language=en-US"
             val proxyResp = runCatching {
-                app.get(proxyUrl, headers = API_HEADERS, timeout = 8_000)
+                app.get(proxyUrl, headers = API_HEADERS, cacheTime = 0, timeout = 8_000)
             }.getOrNull()
             if (proxyResp != null && proxyResp.code in 200..299 && proxyResp.text.isNotBlank()) {
                 val json = runCatching { JSONObject(proxyResp.text) }.getOrNull()
@@ -1799,7 +1834,7 @@ object WizstreamSources {
             val directUrl = "https://api.themoviedb.org/3/$mediaType/$tmdbId" +
                 "?api_key=$TMDB_KEY&append_to_response=external_ids&language=en-US"
             val directResp = runCatching {
-                app.get(directUrl, headers = API_HEADERS, timeout = 8_000)
+                app.get(directUrl, headers = API_HEADERS, cacheTime = 0, timeout = 8_000)
             }.getOrNull() ?: return null
             if (directResp.code !in 200..299 || directResp.text.isBlank()) return null
             val json = runCatching { JSONObject(directResp.text) }.getOrNull() ?: return null
