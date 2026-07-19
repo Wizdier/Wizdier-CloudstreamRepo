@@ -513,6 +513,8 @@ class WizstreamAnimeProvider : MainAPI() {
         // sites (Cineplex BD / FTPBD / Circle FTP / CTGMovies) index
         // reasonably well via their anime categories. WizstreamSources
         // runs all 4 sites in parallel and emits any matches it finds.
+        // Pass tmdbId+imdbId so CinebyResolver can call the Cineby API
+        // (which requires a TMDB ID for its /seed endpoint).
         val sourceJob = async(Dispatchers.IO) {
             runCatching {
                 WizstreamSources.resolveAll(
@@ -533,6 +535,8 @@ class WizstreamAnimeProvider : MainAPI() {
                             anyFound = true
                         }
                     },
+                    tmdbId = ctx.tmdbId,
+                    imdbId = ctx.imdbId,
                 )
             }.getOrDefault(false)
         }

@@ -467,6 +467,8 @@ class WizstreamProvider : MainAPI() {
         // Run the 4 source extensions' search+loadLinks in parallel with
         // the Vid[x] embed family. WizstreamSources handles its own internal
         // concurrency (4-way), so we just await the whole batch here.
+        // Pass tmdbId+imdbId so CinebyResolver can call the Cineby API
+        // (which requires a TMDB ID for its /seed endpoint).
         val sourceJob = async(Dispatchers.IO) {
             runCatching {
                 WizstreamSources.resolveAll(
@@ -487,6 +489,8 @@ class WizstreamProvider : MainAPI() {
                             anyFound = true
                         }
                     },
+                    tmdbId = ctx.tmdbId,
+                    imdbId = ctx.imdbId,
                 )
             }.getOrDefault(false)
         }

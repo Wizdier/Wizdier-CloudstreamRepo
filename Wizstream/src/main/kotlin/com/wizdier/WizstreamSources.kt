@@ -8,6 +8,8 @@ import com.lagradost.nicehttp.Requests
 import kotlinx.coroutines.*
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
+import okhttp3.MediaType.Companion.toMediaTypeOrNull
+import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
 import org.jsoup.Jsoup
@@ -38,14 +40,19 @@ object WizstreamSources {
         labelPrefix: String,
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit,
+        tmdbId: Int? = null,
+        imdbId: String? = null,
     ): Boolean = coroutineScope {
-        if (title.isBlank()) return@coroutineScope false
+        if (title.isBlank() && tmdbId == null && imdbId == null) {
+            return@coroutineScope false
+        }
 
         val sources = listOf(
             CineplexBdResolver,
             FtpBdResolver,
             CircleFtpResolver,
             CtgMoviesResolver,
+            CinebyResolver,
         )
 
         val gate = Semaphore(4)
@@ -63,6 +70,8 @@ object WizstreamSources {
                             labelPrefix = labelPrefix,
                             subtitleCallback = subtitleCallback,
                             callback = callback,
+                            tmdbId = tmdbId,
+                            imdbId = imdbId,
                         )
                     }.getOrDefault(false)
                 }
@@ -266,6 +275,8 @@ object WizstreamSources {
             labelPrefix: String,
             subtitleCallback: (SubtitleFile) -> Unit,
             callback: (ExtractorLink) -> Unit,
+            tmdbId: Int? = null,
+            imdbId: String? = null,
         ): Boolean
     }
 
@@ -293,6 +304,8 @@ object WizstreamSources {
             labelPrefix: String,
             subtitleCallback: (SubtitleFile) -> Unit,
             callback: (ExtractorLink) -> Unit,
+            tmdbId: Int?,
+            imdbId: String?,
         ): Boolean {
             // 1. Search via search.php — same selectors as CineplexBDProvider.
             val searchUrl = "$SITE/search.php?q=${encodeUrl(title)}&page=1"
@@ -661,6 +674,8 @@ object WizstreamSources {
             labelPrefix: String,
             subtitleCallback: (SubtitleFile) -> Unit,
             callback: (ExtractorLink) -> Unit,
+            tmdbId: Int?,
+            imdbId: String?,
         ): Boolean {
             // FTPBD has separate post_type for movies vs tv_shows. Anime
             // lives under tv_shows with "Anime" in the title or /tv_shows/
@@ -896,6 +911,8 @@ object WizstreamSources {
             labelPrefix: String,
             subtitleCallback: (SubtitleFile) -> Unit,
             callback: (ExtractorLink) -> Unit,
+            tmdbId: Int?,
+            imdbId: String?,
         ): Boolean {
             // 1. Search posts — fetch all results, not just the best one.
             val searchText = fetchWithFallback(
@@ -981,16 +998,20 @@ object WizstreamSources {
             }
             if (postDetails.isEmpty()) return false
 
-            // 4. Filter posts by type NOW (after fetching details, where
-            //    `type` is available). This is the correct place to filter:
-            //      • isMovie=true  → keep only singleVideo posts
-            //      • isMovie=false → keep only non-singleVideo posts (TV/anime)
-            //    This prevents a movie post (e.g. "One Piece Film Gold")
-            //    from polluting the TV/anime path, AND prevents TV/anime
-            //    posts from polluting the movie path.
-            val filteredDetails = postDetails.filter { detail ->
-                val pType = detail.optString("type", "")
-                if (isMovie) pType == "singleVideo" else pType != "singleVideo"
+            // 4. Filter posts by type ONLY for movies. For TV/anime, keep ALL
+            //    posts (the pre-v11 behaviour that was working). This is
+            //    safer because:
+            //      • For movies (isMovie=true): we need only singleVideo
+            //        posts, so filtering is correct.
+            //      • For TV/anime (isMovie=false): the type field might be
+            //        inconsistent or missing for some posts. Filtering here
+            //        risks excluding valid posts. The TV path already
+            //        handles both singleVideo and non-singleVideo posts
+            //        gracefully (it checks content JSONArray vs String).
+            val filteredDetails = if (isMovie) {
+                postDetails.filter { it.optString("type", "") == "singleVideo" }
+            } else {
+                postDetails
             }
             if (filteredDetails.isEmpty()) return false
 
@@ -1198,12 +1219,17 @@ object WizstreamSources {
             primary: String,
             fallback: String,
         ): String? {
+            // CRITICAL: verify=false and cacheTime=60 are REQUIRED for the
+            // CircleFTP API to work — the standalone CircleFtpHttp uses
+            // these exact flags. Without verify=false, the API returns
+            // empty/error responses on BDIX networks. Without cacheTime,
+            // every request hits the server (no caching).
             val a = runCatching {
-                app.get(primary, headers = HEADERS, timeout = 10_000)
+                app.get(primary, headers = HEADERS, verify = false, cacheTime = 60, timeout = 10_000)
             }.getOrNull()
             if (a != null && a.code in 200..299 && a.text.isNotBlank()) return a.text
             val b = runCatching {
-                app.get(fallback, headers = HEADERS, timeout = 10_000)
+                app.get(fallback, headers = HEADERS, verify = false, cacheTime = 60, timeout = 10_000)
             }.getOrNull()
             if (b != null && b.code in 200..299 && b.text.isNotBlank()) return b.text
             return null
@@ -1237,6 +1263,8 @@ object WizstreamSources {
             labelPrefix: String,
             subtitleCallback: (SubtitleFile) -> Unit,
             callback: (ExtractorLink) -> Unit,
+            tmdbId: Int?,
+            imdbId: String?,
         ): Boolean {
             val kinds = if (isMovie) listOf("movies", "tv", "anime") else listOf("tv", "anime", "movies")
             val params = mapOf("search" to title)
@@ -1345,6 +1373,462 @@ object WizstreamSources {
 
             return ""
         }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    //  Resolver 5: Cineby  (https://www.cineby.at)
+    //
+    //  Ported from the Aniyomi Cineby extension (Wizdier-AniRepo).
+    //  Cineby is a Next.js SPA that delegates video resolution to a
+    //  Videasy/Insertunit backend at api.speedracelight.com.
+    //
+    //  Three-step resolution flow:
+    //    1. GET /seed?mediaId={tmdbId} → {seed, ttlMs}
+    //    2. GET /{serverPath}/sources-with-title?...&enc=2&seed={seed}
+    //       → encrypted ciphertext (or {"error":"STREAMCRYPTO_SEED_INVALID"})
+    //    3. POST enc-dec.app/api/dec-videasy {text, id, seed}
+    //       → {sources:[{url,quality}], subtitles:[...]}
+    //
+    //  8 servers on api.speedracelight.com:
+    //    Neon    (neon2)     — Original audio, movies + TV
+    //    Yoru    (cdn)       — Original audio, MOVIE ONLY, may have 4K
+    //    Breach  (m4uhd)     — Original audio, movies + TV
+    //    Vyse    (hdmovie)   — English quality filter
+    //    Killjoy (meine)     — German audio
+    //    Fade    (hdmovie)   — Hindi quality filter
+    //    Omen    (lamovie)   — Spanish audio
+    //    Raze    (superflix) — Portuguese audio
+    //
+    //  CRITICAL for HTTP 2004/3003 prevention:
+    //    • Send Referer+Origin headers on EVERY request to api.speedracelight.com
+    //    • Set ExtractorLink.referer = "https://www.cineby.at/" on emitted links
+    //    • Filter out non-http URLs and HTML bodies before emitting (prevents 3003)
+    //    • Force-rewrite http:// → https:// (prevents 2007 cleartext error)
+    //    • Title must be DOUBLE percent-encoded
+    //    • Always pass &enc=2 and &seed=...
+    // ════════════════════════════════════════════════════════════════════════
+
+    internal object CinebyResolver : SourceResolver {
+        private const val SITE = "https://www.cineby.at"
+        private const val API_BASE = "https://api.speedracelight.com"
+        private const val DECRYPT_API = "https://enc-dec.app/api/dec-videasy"
+        private const val TMDB_PROXY = "https://db.speedracelight.com/3"
+        private const val LABEL = "Cineby"
+
+        // TMDB API key — same as the one used in WizstreamProvider.
+        // Used only for the year lookup when ctx.year is null.
+        private const val TMDB_KEY = "98ae14df2b8d8f8f8136499daf79f0e0"
+
+        private val API_HEADERS = mapOf(
+            "User-Agent" to UA,
+            "Referer" to "$SITE/",
+            "Origin" to SITE,
+            "Accept" to "application/json, text/plain, */*",
+            "Accept-Language" to "en-US,en;q=0.9",
+        )
+
+        private data class CinebyServer(
+            val displayName: String,
+            val path: String,
+            val language: String? = null,
+            val movieOnly: Boolean = false,
+            val audioLabel: String? = null,
+            val qualityFilter: String? = null,
+        )
+
+        private val SERVERS = listOf(
+            CinebyServer("Neon",    "neon2",    audioLabel = "Original"),
+            CinebyServer("Yoru",    "cdn",      movieOnly = true,  audioLabel = "Original"),
+            CinebyServer("Breach",  "m4uhd",    audioLabel = "Original"),
+            CinebyServer("Vyse",    "hdmovie",  qualityFilter = "English", audioLabel = "Original"),
+            CinebyServer("Killjoy", "meine",    language = "german", audioLabel = "German"),
+            CinebyServer("Fade",    "hdmovie",  qualityFilter = "Hindi",  audioLabel = "Hindi"),
+            CinebyServer("Omen",    "lamovie",  audioLabel = "Spanish"),
+            CinebyServer("Raze",    "superflix",audioLabel = "Portuguese"),
+        )
+
+        override suspend fun resolve(
+            app: Requests,
+            title: String,
+            year: Int?,
+            isMovie: Boolean,
+            season: Int?,
+            episode: Int?,
+            labelPrefix: String,
+            subtitleCallback: (SubtitleFile) -> Unit,
+            callback: (ExtractorLink) -> Unit,
+            tmdbId: Int?,
+            imdbId: String?,
+        ): Boolean {
+            // Cineby REQUIRES a TMDB ID — without it we can't call the API.
+            if (tmdbId == null) return false
+            val srcLabel = "$labelPrefix • $LABEL"
+            val seasonId = if (isMovie) "1" else (season?.toString() ?: "1")
+            val episodeId = if (isMovie) "1" else (episode?.toString() ?: "1")
+            val mediaType = if (isMovie) "movie" else "tv"
+
+            // If year is null, look it up via TMDB proxy so the backend can
+            // disambiguate (improves hit-rate).
+            val yearStr = year?.toString() ?: fetchYear(app, tmdbId, mediaType) ?: ""
+
+            // If IMDB ID wasn't provided, look it up via TMDB external_ids.
+            val imdbIdStr = imdbId?.takeIf { it.isNotBlank() }
+                ?: fetchImdbId(app, tmdbId, mediaType) ?: ""
+
+            // Hit all eligible servers in parallel.
+            val eligible = SERVERS.filter { !it.movieOnly || isMovie }
+            var any = false
+            coroutineScope {
+                eligible.map { server ->
+                    async(Dispatchers.IO) {
+                        runCatching {
+                            resolveOneServer(
+                                app, server, tmdbId, title, yearStr, imdbIdStr,
+                                mediaType, seasonId, episodeId,
+                                srcLabel, subtitleCallback, callback,
+                            )
+                        }.getOrDefault(false)
+                    }
+                }.awaitAll().forEach { if (it) any = true }
+            }
+            return any
+        }
+
+        private suspend fun resolveOneServer(
+            app: Requests,
+            server: CinebyServer,
+            tmdbId: Int,
+            title: String,
+            yearStr: String,
+            imdbIdStr: String,
+            mediaType: String,
+            seasonId: String,
+            episodeId: String,
+            srcLabel: String,
+            subtitleCallback: (SubtitleFile) -> Unit,
+            callback: (ExtractorLink) -> Unit,
+        ): Boolean {
+            // Step 1: Fetch seed.
+            val seedUrl = "$API_BASE/seed?mediaId=$tmdbId"
+            val seedResp = runCatching {
+                app.get(seedUrl, headers = API_HEADERS, timeout = 10_000)
+            }.getOrNull() ?: return false
+            if (seedResp.code !in 200..299 || seedResp.text.isBlank()) return false
+            val seed = runCatching {
+                JSONObject(seedResp.text).optString("seed", "")
+            }.getOrDefault("").ifBlank { return false }
+
+            // Step 2: Fetch encrypted sources.
+            val titleDoubled = doubleEncode(title)
+            val srcUrl = buildString {
+                append(API_BASE).append('/').append(server.path).append("/sources-with-title")
+                append("?title=").append(titleDoubled)
+                append("&mediaType=").append(mediaType)
+                append("&year=").append(encodeUrl(yearStr))
+                append("&episodeId=").append(episodeId)
+                append("&seasonId=").append(seasonId)
+                append("&tmdbId=").append(tmdbId)
+                append("&enc=2")
+                append("&seed=").append(encodeUrl(seed))
+                if (imdbIdStr.isNotBlank()) append("&imdbId=").append(encodeUrl(imdbIdStr))
+                server.language?.let { append("&language=").append(it) }
+            }
+            val srcResp = runCatching {
+                app.get(srcUrl, headers = API_HEADERS, timeout = 15_000)
+            }.getOrNull() ?: return false
+            if (srcResp.code !in 200..299 || srcResp.text.isBlank()) return false
+            val encryptedText = srcResp.text
+            // Detect error JSON — skip if it's an error.
+            if (encryptedText.trimStart().startsWith("{") &&
+                (encryptedText.contains("\"error\"") || encryptedText.contains("STREAMCRYPTO_SEED_INVALID"))
+            ) {
+                return false
+            }
+
+            // Step 3: Decrypt via enc-dec.app.
+            val decBody = JSONObject().apply {
+                put("text", encryptedText)
+                put("id", tmdbId.toString())
+                put("seed", seed)
+            }.toString()
+            val decResp = runCatching {
+                app.post(
+                    DECRYPT_API,
+                    headers = API_HEADERS + ("Content-Type" to "application/json"),
+                    requestBody = decBody.toRequestBody("application/json".toMediaTypeOrNull()),
+                    timeout = 15_000,
+                )
+            }.getOrNull() ?: return false
+            if (decResp.code !in 200..299 || decResp.text.isBlank()) return false
+            val decJson = runCatching { JSONObject(decResp.text) }.getOrNull() ?: return false
+            val result = decJson.optJSONObject("result") ?: return false
+
+            // Step 4: Emit sources + subtitles.
+            val subtitles = result.optJSONArray("subtitles")
+            if (subtitles != null) {
+                for (i in 0 until subtitles.length()) {
+                    val s = subtitles.optJSONObject(i) ?: continue
+                    val subUrl = s.optStringOrNullCp("url") ?: s.optStringOrNullCp("file")
+                        ?: s.optStringOrNullCp("src") ?: continue
+                    val subLabel = s.optStringOrNullCp("language") ?: s.optStringOrNullCp("label")
+                        ?: s.optStringOrNullCp("lang") ?: s.optStringOrNullCp("name") ?: "Subtitle"
+                    subtitleCallback(SubtitleFile(subLabel, subUrl))
+                }
+            }
+
+            var any = false
+            val sourcesArr = result.optJSONArray("sources")
+            if (sourcesArr != null) {
+                for (i in 0 until sourcesArr.length()) {
+                    val s = sourcesArr.optJSONObject(i) ?: continue
+                    val url = s.optStringOrNullCp("url") ?: continue
+                    // FILTER: prevent 3003 — only emit real http(s) URLs.
+                    if (!url.startsWith("http")) continue
+                    // Force https to prevent 2007 cleartext error.
+                    val safeUrl = if (url.startsWith("http://")) {
+                        url.replaceFirst("http://", "https://")
+                    } else url
+                    val quality = s.optStringOrNullCp("quality") ?: "Auto"
+
+                    // Apply server's qualityFilter (Vyse=English, Fade=Hindi).
+                    if (server.qualityFilter != null &&
+                        !quality.equals(server.qualityFilter, ignoreCase = true)
+                    ) continue
+
+                    val name = buildLabel(server, quality, srcLabel)
+                    if (safeUrl.contains(".m3u8", true)) {
+                        // Use M3u8Helper to expand master playlist → per-quality links.
+                        // CRITICAL: pass Referer+Origin headers to prevent 2004.
+                        M3u8Helper.generateM3u8(
+                            source = srcLabel,
+                            streamUrl = safeUrl,
+                            referer = "$SITE/",
+                            headers = API_HEADERS,
+                        ).forEach { link ->
+                            callback(
+                                newExtractorLink(
+                                    source = srcLabel,
+                                    name = name,
+                                    url = link.url,
+                                    type = ExtractorLinkType.M3U8,
+                                ) {
+                                    this.referer = "$SITE/"
+                                    this.quality = link.quality
+                                    this.headers = API_HEADERS
+                                }
+                            )
+                            any = true
+                        }
+                    } else if (safeUrl.contains(".mp4", true) ||
+                        safeUrl.contains(".mkv", true) ||
+                        safeUrl.contains(".webm", true)
+                    ) {
+                        callback(
+                            newExtractorLink(
+                                source = srcLabel,
+                                name = name,
+                                url = safeUrl,
+                                type = ExtractorLinkType.VIDEO,
+                            ) {
+                                this.referer = "$SITE/"
+                                this.quality = qualityFromName(safeUrl)
+                                this.headers = API_HEADERS
+                            }
+                        )
+                        any = true
+                    } else if (safeUrl.contains(".mpd", true)) {
+                        callback(
+                            newExtractorLink(
+                                source = srcLabel,
+                                name = name,
+                                url = safeUrl,
+                                type = ExtractorLinkType.DASH,
+                            ) {
+                                this.referer = "$SITE/"
+                                this.quality = qualityFromName(safeUrl)
+                                this.headers = API_HEADERS
+                            }
+                        )
+                        any = true
+                    }
+                    // Else: skip — the URL is likely a non-media resource.
+                }
+            } else {
+                // Legacy shape 1: {url:"...m3u8", subtitles:[...]}
+                val singleUrl = result.optStringOrNullCp("url")
+                if (singleUrl != null && singleUrl.startsWith("http")) {
+                    val safeUrl = if (singleUrl.startsWith("http://")) {
+                        singleUrl.replaceFirst("http://", "https://")
+                    } else singleUrl
+                    val name = buildLabel(server, "Auto", srcLabel)
+                    if (safeUrl.contains(".m3u8", true)) {
+                        M3u8Helper.generateM3u8(
+                            source = srcLabel,
+                            streamUrl = safeUrl,
+                            referer = "$SITE/",
+                            headers = API_HEADERS,
+                        ).forEach { link ->
+                            callback(
+                                newExtractorLink(
+                                    source = srcLabel,
+                                    name = name,
+                                    url = link.url,
+                                    type = ExtractorLinkType.M3U8,
+                                ) {
+                                    this.referer = "$SITE/"
+                                    this.quality = link.quality
+                                    this.headers = API_HEADERS
+                                }
+                            )
+                            any = true
+                        }
+                    }
+                } else {
+                    // Legacy shape 2: {streams:{"1080p":"url","720p":"url"}, subtitles:[...]}
+                    val streams = result.optJSONObject("streams")
+                    if (streams != null) {
+                        val keys = streams.keys()
+                        while (keys.hasNext()) {
+                            val q = keys.next()
+                            val url = streams.optString(q, "").ifBlank { continue }
+                            if (!url.startsWith("http")) continue
+                            val safeUrl = if (url.startsWith("http://")) {
+                                url.replaceFirst("http://", "https://")
+                            } else url
+                            val name = buildLabel(server, q, srcLabel)
+                            if (safeUrl.contains(".m3u8", true)) {
+                                M3u8Helper.generateM3u8(
+                                    source = srcLabel,
+                                    streamUrl = safeUrl,
+                                    referer = "$SITE/",
+                                    headers = API_HEADERS,
+                                ).forEach { link ->
+                                    callback(
+                                        newExtractorLink(
+                                            source = srcLabel,
+                                            name = name,
+                                            url = link.url,
+                                            type = ExtractorLinkType.M3U8,
+                                        ) {
+                                            this.referer = "$SITE/"
+                                            this.quality = link.quality
+                                            this.headers = API_HEADERS
+                                        }
+                                    )
+                                    any = true
+                                }
+                            } else {
+                                callback(
+                                    newExtractorLink(
+                                        source = srcLabel,
+                                        name = name,
+                                        url = safeUrl,
+                                        type = INFER_TYPE,
+                                    ) {
+                                        this.referer = "$SITE/"
+                                        this.quality = qualityFromName(q)
+                                        this.headers = API_HEADERS
+                                    }
+                                )
+                                any = true
+                            }
+                        }
+                    }
+                }
+            }
+            return any
+        }
+
+        private fun buildLabel(server: CinebyServer, quality: String, srcLabel: String): String {
+            val parts = mutableListOf(srcLabel, server.displayName)
+            // Skip quality if it's just the language name (avoid duplicate).
+            val isLangQuality = quality.equals(server.audioLabel, ignoreCase = true) ||
+                (server.qualityFilter != null && quality.equals(server.qualityFilter, ignoreCase = true))
+            if (!isLangQuality && quality.isNotBlank() && quality != "Auto") {
+                parts += quality
+            }
+            server.audioLabel?.let { parts += "$it audio" }
+            return parts.joinToString(" · ")
+        }
+
+        // ── TMDB helpers (use the keyless proxy first, fall back to TMDB direct) ──
+
+        private suspend fun fetchYear(app: Requests, tmdbId: Int, mediaType: String): String? {
+            // Try the keyless proxy first.
+            val proxyUrl = "$TMDB_PROXY/$mediaType/$tmdbId?language=en-US"
+            val proxyResp = runCatching {
+                app.get(proxyUrl, headers = API_HEADERS, timeout = 8_000)
+            }.getOrNull()
+            if (proxyResp != null && proxyResp.code in 200..299 && proxyResp.text.isNotBlank()) {
+                val json = runCatching { JSONObject(proxyResp.text) }.getOrNull()
+                if (json != null) {
+                    val dateStr = if (mediaType == "movie") {
+                        json.optStringOrNullCp("release_date")
+                    } else {
+                        json.optStringOrNullCp("first_air_date")
+                    }
+                    dateStr?.substringBefore("-")?.takeIf { it.length == 4 }?.let { return it }
+                }
+            }
+            // Fall back to TMDB direct with API key.
+            val directUrl = "https://api.themoviedb.org/3/$mediaType/$tmdbId?api_key=$TMDB_KEY&language=en-US"
+            val directResp = runCatching {
+                app.get(directUrl, headers = API_HEADERS, timeout = 8_000)
+            }.getOrNull() ?: return null
+            if (directResp.code !in 200..299 || directResp.text.isBlank()) return null
+            val json = runCatching { JSONObject(directResp.text) }.getOrNull() ?: return null
+            val dateStr = if (mediaType == "movie") {
+                json.optStringOrNullCp("release_date")
+            } else {
+                json.optStringOrNullCp("first_air_date")
+            }
+            return dateStr?.substringBefore("-")?.takeIf { it.length == 4 }
+        }
+
+        private suspend fun fetchImdbId(app: Requests, tmdbId: Int, mediaType: String): String? {
+            // Try the keyless proxy with append_to_response=external_ids.
+            val proxyUrl = "$TMDB_PROXY/$mediaType/$tmdbId?append_to_response=external_ids&language=en-US"
+            val proxyResp = runCatching {
+                app.get(proxyUrl, headers = API_HEADERS, timeout = 8_000)
+            }.getOrNull()
+            if (proxyResp != null && proxyResp.code in 200..299 && proxyResp.text.isNotBlank()) {
+                val json = runCatching { JSONObject(proxyResp.text) }.getOrNull()
+                json?.optJSONObject("external_ids")?.optStringOrNullCp("imdb_id")?.let { return it }
+            }
+            // Fall back to TMDB direct.
+            val directUrl = "https://api.themoviedb.org/3/$mediaType/$tmdbId" +
+                "?api_key=$TMDB_KEY&append_to_response=external_ids&language=en-US"
+            val directResp = runCatching {
+                app.get(directUrl, headers = API_HEADERS, timeout = 8_000)
+            }.getOrNull() ?: return null
+            if (directResp.code !in 200..299 || directResp.text.isBlank()) return null
+            val json = runCatching { JSONObject(directResp.text) }.getOrNull() ?: return null
+            return json.optJSONObject("external_ids")?.optStringOrNullCp("imdb_id")
+        }
+
+        // ── Percent-encoding helpers (must match the Aniyomi implementation) ──
+
+        private const val HEX = "0123456789ABCDEF"
+
+        private fun pctEncode(s: String): String {
+            val bytes = s.toByteArray(Charsets.UTF_8)
+            val out = StringBuilder(bytes.size * 3)
+            for (raw in bytes) {
+                val c = raw.toInt() and 0xFF
+                val unreserved = (c in 0x30..0x39) || (c in 0x41..0x5A) || (c in 0x61..0x7A) ||
+                    c == 0x2D || c == 0x2E || c == 0x5F || c == 0x7E
+                if (unreserved) {
+                    out.append(c.toChar())
+                } else {
+                    out.append('%')
+                    out.append(HEX[(c ushr 4) and 0x0F])
+                    out.append(HEX[c and 0x0F])
+                }
+            }
+            return out.toString()
+        }
+
+        private fun doubleEncode(s: String): String = pctEncode(pctEncode(s))
     }
 }
 
