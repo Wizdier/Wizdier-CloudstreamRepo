@@ -358,6 +358,7 @@ class WizstreamProvider : MainAPI() {
                 episode = null,
                 title = title,
                 isMovie = true,
+                year = year,
             ).toJson()
             newMovieLoadResponse(title, url, TvType.Movie, data) {
                 this.posterUrl = posterUrl
@@ -474,7 +475,7 @@ class WizstreamProvider : MainAPI() {
                 WizstreamSources.resolveAll(
                     app = app,
                     title = ctx.title ?: "",
-                    year = null,
+                    year = ctx.year,
                     isMovie = ctx.isMovie,
                     season = s,
                     episode = e,
@@ -646,6 +647,7 @@ class WizstreamProvider : MainAPI() {
                 newEpisode(LinkContext(
                     imdbId = detail.imdbId, tmdbId = tmdbId,
                     season = season, episode = epNum, title = showTitle, isMovie = false,
+                    year = detail.year,
                 ).toJson()) {
                     name = "Episode $epNum"
                     this.season = season
@@ -671,6 +673,7 @@ class WizstreamProvider : MainAPI() {
                 episode = epNum,
                 title = showTitle,
                 isMovie = false,
+                year = detail.year,
             ).toJson()) {
                 this.name = name
                 this.season = season
@@ -723,6 +726,7 @@ class WizstreamProvider : MainAPI() {
         val episode: Int? = null,
         val title: String? = null,
         val isMovie: Boolean = false,
+        val year: Int? = null,   // (v18) TMDB year — needed for identity matching in BDIX resolvers
     ) {
         fun toJson(): String = JSONObject().apply {
             imdbId?.let { put("imdb_id", it) }
@@ -730,6 +734,7 @@ class WizstreamProvider : MainAPI() {
             season?.let { put("season", it) }
             episode?.let { put("episode", it) }
             title?.let { put("title", it) }
+            year?.let { put("year", it) }
             put("is_movie", isMovie)
         }.toString()
 
@@ -742,6 +747,7 @@ class WizstreamProvider : MainAPI() {
                     season = o.optIntOrNullWz("season"),
                     episode = o.optIntOrNullWz("episode"),
                     title = o.optStringOrNullWz("title"),
+                    year = o.optIntOrNullWz("year"),
                     isMovie = o.optBoolean("is_movie", false),
                 )
             }

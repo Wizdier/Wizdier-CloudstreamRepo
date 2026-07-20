@@ -371,6 +371,7 @@ class WizstreamAnimeProvider : MainAPI() {
             TvType.AnimeMovie -> listOf(newEpisode(LinkContext(
                 anilistId = id, imdbId = imdbId, tmdbId = tmdbId, malId = detail.malId,
                 season = null, episode = null, title = title, isMovie = true,
+                year = detail.year,
                 dub = DubStatus.Subbed,
             ).toJson()) { name = "Movie" })
             else -> (1..episodes).map { epNum ->
@@ -378,6 +379,7 @@ class WizstreamAnimeProvider : MainAPI() {
                 newEpisode(LinkContext(
                     anilistId = id, imdbId = imdbId, tmdbId = tmdbId, malId = detail.malId,
                     season = 1, episode = epNum, title = title, isMovie = false,
+                    year = detail.year,
                     dub = DubStatus.Subbed,
                 ).toJson()) {
                     name = epMeta?.title ?: "Episode $epNum"
@@ -520,7 +522,7 @@ class WizstreamAnimeProvider : MainAPI() {
                 WizstreamSources.resolveAll(
                     app = app,
                     title = ctx.title ?: "",
-                    year = null,
+                    year = ctx.year,
                     isMovie = ctx.isMovie,
                     season = ctx.season,
                     episode = ctx.episode,
@@ -898,6 +900,7 @@ class WizstreamAnimeProvider : MainAPI() {
         val episode: Int? = null,
         val title: String? = null,
         val isMovie: Boolean = false,
+        val year: Int? = null,   // (v18) identity matching for BDIX resolvers
         val dub: DubStatus = DubStatus.Subbed,
     ) {
         fun toJson(): String = JSONObject().apply {
@@ -908,6 +911,7 @@ class WizstreamAnimeProvider : MainAPI() {
             season?.let { put("season", it) }
             episode?.let { put("episode", it) }
             title?.let { put("title", it) }
+            year?.let { put("year", it) }
             put("is_movie", isMovie)
             put("dub", dub.ordinal)
         }.toString()
@@ -923,6 +927,7 @@ class WizstreamAnimeProvider : MainAPI() {
                     season = o.aOptInt("season"),
                     episode = o.aOptInt("episode"),
                     title = o.aOptStr("title"),
+                    year = o.aOptInt("year"),
                     isMovie = o.optBoolean("is_movie", false),
                     dub = DubStatus.values().getOrElse(o.optInt("dub", 0)) { DubStatus.Subbed },
                 ).also { require(it.anilistId != 0) }

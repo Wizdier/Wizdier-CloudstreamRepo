@@ -123,6 +123,101 @@ object WizstreamSources {
     internal fun encodeUrl(s: String): String =
         URLEncoder.encode(s, "UTF-8").replace("+", "%20")
 
+    // ═══════════════════════════════════════════════════════════════════════
+    //  Title-identity matching  (v18)
+    //
+    //  The BDIX search APIs return loose matches: searching "Scream" returns
+    //  every Scream franchise entry plus anything else with "scream" in the
+    //  title. Wizstream must attach links for THE movie/series TMDB says the
+    //  user opened — nothing else — so posts are checked for *identity*,
+    //  not token overlap:
+    //    • identity tokens = title tokens with quality/rip/codec/lang junk,
+    //      SxxEyy/Season markers, sizes and years stripped, roman numerals
+    //      unified with digits ("VI" == "6")
+    //    • a post matches when its identity tokens EQUAL the query's
+    //      (stop-words ignored) — or differ only by edition keywords — AND
+    //      the year (when both sides have one) is within ±1 of the TMDB year
+    //
+    //  This kills "the whole franchise in one video item" while still
+    //  allowing several posts of the SAME film (multiple encodes/cuts).
+    // ═══════════════════════════════════════════════════════════════════════
+
+    internal val IDENTITY_JUNK_REGEX = Regex(
+        "(?i)\\b(480p|576p|540p|720p|900p|1080p|1440p|2160p|4320p|[48]k|uhd|fhd|qhd|" +
+            "blu[- ]?ray|bluray|bdremux|bdrip|brrip|web[- ]?dl|webdl|webrip|hdrip|" +
+            "hd[- ]?rip|hdtv|pdtv|dvdrip|dvdscr|hdcam|hdts|hqcam|telesync|telecine|" +
+            "camrip|screener|predvd|x264|x265|h\\.?26[45]|hevc|avc|av1|vp9|xvid|divx|" +
+            "(?:8|10|12)[- ]?bit|hdr10\\+?|hdr|dolby[ -]?vision|sdr|" +
+            "aac|ac3|e[- ]?ac3|ddp?[- ]?5\\.1|ddp?[- ]?7\\.1|dts|truehd|atmos|mp3|flac|" +
+            "[257]\\.[01]|mkv|mp4|avi|mov|wmv|m4v|mpg|mpeg|hmulti|multi[- ]?audio|" +
+            "dual[- ]?audio|dubbed|dub|subbed|subs?|esubs?|korsub|hc|" +
+            "hindi|bengali|bangla|english|urdu|tamil|telugu|malayalam|kannada|nepali|" +
+            "korean|japanese|chinese|french|german|spanish|portuguese|italian|russian|" +
+            "arabic|turkish|persian|farsi|thai|" +
+            "proper|repack|internal|limited|r5|nf|amzn|atvp|hulu|dsnp|hotstar|" +
+            "open[- ]?matte|uncensored|readnfo|itunes|hybrid)\\b"
+    )
+
+    internal val IDENTITY_STOPWORDS = setOf("the", "a", "an", "of")
+
+    // Edition/cut words that do NOT make a film a different film.
+    internal val EDITION_TOKENS = setOf(
+        "extended", "directors", "director", "cut", "final", "unrated", "uncut",
+        "remastered", "remaster", "theatrical", "edition", "imax", "restored",
+        "definitive", "ultimate", "anniversary", "special", "redux"
+    )
+
+    private val ROMAN_EQUIV = mapOf(
+        "i" to "1", "ii" to "2", "iii" to "3", "iv" to "4", "v" to "5",
+        "vi" to "6", "vii" to "7", "viii" to "8", "ix" to "9", "x" to "10",
+    )
+
+    internal data class TitleMeta(val tokens: Set<String>, val year: Int?)
+
+    internal fun String.toTitleMeta(): TitleMeta {
+        var t = this
+        val yr = Regex("\\b(19|20)\\d{2}\\b").find(t)?.value?.toIntOrNull()
+        t = t
+            .replace(Regex("\\[[^]]*]"), " ")
+            .replace(Regex("\\([^)]*\\)"), " ")
+            .replace(Regex("(?i)\\b(19|20)\\d{2}\\b"), " ")
+            .replace(IDENTITY_JUNK_REGEX, " ")
+            .replace(Regex("(?i)\\bseason\\s*\\d{1,2}\\b"), " ")
+            .replace(Regex("(?i)\\bs\\d{1,2}\\s*e\\d{1,3}\\b"), " ")
+            .replace(Regex("(?i)\\bs\\d{1,2}\\b"), " ")
+            .replace(Regex("(?i)\\be\\d{1,3}\\b"), " ")
+            .replace(Regex("(?i)\\b(?:ep|episode)\\s*\\d{1,3}\\b"), " ")
+            .replace(Regex("(?i)\\b\\d+(?:[.,]\\d+)?\\s*(?:gb|mb|tb)\\b"), " ")
+        val toks = t.lowercase()
+            .replace(Regex("[^a-z0-9]+"), " ")
+            .split(Regex("\\s+"))
+            .filter { it.isNotBlank() }
+            .map { ROMAN_EQUIV[it] ?: it }
+            .toSet()
+        return TitleMeta(toks, yr)
+    }
+
+    /**
+     * True when [postTitle] is the SAME movie/series as the TMDB item
+     * ([queryTitle]/[queryYear]); false for franchise siblings, remakes with
+     * a different year, and unrelated partial matches. A post may add pure
+     * edition/cut keywords ("Extended Cut") and still be the same film, but
+     * any other extra token ("2", "VI", "Queens", "Collection") marks a
+     * DIFFERENT film.
+     */
+    internal fun isSameMediaTitle(postTitle: String, queryTitle: String, queryYear: Int?): Boolean {
+        val q = queryTitle.toTitleMeta()
+        val p = postTitle.toTitleMeta()
+        if (q.tokens.isEmpty() || p.tokens.isEmpty()) return false
+        // Year gate (Scream 1996 vs Scream 2022 — identical titles, different films).
+        if (q.year != null && p.year != null && kotlin.math.abs(q.year - p.year) > 1) return false
+        val missing = q.tokens - p.tokens - IDENTITY_STOPWORDS
+        val extra = p.tokens - q.tokens - IDENTITY_STOPWORDS
+        if (missing.isEmpty() && extra.isEmpty()) return true
+        if (missing.isEmpty() && extra.all { it in EDITION_TOKENS }) return true
+        return false
+    }
+
     internal fun ExtractorLink.relabel(newSource: String, newName: String): ExtractorLink =
         runBlocking {
             newExtractorLink(
@@ -362,12 +457,20 @@ object WizstreamSources {
             }.ifEmpty { candidates }
 
             // Exact-normalised match first, then fall back to highest similarity.
-            val qNorm = title.normaliseTitle()
-            val best = filtered.firstOrNull { (_, ct) -> ct.normaliseTitle() == qNorm }
-                ?: filtered.maxByOrNull { (_, ct) -> titleSimilarity(ct, title) }
-                ?: return false
-            // Require a minimum similarity to avoid false positives.
-            if (titleSimilarity(best.second, title) < 0.4) return false
+            // FIX (v18): identity matching. The old exact-then-Jaccard pick
+            // with a hard 0.4 cutoff silently rejected legitimate matches
+            // whenever the card title carried extras the TMDB title lacks
+            // (year, quality, "Bengali Dubbed", ...) — which is why
+            // CineplexBD looked dead inside Wizstream while the standalone
+            // (no auto-match gate, the user picks by hand) worked fine.
+            // Multiple candidates of the same film (quality variants) are
+            // still tried in best-similarity order.
+            val identityMatches = filtered.filter { (_, ct) -> isSameMediaTitle(ct, title, year) }
+            val best = identityMatches.maxByOrNull { (_, ct) -> titleSimilarity(ct, title) }
+                ?: run {
+                    Log.d(TAG, "CineplexBD: no identity match for '$title' (year=$year)")
+                    return false
+                }
 
             val srcLabel = "$labelPrefix • $LABEL"
 
@@ -715,14 +818,16 @@ object WizstreamSources {
             // normalizedTitle). This is critical for anime — without stripping
             // "[Hindi Dubbed]" / "Season 1", "One Piece" would match the wrong
             // series. Fall back to Jaccard similarity only if no exact match.
-            val qNorm = title.normaliseTitle()
-            val best = candidates
-                .distinctBy { it.first }
-                .firstOrNull { (_, ct) -> ct.normaliseTitle() == qNorm }
-                ?: candidates.distinctBy { it.first }
-                    .maxByOrNull { (_, ct) -> titleSimilarity(ct, title) }
-                ?: return false
-            if (titleSimilarity(best.second, title) < 0.4) return false
+            // (v18) identity matching with year gate — same fix as
+            // CineplexBD/CircleFTP; avoids both false rejects and franchise
+            // cross-contamination.
+            val identityMatches = candidates.distinctBy { it.first }
+                .filter { (_, ct) -> isSameMediaTitle(ct, title, year) }
+            val best = identityMatches.maxByOrNull { (_, ct) -> titleSimilarity(ct, title) }
+                ?: run {
+                    Log.d(TAG, "FTPBD: no identity match for '$title' (year=$year)")
+                    return false
+                }
 
             val srcLabel = "$labelPrefix • $LABEL"
             val detailHtml = runCatching {
@@ -925,7 +1030,20 @@ object WizstreamSources {
                 .getOrNull() ?: return false
             if (postsArr.length() == 0) return false
 
-            // 2. Collect ALL posts returned by the search API.
+            // 2. Collect all posts, then keep only the ones that ARE the
+            //    requested TMDB item.
+            //
+            //    FIX (v18): v17 collected EVERY post the search API returned
+            //    and the "4b" zero-token check only dropped posts with no
+            //    shared word — so "Scream" pulled in Scream 2/3/4/VI and
+            //    anything else containing "scream", and their links were all
+            //    merged into one video item. Posts are now identity-matched
+            //    (tokens + year) against the TMDB title; franchise siblings
+            //    and unrelated matches are dropped, while multiple posts of
+            //    the SAME film (different encodes / cuts / audio variants)
+            //    are kept. If NOTHING matches, we emit nothing from Circle
+            //    FTP — wrong links are worse than missing links.
+            val identityFiltered = mutableListOf<Pair<Int, String>>()
             //
             //    FIX (v17): The previous code filtered posts by title similarity
             //    (score >= 0.5 AND pNorm.contains(qNorm)) which was TOO STRICT.
@@ -942,14 +1060,26 @@ object WizstreamSources {
             //
             //    The search API itself does the relevance filtering server-side,
             //    so we trust its results. If the API returns 0 posts, we bail.
-            val matchingPostIds = mutableListOf<Pair<Int, String>>() // (id, title)
             for (i in 0 until postsArr.length()) {
                 val p = postsArr.optJSONObject(i) ?: continue
                 val ptitle = p.optString("title").ifBlank { p.optString("name") ?: "" }
                 if (ptitle.isBlank()) continue
-                matchingPostIds += p.optInt("id", -1) to ptitle
+                // Year hint for the identity check: title year first, then the
+                // post's date fields (API rows often carry them).
+                val postYear = Regex("\\b(19|20)\\d{2}\\b").find(ptitle)?.value?.toIntOrNull()
+                    ?: p.optStringOrNullCp("date")?.take(4)?.toIntOrNull()
+                    ?: p.optStringOrNullCp("created_at")?.take(4)?.toIntOrNull()
+                    ?: p.optStringOrNullCp("upload_date")?.take(4)?.toIntOrNull()
+                val effectiveYear = year ?: postYear
+                if (isSameMediaTitle(ptitle, title, effectiveYear)) {
+                    identityFiltered += p.optInt("id", -1) to ptitle
+                }
             }
-            if (matchingPostIds.isEmpty()) return false
+            val matchingPostIds = identityFiltered
+            if (matchingPostIds.isEmpty()) {
+                Log.d(TAG, "CircleFTP: no identity match for '$title' (year=$year) — skipping")
+                return false
+            }
 
             val srcLabel = "$labelPrefix • $LABEL"
             val mediaUrls = linkedSetOf<String>()
@@ -992,22 +1122,10 @@ object WizstreamSources {
             }
             if (typeFiltered.isEmpty()) return false
 
-            // 4b. Light relevance filter: drop posts whose cleaned title has
-            //     ZERO token overlap with the query. This prevents emitting
-            //     links for completely unrelated posts that the search API
-            //     returned as loose matches. We use a very low threshold
-            //     (≥1 shared token) so we don't reintroduce the v16 bug
-            //     where short titles like "Dune" got filtered out.
-            val qTokens = title.normaliseTitle().split(Regex("\\s+")).filter { it.length > 2 }.toSet()
-            val filteredDetails = if (qTokens.isEmpty()) {
-                typeFiltered
-            } else {
-                typeFiltered.filter { detail ->
-                    val ptitle = detail.optString("title", "").ifBlank { detail.optString("name", "") }
-                    val pTokens = ptitle.normaliseTitle().split(Regex("\\s+")).filter { it.length > 2 }.toSet()
-                    pTokens.intersect(qTokens).isNotEmpty()
-                }
-            }.ifEmpty { typeFiltered } // fallback: keep all if filter is too aggressive
+            // (v18) identity matching happened before the detail fetches —
+            // every post here is the requested title, so no relevance
+            // re-check (and no "keep everything" fallback) is needed.
+            val filteredDetails = typeFiltered
             if (filteredDetails.isEmpty()) return false
 
             // 5. Route to movie or TV/anime path based on the user's request.
@@ -1280,10 +1398,16 @@ object WizstreamSources {
 
             if (candidates.isEmpty()) return false
 
+            // (v18) identity matching — CTG takes a SINGLE best post, so a
+            // wrong pick emits a completely different film's links. Require
+            // identity (tokens + year), then order by similarity.
             val best = candidates
+                .filter { (_, _, ct) -> isSameMediaTitle(ct, title, year) }
                 .maxByOrNull { (_, _, ct) -> titleSimilarity(ct, title) }
-                ?: return false
-            if (titleSimilarity(best.third, title) < 0.4) return false
+                ?: run {
+                    Log.d(TAG, "CTGMovies: no identity match for '$title' (year=$year)")
+                    return false
+                }
 
             val detailText = apiGet(app, "/${best.first}/${encodeUrl(best.second)}", emptyMap())
             val detail = runCatching { JSONObject(detailText) }.getOrNull() ?: return false
@@ -1645,7 +1769,9 @@ object WizstreamSources {
                     ) continue
 
                     val name = buildLabel(server, quality, srcLabel)
-                    if (safeUrl.contains(".m3u8", true)) {
+                    if (emitTaggedMedia(app, safeUrl, serverSourceLabel, name, callback)) {
+                        any = true
+                    } else if (safeUrl.contains(".m3u8", true)) {
                         // Use M3u8Helper to expand master playlist → per-quality links.
                         // CRITICAL: pass Referer+Origin headers to prevent 2004.
                         M3u8Helper.generateM3u8(
@@ -1799,6 +1925,170 @@ object WizstreamSources {
          *     ├── 1080p · Original audio
          *     └── 720p · Original audio
          */
+
+        // ── Codec probing (v18) ─────────────────────────────────────────────
+        // Some Cineby mirrors serve HEVC / AV1 / 10-bit encodes. Many smart
+        // TVs have no hardware decoder for those, so ExoPlayer dies with
+        // error 4003 (DECODING_FAILED) while phones happily software-decode.
+        // The API response doesn't say which codec a source uses, so we
+        // fetch the HLS master / DASH MPD (one small request — it replaces
+        // the fetch M3u8Helper would do anyway) and probe MP4 headers, then
+        // tag every emitted link: "· H.264" is TV-safe, "· HEVC ⚠" / "· AV1 ⚠"
+        // tells the user to pick another server/quality on TV.
+
+        private fun codecTagFromCodecs(codecs: String?): String {
+            if (codecs.isNullOrBlank()) return ""
+            val c = codecs.lowercase()
+            val v = when {
+                c.contains("hvc1") || c.contains("hev1") || c.contains("dvh1") -> " · HEVC ⚠"
+                c.contains("av01") -> " · AV1 ⚠"
+                c.contains("vp09") || c.contains("vp9") -> " · VP9 ⚠"
+                c.contains("avc1") || c.contains("avc3") -> " · H.264"
+                else -> ""
+            }
+            val a = when {
+                c.contains("ec-3") || c.contains("ec3") -> " · EAC3"
+                c.contains("ac-3") -> " · AC3"
+                else -> ""
+            }
+            return v + a
+        }
+
+        private data class HlsVariant(val url: String, val height: Int, val codecTag: String)
+
+        /** Fetch an HLS master playlist and parse its variant streams. Empty
+         *  list returned → not a master playlist (or unreachable). */
+        private suspend fun parseHlsMaster(app: Requests, masterUrl: String): List<HlsVariant> {
+            val text = runCatching {
+                app.get(masterUrl, headers = API_HEADERS, cacheTime = 0, timeout = 12_000).text
+            }.getOrNull() ?: return emptyList()
+            if (!text.startsWith("#EXTM3U") || !text.contains("#EXT-X-STREAM-INF")) {
+                return emptyList()
+            }
+            val out = mutableListOf<HlsVariant>()
+            val lines = text.lines().map { it.trim() }
+            var i = 0
+            while (i < lines.size) {
+                val l = lines[i]
+                if (l.startsWith("#EXT-X-STREAM-INF")) {
+                    val codecs = Regex("CODECS=\"([^\"]+)\"").find(l)?.groupValues?.get(1)
+                    val height = Regex("RESOLUTION=\\d+x(\\d+)").find(l)
+                        ?.groupValues?.get(1)?.toIntOrNull() ?: 0
+                    val uri = lines.getOrNull(i + 1)?.takeIf { it.isNotBlank() && !it.startsWith("#") }
+                    if (uri != null) {
+                        out += HlsVariant(resolveAbs(masterUrl, uri), height, codecTagFromCodecs(codecs))
+                    }
+                }
+                i++
+            }
+            return out
+        }
+
+        /** Probe the first bytes of a progressive MP4 for its ftyp brands /
+         *  sample-entry fourccs to guess the video codec. */
+        private suspend fun probeMp4Codec(app: Requests, url: String): String {
+            val resp = runCatching {
+                app.get(
+                    url,
+                    headers = API_HEADERS + ("Range" to "bytes=0-65535"),
+                    cacheTime = 0,
+                    timeout = 10_000,
+                )
+            }.getOrNull() ?: return ""
+            if (resp.code !in 200..299 && resp.code != 206) return ""
+            val body = resp.text
+            val rx = Regex("hvc1|hev1|dvh1|av01|vp09|avc1|avc3")
+            val found = rx.find(body)?.value ?: return ""
+            return codecTagFromCodecs(found)
+        }
+
+        /** Emit one HLS/DASH/progressive link with codec tagging. */
+        private suspend fun emitTaggedMedia(
+            app: Requests,
+            safeUrl: String,
+            serverSourceLabel: String,
+            name: String,
+            callback: (ExtractorLink) -> Unit,
+        ): Boolean {
+            when {
+                safeUrl.contains(".m3u8", true) -> {
+                    val variants = parseHlsMaster(app, safeUrl)
+                    if (variants.isEmpty()) {
+                        // Media playlist (no variants) or unreachable — emit as-is.
+                        callback(
+                            newExtractorLink(
+                                source = serverSourceLabel,
+                                name = name,
+                                url = safeUrl,
+                                type = ExtractorLinkType.M3U8,
+                            ) {
+                                this.referer = "$SITE/"
+                                this.quality = qualityFromName(safeUrl)
+                                this.headers = API_HEADERS
+                            }
+                        )
+                        return true
+                    }
+                    variants.distinctBy { Pair(it.url, it.codecTag) }.forEach { v ->
+                        callback(
+                            newExtractorLink(
+                                source = serverSourceLabel,
+                                name = name + v.codecTag,
+                                url = v.url,
+                                type = ExtractorLinkType.M3U8,
+                            ) {
+                                this.referer = "$SITE/"
+                                this.quality = if (v.height > 0) v.height else qualityFromName(safeUrl)
+                                this.headers = API_HEADERS
+                            }
+                        )
+                    }
+                    return true
+                }
+                safeUrl.contains(".mpd", true) -> {
+                    // Fetch the MPD text once to extract codec info.
+                    val mpd = runCatching {
+                        app.get(safeUrl, headers = API_HEADERS, cacheTime = 0, timeout = 12_000).text
+                    }.getOrNull().orEmpty()
+                    val videoCodecs = Regex("codecs=\"([^\"]+)\"").findAll(mpd)
+                        .map { it.groupValues[1] }
+                        .firstOrNull { codecTagFromCodecs(it).isNotBlank() }
+                    val tag = codecTagFromCodecs(videoCodecs)
+                    callback(
+                        newExtractorLink(
+                            source = serverSourceLabel,
+                            name = name + tag,
+                            url = safeUrl,
+                            type = ExtractorLinkType.DASH,
+                        ) {
+                            this.referer = "$SITE/"
+                            this.quality = qualityFromName(safeUrl)
+                            this.headers = API_HEADERS
+                        }
+                    )
+                    return true
+                }
+                safeUrl.contains(".mp4", true) || safeUrl.contains(".mkv", true) ||
+                    safeUrl.contains(".webm", true) -> {
+                    val tag = if (safeUrl.contains(".mp4", true)) probeMp4Codec(app, safeUrl) else ""
+                    callback(
+                        newExtractorLink(
+                            source = serverSourceLabel,
+                            name = name + tag,
+                            url = safeUrl,
+                            type = ExtractorLinkType.VIDEO,
+                        ) {
+                            this.referer = "$SITE/"
+                            this.quality = qualityFromName(safeUrl)
+                            this.headers = API_HEADERS
+                        }
+                    )
+                    return true
+                }
+            }
+            return false
+        }
+
         private fun buildLabel(server: CinebyServer, quality: String, srcLabel: String): String {
             val parts = mutableListOf<String>()
             // Skip quality if it's just the language name (avoid duplicate
