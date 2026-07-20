@@ -1510,7 +1510,7 @@ object WizstreamSources {
     //
     //  8 servers on api.speedracelight.com:
     //    Neon    (neon2)     — Original audio, movies + TV
-    //    Yoru    (cdn)       — Original audio, MOVIE ONLY, may have 4K
+    //    Yoru    (cdn)       — Original audio, movies + TV (v19), may have 4K
     //    Breach  (m4uhd)     — Original audio, movies + TV
     //    Vyse    (hdmovie)   — English quality filter
     //    Killjoy (meine)     — German audio
@@ -1557,7 +1557,10 @@ object WizstreamSources {
 
         private val SERVERS = listOf(
             CinebyServer("Neon",    "neon2",    audioLabel = "Original"),
-            CinebyServer("Yoru",    "cdn",      movieOnly = true,  audioLabel = "Original"),
+            // (v19) Yoru serves TV series too — verified against the live API
+            // (mediaType=tv returns sources+subtitles). The old movieOnly flag
+            // was the only reason it never appeared for series.
+            CinebyServer("Yoru",    "cdn",      audioLabel = "Original"),
             CinebyServer("Breach",  "m4uhd",    audioLabel = "Original"),
             CinebyServer("Vyse",    "hdmovie",  qualityFilter = "English", audioLabel = "Original"),
             CinebyServer("Killjoy", "meine",    language = "german", audioLabel = "German"),
