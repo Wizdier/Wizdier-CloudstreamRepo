@@ -38,6 +38,7 @@ import java.io.ByteArrayInputStream
  *   5. UniqueStream— https://anime.uniquestream.net  (open FastAPI, signed HLS)
  *   6. AniNeko     — https://anineko.to             (server-video embeds → direct HLS)
  *   7. ReANIME     — https://reanime.to             (SvelteKit __data.json scan)
+ *   8. TokyoInsider — https://www.tokyoinsider.com  (direct MKV/MP4 downloads)
  *
  * All are invoked in parallel from `resolveAnime()`. Each returns
  * `true` on the first playable link it emits; the aggregator returns true
@@ -77,6 +78,7 @@ object WizstreamAnimeSources {
             UniqueStreamResolver,
             AniNekoResolver,
             ReAnimeResolver,
+            TokyoInsiderResolver,
         )
 
         val gate = Semaphore(4)
@@ -1995,6 +1997,257 @@ object WizstreamAnimeSources {
                     forceHls = !u.contains(".mp4", ignoreCase = true),
                 )
             }
+            return emitMediaCandidates(cands, subtitleCallback, callback)
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    //  Resolver 8: Tokyo Insider — https://www.tokyoinsider.com
+    //
+    //  Old-school direct-download fansub site: every release row is a
+    //  progressive MKV/MP4 file on media.tokyoinsider.com:8080 (signed,
+    //  time-limited URLs — hence resolved fresh on every user click).
+    //
+    //  Pipeline:
+    //   1. /upload/autocomplete.js — static ~420KB JS containing the ENTIRE
+    //      catalogue (~5,600 series) as [["Title (Type)","\/anime\/L\/Slug"],…].
+    //      Static file, so it's NOT behind the Cloudflare challenge that
+    //      protects the dynamic pages — search works even when CF is grumpy.
+    //   2. /anime/L/Slug — episode index: rows of
+    //      div.episode a.download-link (episode number in <strong>, href
+    //      /anime/…/episode/N; movies use /movie/1).
+    //   3. /anime/…/episode/N — release rows (div.c_h2 / div.c_h2b) whose
+    //      download anchors point at media.tokyoinsider.com:8080/dl/<sig>/FILE.
+    //
+    //  Anti-scrape note: dynamic pages interleave decoy
+    //  <i class="<hash>" aria-hidden="true">junk</i> nodes inside visible
+ 	//  text (CSS display:none hides them for humans). Jsoup doesn't apply
+    //  CSS, so we strip those nodes BEFORE reading any text(). Hrefs are
+    //  never obfuscated.
+    //
+    //  3003/4003 safety: only .mkv/.mp4/.webm rows are emitted (AVI/WMV
+    //  would hard-crash ExoPlayer's parser), and every link gets the v18
+    //  codec tag parsed out of the release filename (x265/HEVC → " · HEVC ⚠"
+    //  …) so old-TVs can avoid HEVC/AV1. All links pass through the
+ 	//  emitMediaCandidates range-probe gate (drops 4xx/5xx/HTML bodies → the
+    //  2004/3003 protection).
+    // ─────────────────────────────────────────────────────────────────────
+    internal object TokyoInsiderResolver : AnimeSourceResolver {
+        private const val SITE = "https://www.tokyoinsider.com"
+        private const val MEDIA_HOST = "media.tokyoinsider.com"
+        private const val LABEL = "TokyoInsider"
+        private const val MAX_LINKS = 12
+        private val HEADERS = mapOf(
+            "User-Agent" to UA,
+            "Referer" to "$SITE/",
+            "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language" to "en-US,en;q=0.9",
+        )
+
+        /** Catalogue entry regex: `["Bleach (TV)","\/anime\/B\/Bleach_(TV)"]` */
+        private val ENTRY_RX = Regex("""\["([^"]+)","([^"]+)"\]""")
+        private val TYPE_RX = Regex("""\(([^()]+)\)\s*$""")
+
+        /** Series-page slug, e.g. `/anime/C/Chainsaw_Man_(TV)` (absolute or relative). */
+        private val SLUG_RX = Regex(
+            """^(?:https?://www\.tokyoinsider\.com)?""" +
+                """(/anime/[A-Za-z0-9]/[^?#"']+\((?:TV|Movie|OVA|ONA|Special)\))$"""
+        )
+        private val VIDEO_FILE_RX = Regex("""\.(mkv|mp4|webm)$""", RegexOption.IGNORE_CASE)
+
+        override suspend fun resolve(
+            app: Requests,
+            title: String,
+            anilistId: Int?,
+            malId: Int?,
+            isMovie: Boolean,
+            season: Int?,
+            episode: Int?,
+            labelPrefix: String,
+            subtitleCallback: (SubtitleFile) -> Unit,
+            callback: (ExtractorLink) -> Unit,
+        ): Boolean {
+            if (title.isBlank()) return false
+            if (!isMovie && episode == null) return false
+            val srcLabel = "$labelPrefix • $LABEL"
+
+            // 1. Title candidates. PRIMARY: the live server-side search
+            //    (GET /anime/search?k=…) — the static autocomplete.js the
+            //    site's own search box uses is stuck in ~2021 (no Chainsaw
+            //    Man, no Mob Psycho III, no Frieren). FALLBACK: that same
+            //    static JS anyway, since it's not behind the Cloudflare
+            //    challenge the dynamic pages sometimes throw.
+            // (title w/o type suffix, type, /anime path)
+            val entries = mutableListOf<Triple<String, String, String>>()
+
+            runCatching {
+                val searchUrl = "$SITE/anime/search?k=${encodeUrl(title)}"
+                val html = app.get(searchUrl, headers = HEADERS, timeout = 15_000).text
+                // A CF "Just a moment" page has no series links — harmless.
+                val doc = Jsoup.parse(html, searchUrl)
+                doc.select("i[aria-hidden=true]").remove()
+                doc.select("a[href]").forEach { a ->
+                    val m = SLUG_RX.matchEntire(a.attr("href").trim()) ?: return@forEach
+                    val path = m.groupValues[1]
+                    val type = TYPE_RX.find(path)?.groupValues?.getOrNull(1)?.trim() ?: return@forEach
+                    // Card text-links read "Chainsaw Man (TV)"; if a link
+                    // only wraps the cover image, fall back to its title
+                    // attribute ("Chainsaw Man"). The type comes from the
+                    // slug either way.
+                    val txt = a.text().trim()
+                    val clean = if (TYPE_RX.containsMatchIn(txt)) txt.replace(TYPE_RX, "").trim()
+                        else a.attr("title").trim().ifBlank {
+                            a.selectFirst("img")?.attr("alt")?.trim() ?: ""
+                        }
+                    if (clean.isNotBlank()) entries += Triple(clean, type, path)
+                }
+            }
+
+            if (entries.isEmpty()) {
+                val indexText = runCatching {
+                    app.get("$SITE/upload/autocomplete.js", headers = HEADERS, timeout = 15_000).text
+                }.getOrNull() ?: return false
+                ENTRY_RX.findAll(indexText).forEach { m ->
+                    val raw = m.groupValues[1]
+                    val path = m.groupValues[2].replace("\\/", "/")
+                    if (!path.startsWith("/anime/")) return@forEach
+                    val type = TYPE_RX.find(raw)?.groupValues?.getOrNull(1)?.trim() ?: ""
+                    val clean = raw.replace(TYPE_RX, "").trim()
+                    if (clean.isNotBlank()) entries += Triple(clean, type, path)
+                }
+            }
+            if (entries.isEmpty()) return false
+
+            // 2. Season-aware fuzzy match. TMDB-tracked anime passes the BASE
+            //    title + season, but Tokyo Insider splits seasons into their
+            //    own catalogue entries ("Mob Psycho 100 III (TV)").
+            val queries = buildList {
+                add(title)
+                val s = season ?: 1
+                if (!isMovie && s > 1) {
+                    val roman = arrayOf("", "I", "II", "III", "IV", "V", "VI", "VII", "VIII", "IX", "X")
+                    if (s in 1..10) add("$title ${roman[s]}")
+                    add("$title Season $s")
+                    val ord = when (s) { 1 -> "1st"; 2 -> "2nd"; 3 -> "3rd"; else -> "${s}th" }
+                    add("$title $ord Season")
+                    add("$title S$s")
+                    add("$title Part $s")
+                }
+            }
+
+            // Prefer the right container type; soft-penalise mismatches.
+            fun kindRank(t: String): Int = when {
+                isMovie && t.equals("Movie", true) -> 0
+                isMovie && (t.equals("OVA", true) || t.equals("ONA", true) ||
+                    t.equals("Special", true)) -> 1
+                !isMovie && (t.equals("TV", true) || t.equals("ONA", true) ||
+                    t.equals("OVA", true) || t.equals("Special", true)) -> 0
+                !isMovie && t.equals("Movie", true) -> 1
+                t.isBlank() -> 1
+                else -> 2
+            }
+
+            var best: Triple<String, String, String>? = null
+            var bestScore = 0.0
+            for (e in entries.distinctBy { it.third }) {
+                val qn = e.first.normaliseTitle()
+                var s = 0.0
+                var variantHit = false
+                queries.forEachIndexed { qi, q ->
+                    val qq = q.normaliseTitle()
+                    val sc = if (qn == qq) 1.0 else titleSimilarity(e.first, q)
+                    if (sc > s) { s = sc; variantHit = qi > 0 }
+                }
+                // Ties between the base series and its season entry
+                // (both 1.00 vs their best query) go to the season-variant
+                // match — "Mob Psycho 100" S3 must pick "…III", not S1.
+                if (variantHit) s += 0.04
+                s -= kindRank(e.second) * 0.25
+                if (s > bestScore) { bestScore = s; best = e }
+            }
+            if (best == null || bestScore < 0.5) return false
+
+            // 3. Anime page → episode/movie entry URL. Hrefs are plain text;
+            //    only visible text carries the decoy nodes.
+            val animeUrl = SITE + best.third
+            val animeHtml = runCatching {
+                app.get(animeUrl, headers = HEADERS, timeout = 15_000).text
+            }.getOrNull() ?: return false
+            val animeDoc = Jsoup.parse(animeHtml, animeUrl)
+            animeDoc.select("i[aria-hidden=true]").remove()
+
+            val targetPath: String = if (isMovie) {
+                animeDoc.select("div.episode a.download-link[href*=/movie/]")
+                    .firstOrNull()?.attr("href")
+            } else {
+                val want = episode ?: return false
+                animeDoc.select("div.episode a.download-link").firstNotNullOfOrNull { a ->
+                    val href = a.attr("href")
+                    if (!href.contains("/episode/")) return@firstNotNullOfOrNull null
+                    val n = a.selectFirst("strong")?.text()?.trim()?.toIntOrNull()
+                        ?: Regex("""/episode/(\d+)""").find(href)?.groupValues?.getOrNull(1)?.toIntOrNull()
+                    if (n == want) href else null
+                }
+            }?.takeIf { it.isNotBlank() } ?: return false
+
+            // 4. Episode page → direct file rows.
+            val epUrl = if (targetPath.startsWith("http")) targetPath else SITE + targetPath
+            val epHtml = runCatching {
+                app.get(epUrl, headers = HEADERS, timeout = 15_000).text
+            }.getOrNull() ?: return false
+            val epDoc = Jsoup.parse(epHtml, epUrl)
+            epDoc.select("i[aria-hidden=true]").remove()
+
+            data class Row(val url: String, val fname: String)
+            val rows = epDoc.select(
+                "div.c_h2 a[href*=\"$MEDIA_HOST\"], div.c_h2b a[href*=\"$MEDIA_HOST\"]"
+            ).mapNotNull { a ->
+                val url = a.attr("href").trim()
+                if (!url.startsWith("http")) return@mapNotNull null
+                val fname = a.text().trim().ifBlank {
+                    runCatching {
+                        java.net.URLDecoder.decode(
+                            url.substringAfterLast('/'), Charsets.UTF_8.name()
+                        )
+                    }.getOrDefault(url.substringAfterLast('/')).trim()
+                }
+                // AVI/WMV/etc. can't be parsed by ExoPlayer → certain 3003.
+                if (!VIDEO_FILE_RX.containsMatchIn(if (fname.isNotBlank()) fname else url)) null
+                else Row(url, fname.ifBlank { url.substringAfterLast('/') })
+            }.distinctBy { it.url }
+            if (rows.isEmpty()) return false
+
+            fun codecTag(f: String): String {
+                val fLower = f.lowercase()
+                return when {
+                    fLower.contains("hevc") || fLower.contains("x265") ||
+                        fLower.contains("h.265") || fLower.contains("h265") -> " · HEVC ⚠"
+                    fLower.contains("av1") -> " · AV1 ⚠"
+                    else -> " · H.264"
+                }
+            }
+
+            val cands = rows.map { r ->
+                val f = r.fname
+                val q = qualityFromLabel(f)
+                val group = Regex("""^\[([^\]]+)\]""").find(f)
+                    ?.groupValues?.getOrNull(1)?.trim()
+                val qb = if (q > 0) " · ${q}p" else ""
+                val codec = codecTag(f)
+                val dub = if (Regex("""(?i)\b(?:english\s+)?dub(?:bed)?\b""")
+                        .containsMatchIn(f) &&
+                    !f.contains("Multiple Subtitle", ignoreCase = true)) " · DUB" else ""
+                val multiSub = if (f.contains("Multiple Subtitle", ignoreCase = true) ||
+                    f.contains("multi-sub", ignoreCase = true) ||
+                    f.contains("multisub", ignoreCase = true)) " · Multi-Sub" else ""
+                val name = srcLabel +
+                    (group?.let { " · $it" } ?: "") + qb + codec + dub + multiSub
+                MediaCandidate(
+                    url = r.url, sourceLabel = srcLabel, name = name,
+                    referer = epUrl, headers = HEADERS, quality = q,
+                )
+            }.sortedByDescending { it.quality }.take(MAX_LINKS)
+
             return emitMediaCandidates(cands, subtitleCallback, callback)
         }
     }
