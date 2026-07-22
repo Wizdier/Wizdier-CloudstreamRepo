@@ -544,7 +544,7 @@ class WizstreamAnimeProvider : MainAPI() {
         }
 
         // ── Anime-focused source resolvers ──────────────────────────────
-        // AniZone, Mkissa (via AllAnime API), Miruro (secure pipe), AniChi
+        // AniZone, Allmanga (AllAnime-family persisted API), AniChi
         // (via mapper.nekostream.site). These are dedicated anime streaming
         // sites that complement the BDIX sources above. AniChi uses the MAL
         // ID directly via the mapper API — no search needed.

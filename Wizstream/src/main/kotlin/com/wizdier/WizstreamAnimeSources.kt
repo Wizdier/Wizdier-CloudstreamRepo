@@ -22,8 +22,6 @@ import java.util.concurrent.TimeUnit
 import javax.crypto.Cipher
 import javax.crypto.spec.GCMParameterSpec
 import javax.crypto.spec.SecretKeySpec
-import java.util.zip.GZIPInputStream
-import java.io.ByteArrayInputStream
 
 /**
  * WizstreamAnimeSources — bundled anime-specific source resolver.
@@ -32,13 +30,12 @@ import java.io.ByteArrayInputStream
  * WizstreamSources:
  *
  *   1. AniZone     — https://anizone.to              (direct .m3u8 in <media-player>)
- *   2. Mkissa      — https://mkissa.to               (AllAnime API + AA-CRYPTO bypass)
- *   3. Miruro      — https://www.miruro.to           (secure-pipe API + AniList)
- *   4. AniChi      — https://anichi.to               (mapper.nekostream.site API)
- *   5. UniqueStream— https://anime.uniquestream.net  (open FastAPI, signed HLS)
- *   6. AniNeko     — https://anineko.to             (server-video embeds → direct HLS)
- *   7. ReANIME     — https://reanime.to             (SvelteKit __data.json scan)
- *   8. TokyoInsider — https://www.tokyoinsider.com  (direct MKV/MP4 downloads)
+ *   2. Allmanga    — https://allmanga.to             (AllAnime-family API + AA-CRYPTO)
+ *   3. AniChi      — https://anichi.to               (mapper.nekostream.site API)
+ *   4. UniqueStream— https://anime.uniquestream.net  (open FastAPI, signed HLS)
+ *   5. AniNeko     — https://anineko.to             (server-video embeds → direct HLS)
+ *   6. ReANIME     — https://reanime.to             (SvelteKit __data.json scan)
+ *   7. TokyoInsider — https://www.tokyoinsider.com  (direct MKV/MP4 downloads)
  *
  * All are invoked in parallel from `resolveAnime()`. Each returns
  * `true` on the first playable link it emits; the aggregator returns true
@@ -72,8 +69,7 @@ object WizstreamAnimeSources {
 
         val sources = listOf(
             AniZoneResolver,
-            MkissaResolver,
-            MiruroResolver,
+            AllmangaResolver,
             AniChiResolver,
             UniqueStreamResolver,
             AniNekoResolver,
@@ -140,16 +136,6 @@ object WizstreamAnimeSources {
     internal fun urlSafeB64DecodeText(s: String): String? = runCatching {
         String(urlSafeB64Decode(s))
     }.getOrNull()
-
-    /** Decode the Miruro pipe response: URL-safe base64 → GZIP → JSON. */
-    internal fun decodePipeResponse(s: String): JSONObject? = runCatching {
-        val compressed = urlSafeB64Decode(s.trim())
-        GZIPInputStream(ByteArrayInputStream(compressed)).bufferedReader().use { it.readText() }
-    }.getOrNull()?.let { runCatching { JSONObject(it) }.getOrNull() }
-
-    /** Encode JSON payload for Miruro pipe. */
-    internal fun encodePipeRequest(payload: JSONObject): String =
-        urlSafeB64Encode(payload.toString().toByteArray())
 
     internal fun ExtractorLink.relabel(newSource: String, newName: String): ExtractorLink =
         runBlocking {
@@ -614,51 +600,70 @@ object WizstreamAnimeSources {
     }
 
     // ════════════════════════════════════════════════════════════════════════
-    //  Resolver 2: Mkissa  (https://mkissa.to)
+    //  Resolver 2: Allmanga  (https://allmanga.to/anime)
     //
-    //  Mkissa proxies the AllAnime player, so we bypass mkissa entirely and
-    //  hit the AllAnime Apollo persisted-query API at api.allanime.day.
-    //  This returns direct .m3u8 / .mp4 URLs — no iframe parsing needed.
+    //  Allmanga (allmanga.to) is the current flagship front-end of the
+    //  AllAnime network. Clicking an episode there redirects to the shared
+    //  SvelteKit player on mkissa.to, and both are backed by the same Apollo
+    //  persisted-query database — so this resolver replaces the retired
+    //  Mkissa resolver (the old CLOCK_BASE host allanime.day started
+    //  500ing/redirect-looping, which is what made Mkissa appear "broken").
     //
-    //  Three persisted-query hashes are used:
-    //    • search  (9343797c…)
-    //    • show    (73d998d2…) — episode count
-    //    • episode (5f1a64b7…) — stream source URLs
+    //  Flow:
+    //    1. Search the show via persisted-query POST against
+    //       api.mkissa.net (Cloudflare-free mirror of api.allanime.day).
+    //    2. Fetch episode `sourceUrls` via a persisted-query GET that must
+    //       carry an `aaReq` AES-256-GCM token (the "AA crypto" scheme).
+    //    3. Sources come in three flavours:
+    //         • third-party iframe hosts (ok.ru, mp4upload, streamsb, …)
+    //           → handed to loadExtractor()
+    //         • "--" XOR-encoded paths → allanime.day /apivtwo/clock.json
+    //           link lists (CDN ladder) — currently 5xx operator-side, kept
+    //           for when the host recovers
+    //         • rare direct mp4/m3u8 endpoints → media candidates
+    //    Every candidate passes through the emitMediaCandidates probe gate,
+    //    so dead links never reach the player (no 2004/3003/4003 cascade).
     //
-    //  Required headers:
-    //    Referer: https://allmanga.to/
-    //    Origin:  https://allmanga.to
+    //  The AA crypto bootstrap (all material live-verified):
+    //    window.__aaCrypto on https://mkissa.to (plain page, no challenge)
+    //      = {"epoch":N,"switchAt":Ms,"graceMs":Ms,"partB":"<b64>"}
+    //    app chunk → crypto chunk holds ONE 64-hex "mask"
+    //    AES key = mask XOR base64decode(partB)     (rotates every ~3 days)
+    //    aaReq   = b64( 0x01 ‖ iv ‖ AES-256-GCM(key, iv, payload) )
+    //    payload = {"v":1,"ts":bucketMs,"epoch":N,"buildId":"B","qh":"<sha256>"}
+    //    iv      = sha256("N:B:qh:bucketMs")[0:12]   (5-minute ts bucket)
+    //    episode response carries encrypted `tobeparsed`, decrypted with the
+    //    same key.
+    //
+    //  Fallback chain: live bootstrap → anipy-cli keygen.json mirror →
+    //  embedded snapshot. On AA_CRYPTO_* errors we re-bootstrap once.
     // ════════════════════════════════════════════════════════════════════════
 
-    internal object MkissaResolver : AnimeSourceResolver {
-        // (v19) Mkissa is a re-skin of AllAnime on its OWN api origin
-        // (api.mkissa.net — sending tokens to api.allanime.day is what used
-        // to produce AA_CRYPTO_STALE). Episode streams are protected by the
-        // "AA crypto" scheme: a persisted-query GET that must carry an
-        // `aaReq` AES-256-GCM token. The key material rotates every ~3 days
-        // and is bootstrapped live from the mkissa.to front page:
-        //
-        //   window.__aaCrypto = {"epoch":N,"switchAt":Ms,"graceMs":Ms,"partB":"<b64>"}
-        //   app chunk → crypto chunk holds ONE 64-hex "mask"
-        //   AES key = mask XOR base64decode(partB)
-        //   aaReq   = b64( 0x01 ‖ iv ‖ AES-GCM(key, iv, payload) )
-        //   payload = {"v":1,"ts":bucketMs,"epoch":N,"buildId":"B","qh":"<sha256>"}
-        //   iv      = sha256("N:B:qh:bucketMs")[0:12]   (5-minute ts bucket)
-        //
-        // Fallback chain: live bootstrap → anipy-cli keygen.json mirror →
-        // embedded snapshot. On AA_CRYPTO_* errors we re-bootstrap once.
+    internal object AllmangaResolver : AnimeSourceResolver {
+        // (v22) SITE is the player front-end that hosts window.__aaCrypto and
+        // the _app/immutable JS chunks. allmanga.to itself is a Nuxt SPA that
+        // forwards viewers to mkissa.to to actually watch, but both share the
+        // API (api.mkissa.net — sending tokens to api.allanime.day used to
+        // produce AA_CRYPTO_STALE and that host is now mostly dead anyway).
         private const val SITE = "https://mkissa.to"
         private const val API = "https://api.mkissa.net/api"
-        private const val CLOCK_BASE = "https://allanime.day"
+        // clock.json hosts, tried in order — canonical host first, the
+        // api-t fallback second (both currently 5xx operator-side; the code
+        // path stays so it revives automatically when the servers recover).
+        private val CLOCK_BASES = listOf(
+            "https://allanime.day",
+            "https://api-t.allanime.day",
+        )
         private const val CDN_IMMUTABLE = "https://cdn.allanime.day/all/mk/_app/immutable/"
         private const val KEYGEN_URL =
             "https://raw.githubusercontent.com/sdaqo/anipy-cli/refs/heads/key-gen/scripts/keygen/keygen.json"
-        private const val LABEL = "Mkissa"
+        private const val LABEL = "Allmanga"
         private const val SEARCH_HASH =
             "a24c500a1b765c68ae1d8dd85174931f661c71369c89b92b88b75a725afc471c"
-        private const val FALLBACK_EPOCH = 6884L
+        private const val FALLBACK_EPOCH = 6885L
+        // Embedded snapshot harvested live (epoch 6885, ~3-day rotation).
         private const val FALLBACK_KEY_HEX =
-            "f34fa715e2958b8c1ebc6efa4d089acd8f196d8b83d4b6201586c00c8a52e4a8"
+            "ff102360a5065bb72fc128f7efa5042dbf4db582e5c58754078265926a76bfd8"
         private const val FALLBACK_QH =
             "f4662f4b7510b26795dd53ef824a0bf1740fbbc5d1273fab18222ac831bca8d0"
         private const val FALLBACK_BUILD = "51"
@@ -698,7 +703,8 @@ object WizstreamAnimeSources {
             val srcLabel = "$labelPrefix • $LABEL"
             val epToUse = episode ?: 1
 
-            // 1. Search (POST — plain GET trips the Cloudflare challenge).
+            // 1. Search (POST — a raw query= in the GET URL trips the site's
+            //    WAF; a JSON body POST sails through the public gateway).
             val searchBody = JSONObject().apply {
                 put("variables", JSONObject().apply {
                     put("search", JSONObject().apply {
@@ -767,10 +773,14 @@ object WizstreamAnimeSources {
                                 referer = SITE, headers = HEADERS, forceHls = true,
                             )
                         }
-                        // Third-party iframe hosts (ok.ru, streamsb, …)
-                        rawUrl.startsWith("http") -> {
+                        // Third-party iframe hosts (ok.ru, streamsb, …).
+                        // Note: some servers are emitted protocol-relative
+                        // ("//host/e/...") — promote them to https first.
+                        rawUrl.startsWith("http") || rawUrl.startsWith("//") -> {
+                            val iframeUrl =
+                                if (rawUrl.startsWith("//")) "https:$rawUrl" else rawUrl
                             runCatching {
-                                loadExtractor(rawUrl, "$SITE/", subtitleCallback) { link ->
+                                loadExtractor(iframeUrl, "$SITE/", subtitleCallback) { link ->
                                     callback(link.relabel(srcLabel, "$label — ${link.name}"))
                                     any = true
                                 }
@@ -802,7 +812,7 @@ object WizstreamAnimeSources {
         }
 
         private suspend fun bootstrapCrypto(app: Requests): AaCrypto? {
-            // 1. Live bootstrap straight from mkissa.to.
+            // 1. Live bootstrap straight from the player front-end.
             runCatching {
                 val html = app.get("$SITE/", headers = HEADERS, timeout = 12_000).text
                 val aaRaw = Regex("""window\.__aaCrypto\s*=\s*(\{.*?\})""")
@@ -847,7 +857,7 @@ object WizstreamAnimeSources {
                         }
                     }
                 }
-            }.onFailure { Log.d(TAG, "Mkissa live bootstrap failed: ${it.message}") }
+            }.onFailure { Log.d(TAG, "Allmanga live bootstrap failed: ${it.message}") }
 
             // 2. anipy-cli keygen.json mirror (CI-updated every few hours).
             runCatching {
@@ -1003,7 +1013,7 @@ object WizstreamAnimeSources {
             }.getOrDefault("")
         }
 
-        /** GET the clock.json link list on allanime.day + harvest candidates. */
+        /** GET the clock.json link list on the AllAnime hosts + harvest. */
         private suspend fun resolveClock(
             app: Requests,
             path: String,
@@ -1011,46 +1021,49 @@ object WizstreamAnimeSources {
             label: String,
             out: MutableList<MediaCandidate>,
         ) {
-            val body = runCatching {
-                app.get(
-                    CLOCK_BASE + path,
-                    headers = mapOf("User-Agent" to UA, "Referer" to "$SITE/"),
-                    timeout = 12_000,
-                ).text
-            }.getOrNull() ?: return
-            val json = runCatching { JSONObject(body) }.getOrNull() ?: return
-            val links = json.optJSONArray("links") ?: return
-            for (i in 0 until links.length()) {
-                val l = links.optJSONObject(i) ?: continue
-                var link = l.optStringOrNull("link") ?: continue
-                val linkRef = l.optJSONObject("headers")?.optStringOrNull("Referer")
-                    ?: CLOCK_BASE
-                if ("repackager.wixmp.com" in link) {
-                    // Comma-joined quality ladder — rebuild one URL per quality.
-                    link = link.substringBefore(".urlset")
-                        .replace("repackager.wixmp.com/", "")
-                    val parts = link.split(",")
-                    if (parts.size >= 3) {
-                        for (qi in 1 until parts.size - 1) {
-                            val qual = parts[qi].trim()
-                            if (qual.isBlank()) continue
-                            val u = parts[0] + qual + parts.last()
-                            out += MediaCandidate(
-                                url = u, sourceLabel = srcLabel,
-                                name = "$label · $qual",
-                                referer = linkRef, forceHls = true,
-                                quality = qualityFromLabel(qual),
-                            )
+            for (base in CLOCK_BASES) {
+                val body = runCatching {
+                    app.get(
+                        base + path,
+                        headers = mapOf("User-Agent" to UA, "Referer" to "$SITE/"),
+                        timeout = 12_000,
+                    ).text
+                }.getOrNull() ?: continue
+                val json = runCatching { JSONObject(body) }.getOrNull() ?: continue
+                val links = json.optJSONArray("links") ?: continue
+                for (i in 0 until links.length()) {
+                    val l = links.optJSONObject(i) ?: continue
+                    var link = l.optStringOrNull("link") ?: continue
+                    val linkRef = l.optJSONObject("headers")?.optStringOrNull("Referer")
+                        ?: base
+                    if ("repackager.wixmp.com" in link) {
+                        // Comma-joined quality ladder — rebuild one URL per quality.
+                        link = link.substringBefore(".urlset")
+                            .replace("repackager.wixmp.com/", "")
+                        val parts = link.split(",")
+                        if (parts.size >= 3) {
+                            for (qi in 1 until parts.size - 1) {
+                                val qual = parts[qi].trim()
+                                if (qual.isBlank()) continue
+                                val u = parts[0] + qual + parts.last()
+                                out += MediaCandidate(
+                                    url = u, sourceLabel = srcLabel,
+                                    name = "$label · $qual",
+                                    referer = linkRef, forceHls = true,
+                                    quality = qualityFromLabel(qual),
+                                )
+                            }
+                            continue
                         }
-                        continue
                     }
+                    out += MediaCandidate(
+                        url = link, sourceLabel = srcLabel, name = label,
+                        referer = linkRef,
+                        forceHls = !link.contains(".mp4", ignoreCase = true),
+                        quality = qualityFromLabel(l.optStringOrNull("resolutionStr")),
+                    )
                 }
-                out += MediaCandidate(
-                    url = link, sourceLabel = srcLabel, name = label,
-                    referer = linkRef,
-                    forceHls = !link.contains(".mp4", ignoreCase = true),
-                    quality = qualityFromLabel(l.optStringOrNull("resolutionStr")),
-                )
+                return // got a parseable link list — don't fall through
             }
         }
 
@@ -1083,289 +1096,6 @@ object WizstreamAnimeSources {
 
         private fun xorBytes(a: ByteArray, b: ByteArray): ByteArray =
             ByteArray(minOf(a.size, b.size)) { i -> (a[i].toInt() xor b[i].toInt()).toByte() }
-    }
-
-    // ════════════════════════════════════════════════════════════════════════
-    //  Resolver 3: Miruro  (https://www.miruro.to)
-    //
-    //  Search via AniList GraphQL (no Cloudflare there). For episodes and
-    //  stream URLs, use Miruro's `/api/secure/pipe?e={base64(json)}` endpoint.
-    //  The response is URL-safe base64 → GZIP → JSON.
-    //
-    //  The pipe payload is:
-    //    {"path":"episodes","method":"GET","query":{"anilistId":X},"body":null,"version":"0.1.0"}
-    //
-    //  For sources, use path="sources" with query
-    //  {episodeId, provider, category, anilistId}.
-    //
-    //  Provider priority: zoro > animepahe > gogoanime > kiwi.
-    //
-    //  Cloudflare: strict on the home page. The /api/secure/pipe endpoint
-    //  sometimes works without cf_clearance from datacenter IPs; if it
-    //  doesn't, the user can use a CloudflareKiller interceptor at the
-    //  provider level. Here we attempt the direct request.
-    // ════════════════════════════════════════════════════════════════════════
-
-    internal object MiruroResolver : AnimeSourceResolver {
-        private const val SITE = "https://www.miruro.to"
-        private const val PIPE = "$SITE/api/secure/pipe"
-        private const val ANILIST_GQL = "https://graphql.anilist.co"
-        private const val LABEL = "Miruro"
-        private val HEADERS = mapOf(
-            "User-Agent" to UA,
-            "Accept" to "application/json, text/plain, */*",
-            "Accept-Language" to "en-US,en;q=0.9",
-            "Origin" to SITE,
-            "Referer" to "$SITE/",
-            "Sec-Fetch-Dest" to "empty",
-            "Sec-Fetch-Mode" to "cors",
-            "Sec-Fetch-Site" to "same-origin",
-        )
-        private val ANILIST_HEADERS = mapOf(
-            "User-Agent" to UA,
-            "Accept" to "application/json",
-            "Content-Type" to "application/json",
-        )
-        private val PROVIDER_PRIORITY = listOf("zoro", "animepahe", "gogoanime", "kiwi")
-
-        override suspend fun resolve(
-            app: Requests,
-            title: String,
-            anilistId: Int?,
-            malId: Int?,
-            isMovie: Boolean,
-            season: Int?,
-            episode: Int?,
-            labelPrefix: String,
-            subtitleCallback: (SubtitleFile) -> Unit,
-            callback: (ExtractorLink) -> Unit,
-        ): Boolean {
-            // 1. Resolve the AniList ID — use the one passed in directly,
-            //    otherwise search AniList by title.
-            val aid = anilistId ?: searchAnilistId(app, title) ?: return false
-            val srcLabel = "$labelPrefix • $LABEL"
-            val epToUse = episode ?: 1
-            val category = "sub"
-
-            // 2. Fetch the raw episode list for this AniList ID.
-            val epPayload = JSONObject().apply {
-                put("path", "episodes")
-                put("method", "GET")
-                put("query", JSONObject().apply { put("anilistId", aid) })
-                put("body", JSONObject.NULL)
-                put("version", "0.1.0")
-            }
-            val epRespText = pipeGet(app, epPayload) ?: return false
-            val providers = epRespText.optJSONObject("providers") ?: return false
-
-            // 3. Collect episode IDs from every provider, prioritising zoro.
-            //    Each episode has `id` (which may be a base64-encoded
-            //    "id:category" pair) and `number`.
-            val epCandidates = mutableListOf<Pair<String, String>>() // (provider, episodeId)
-            val sortedProviderKeys = providers.keys().asSequence().toList().sortedBy { p ->
-                PROVIDER_PRIORITY.indexOf(p.lowercase()).let { if (it == -1) PROVIDER_PRIORITY.size else it }
-            }
-            for (providerKey in sortedProviderKeys) {
-                val pobj = providers.optJSONObject(providerKey) ?: continue
-                val epsObj = pobj.optJSONObject("episodes") ?: continue
-                val catArr = epsObj.optJSONArray(category) ?: continue
-                for (i in 0 until catArr.length()) {
-                    val ep = catArr.optJSONObject(i) ?: continue
-                    val num = ep.optInt("number", 0)
-                    if (num != epToUse) continue
-                    val rawId = ep.optString("id").ifBlank { continue }
-                    val sourceId = if (rawId.startsWith("watch/")) rawId else normalizeEpisodeId(rawId)
-                    epCandidates += providerKey to sourceId
-                }
-                if (epCandidates.isNotEmpty()) break
-            }
-            if (epCandidates.isEmpty()) {
-                // Movie fallback — try a synthesised episode id "movie-1".
-                if (isMovie) {
-                    epCandidates += "kiwi" to "movie-1"
-                } else return false
-            }
-
-            // 4. For each candidate, fetch the stream URLs.
-            var any = false
-            for ((provider, epId) in epCandidates) {
-                val encodedEpId = if (epId.startsWith("watch/")) {
-                    // Direct watch path — fetch via pipe with the path itself.
-                    val directPayload = JSONObject().apply {
-                        put("path", epId)
-                        put("method", "GET")
-                        put("query", JSONObject.NULL)
-                        put("body", JSONObject.NULL)
-                        put("version", "0.1.0")
-                    }
-                    val direct = pipeGet(app, directPayload)
-                    if (direct != null && hasPlayableStreams(direct)) {
-                        emitStreams(direct, srcLabel, provider, subtitleCallback, callback)
-                        any = true
-                    }
-                    continue
-                } else {
-                    urlSafeB64Encode(epId.toByteArray())
-                }
-
-                val srcPayload = JSONObject().apply {
-                    put("path", "sources")
-                    put("method", "GET")
-                    put("query", JSONObject().apply {
-                        put("episodeId", encodedEpId)
-                        put("provider", provider)
-                        put("category", category)
-                        put("anilistId", aid)
-                    })
-                    put("body", JSONObject.NULL)
-                    put("version", "0.1.0")
-                }
-                val srcResp = pipeGet(app, srcPayload) ?: continue
-                if (emitStreams(srcResp, srcLabel, provider, subtitleCallback, callback)) {
-                    any = true
-                }
-            }
-            return any
-        }
-
-        private fun normalizeEpisodeId(value: String): String {
-            val decoded = urlSafeB64DecodeText(value)
-            return if (decoded != null && ":" in decoded) decoded else value
-        }
-
-        private fun hasPlayableStreams(node: JSONObject): Boolean {
-            return findFirstArray(node, "streams", "sources")?.let { arr ->
-                (0 until arr.length()).any { i ->
-                    arr.optJSONObject(i)?.let { streamUrl(it) } != null
-                }
-            } == true
-        }
-
-        private fun findFirstArray(node: JSONObject, vararg names: String): JSONArray? {
-            for (name in names) {
-                node.optJSONArray(name)?.let { return it }
-            }
-            val keys = node.keys()
-            while (keys.hasNext()) {
-                val k = keys.next()
-                val v = node.opt(k)
-                if (v is JSONArray) return v
-                if (v is JSONObject) findFirstArray(v, *names)?.let { return it }
-            }
-            return null
-        }
-
-        private fun streamUrl(node: JSONObject): String? {
-            return node.optStringOrNull("url") ?: node.optStringOrNull("file")
-                ?: node.optStringOrNull("stream")
-                ?: node.optJSONObject("source")?.optStringOrNull("url")
-                ?: node.optJSONObject("source")?.optStringOrNull("file")
-        }
-
-        private suspend fun emitStreams(
-            node: JSONObject,
-            sourceLabel: String,
-            provider: String,
-            subtitleCallback: (SubtitleFile) -> Unit,
-            callback: (ExtractorLink) -> Unit,
-        ): Boolean {
-            var found = false
-            // Subtitles
-            findFirstArray(node, "subtitles", "tracks")?.let { subs ->
-                for (i in 0 until subs.length()) {
-                    val s = subs.optJSONObject(i) ?: continue
-                    val url = s.optStringOrNull("file") ?: s.optStringOrNull("url") ?: continue
-                    val label = s.optStringOrNull("label") ?: s.optStringOrNull("lang")
-                        ?: s.optStringOrNull("language") ?: "Subtitle"
-                    subtitleCallback(SubtitleFile(label, url))
-                }
-            }
-            // Streams
-            findFirstArray(node, "streams", "sources")?.let { streams ->
-                for (i in 0 until streams.length()) {
-                    val s = streams.optJSONObject(i) ?: continue
-                    val url = streamUrl(s) ?: continue
-                    val qLabel = s.optStringOrNull("quality") ?: s.optStringOrNull("label")
-                        ?: s.optStringOrNull("resolution") ?: "Auto"
-                    val type = s.optStringOrNull("type")?.lowercase()
-                    val link = newExtractorLink(
-                        source = sourceLabel,
-                        name = "$sourceLabel ${provider.uppercase()} $qLabel",
-                        url = url,
-                        type = when {
-                            type == "dash" || type == "mpd" || url.contains(".mpd", true) -> ExtractorLinkType.DASH
-                            url.contains(".m3u8", true) -> ExtractorLinkType.M3U8
-                            else -> ExtractorLinkType.VIDEO
-                        },
-                    ) {
-                        this.referer = SITE
-                        this.quality = qualityFromLabel(qLabel).takeIf { it != Qualities.Unknown.value }
-                            ?: Qualities.Unknown.value
-                        this.headers = mapOf("Referer" to "$SITE/", "Origin" to SITE)
-                    }
-                    callback(link)
-                    found = true
-                }
-            }
-            return found
-        }
-
-        private suspend fun pipeGet(app: Requests, payload: JSONObject): JSONObject? {
-            val encoded = encodePipeRequest(payload)
-            val url = "$PIPE?e=${encodeUrl(encoded)}"
-            val r = runCatching {
-                app.get(url, headers = HEADERS, timeout = 12_000)
-            }.getOrNull() ?: return null
-            if (r.code !in 200..299 || r.text.isBlank()) return null
-            // Cloudflare challenge body is HTML, not base64 — short-circuit.
-            if (r.text.contains("cloudflare", ignoreCase = true) ||
-                r.text.contains("<!DOCTYPE", ignoreCase = true)) return null
-            return decodePipeResponse(r.text)
-        }
-
-        private suspend fun searchAnilistId(app: Requests, query: String): Int? {
-            val gql = """
-                query (${'$'}search: String, ${'$'}page: Int, ${'$'}perPage: Int) {
-                  Page(page: ${'$'}page, perPage: ${'$'}perPage) {
-                    media(search: ${'$'}search, type: ANIME, sort: SEARCH_MATCH) {
-                      id
-                      title { romaji english native }
-                    }
-                  }
-                }
-            """.trimIndent()
-            val body = JSONObject().apply {
-                put("query", gql)
-                put("variables", JSONObject().apply {
-                    put("search", query)
-                    put("page", 1)
-                    put("perPage", 5)
-                })
-            }.toString().toRequestBody("application/json".toMediaTypeOrNull())
-            val res = runCatching {
-                app.post(ANILIST_GQL, headers = ANILIST_HEADERS, requestBody = body, timeout = 10_000)
-            }.getOrNull() ?: return null
-            if (res.code !in 200..299) return null
-            val mediaArr = runCatching {
-                JSONObject(res.text).optJSONObject("data")?.optJSONObject("Page")?.optJSONArray("media")
-            }.getOrNull() ?: return null
-            // Pick the best title match.
-            var bestId: Int? = null
-            var bestScore = 0.0
-            for (i in 0 until mediaArr.length()) {
-                val m = mediaArr.optJSONObject(i) ?: continue
-                val id = m.optInt("id", 0).takeIf { it != 0 } ?: continue
-                val titles = m.optJSONObject("title")
-                val t = titles?.optStringOrNull("english") ?: titles?.optStringOrNull("romaji")
-                    ?: titles?.optStringOrNull("native") ?: continue
-                val score = titleSimilarity(t, query)
-                if (score > bestScore) {
-                    bestScore = score
-                    bestId = id
-                }
-            }
-            return if (bestScore >= 0.5) bestId else null
-        }
     }
 
     // ════════════════════════════════════════════════════════════════════════
