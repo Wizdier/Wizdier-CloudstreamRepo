@@ -1,125 +1,173 @@
 # 🎬 Wizdier Cloudstream Repository
 
-A collection of **Cloudstream** extensions for BDIX / Bangladeshi streaming sources.
+> **6 Cloudstream extensions** — one unified catalogue plugin (movies · TV ·
+> anime) plus five standalone BDIX source extensions.
+> Movies, web-series, anime, animation, cartoons & documentaries — Bangla,
+> Hindi, English, Korean, Japanese and more. Health-checked **2026-07-22**.
 
-Provides movies, web-series, anime, animation and TV shows — Bangla, Hindi,
-English, Korean, Japanese, Chinese and more.
+[![Cloudstream](https://img.shields.io/badge/Cloudstream-extension-blueviolet?logo=android)](https://github.com/recloudstream/cloudstream)
+[![Extensions](https://img.shields.io/badge/extensions-6-success)](#-extensions-index)
+[![Latest build](https://img.shields.io/badge/Wizstream-v25-orange)](#-changelog)
 
 ---
 
-## 📦 Extensions
+## 📥 Install this repository
 
-| Extension | Content | Sources |
-|-----------|---------|---------|
-| **Wizstream** *(unified)* | Movies, TV series, anime, OVA — TMDB + AniList catalogues in one plugin | Vid[x] family (vidsrc, vidnest, vidplay, vidup, vidrock, vidfast, videasy) + 4 BDIX sites bundled |
-| **Circle FTP** | Movies, TV series, anime, animation, documentaries, Asian dramas | `new.circleftp.net` |
-| **CTGMovies** | Movies, TV shows, anime | `ctgmovies.com` |
-| **Cineplex BD** | Movies, anime, web-series, cartoons | `cineplexbd.net` |
-| **FTPBD** | Movies, TV shows, anime movies | `ftpbd.net` |
+In **CloudStream → Settings → Extensions → Add repository**, paste:
 
-### 🆕 Wizstream — unified catalogue plugin
+```
+https://raw.githubusercontent.com/Wizdier/Wizdier-CloudstreamRepo/main/repo.json
+```
 
-A single `.cs3` plugin file that registers **two MainAPI providers** from one
-Cloudstream plugin (the "streamplay" pattern):
+Then you'll see every extension below in the repo's extension list.
+CI rebuilds and republishes the `builds` branch (with fresh `plugins.json`
+and all `.cs3` files) on every push.
 
-1. **Wizstream** — TMDB catalogue (movies & TV). Trending / Popular / Top-Rated
-   / Upcoming / Now Playing / On The Air.
-2. **Wizstream-Anime** — AniList catalogue (anime / OVA / movies). Trending /
-   Popular This Season / Top Rated / Upcoming / All-Time Popular.
+---
 
-Both providers share a single `WizstreamSources` resolver bundle, so every
-`loadLinks` call attempts **all** of these in parallel:
+## 🗂️ Extensions Index
 
-- **Vid[x] family** (7 explicit hosts): `vidsrc`, `vidnest`, `vidplay`,
-  `vidup`, `vidrock`, `vidfast`, `videasy`.
-- **Extended VidSrc family** (12 more): VidSrc.icu / VidSrc.to / VidSrc.me /
-  VidSrc.xyz / VidSrc.mov / VidBinge / VidJoy / 2Embed / MultiEmbed /
-  SuperEmbed / Gomo / SmashyStream / VidAPI / VAPlayer / ApiPlayer /
-  111Movies / Remotestream / AutoEmbe.
-- **4 BDIX source sites** (bundled resolvers): Cineplex BD · FTPBD ·
-  Circle FTP · CTGMovies — each searched by title, best-matched, then
-  detail-page-scraped for direct media URLs + iframe embeds.
-- **Anime-specific** (Wizstream-Anime only): AllManga · AnimeStream · ZoroAnime.
+| # | Extension | Version | Lang | Content types | Source host(s) | Today's health |
+|---|-----------|:-------:|:----:|---------------|----------------|:--------------:|
+| 1 | **Wizstream** ⭐ | v25 | en | Movie · TvSeries · Anime · AnimeMovie · OVA | Multi-source (see below) | ✅ |
+| 2 | **Cineplex BD** | v8 | bn | Movie · TvSeries · Anime · AnimeMovie · Cartoon | `cineplexbd.net` | ✅ BDIX |
+| 3 | **Circle FTP** | v8 | en | Movie · TvSeries · Anime · AnimeMovie · Cartoon · AsianDrama · Documentary · OVA | `new.circleftp.net` | ✅ BDIX |
+| 4 | **CTGMovies** | v4 | bn | Movie · TvSeries · Anime · AnimeMovie | `ctgmovies.com` | ✅ |
+| 5 | **FTPBD** | v3 | en | Movie · TvSeries · AnimeMovie | `ftpbd.net` | ✅ |
+| 6 | **FlixHub** | v2 | en | Movie · TvSeries (Hollywood · Bollywood · South-Indian · anime/animation sections) | `flixhub.net` | ✅ BDIX |
 
-Duplicate URLs are de-duped globally across all sources.
+> **About "BDIX" health marks:** `cineplexbd.net`, `new.circleftp.net` and
+> `flixhub.net` live behind Bangladeshi ISP peering (one of them is even on a
+> private `15.1.1.50` intranet address). They time out from outside BD — that
+> is **expected** and *not* an error; from a Bangladeshi connection they work.
+> "Today's health" for BDIX sites = reachable & serving from a BD network.
+
+---
+
+## ⭐ Wizstream in depth
+
+One `.cs3` registers **two catalogue providers**:
+
+| Provider | Catalogue | Pages |
+|----------|-----------|-------|
+| **Wizstream** | TMDB (movies & TV) | Trending · Popular · Top Rated · Upcoming · Now Playing · On The Air |
+| **Wizstream-Anime** | AniList (anime, OVA, movies) | Trending · Popular This Season · Top Rated · Upcoming · All-Time Popular |
+
+Trackers: **MAL · AniList · Kitsu · Simkl** sync where applicable. Posters,
+backdrops, logos, trailers, ratings, cast & per-episode stills via TMDB,
+AniList and ani.zip.
+
+### 🎥 Movie / TV link pipeline (parallel, de-duplicated)
+
+| Group | Sources |
+|-------|---------|
+| **BDIX resolvers** | Cineplex BD · FTPBD · Circle FTP · CTGMovies (fuzzy title-match ≥ 0.4 + year ±1, direct/iframe extraction) |
+| **Cineby** | 8 servers: Neon · Yoru (up to 4K) · Breach · Vyse (English HD) · Killjoy (German) · Fade (Hindi) · Omen (Spanish) · Raze (Portuguese) — encrypted `sources-with-title` API + seed + decrypt service |
+| **Bingr** (new in v24) | 7 scraper servers: Sirius (Global) · Elysium · Miller · Mann · Edmunds · Luna · Aditya (IN) — every link range-probed before it shows |
+| **Moonflix** (new in v24) | 3 backends: multi-audio mp4 ladder (English/**Hindi**/Original…) · HDGhar HLS · VIP/LUL HLS servers for TV + Stremio-track subtitles |
+| **Vid-embed family** | VidSrc · VidNest · VidPlay · VidUp/VidLink · VidRock · VidFast · VidEasy (2embed) · MultiEmbed · SuperEmbed · DatabaseGdrive · VidAPI · VAPlayer · ApiPlayer |
+
+### 🍥 Anime link pipeline (Wizstream-Anime only)
+
+AniZone · **Allmanga** (AllAnime-family persisted API, live-bootstrapped
+aaReq AES-GCM crypto with 3-tier key fallback) · AniChi · UniqueStream ·
+AniNeko · ReANIME · TokyoInsider (direct MKV/MP4 downloads)
+
+Sub/dub aware (Allmanga emits separate `· DUB` batches). AVI/WMV containers
+are excluded on purpose.
+
+### 🏷️ Label conventions in the source picker
+
+```
+Wizstream  • Cineby · Yoru          ← source group (server)
+           ├── 1080p · Original · H.264   ← quality · audio · codec tags
+Wizstream-A • Allmanga · Ak · DUB         ← anime source + dub batch
+[Neon] English                          ← subtitles prefixed with their server
+```
+
+- `· H.264` — TV-safe codec &nbsp;·&nbsp; `· HEVC ⚠` / ` · AV1 ⚠` — no hardware
+  decode on many smart TVs
+- `· DUB`, `· Hindi`, `· German`, … — audio language
+- `· HLS` — adaptive stream
+
+### 🛡️ Error hygiene (no 2004 / 3003 / 4003 cascades)
+
+- **Probe gate** — direct links are verified with a `Range: bytes=0-511`
+  request before they appear in your list; 4xx/5xx and HTML bodies are
+  dropped silently *(kept-alive links on timeouts, so a slow BDIX server
+  never loses you a link)*.
+- **Codec tags** from live HLS-master / MP4-header probing so you can avoid
+  decoders your device lacks (kills ExoPlayer 4003 on old TVs).
+- **No embed-page links ever** — v25 removes the legacy fallback that could
+  emit a raw HTML player page as a stream (root cause of 3003-style errors).
+- **Dead-host policy** — every health sweep, broken non-BDIX hosts are
+  *removed*, not just hidden.
+
+---
+
+## 🧹 v25 removals (health sweep 2026-07-22)
+
+Removed because their hosts are dead/unreachable today:
+
+- `SmashyStream` (embed.smashystream.com — broken TLS) → host + extractor
+- `AutoEmbe` (autoembe.xyz — connection refused)
+- `AnimeStream` (anicdn.stream — unreachable)
+- `ZoroAnime` (hianime.to — hangs indefinitely)
+
+Broken-upstream servers that an operator can still fix (e.g. Cineby's
+Vyse/Fade/Raze, Allmanga's Ak/Uv/Luf clock hosts) stay in code and skip
+gracefully until they recover — they cost nothing while dead.
+
+---
 
 ## ✨ Features
 
-- 🚀 **Fast & responsive** — parallel fetching, TTL metadata caching, and
-  bounded retries with exponential back-off keep every extension snappy.
-- ⏱️ **Hard timeouts** on every network call so a slow or dead server never
-  freezes the UI.
-- 🖼️ **Rich metadata** — posters, backdrops, title logos, trailers, ratings,
-  cast/voice-actor data, and per-episode stills & synopses via **TMDB**,
-  **AniList**, and **ani.zip**.
-- 🔗 **Multi-source support** — multiple releases / audio tracks for the same
-  title are grouped together automatically.
-- 📺 **Tracker sync** — **MAL**, **AniList**, **Kitsu**, and **Simkl** (via IMDb)
-  integration where applicable.
-- 🎚️ **Quality detection** — sources are auto-tagged (4K / 1080p / WEB-DL / etc.)
-  from filenames and metadata.
-- 🧩 **Unified plugin** — `Wizstream.cs3` ships both TMDB + AniList catalogues
-  in one file, mirroring phisher98's streamplay architecture.
-
-## 🔧 Installation
-
-### Add the repository to Cloudstream
-
-```
-https://raw.githubusercontent.com/Wizdier/Wizdier-CloudstreamRepo/builds/plugins.json
-```
-
-1. Open **Cloudstream** → **Settings** → **Extensions** → **Repositories**
-2. Tap **➕** and paste the URL above
-3. Install the extensions you want from the list
-
-### Build from source
-
-```bash
-# Requires JDK 21+ and Android SDK (compileSdk 35)
-./gradlew make        # build all .cs3 files
-./gradlew :Wizstream:make   # build only the unified Wizstream plugin
-```
-
-Built extensions (`.cs3` files) are output to each module's `build/`
-directory (e.g. `Wizstream/build/Wizstream.cs3`).
-
-> **CTGMovies note:** some content requires authentication. Open the extension's
-> settings to enter an email/password (auto-login), a `ctg.token` / Bearer
-> token, or a raw `Cookie` header for protected content.
-
-## 🏗️ Tech Stack
-
-- **Kotlin** + **Coroutines** (concurrent fetches)
-- **Cloudstream Plugin** framework (`com.lagradost.cloudstream3`)
-- **Gradle** (Kotlin DSL) with the recloudstream plugin
-- **Jsoup** for HTML parsing · **org.json** for JSON · **NiceHttp** for HTTP
-- **TMDB / AniList / ani.zip** for metadata enrichment
-
-## 📂 Project Structure
-
-```
-Wizdier-CloudstreamRepo/
-├── Wizstream/        # Unified plugin: WizstreamProvider (TMDB) +
-│                     # WizstreamAnimeProvider (AniList) + WizstreamSources
-│                     # (4 BDIX resolvers + Vid[x] family)
-├── Circle FTP/       # CircleFtpProvider + CircleFtpHttp (resilience layer)
-├── CTGMovies/        # CTGMovies + CTGConcurrent (concurrency/cache)
-├── Cineplex BD/      # CineplexBD + MetadataEnricher + CineplexConcurrent
-├── FTPBD/            # FTPBD + FTPBDConcurrent
-├── icons/            # WizstreamIcon.png + WizstreamAnimeIcon.png
-├── build.gradle.kts  # Root config
-└── repo.json         # Repository manifest
-```
-
-## 📄 License
-
-Provided as-is for personal use.
+- 🚀 Parallel fetching everywhere, TTL metadata caches, bounded retries
+  with exponential back-off.
+- ⏱️ Hard timeouts on every call — a dead server can never freeze the UI.
+- 🖼️ Rich metadata: posters, backdrops, logos, trailers, ratings, cast,
+  per-episode stills & synopses.
+- 🔗 Multi-release grouping — several encodes/audio tracks of the same
+  title grouped under one server label.
+- 🎚️ Quality tags (4K/1080p/720p…) detected from HLS variants, filenames
+  and API fields.
+- 🔐 Cineby account/token settings for protected content.
 
 ---
 
-<div align="center">
+## 🛠️ For developers
 
-Made with ❤️ by **Wizdier**
+```bash
+./gradlew make            # build every extension → */build/*.cs3
+./gradlew makePluginsJson # regenerate build/plugins.json (CI parity)
+./gradlew :Wizstream:make # build a single module
+```
 
-</div>
+Repo layout:
+
+```
+├── Wizstream/     unified catalogue plugin (this repo's flagship)
+├── Cineplex BD/   standalone BDIX
+├── Circle FTP/    standalone BDIX
+├── CTGMovies/     standalone BDIX
+├── FTPBD/         standalone BDIX
+├── FlixHub/       standalone BDIX
+├── icons/         repo artwork (FlixHubIcon, WizstreamIcon, WizstreamAnimeIcon)
+├── repo.json      repository index (what you paste into CloudStream)
+└── .github/workflows/build.yml   CI: build → builds branch
+```
+
+---
+
+## 📜 Changelog
+
+| Version | Highlights |
+|---------|-----------|
+| **v25** (2026-07-22) | Full-repo health sweep: removed 4 dead embed hosts + SmashyStream extractor; removed embed-page fallback links (3003 fixes); FlixHub icon added; README & repo.json reorganised |
+| v24 (2026-07-22) | Added **Bingr** (7 servers) and **Moonflix** (3 backends incl. Hindi-dub mp4 ladder); Cineby server re-verification |
+| v23 | Movie sources trimmed to BDIX + Cineby (removed Aether); Miruro removed from anime sources |
+| v22 | Mkissa removed → **Allmanga** added (AllAnime family, self-bootstrapping crypto) |
+| v21 | TokyoInsider resolver (direct MKV/MP4 anime downloads) |
+| v20 | BDIX fuzzy-pick revert (stability); Aether source (removed in v23) |
+| v19 | Mkissa AA-crypto bypass; UniqueStream · AniNeko · ReANIME anime resolvers; probe gate |
+| v18 | Codec tagging (HEVC ⚠/AV1 ⚠) against decoder errors on older TVs |

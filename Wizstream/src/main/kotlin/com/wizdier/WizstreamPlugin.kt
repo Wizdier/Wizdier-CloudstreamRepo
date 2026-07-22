@@ -13,8 +13,11 @@ import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
  * Both providers share the same `WizstreamSources` resolver bundle so
  * every loadLinks call attempts the 4 BDIX source sites (Cineplex BD,
  * FTPBD, Circle FTP, CTGMovies) AND the Vid[x] embed family
- * (vidsrc, vidnest, vidplay, vidup, vidrock, vidfast, videasy) in
- * parallel. Duplicates are de-duped by URL.
+ * (vidsrc, vidnest, vidplay, vidup/vidlink, vidrock, vidfast, videasy)
+ * plus the bundled web sources (Cineby, Bingr, Moonflix), all in
+ * parallel. Duplicates are de-duped by URL. Dead embed hosts
+ * (SmashyStream, AutoEmbe, AnimeStream, ZoroAnime) were removed in v25
+ * after a fresh live health sweep.
  *
  * Custom extractors (WizstreamExtractors.kt) are registered here so
  * `loadExtractor` can dispatch to them when a vid embed URL is encountered
@@ -36,7 +39,6 @@ class WizstreamPlugin : BasePlugin() {
         // vidsrc.me redirects (they all 302 to vsembed.ru).
         registerExtractorAPI(VsEmbedExtractor())
         registerExtractorAPI(TwoEmbedCcExtractor())
-        registerExtractorAPI(SmashyStreamExtractor())
         registerExtractorAPI(VidFastExtractor())
         registerExtractorAPI(VidLinkExtractor())
     }

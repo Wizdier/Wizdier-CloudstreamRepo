@@ -183,7 +183,7 @@ class WizstreamProvider : MainAPI() {
         SyncIdName.Imdb,
         runCatching { SyncIdName.valueOf("Simkl") }.getOrNull(),
         runCatching { SyncIdName.valueOf("Tmdb") }.getOrNull(),
-    )
+        )
 
     companion object {
         private const val TAG = "Wizstream"
@@ -231,9 +231,6 @@ class WizstreamProvider : MainAPI() {
             VidHost("DatabaseGdrive",
                 { id -> "https://databasegdriveplayer.co/player.php?imdb=$id" },
                 { id, s, e -> "https://databasegdriveplayer.co/player.php?type=series&imdb=$id&season=$s&episode=$e" }),
-            VidHost("SmashyStream",
-                { id -> "https://embed.smashystream.com/playere.php?imdb=$id" },
-                { id, s, e -> "https://embed.smashystream.com/playere.php?imdb=$id&season=$s&episode=$e" }),
             VidHost("VidAPI",
                 { id -> "https://vidapi.ru/embed/movie/$id" },
                 { id, s, e -> "https://vidapi.ru/embed/tv/$id/$s/$e" }),
@@ -243,9 +240,6 @@ class WizstreamProvider : MainAPI() {
             VidHost("ApiPlayer",
                 { id -> "https://apiplayer.ru/embed/movie/$id" },
                 { id, s, e -> "https://apiplayer.ru/embed/tv/$id/$s/$e" }),
-            VidHost("AutoEmbe",
-                { id -> "https://autoembe.xyz/embed/movie?imdb=$id" },
-                { id, s, e -> "https://autoembe.xyz/embed/tv?imdb=$id&sea=$s&epi=$e" }),
         )
 
         private val metaCache = ConcurrentHashMap<String, Pair<Long, TmdbDetail>>()
@@ -443,18 +437,6 @@ class WizstreamProvider : MainAPI() {
                             val newSource = "Wizstream • ${host.label}"
                             val newName = "${host.label} — ${link.name}".trimEnd('—', ' ')
                             callback(link.relabel(newSource, newName))
-                            anyFound = true
-                        }
-                        if (!anyFound && !before) {
-                            callback(newExtractorLink(
-                                source = "Wizstream • ${host.label}",
-                                name = "${host.label} — Auto",
-                                url = embedUrl,
-                                type = INFER_TYPE,
-                            ) {
-                                referer = host.referer.ifBlank { "https://" }
-                                quality = Qualities.Unknown.value
-                            })
                             anyFound = true
                         }
                     } catch (t: Throwable) {

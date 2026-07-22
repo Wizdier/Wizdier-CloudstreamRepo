@@ -178,7 +178,7 @@ class WizstreamAnimeProvider : MainAPI() {
         runCatching { SyncIdName.valueOf("Kitsu") }.getOrNull(),
         runCatching { SyncIdName.valueOf("Simkl") }.getOrNull(),
         runCatching { SyncIdName.valueOf("Imdb") }.getOrNull(),
-    )
+        )
 
     companion object {
         private const val TAG = "WizstreamAnime"
@@ -228,9 +228,6 @@ class WizstreamAnimeProvider : MainAPI() {
             VidHost("DatabaseGdrive",
                 { id -> "https://databasegdriveplayer.co/player.php?imdb=$id" },
                 { id, s, e -> "https://databasegdriveplayer.co/player.php?type=series&imdb=$id&season=$s&episode=$e" }),
-            VidHost("SmashyStream",
-                { id -> "https://embed.smashystream.com/playere.php?imdb=$id" },
-                { id, s, e -> "https://embed.smashystream.com/playere.php?imdb=$id&season=$s&episode=$e" }),
             VidHost("VidAPI",
                 { id -> "https://vidapi.ru/embed/movie/$id" },
                 { id, s, e -> "https://vidapi.ru/embed/tv/$id/$s/$e" }),
@@ -240,19 +237,10 @@ class WizstreamAnimeProvider : MainAPI() {
             VidHost("ApiPlayer",
                 { id -> "https://apiplayer.ru/embed/movie/$id" },
                 { id, s, e -> "https://apiplayer.ru/embed/tv/$id/$s/$e" }),
-            VidHost("AutoEmbe",
-                { id -> "https://autoembe.xyz/embed/movie?imdb=$id" },
-                { id, s, e -> "https://autoembe.xyz/embed/tv?imdb=$id&sea=$s&epi=$e" }),
             // Anime-specific
             VidHost("AllManga",
                 { id -> "https://allmanga.to/manga/$id" },
                 { id, _, e -> "https://allmanga.to/streaming/anicdn.php?anime_id=$id&ep=$e" }),
-            VidHost("AnimeStream",
-                { id -> "https://anicdn.stream/anime/$id" },
-                { id, _, e -> "https://anicdn.stream/episode/$id-$e" }),
-            VidHost("ZoroAnime",
-                { id -> "https://hianime.to/search?keyword=$id" },
-                { id, _, e -> "https://hianime.to/ajax/v2/episode/sources?id=$id&ep=$e" }),
         )
     }
 
@@ -486,20 +474,6 @@ class WizstreamAnimeProvider : MainAPI() {
                                 val newSource = "Wizstream-A • ${host.label}"
                                 val newName = "${host.label} — ${link.name}".trimEnd('—', ' ')
                                 callback(link.aRelabel(newSource, newName))
-                                anyFound = true
-                            }
-                            if (!anyFound && !before) {
-                                callback(newExtractorLink(
-                                    source = "Wizstream-A • ${host.label}",
-                                    name = "${host.label} — Auto",
-                                    url = embedUrl,
-                                    type = INFER_TYPE,
-                                ) {
-                                    referer = runCatching {
-                                        "https://" + java.net.URL(embedUrl).host + "/"
-                                    }.getOrDefault("https://")
-                                    quality = Qualities.Unknown.value
-                                })
                                 anyFound = true
                             }
                         } catch (_: Throwable) {
