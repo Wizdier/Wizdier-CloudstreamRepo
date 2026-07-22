@@ -53,6 +53,8 @@ object WizstreamSources {
             CircleFtpResolver,
             CtgMoviesResolver,
             CinebyResolver,
+            BingrResolver,
+            MoonflixResolver,
         )
 
         val gate = Semaphore(4)
@@ -2190,6 +2192,546 @@ object WizstreamSources {
         private fun doubleEncode(s: String): String = pctEncode(pctEncode(s))
     }
 
+    // ════════════════════════════════════════════════════════════════════════
+    //  Resolver 6: Bingr  (https://bingr.one)
+    //
+    //  Recon (2026-07-22): Vite SPA backed by one anonymous JSON API:
+    //    POST https://api.bingr.one/api/stream
+    //    body  {"srv": <serverId>, "t": "movie"|"tv", "id": <tmdbId>,
+    //           "query": {"title":…, "year":…, "season":…, "episode":…}}
+    //    resp  {"scraperName": "Sirius",
+    //           "sources":   [{"url","quality","language","type","label"}],
+    //           "subtitles": []}
+    //  Seven active scraper servers (three more exist but are flagged
+    //  `comingSoon` server-side and return nothing):
+    //    s11 Sirius · s10 Elysium · s1 Miller · s2 Mann · s3 Edmunds ·
+    //    s4 Luna · s5 Aditya
+    //  Returned media URLs are already proxied (filmu.in / workers.dev) and
+    //  embed whatever referer the origin host needs — dead variants are
+  //  common, so every link is verified with a probe before it is emitted.
+    // ════════════════════════════════════════════════════════════════════════
+
+    internal object BingrResolver : SourceResolver {
+        private const val SITE = "https://bingr.one"
+        private const val API = "https://api.bingr.one/api"
+        private const val LABEL = "Bingr"
+        private val HEADERS = mapOf(
+            "User-Agent" to UA,
+            "Referer" to "$SITE/",
+            "Origin" to SITE,
+            "Accept" to "application/json, text/plain, */*",
+        )
+
+        private val SERVERS = listOf(
+            "s11" to "Sirius",
+            "s10" to "Elysium",
+            "s1" to "Miller",
+            "s2" to "Mann",
+            "s3" to "Edmunds",
+            "s4" to "Luna",
+            "s5" to "Aditya",
+        )
+
+        override suspend fun resolve(
+            app: Requests,
+            title: String,
+            year: Int?,
+            isMovie: Boolean,
+            season: Int?,
+            episode: Int?,
+            labelPrefix: String,
+            subtitleCallback: (SubtitleFile) -> Unit,
+            callback: (ExtractorLink) -> Unit,
+            tmdbId: Int?,
+            imdbId: String?,
+        ): Boolean {
+            if (tmdbId == null) return false
+            val srcLabel = "$labelPrefix • $LABEL"
+            val mediaType = if (isMovie) "movie" else "tv"
+
+            val query = JSONObject().apply {
+                put("title", title)
+                year?.let { put("year", it) }
+                if (!isMovie) {
+                    put("season", season ?: 1)
+                    put("episode", episode ?: 1)
+                }
+            }
+
+            var any = false
+            val gate = Semaphore(3)
+            coroutineScope {
+                SERVERS.map { (srvId, srvName) ->
+                    async(Dispatchers.IO) {
+                        gate.withPermit {
+                            runCatching {
+                                resolveOneServer(
+                                    app, srvId, srvName, mediaType, tmdbId,
+                                    query, srcLabel, subtitleCallback, callback,
+                                )
+                            }.getOrDefault(false)
+                        }
+                    }
+                }.awaitAll().forEach { if (it) any = true }
+            }
+            return any
+        }
+
+        private suspend fun resolveOneServer(
+            app: Requests,
+            srvId: String,
+            srvName: String,
+            mediaType: String,
+            tmdbId: Int,
+            query: JSONObject,
+            srcLabel: String,
+            subtitleCallback: (SubtitleFile) -> Unit,
+            callback: (ExtractorLink) -> Unit,
+        ): Boolean {
+            val body = JSONObject().apply {
+                put("srv", srvId)
+                put("t", mediaType)
+                put("id", tmdbId.toString())
+                put("query", query)
+            }.toString()
+            val resp = runCatching {
+                app.post(
+                    "$API/stream",
+                    headers = HEADERS + ("Content-Type" to "application/json"),
+                    requestBody = body.toRequestBody("application/json".toMediaTypeOrNull()),
+                    cacheTime = 0,
+                    timeout = 20_000,
+                )
+            }.getOrNull() ?: return false
+            if (resp.code !in 200..299 || resp.text.isBlank()) return false
+            val json = runCatching { JSONObject(resp.text) }.getOrNull() ?: return false
+
+            val serverSourceLabel = "$srcLabel · $srvName"
+            var any = false
+
+            // Subtitles ride the top-level array.
+            val subs = json.optJSONArray("subtitles")
+            if (subs != null) {
+                for (i in 0 until subs.length()) {
+                    val s = subs.optJSONObject(i) ?: continue
+                    val subUrl = s.optStringOrNullCp("url") ?: s.optStringOrNullCp("file")
+                        ?: s.optStringOrNullCp("src") ?: continue
+                    if (!subUrl.startsWith("http")) continue
+                    val rawLabel = s.optStringOrNullCp("label") ?: s.optStringOrNullCp("language")
+                        ?: s.optStringOrNullCp("lang") ?: "Subtitle"
+                    subtitleCallback(SubtitleFile("[$srvName] $rawLabel", subUrl))
+                }
+            }
+
+            val sources = json.optJSONArray("sources") ?: return any
+            for (i in 0 until sources.length()) {
+                val s = sources.optJSONObject(i) ?: continue
+                val url = s.optStringOrNullCp("url") ?: continue
+                if (!url.startsWith("http")) continue
+                val quality = s.optStringOrNullCp("quality") ?: "Auto"
+                val language = s.optStringOrNullCp("language")
+                val langTag = when {
+                    language.isNullOrBlank() || language.equals("Original", true) -> ""
+                    language.equals("English", true) -> " · English"
+                    else -> " · $language"
+                }
+                val type = s.optStringOrNullCp("type") ?: ""
+                val isHls = url.contains(".m3u8", true) ||
+                    type.contains("mpegurl", true) || type.contains("m3u8", true)
+                val isMp4 = !isHls && (url.contains(".mp4", true) ||
+                    type.contains("mp4", true))
+
+                // Probe before emitting — Bingr scrapers return dead variants
+                // often; a 403/404/5xx link must never reach the player.
+                when {
+                    isHls -> {
+                        val masterText = runCatching {
+                            app.get(url, headers = HEADERS + ("Range" to "bytes=0-16384"),
+                                cacheTime = 0, timeout = 12_000)
+                        }.getOrNull()
+                        if (masterText == null || masterText.code !in 200..299 && masterText.code != 206) continue
+                        val text = masterText.text
+                        if (!text.contains("#EXTM3U")) continue
+                        val codecTag = codecTagFromCodecs(
+                            Regex("""CODECS=\"([^\"]+)\"""").find(text)?.groupValues?.get(1)
+                        )
+                        callback(
+                            newExtractorLink(
+                                source = serverSourceLabel,
+                                name = "$quality$langTag$codecTag",
+                                url = url,
+                                type = ExtractorLinkType.M3U8,
+                            ) {
+                                this.referer = "$SITE/"
+                                this.quality = qualityFromName(quality)
+                                this.headers = HEADERS
+                            }
+                        )
+                        any = true
+                    }
+                    isMp4 -> {
+                        val probe = runCatching {
+                            app.get(url, headers = HEADERS + ("Range" to "bytes=0-511"),
+                                cacheTime = 0, timeout = 12_000)
+                        }.getOrNull()
+                        if (probe == null || probe.code !in 200..299 && probe.code != 206) continue
+                        callback(
+                            newExtractorLink(
+                                source = serverSourceLabel,
+                                name = "$quality$langTag",
+                                url = url,
+                                type = ExtractorLinkType.VIDEO,
+                            ) {
+                                this.referer = "$SITE/"
+                                this.quality = qualityFromName(quality)
+                                this.headers = HEADERS
+                            }
+                        )
+                        any = true
+                    }
+                    else -> continue // unknown container — skip (prevents 3003)
+                }
+            }
+            return any
+        }
+
+        private fun codecTagFromCodecs(codecs: String?): String {
+            if (codecs.isNullOrBlank()) return ""
+            val c = codecs.lowercase()
+            return when {
+                c.contains("hvc1") || c.contains("hev1") || c.contains("dvh1") -> " · HEVC ⚠"
+                c.contains("av01") -> " · AV1 ⚠"
+                c.contains("vp09") || c.contains("vp9") -> " · VP9 ⚠"
+                c.contains("avc1") || c.contains("avc3") -> " · H.264"
+                else -> ""
+            }
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    //  Resolver 7: Moonflix  (https://moonflix.website)
+    //
+    //  Recon (2026-07-22): Lovable/Vite SPA. Playback happens on
+    //  player.moonflix.website, which queries three anonymous Railway
+    //  backends (all TMDB-keyed, no auth, no cookies):
+    //    CH = https://confident-harmony-production-0578.up.railway.app
+    //         /movie/{id}  ·  /tv/{id}/{season}/{episode}
+    //         → {streams: [{language, available, qualities:
+    //                       [{resolution, codec, raw_url}]}], subtitles: []}
+    //         Multi-audio direct mp4 ladder (English/Hindi/Original/…).
+    //         ALSO: /subtitles/movie/{id} · /subtitles/tv/{id}/{s}/{e}
+    //         (a bare JSON array or {"subtitles": [...]} — handle both).
+    //    HV = https://hvhyu-production.up.railway.app  (same paths)
+    //         → {streams: [{quality, url(.m3u8), type: "hls"}]}
+    //    SE = https://series-production-5c1c.up.railway.app   (TV only)
+    //         → {sources: [{name: "VIP 1"/"LUL 2"/…, url, proxy_url}]}
+    //  Live-verified limitations: CH's CDN (hakunaymatata) reverse-proxies
+    //  behind a cache layer that denies datacenter IPs and rate-limits hard,
+    //  so we canary-probe it ONCE with the site's own player referer and
+  //  emit the whole ladder only when the user's network can actually eat it.
+    // ════════════════════════════════════════════════════════════════════════
+
+    internal object MoonflixResolver : SourceResolver {
+        private const val SITE = "https://moonflix.website"
+        private const val PLAYER = "https://player.moonflix.website"
+        private const val LABEL = "Moonflix"
+        private const val API_CH = "https://confident-harmony-production-0578.up.railway.app"
+        private const val API_HV = "https://hvhyu-production.up.railway.app"
+        private const val API_SE = "https://series-production-5c1c.up.railway.app"
+
+        private val HEADERS = mapOf("User-Agent" to UA)
+        private val PLAYER_HEADERS = mapOf(
+            "User-Agent" to UA,
+            "Referer" to "$PLAYER/",
+            "Origin" to PLAYER,
+        )
+
+        override suspend fun resolve(
+            app: Requests,
+            title: String,
+            year: Int?,
+            isMovie: Boolean,
+            season: Int?,
+            episode: Int?,
+            labelPrefix: String,
+            subtitleCallback: (SubtitleFile) -> Unit,
+            callback: (ExtractorLink) -> Unit,
+            tmdbId: Int?,
+            imdbId: String?,
+        ): Boolean {
+            if (tmdbId == null) return false
+            val srcLabel = "$labelPrefix • $LABEL"
+            val sNum = if (isMovie) 1 else (season ?: 1)
+            val eNum = if (isMovie) 1 else (episode ?: 1)
+            val mediaPath = if (isMovie) "movie/$tmdbId" else "tv/$tmdbId/$sNum/$eNum"
+
+            var any = false
+            coroutineScope {
+                val chJob = async(Dispatchers.IO) {
+                    runCatching {
+                        fetchCh(app, mediaPath, srcLabel, callback)
+                    }.getOrDefault(false)
+                }
+                val hvJob = async(Dispatchers.IO) {
+                    runCatching {
+                        fetchHv(app, mediaPath, srcLabel, callback)
+                    }.getOrDefault(false)
+                }
+                val seJob = async(Dispatchers.IO) {
+                    if (isMovie) return@async false
+                    runCatching {
+                        fetchSe(app, tmdbId, sNum, eNum, srcLabel, callback)
+                    }.getOrDefault(false)
+                }
+                val subJob = async(Dispatchers.IO) {
+                    runCatching { fetchSubs(app, mediaPath, subtitleCallback) }
+                }
+                listOf(chJob, hvJob, seJob).awaitAll().forEach { if (it) any = true }
+                subJob.await()
+            }
+            return any
+        }
+
+        // ── CH backend: multi-language direct mp4 ladder ────────────────────
+
+        private suspend fun fetchCh(
+            app: Requests,
+            mediaPath: String,
+            srcLabel: String,
+            callback: (ExtractorLink) -> Unit,
+        ): Boolean {
+            val json = getJson(app, "$API_CH/$mediaPath") ?: return false
+            val streams = json.optJSONArray("streams") ?: return false
+            if (streams.length() == 0) return false
+
+            data class ChLink(val lang: String, val resolution: String, val codec: String, val url: String)
+            val links = mutableListOf<ChLink>()
+            for (i in 0 until streams.length()) {
+                val st = streams.optJSONObject(i) ?: continue
+                if (!st.optBoolean("available", false)) continue
+                val lang = st.optStringOrNullCp("language") ?: continue
+                val qualities = st.optJSONArray("qualities") ?: continue
+                for (q in 0 until qualities.length()) {
+                    val qual = qualities.optJSONObject(q) ?: continue
+                    val raw = qual.optStringOrNullCp("raw_url") ?: continue
+                    if (!raw.startsWith("http")) continue
+                    links += ChLink(
+                        lang = lang,
+                        resolution = qual.optStringOrNullCp("resolution") ?: "Auto",
+                        codec = qual.optStringOrNullCp("codec") ?: "",
+                        url = raw,
+                    )
+                }
+            }
+            if (links.isEmpty()) return false
+
+            // Canary probe — CH's CDN (squid "web cache") hard-denies
+            // datacenter IPs with 403 and rate-limits aggressively, so we
+            // must NOT fire one probe per link. One probe on the first link:
+            // reachable → the user's network is good, emit the whole ladder;
+            // denied    → drop the group entirely (clean absence, no 2004s).
+            val canary = runCatching {
+                app.get(
+                    links.first().url,
+                    headers = PLAYER_HEADERS + ("Range" to "bytes=0-511"),
+                    cacheTime = 0, timeout = 12_000,
+                )
+            }.getOrNull() ?: return false
+            if (canary.code !in 200..299 && canary.code != 206) return false
+
+            var any = false
+            for (l in links) {
+                val pretty = l.lang.replaceFirstChar { it.uppercase() }
+                val codecTag = chCodecTag(l.codec)
+                callback(
+                    newExtractorLink(
+                        source = "$srcLabel · $pretty",
+                        name = "${l.resolution}$codecTag",
+                        url = l.url,
+                        type = ExtractorLinkType.VIDEO,
+                    ) {
+                        this.referer = "$PLAYER/"
+                        this.quality = qualityFromName(l.resolution)
+                        this.headers = PLAYER_HEADERS
+                    }
+                )
+                any = true
+            }
+            return any
+        }
+
+        private fun chCodecTag(codec: String): String {
+            val c = codec.lowercase()
+            return when {
+                c.contains("265") || c.contains("hevc") || c.contains("hvc1") -> " · HEVC ⚠"
+                c.contains("av1") -> " · AV1 ⚠"
+                c.contains("vp9") -> " · VP9 ⚠"
+                c.contains("264") || c.contains("avc") -> " · H.264"
+                else -> ""
+            }
+        }
+
+        // ── HV backend: per-quality HLS ──────────────────────────────────────
+
+        private suspend fun fetchHv(
+            app: Requests,
+            mediaPath: String,
+            srcLabel: String,
+            callback: (ExtractorLink) -> Unit,
+        ): Boolean {
+            val json = getJson(app, "$API_HV/$mediaPath") ?: return false
+            val streams = json.optJSONArray("streams") ?: return false
+            var any = false
+            val serverSourceLabel = "$srcLabel · HDGhar"
+            for (i in 0 until streams.length()) {
+                val st = streams.optJSONObject(i) ?: continue
+                val url = st.optStringOrNullCp("url") ?: continue
+                if (!url.startsWith("http")) continue
+                val quality = st.optStringOrNullCp("quality") ?: "Auto"
+                if (url.contains(".m3u8", true)) {
+                    // Probe the master (single GET doubles as the codec probe).
+                    val master = runCatching {
+                        app.get(url, headers = HEADERS, cacheTime = 0, timeout = 12_000)
+                    }.getOrNull()
+                    if (master == null || master.code !in 200..299 && master.code != 206 ||
+                        !master.text.contains("#EXTM3U")
+                    ) continue
+                    val codecTag = chCodecTagFromCodecs(
+                        Regex("""CODECS=\"([^\"]+)\"""").find(master.text)?.groupValues?.get(1)
+                    )
+                    callback(
+                        newExtractorLink(
+                            source = serverSourceLabel,
+                            name = "$quality$codecTag",
+                            url = url,
+                            type = ExtractorLinkType.M3U8,
+                        ) {
+                            this.referer = "$PLAYER/"
+                            this.quality = qualityFromName(quality)
+                            this.headers = HEADERS
+                        }
+                    )
+                    any = true
+                } else {
+                    callback(
+                        newExtractorLink(
+                            source = serverSourceLabel,
+                            name = quality,
+                            url = url,
+                            type = ExtractorLinkType.VIDEO,
+                        ) {
+                            this.referer = "$PLAYER/"
+                            this.quality = qualityFromName(quality)
+                            this.headers = HEADERS
+                        }
+                    )
+                    any = true
+                }
+            }
+            return any
+        }
+
+        private fun chCodecTagFromCodecs(codecs: String?): String {
+            if (codecs.isNullOrBlank()) return ""
+            val c = codecs.lowercase()
+            return when {
+                c.contains("hvc1") || c.contains("hev1") || c.contains("dvh1") -> " · HEVC ⚠"
+                c.contains("av01") -> " · AV1 ⚠"
+                c.contains("vp09") || c.contains("vp9") -> " · VP9 ⚠"
+                c.contains("avc1") || c.contains("avc3") -> " · H.264"
+                else -> ""
+            }
+        }
+
+        // ── SE backend: named VIP/LUL HLS servers (TV only) ─────────────────
+
+        private suspend fun fetchSe(
+            app: Requests,
+            tmdbId: Int,
+            seasonNum: Int,
+            episodeNum: Int,
+            srcLabel: String,
+            callback: (ExtractorLink) -> Unit,
+        ): Boolean {
+            val json = getJson(app, "$API_SE/tv/$tmdbId/$seasonNum/$episodeNum") ?: return false
+            val sources = json.optJSONArray("sources") ?: return false
+            var any = false
+            for (i in 0 until sources.length()) {
+                val st = sources.optJSONObject(i) ?: continue
+                val name = st.optStringOrNullCp("name") ?: "Server"
+                // The site itself prefers the proxied URL (bypasses origin
+                // referer checks); raw url is the fallback.
+                val url = st.optStringOrNullCp("proxy_url")
+                    ?: st.optStringOrNullCp("url") ?: continue
+                if (!url.startsWith("http")) continue
+                if (!url.contains(".m3u8", true) && !url.contains("proxy?url=", true)) continue
+                val probe = runCatching {
+                    app.get(url, headers = HEADERS + ("Range" to "bytes=0-8192"),
+                        cacheTime = 0, timeout = 12_000)
+                }.getOrNull()
+                if (probe == null || probe.code !in 200..299 && probe.code != 206) continue
+                if (probe.text.isNotBlank() && !probe.text.startsWith("#EXTM3U") &&
+                    !probe.text.contains("mpegurl", true) && probe.text.length < 40
+                ) continue
+                callback(
+                    newExtractorLink(
+                        source = "$srcLabel · $name",
+                        name = "Auto · HLS",
+                        url = url,
+                        type = ExtractorLinkType.M3U8,
+                    ) {
+                        this.referer = "$PLAYER/"
+                        this.quality = qualityFromName(url)
+                        this.headers = HEADERS
+                    }
+                )
+                any = true
+            }
+            return any
+        }
+
+        // ── Subtitles (CH) ──────────────────────────────────────────────────
+
+        private suspend fun fetchSubs(
+            app: Requests,
+            mediaPath: String,
+            subtitleCallback: (SubtitleFile) -> Unit,
+        ) {
+            val resp = runCatching {
+                app.get("$API_CH/subtitles/$mediaPath", headers = HEADERS,
+                    cacheTime = 0, timeout = 15_000)
+            }.getOrNull() ?: return
+            if (resp.code !in 200..299 || resp.text.isBlank()) return
+            val trimmed = resp.text.trimStart()
+            // Shape is either a bare array or {"subtitles": [...]}.
+            val arr = when {
+                trimmed.startsWith("[") -> runCatching { JSONArray(trimmed) }.getOrNull()
+                trimmed.startsWith("{") -> runCatching { JSONObject(trimmed) }.getOrNull()
+                    ?.optJSONArray("subtitles")
+                else -> null
+            } ?: return
+            var emitted = 0
+            for (i in 0 until arr.length()) {
+                if (emitted >= 12) break
+                val s = arr.optJSONObject(i) ?: continue
+                val url = s.optStringOrNullCp("url") ?: s.optStringOrNullCp("file")
+                    ?: s.optStringOrNullCp("src") ?: continue
+                if (!url.startsWith("http")) continue
+                val lang = s.optStringOrNullCp("lang") ?: s.optStringOrNullCp("language")
+                    ?: s.optStringOrNullCp("label") ?: "Unknown"
+                subtitleCallback(SubtitleFile("[Moonflix] ${lang.uppercase()}", url))
+                emitted++
+            }
+        }
+
+        private suspend fun getJson(app: Requests, url: String): JSONObject? {
+            val resp = runCatching {
+                app.get(url, headers = HEADERS, cacheTime = 0, timeout = 20_000)
+            }.getOrNull() ?: return null
+            if (resp.code !in 200..299 || resp.text.isBlank()) return null
+            return runCatching { JSONObject(resp.text) }.getOrNull()
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
