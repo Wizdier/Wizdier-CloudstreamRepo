@@ -1771,7 +1771,7 @@ object WizstreamSources {
                         !quality.equals(server.qualityFilter, ignoreCase = true)
                     ) continue
 
-                    val name = buildLabel(server, quality, srcLabel)
+                    val name = buildLabel(server)
                     if (emitTaggedMedia(app, safeUrl, serverSourceLabel, name, callback)) {
                         any = true
                     } else if (safeUrl.contains(".m3u8", true)) {
@@ -1838,7 +1838,7 @@ object WizstreamSources {
                     val safeUrl = if (singleUrl.startsWith("http://")) {
                         singleUrl.replaceFirst("http://", "https://")
                     } else singleUrl
-                    val name = buildLabel(server, "Auto", srcLabel)
+                    val name = buildLabel(server)
                     if (safeUrl.contains(".m3u8", true)) {
                         M3u8Helper.generateM3u8(
                             source = serverSourceLabel,
@@ -1873,7 +1873,7 @@ object WizstreamSources {
                             val safeUrl = if (url.startsWith("http://")) {
                                 url.replaceFirst("http://", "https://")
                             } else url
-                            val name = buildLabel(server, q, srcLabel)
+                            val name = buildLabel(server)
                             if (safeUrl.contains(".m3u8", true)) {
                                 M3u8Helper.generateM3u8(
                                     source = serverSourceLabel,
@@ -2092,25 +2092,16 @@ object WizstreamSources {
             return false
         }
 
-        private fun buildLabel(server: CinebyServer, quality: String, srcLabel: String): String {
-            val parts = mutableListOf<String>()
-            // Skip quality if it's just the language name (avoid duplicate
-            // with the audioLabel below).
-            val isLangQuality = quality.equals(server.audioLabel, ignoreCase = true) ||
-                (server.qualityFilter != null && quality.equals(server.qualityFilter, ignoreCase = true))
-            if (!isLangQuality && quality.isNotBlank() && quality != "Auto") {
-                parts += quality
-            }
-            // If quality is "Auto" or a language name, show "Auto" as fallback
-            // so the user sees something useful.
-            if (parts.isEmpty() && (quality == "Auto" || isLangQuality)) {
-                parts += "Auto"
-            }
-            server.audioLabel?.let { parts += "$it audio" }
-            // If we have no parts at all, return a minimal label.
-            if (parts.isEmpty()) parts += "Stream"
-            return parts.joinToString(" · ")
-        }
+        /**
+         * (v26) The in-player source switcher renders ONLY name (+ the
+         * quality it appends itself) - the `source` field is invisible
+         * there. So the full "Cineby · Server" path lives INSIDE the name,
+         * and the resolution is intentionally NOT included (the UI appends
+         * it from link.quality, which used to produce "720p · Hindi 720p"
+         * duplicates).
+         */
+        private fun buildLabel(server: CinebyServer): String =
+            "Cineby · ${server.displayName} — ${server.audioLabel ?: "Original"} audio"
 
         // ── TMDB helpers (use the keyless proxy first, fall back to TMDB direct) ──
 
@@ -2330,10 +2321,11 @@ object WizstreamSources {
                 if (!url.startsWith("http")) continue
                 val quality = s.optStringOrNullCp("quality") ?: "Auto"
                 val language = s.optStringOrNullCp("language")
-                val langTag = when {
+                // (v26) name carries the full "Bingr · Server" path + tags;
+                // quality is left to the UI's own quality chip.
+                val langPart = when {
                     language.isNullOrBlank() || language.equals("Original", true) -> ""
-                    language.equals("English", true) -> " · English"
-                    else -> " · $language"
+                    else -> language
                 }
                 val type = s.optStringOrNullCp("type") ?: ""
                 val isHls = url.contains(".m3u8", true) ||
@@ -2358,7 +2350,7 @@ object WizstreamSources {
                         callback(
                             newExtractorLink(
                                 source = serverSourceLabel,
-                                name = "$quality$langTag$codecTag",
+                                name = bingrName(srvName, langPart, codecTag),
                                 url = url,
                                 type = ExtractorLinkType.M3U8,
                             ) {
@@ -2378,7 +2370,7 @@ object WizstreamSources {
                         callback(
                             newExtractorLink(
                                 source = serverSourceLabel,
-                                name = "$quality$langTag",
+                                name = bingrName(srvName, langPart, ""),
                                 url = url,
                                 type = ExtractorLinkType.VIDEO,
                             ) {
@@ -2405,6 +2397,12 @@ object WizstreamSources {
                 c.contains("avc1") || c.contains("avc3") -> " · H.264"
                 else -> ""
             }
+        }
+
+        private fun bingrName(srvName: String, langPart: String, codecTag: String): String {
+            val tags = listOf(langPart, codecTag.trimStart('·', ' '))
+                .filter { it.isNotBlank() }
+            return "Bingr · $srvName" + if (tags.isEmpty()) "" else " — " + tags.joinToString(" · ")
         }
     }
 
@@ -2542,11 +2540,13 @@ object WizstreamSources {
             var any = false
             for (l in links) {
                 val pretty = l.lang.replaceFirstChar { it.uppercase() }
-                val codecTag = chCodecTag(l.codec)
+                // (v26) resolution omitted from the name — the player UI
+                // appends link.quality itself ("1080p 1080p" otherwise).
+                val name = "Moonflix · $pretty" + chCodecTag(l.codec)
                 callback(
                     newExtractorLink(
                         source = "$srcLabel · $pretty",
-                        name = "${l.resolution}$codecTag",
+                        name = name,
                         url = l.url,
                         type = ExtractorLinkType.VIDEO,
                     ) {
@@ -2602,7 +2602,7 @@ object WizstreamSources {
                     callback(
                         newExtractorLink(
                             source = serverSourceLabel,
-                            name = "$quality$codecTag",
+                            name = "Moonflix · HDGhar$codecTag",
                             url = url,
                             type = ExtractorLinkType.M3U8,
                         ) {
@@ -2616,7 +2616,7 @@ object WizstreamSources {
                     callback(
                         newExtractorLink(
                             source = serverSourceLabel,
-                            name = quality,
+                            name = "Moonflix · HDGhar",
                             url = url,
                             type = ExtractorLinkType.VIDEO,
                         ) {
@@ -2676,7 +2676,7 @@ object WizstreamSources {
                 callback(
                     newExtractorLink(
                         source = "$srcLabel · $name",
-                        name = "Auto · HLS",
+                        name = "Moonflix · $name · HLS",
                         url = url,
                         type = ExtractorLinkType.M3U8,
                     ) {

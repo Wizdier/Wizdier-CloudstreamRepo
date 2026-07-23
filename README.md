@@ -7,7 +7,7 @@
 
 [![Cloudstream](https://img.shields.io/badge/Cloudstream-extension-blueviolet?logo=android)](https://github.com/recloudstream/cloudstream)
 [![Extensions](https://img.shields.io/badge/extensions-6-success)](#-extensions-index)
-[![Latest build](https://img.shields.io/badge/Wizstream-v25-orange)](#-changelog)
+[![Latest build](https://img.shields.io/badge/Wizstream-v26-orange)](#-changelog)
 
 ---
 
@@ -163,6 +163,7 @@ Repo layout:
 
 | Version | Highlights |
 |---------|-----------|
+| **v26** (2026-07-23) | Self-descriptive link names: every stream now shows "Source · Server — audio/codec tags" in the player switcher; duplicate quality text removed |
 | **v25** (2026-07-22) | Full-repo health sweep: removed 4 dead embed hosts + SmashyStream extractor; removed embed-page fallback links (3003 fixes); FlixHub icon added; README & repo.json reorganised |
 | v24 (2026-07-22) | Added **Bingr** (7 servers) and **Moonflix** (3 backends incl. Hindi-dub mp4 ladder); Cineby server re-verification |
 | v23 | Movie sources trimmed to BDIX + Cineby (removed Aether); Miruro removed from anime sources |
