@@ -54,6 +54,7 @@ object WizstreamAnimeSources {
     suspend fun resolveAnime(
         app: Requests,
         title: String,
+        altTitle: String? = null,
         anilistId: Int?,
         malId: Int?,
         isMovie: Boolean,
@@ -85,6 +86,7 @@ object WizstreamAnimeSources {
                         src.resolve(
                             app = app,
                             title = title,
+                            altTitle = altTitle,
                             anilistId = anilistId,
                             malId = malId,
                             isMovie = isMovie,
@@ -107,6 +109,7 @@ object WizstreamAnimeSources {
         suspend fun resolve(
             app: Requests,
             title: String,
+            altTitle: String?,
             anilistId: Int?,
             malId: Int?,
             isMovie: Boolean,
@@ -171,6 +174,19 @@ object WizstreamAnimeSources {
             .replace(Regex("[^a-z0-9]+"), " ")
             .trim()
             .replace(Regex("\\s+"), " ")
+
+    /** Similarity of a candidate against BOTH our title aliases (v29). */
+    internal fun bestTitleSim(candidate: String, title: String, altTitle: String?): Double =
+        maxOf(
+            titleSimilarity(candidate, title),
+            altTitle?.let { titleSimilarity(candidate, it) } ?: 0.0,
+        )
+
+    /** Exact-normalised match against either alias. */
+    internal fun matchesEitherTitle(candidate: String, title: String, altTitle: String?): Boolean {
+        val n = candidate.normaliseTitle()
+        return n == title.normaliseTitle() || (altTitle != null && n == altTitle.normaliseTitle())
+    }
 
     /** Jaccard token-overlap similarity 0..1. */
     internal fun titleSimilarity(a: String, b: String): Double {
@@ -496,6 +512,7 @@ object WizstreamAnimeSources {
         override suspend fun resolve(
             app: Requests,
             title: String,
+            altTitle: String?,
             anilistId: Int?,
             malId: Int?,
             isMovie: Boolean,
@@ -514,14 +531,17 @@ object WizstreamAnimeSources {
             //    browse list (which earlier missed anything not in the first
             //    ~90 catalogue entries).
             val candidates = mutableListOf<Pair<String, String>>() // (8-char-id, title)
-            runCatching {
-                val searchUrl = "$SITE/anime?q=${encodeUrl(title)}"
-                val html = app.get(searchUrl, headers = HEADERS, timeout = 12_000).text
-                Jsoup.parse(html, searchUrl).select("a[href~=/anime/[a-z0-9]{8}$]").forEach { a ->
-                    val id = Regex("""/anime/([a-z0-9]{8})""").find(a.attr("href"))?.groupValues?.getOrNull(1)
-                        ?: return@forEach
-                    val t = a.selectFirst("img")?.attr("alt")?.trim() ?: a.text().trim()
-                    if (t.isNotBlank() && id.isNotBlank()) candidates += id to t
+            for (q in listOfNotNull(title, altTitle).distinct()) {
+                if (candidates.isNotEmpty()) break
+                runCatching {
+                    val searchUrl = "$SITE/anime?q=${encodeUrl(q)}"
+                    val html = app.get(searchUrl, headers = HEADERS, timeout = 12_000).text
+                    Jsoup.parse(html, searchUrl).select("a[href~=/anime/[a-z0-9]{8}$]").forEach { a ->
+                        val id = Regex("""/anime/([a-z0-9]{8})""").find(a.attr("href"))?.groupValues?.getOrNull(1)
+                            ?: return@forEach
+                        val t = a.selectFirst("img")?.attr("alt")?.trim() ?: a.text().trim()
+                        if (t.isNotBlank() && id.isNotBlank()) candidates += id to t
+                    }
                 }
             }
             // Fall back to paging the public /anime browse list.
@@ -545,15 +565,14 @@ object WizstreamAnimeSources {
             if (candidates.isEmpty()) return false
             if (candidates.isEmpty()) return false
 
-            // 2. Pick the best title match.
-            val qNorm = title.normaliseTitle()
+            // 2. Pick the best title match (against both of our aliases).
             val best = candidates
                 .distinctBy { it.first }
-                .firstOrNull { (_, ct) -> ct.normaliseTitle() == qNorm }
+                .firstOrNull { (_, ct) -> matchesEitherTitle(ct, title, altTitle) }
                 ?: candidates.distinctBy { it.first }
-                    .maxByOrNull { (_, ct) -> titleSimilarity(ct, title) }
+                    .maxByOrNull { (_, ct) -> bestTitleSim(ct, title, altTitle) }
                 ?: return false
-            if (titleSimilarity(best.second, title) < 0.5) return false
+            if (bestTitleSim(best.second, title, altTitle) < 0.5) return false
 
             val animeId = best.first
             val epNum = episode ?: 1
@@ -690,6 +709,7 @@ object WizstreamAnimeSources {
         override suspend fun resolve(
             app: Requests,
             title: String,
+            altTitle: String?,
             anilistId: Int?,
             malId: Int?,
             isMovie: Boolean,
@@ -705,40 +725,57 @@ object WizstreamAnimeSources {
 
             // 1. Search (POST — a raw query= in the GET URL trips the site's
             //    WAF; a JSON body POST sails through the public gateway).
-            val searchBody = JSONObject().apply {
-                put("variables", JSONObject().apply {
-                    put("search", JSONObject().apply {
-                        put("allowAdult", false)
-                        put("allowUnknown", false)
-                        put("query", title)
+            suspend fun searchEdges(q: String): JSONArray {
+                val searchBody = JSONObject().apply {
+                    put("variables", JSONObject().apply {
+                        put("search", JSONObject().apply {
+                            put("allowAdult", false)
+                            put("allowUnknown", false)
+                            put("query", q)
+                        })
+                        put("limit", 26)
+                        put("page", 1)
+                        put("translationType", "sub")
+                        put("countryOrigin", "ALL")
                     })
-                    put("limit", 26)
-                    put("page", 1)
-                    put("translationType", "sub")
-                    put("countryOrigin", "ALL")
-                })
-                put("extensions", """{"persistedQuery":{"version":1,"sha256Hash":"$SEARCH_HASH"}}""")
-            }.toString()
-            val searchResp = postJson(app, searchBody) ?: return false
-            val edges = searchResp.optJSONObject("data")?.optJSONObject("shows")
-                ?.optJSONArray("edges") ?: return false
-            if (edges.length() == 0) return false
-
-            // 2. Best title match; availableEpisodes rides along on the edge
-            //    so no separate show query is needed.
-            data class Show(val id: String, val name: String, val sub: Int, val dub: Int)
-            val shows = (0 until edges.length()).mapNotNull { i ->
-                val e = edges.optJSONObject(i) ?: return@mapNotNull null
-                val id = e.optStringOrNull("_id") ?: return@mapNotNull null
-                val nm = e.optStringOrNull("name") ?: return@mapNotNull null
-                val av = e.optJSONObject("availableEpisodes")
-                Show(id, nm, av?.optInt("sub", 0) ?: 0, av?.optInt("dub", 0) ?: 0)
+                    put("extensions", """{"persistedQuery":{"version":1,"sha256Hash":"$SEARCH_HASH"}}""")
+                }.toString()
+                return postJson(app, searchBody)?.optJSONObject("data")
+                    ?.optJSONObject("shows")?.optJSONArray("edges") ?: JSONArray()
             }
-            val qNorm = title.normaliseTitle()
-            val best = shows.firstOrNull { it.name.normaliseTitle() == qNorm }
-                ?: shows.maxByOrNull { titleSimilarity(it.name, title) }
-                ?: return false
-            if (titleSimilarity(best.name, title) < 0.5) return false
+
+            // 2. (v29) Match against ALL the aliases the edge ships
+            //    (name / englishName / nativeName) AND both of ours
+            //    (title / altTitle). This is what was killing Allmanga:
+            //    AniList feeds us ENGLISH titles ("Frieren: Beyond Journey's
+            //    End", "1P"→"One Piece") while Allmanga's `name` is often
+            //    ROMAJI ("Sousou no Frieren", "1P") — a 0.17-similarity and
+            //    the resolver gave up, so AniNeko was all the user ever saw.
+            data class Show(val id: String, val names: List<String>, val sub: Int, val dub: Int)
+            fun pickShow(edges: JSONArray): Show? {
+                val shows = (0 until edges.length()).mapNotNull { i ->
+                    val e = edges.optJSONObject(i) ?: return@mapNotNull null
+                    val id = e.optStringOrNull("_id") ?: return@mapNotNull null
+                    val nm = e.optStringOrNull("name") ?: return@mapNotNull null
+                    val av = e.optJSONObject("availableEpisodes")
+                    val names = listOfNotNull(
+                        nm,
+                        e.optStringOrNull("englishName"),
+                        e.optStringOrNull("nativeName"),
+                    )
+                    Show(id, names, av?.optInt("sub", 0) ?: 0, av?.optInt("dub", 0) ?: 0)
+                }
+                fun Show.sim() = names.maxOf { bestTitleSim(it, title, altTitle) }
+                return shows.firstOrNull { s ->
+                    s.names.any { matchesEitherTitle(it, title, altTitle) }
+                } ?: shows.maxByOrNull { it.sim() }?.takeIf { it.sim() >= 0.5 }
+            }
+
+            var best = pickShow(searchEdges(title))
+            if (best == null && !altTitle.isNullOrBlank() && !altTitle.equals(title, true)) {
+                best = pickShow(searchEdges(altTitle))
+            }
+            if (best == null) return false
 
             val wantDub = best.dub >= epToUse
             if (best.sub < epToUse && !wantDub) return false
@@ -1133,6 +1170,7 @@ object WizstreamAnimeSources {
         override suspend fun resolve(
             app: Requests,
             title: String,
+            altTitle: String?,
             anilistId: Int?,
             malId: Int?,
             isMovie: Boolean,
@@ -1148,7 +1186,10 @@ object WizstreamAnimeSources {
             // 1. Find the anime's slug-id on AniChi by searching the title.
             //    (The slug-id is the URL identifier like "naruto-eybxz" —
             //    needed to build the watch URL.)
-            val slugId = findAniChiSlugId(app, title) ?: return false
+            val slugId = findAniChiSlugId(app, title)
+                ?: altTitle?.takeIf { !it.equals(title, true) }
+                    ?.let { findAniChiSlugId(app, it) }
+                ?: return false
 
             // 2. Fetch the watch page for the specific episode. The watch
             //    page contains `data-mal`, `data-slug`, `data-timestamp`
@@ -1315,6 +1356,7 @@ object WizstreamAnimeSources {
         override suspend fun resolve(
             app: Requests,
             title: String,
+            altTitle: String?,
             anilistId: Int?,
             malId: Int?,
             isMovie: Boolean,
@@ -1328,26 +1370,31 @@ object WizstreamAnimeSources {
             val srcLabel = "$labelPrefix • $LABEL"
             val epToUse = episode ?: 1
 
-            // 1. Search.
-            val search = getJson(
-                app, "$API/search?query=${encodeUrl(title)}&limit=5"
-            ) ?: return false
-            val seriesArr = search.optJSONArray("series")
-
+            // 1. Search (both title aliases — (v29) the site's index is
+            //    romaji-heavy while our primary title is usually English).
             data class SMatch(val cid: String, val title: String)
-            val series = (0 until (seriesArr?.length() ?: 0)).mapNotNull { i ->
-                val o = seriesArr?.optJSONObject(i) ?: return@mapNotNull null
-                val cid = o.optStringOrNull("content_id") ?: return@mapNotNull null
-                val t = o.optStringOrNull("title") ?: return@mapNotNull null
-                SMatch(cid, t)
+            var search: JSONObject? = null
+            var bestSeries: SMatch? = null
+            for (q in listOfNotNull(title, altTitle).distinct()) {
+                val s = getJson(app, "$API/search?query=${encodeUrl(q)}&limit=5") ?: continue
+                search = s
+                val seriesArr = s.optJSONArray("series")
+                val series = (0 until (seriesArr?.length() ?: 0)).mapNotNull { i ->
+                    val o = seriesArr?.optJSONObject(i) ?: return@mapNotNull null
+                    val cid = o.optStringOrNull("content_id") ?: return@mapNotNull null
+                    val t = o.optStringOrNull("title") ?: return@mapNotNull null
+                    SMatch(cid, t)
+                }
+                bestSeries = series.firstOrNull { matchesEitherTitle(it.title, title, altTitle) }
+                    ?: series.maxByOrNull { bestTitleSim(it.title, title, altTitle) }
+                        ?.takeIf { bestTitleSim(it.title, title, altTitle) >= 0.5 }
+                if (bestSeries != null) break
             }
-            val qNorm = title.normaliseTitle()
-            val bestSeries = series.firstOrNull { it.title.normaliseTitle() == qNorm }
-                ?: series.maxByOrNull { titleSimilarity(it.title, title) }
+            if (search == null) return false
 
             // 2. Track down the episode content_id.
             var epContentId: String? = null
-            if (bestSeries != null && titleSimilarity(bestSeries.title, title) >= 0.5) {
+            if (bestSeries != null) {
                 epContentId = findEpisodeContentId(app, bestSeries.cid, epToUse)
             }
             if (epContentId == null && isMovie) {
@@ -1359,9 +1406,9 @@ object WizstreamAnimeSources {
                     val t = o.optStringOrNull("title") ?: return@mapNotNull null
                     SMatch(cid, t)
                 }
-                epContentId = (movieHits.firstOrNull { it.title.normaliseTitle() == qNorm }
-                    ?: movieHits.maxByOrNull { titleSimilarity(it.title, title) }
-                        )?.takeIf { titleSimilarity(it.title, title) >= 0.5 }?.cid
+                epContentId = (movieHits.firstOrNull { matchesEitherTitle(it.title, title, altTitle) }
+                    ?: movieHits.maxByOrNull { bestTitleSim(it.title, title, altTitle) }
+                        )?.takeIf { bestTitleSim(it.title, title, altTitle) >= 0.5 }?.cid
             }
             if (epContentId.isNullOrBlank()) return false
 
@@ -1501,6 +1548,7 @@ object WizstreamAnimeSources {
         override suspend fun resolve(
             app: Requests,
             title: String,
+            altTitle: String?,
             anilistId: Int?,
             malId: Int?,
             isMovie: Boolean,
@@ -1514,29 +1562,34 @@ object WizstreamAnimeSources {
             val srcLabel = "$labelPrefix • $LABEL"
             val epToUse = episode ?: 1
 
-            // 1. Ajax search → watch slug.
-            val searchBody = runCatching {
-                app.get(
-                    "$SITE/ajax/search?q=${encodeUrl(title)}",
-                    headers = AJAX_HEADERS, timeout = 12_000,
-                ).text
-            }.getOrNull() ?: return false
-            val results = runCatching { JSONObject(searchBody) }.getOrNull()
-                ?.optJSONArray("results") ?: return false
+            // 1. Ajax search → watch slug (both aliases — v29).
             data class Hit(val slug: String, val title: String)
-            val hits = (0 until results.length()).mapNotNull { i ->
-                val o = results.optJSONObject(i) ?: return@mapNotNull null
-                val t = o.optStringOrNull("title") ?: return@mapNotNull null
-                val slug = o.optStringOrNull("url")
-                    ?.substringAfterLast("/")?.takeIf { it.isNotBlank() }
-                    ?: return@mapNotNull null
-                Hit(slug, t)
+            suspend fun doSearch(q: String): List<Hit> {
+                val searchBody = runCatching {
+                    app.get(
+                        "$SITE/ajax/search?q=${encodeUrl(q)}",
+                        headers = AJAX_HEADERS, timeout = 12_000,
+                    ).text
+                }.getOrNull() ?: return emptyList()
+                val results = runCatching { JSONObject(searchBody) }.getOrNull()
+                    ?.optJSONArray("results") ?: return emptyList()
+                return (0 until results.length()).mapNotNull { i ->
+                    val o = results.optJSONObject(i) ?: return@mapNotNull null
+                    val t = o.optStringOrNull("title") ?: return@mapNotNull null
+                    val slug = o.optStringOrNull("url")
+                        ?.substringAfterLast("/")?.takeIf { it.isNotBlank() }
+                        ?: return@mapNotNull null
+                    Hit(slug, t)
+                }
             }
-            val qNorm = title.normaliseTitle()
-            val best = hits.firstOrNull { it.title.normaliseTitle() == qNorm }
-                ?: hits.maxByOrNull { titleSimilarity(it.title, title) }
-                ?: return false
-            if (titleSimilarity(best.title, title) < 0.5) return false
+            fun List<Hit>.pickBest() = firstOrNull { matchesEitherTitle(it.title, title, altTitle) }
+                ?: maxByOrNull { bestTitleSim(it.title, title, altTitle) }
+                    ?.takeIf { bestTitleSim(it.title, title, altTitle) >= 0.5 }
+            var best = doSearch(title).pickBest()
+            if (best == null && !altTitle.isNullOrBlank() && !altTitle.equals(title, true)) {
+                best = doSearch(altTitle).pickBest()
+            }
+            if (best == null) return false
 
             // 2. Episode page → server buttons.
             val epUrl = "$SITE/watch/${best.slug}/ep-$epToUse"
@@ -1664,6 +1717,7 @@ object WizstreamAnimeSources {
         override suspend fun resolve(
             app: Requests,
             title: String,
+            altTitle: String?,
             anilistId: Int?,
             malId: Int?,
             isMovie: Boolean,
@@ -1677,34 +1731,39 @@ object WizstreamAnimeSources {
             val srcLabel = "$labelPrefix • $LABEL"
             val epToUse = episode ?: 1
 
-            // 1. Search the open API.
-            val body = runCatching {
-                app.get(
-                    "$SITE/api/v1/search?q=${encodeUrl(title)}&limit=5",
-                    headers = HEADERS, timeout = 12_000,
-                ).text
-            }.getOrNull() ?: return false
-            val results = runCatching { JSONObject(body) }.getOrNull()
-                ?.optJSONArray("results") ?: return false
+            // 1. Search the open API (both aliases — v29).
             data class Hit(val slug: String, val names: List<String>)
-            val hits = (0 until results.length()).mapNotNull { i ->
-                val o = results.optJSONObject(i) ?: return@mapNotNull null
-                val slug = o.optStringOrNull("anime_id") ?: return@mapNotNull null
-                val t = o.optJSONObject("title")
-                val names = listOfNotNull(
-                    t?.optStringOrNull("english"),
-                    t?.optStringOrNull("romaji"),
-                    t?.optStringOrNull("native"),
-                )
-                if (names.isEmpty()) return@mapNotNull null
-                Hit(slug, names)
+            suspend fun doSearch(q: String): List<Hit> {
+                val body = runCatching {
+                    app.get(
+                        "$SITE/api/v1/search?q=${encodeUrl(q)}&limit=5",
+                        headers = HEADERS, timeout = 12_000,
+                    ).text
+                }.getOrNull() ?: return emptyList()
+                val results = runCatching { JSONObject(body) }.getOrNull()
+                    ?.optJSONArray("results") ?: return emptyList()
+                return (0 until results.length()).mapNotNull { i ->
+                    val o = results.optJSONObject(i) ?: return@mapNotNull null
+                    val slug = o.optStringOrNull("anime_id") ?: return@mapNotNull null
+                    val t = o.optJSONObject("title")
+                    val names = listOfNotNull(
+                        t?.optStringOrNull("english"),
+                        t?.optStringOrNull("romaji"),
+                        t?.optStringOrNull("native"),
+                    )
+                    if (names.isEmpty()) return@mapNotNull null
+                    Hit(slug, names)
+                }
             }
-            val qNorm = title.normaliseTitle()
-            fun Hit.bestSim(): Double = names.maxOf { titleSimilarity(it, title) }
-            val best = hits.firstOrNull { h -> h.names.any { it.normaliseTitle() == qNorm } }
-                ?: hits.maxByOrNull { it.bestSim() }
-                ?: return false
-            if (best.bestSim() < 0.5) return false
+            fun Hit.bestSim(): Double = names.maxOf { bestTitleSim(it, title, altTitle) }
+            fun List<Hit>.pickBest() = firstOrNull { h ->
+                h.names.any { matchesEitherTitle(it, title, altTitle) }
+            } ?: maxByOrNull { it.bestSim() }?.takeIf { it.bestSim() >= 0.5 }
+            var best = doSearch(title).pickBest()
+            if (best == null && !altTitle.isNullOrBlank() && !altTitle.equals(title, true)) {
+                best = doSearch(altTitle).pickBest()
+            }
+            if (best == null) return false
 
             // 2. SvelteKit data payload for the episode — may be sizeable.
             val watchUrl = "$SITE/watch/${best.slug}"
@@ -1788,6 +1847,7 @@ object WizstreamAnimeSources {
         override suspend fun resolve(
             app: Requests,
             title: String,
+            altTitle: String?,
             anilistId: Int?,
             malId: Int?,
             isMovie: Boolean,
@@ -1853,6 +1913,7 @@ object WizstreamAnimeSources {
             //    own catalogue entries ("Mob Psycho 100 III (TV)").
             val queries = buildList {
                 add(title)
+                if (!altTitle.isNullOrBlank() && !altTitle.equals(title, true)) add(altTitle)
                 val s = season ?: 1
                 if (!isMovie && s > 1) {
                     val roman = arrayOf("", "I", "II", "III", "IV", "V", "VI", "VII", "VIII", "IX", "X")

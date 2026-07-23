@@ -1722,12 +1722,14 @@ object WizstreamSources {
     //  Cineby is a Next.js SPA that delegates video resolution to a
     //  Videasy/Insertunit backend at api.speedracelight.com.
     //
-    //  Three-step resolution flow:
+    //  v30 flow (site rebuilt June 2026 — reverse-engineered from cineby.at):
     //    1. GET /seed?mediaId={tmdbId} → {seed, ttlMs}
-    //    2. GET /{serverPath}/sources-with-title?...&enc=2&seed={seed}
-    //       → encrypted ciphertext (or {"error":"STREAMCRYPTO_SEED_INVALID"})
-    //    3. POST enc-dec.app/api/dec-videasy {text, id, seed}
-    //       → {sources:[{url,quality}], subtitles:[...]}
+    //    2. GET /mbx/sources-with-title?...&enc=2&seed={seed}  (aggregate: ALL
+    //       servers in ONE response — the site's own player calls exactly this)
+    //    3. Decrypt the base64url payload LOCALLY with the "mvm1" stream cipher
+    //       ported 1:1 from the site's JS (the enc-dec.app service is retired).
+    //    Fallback: the old per-server /{path}/sources-with-title endpoints are
+    //       still alive (used by the site's watch-party) — same local decrypt.
     //
     //  8 servers on api.speedracelight.com:
     //    Neon    (neon2)     — Original audio, movies + TV
@@ -1751,7 +1753,7 @@ object WizstreamSources {
     internal object CinebyResolver : SourceResolver {
         private const val SITE = "https://www.cineby.at"
         private const val API_BASE = "https://api.speedracelight.com"
-        private const val DECRYPT_API = "https://enc-dec.app/api/dec-videasy"
+        private const val SUBS_API = "https://subs.videasy.to/search"
         private const val TMDB_PROXY = "https://db.speedracelight.com/3"
         private const val LABEL = "Cineby"
 
@@ -1818,44 +1820,70 @@ object WizstreamSources {
             val imdbIdStr = imdbId?.takeIf { it.isNotBlank() }
                 ?: fetchImdbId(app, tmdbId, mediaType) ?: ""
 
-            // ── Fetch the seed ONCE per media item ──────────────────────────
-            // The seed URL is the same for ALL servers (same apiBase + mediaId),
-            // so fetching it 8 times (once per server) is wasteful and triggers
-            // rate-limiting on api.speedracelight.com. Fetch it once and reuse.
-            // The seed has a 30-second TTL — plenty for 8 sequential server calls.
-            val seed = fetchSeed(app, tmdbId)
+            // ── v30: /mbx aggregate first, per-server endpoints as fallback ──
+            var seed = fetchSeed(app, tmdbId)
             if (seed.isBlank()) {
                 Log.d(TAG, "Cineby: seed fetch failed for tmdbId=$tmdbId")
                 return false
             }
+            suspend fun refreshSeed(): Boolean {
+                val s = fetchSeed(app, tmdbId)
+                if (s.isBlank()) return false
+                seed = s
+                return true
+            }
 
-            // Hit all eligible servers in parallel, but with bounded concurrency
-            // (3 at a time) to avoid rate-limiting on api.speedracelight.com.
-            // The "first works, rest fail" bug was caused by firing 24 requests
-            // (8 seeds + 8 sources + 8 decrypts) simultaneously — the backend
-            // rate-limited the IP after the first batch.
-            val eligible = SERVERS.filter { !it.movieOnly || isMovie }
-            val gate = Semaphore(3)
             var any = false
-            coroutineScope {
-                eligible.map { server ->
-                    async(Dispatchers.IO) {
-                        gate.withPermit {
-                            runCatching {
-                                resolveOneServer(
+            // Primary: aggregate endpoint (what the site's own player calls).
+            // Retried once with a fresh seed on a 401, mirroring the site's BV().
+            for (attempt in 0..1) {
+                try {
+                    any = resolveMbx(
+                        app, tmdbId, title, yearStr, imdbIdStr,
+                        mediaType, seasonId, episodeId, isMovie,
+                        seed, srcLabel, subtitleCallback, callback,
+                    )
+                    break
+                } catch (e: SeedInvalidException) {
+                    Log.d(TAG, "Cineby: mbx seed rejected, refreshing (attempt $attempt)")
+                    if (attempt == 1 || !refreshSeed()) break
+                } catch (e: Exception) {
+                    Log.d(TAG, "Cineby: mbx failed: ${e.message}")
+                    break
+                }
+            }
+
+            // Fallback: per-server fan-out, bounded concurrency (same as before,
+            // but now with local mvm1 decryption instead of enc-dec.app).
+            if (!any) {
+                val eligible = SERVERS.filter { !it.movieOnly || isMovie }
+                val gate = Semaphore(3)
+                val refreshedOnce = java.util.concurrent.atomic.AtomicBoolean(false)
+                coroutineScope {
+                    eligible.map { server ->
+                        async(Dispatchers.IO) {
+                            gate.withPermit {
+                                suspend fun callServer(): Boolean = resolveOneServer(
                                     app, server, tmdbId, seed, title, yearStr, imdbIdStr,
                                     mediaType, seasonId, episodeId,
                                     srcLabel, subtitleCallback, callback,
                                 )
-                            }.onFailure {
-                                Log.d(TAG, "Cineby: server ${server.displayName} failed: ${it.message}")
-                            }.getOrDefault(false)
+                                try {
+                                    callServer()
+                                } catch (e: SeedInvalidException) {
+                                    if (refreshedOnce.compareAndSet(false, true)) refreshSeed()
+                                    runCatching { callServer() }.getOrDefault(false)
+                                } catch (e: Exception) {
+                                    Log.d(TAG, "Cineby: server ${server.displayName} failed: ${e.message}")
+                                    false
+                                }
+                            }
                         }
-                    }
-                }.awaitAll().forEach { if (it) any = true }
+                    }.awaitAll().forEach { if (it) any = true }
+                }
             }
             if (!any) {
-                Log.d(TAG, "Cineby: all servers failed for tmdbId=$tmdbId title=$title")
+                Log.d(TAG, "Cineby: all endpoints failed for tmdbId=$tmdbId title=$title")
             }
             return any
         }
@@ -1875,6 +1903,400 @@ object WizstreamSources {
             return runCatching {
                 JSONObject(resp.text).optString("seed", "")
             }.getOrDefault("")
+        }
+
+        /** Build the /sources-with-title query string for one endpoint path
+         * ("mbx" aggregate or a per-server path like "neon2"). enc=2/seed are
+         * appended by fetchAndDecrypt. */
+        private fun buildSourcesQuery(
+            path: String,
+            tmdbId: Int,
+            titleDoubled: String,
+            mediaType: String,
+            yearStr: String,
+            imdbIdStr: String,
+            seasonId: String,
+            episodeId: String,
+            language: String?,
+        ): String = buildString {
+            append(API_BASE).append('/').append(path).append("/sources-with-title")
+            append("?title=").append(titleDoubled)
+            append("&mediaType=").append(mediaType)
+            append("&year=").append(encodeUrl(yearStr))
+            append("&episodeId=").append(episodeId)
+            append("&seasonId=").append(seasonId)
+            append("&tmdbId=").append(tmdbId)
+            if (imdbIdStr.isNotBlank()) append("&imdbId=").append(encodeUrl(imdbIdStr))
+            language?.let { append("&language=").append(it) }
+        }
+
+        /** The backend answers 401 when the seed expired — callers refresh the
+         *  seed and retry once, exactly like the site's BV() helper. */
+        private class SeedInvalidException : Exception()
+
+        /** GET an encrypted sources payload and decrypt it LOCALLY (mvm1).
+         *  Throws SeedInvalidException on 401 / stale-seed responses. */
+        private suspend fun fetchAndDecrypt(
+            app: Requests,
+            query: String,
+            tmdbId: Int,
+            seed: String,
+        ): String? {
+            val url = "$query&enc=2&seed=${encodeUrl(seed)}"
+            val resp = runCatching {
+                app.get(url, headers = API_HEADERS, cacheTime = 0, timeout = 15_000)
+            }.getOrNull() ?: return null
+            if (resp.code == 401) throw SeedInvalidException()
+            if (resp.code !in 200..299) return null
+            var txt = resp.text.trim()
+            if (txt.isEmpty()) return null
+            if (txt.startsWith("{")) {
+                // Server-side error object.
+                if (txt.contains("STREAMCRYPTO_SEED_INVALID")) throw SeedInvalidException()
+                return null
+            }
+            // Some proxies wrap the binary blob in a JSON string literal.
+            if (txt.length > 2 && txt.startsWith("\"") && txt.endsWith("\"")) {
+                txt = txt.substring(1, txt.length - 1)
+            }
+            return runCatching { Mvm1.decryptToString(txt, tmdbId, seed) }
+                .onFailure { Log.d(TAG, "Cineby: mvm1 decrypt failed: ${it.message}") }
+                .getOrNull()
+        }
+
+        /** Parse the decrypted JSON — unwrap a {"result":{…}} shell if present. */
+        private fun unwrapResult(plaintext: String): JSONObject? {
+            val j = runCatching { JSONObject(plaintext) }.getOrNull() ?: return null
+            j.optJSONObject("result")?.let { return it }
+            return j.takeIf { it.has("sources") || it.has("subtitles") }
+        }
+
+        /** v30 primary path: the aggregate /mbx endpoint — one request returns
+         *  sources for every server the backend considers alive. */
+        private suspend fun resolveMbx(
+            app: Requests,
+            tmdbId: Int,
+            title: String,
+            yearStr: String,
+            imdbIdStr: String,
+            mediaType: String,
+            seasonId: String,
+            episodeId: String,
+            isMovie: Boolean,
+            seed: String,
+            srcLabel: String,
+            subtitleCallback: (SubtitleFile) -> Unit,
+            callback: (ExtractorLink) -> Unit,
+        ): Boolean {
+            val query = buildSourcesQuery(
+                "mbx", tmdbId, doubleEncode(title), mediaType, yearStr,
+                imdbIdStr, seasonId, episodeId, language = null,
+            )
+            val plaintext = fetchAndDecrypt(app, query, tmdbId, seed) ?: return false
+            val result = unwrapResult(plaintext) ?: return false
+
+            var any = false
+            val sourcesArr = result.optJSONArray("sources")
+            if (sourcesArr != null) {
+                emitSubtitles(result.optJSONArray("subtitles"), "Cineby", subtitleCallback)
+                for (i in 0 until sourcesArr.length()) {
+                    val s = sourcesArr.optJSONObject(i) ?: continue
+                    val url = s.optStringOrNullCp("url") ?: continue
+                    if (!url.startsWith("http")) continue
+                    val safeUrl = if (url.startsWith("http://")) {
+                        url.replaceFirst("http://", "https://")
+                    } else url
+                    val quality = s.optStringOrNullCp("quality") ?: "Auto"
+                    val tag = serverTagOf(s, safeUrl)
+                    val group = if (tag != null) "$srcLabel · $tag" else srcLabel
+                    val name = "Cineby" + (tag?.let { " · $it" } ?: "") + languageTagOf(quality)
+                    if (emitMedia(app, safeUrl, quality, group, name, callback)) {
+                        any = true
+                    }
+                }
+            }
+            if (any) {
+                // The site fetches subtitles for the player from subs.videasy.to
+                // separately — mirror that so Cineby picks keep subtitles.
+                fetchVideasySubs(app, tmdbId, isMovie, seasonId, episodeId, subtitleCallback)
+            }
+            return any
+        }
+
+        /** v30: shared emission ladder for the aggregate path — same probe and
+         *  device gates the per-server path applies inline. */
+        private suspend fun emitMedia(
+            app: Requests,
+            safeUrl: String,
+            qualityRaw: String,
+            serverSourceLabel: String,
+            name: String,
+            callback: (ExtractorLink) -> Unit,
+        ): Boolean {
+            if (emitTaggedMedia(app, safeUrl, serverSourceLabel, name, callback)) return true
+            when {
+                safeUrl.contains(".m3u8", true) -> {
+                    M3u8Helper.generateM3u8(
+                        source = serverSourceLabel,
+                        streamUrl = safeUrl,
+                        referer = "$SITE/",
+                        headers = API_HEADERS,
+                    ).forEach { link ->
+                        callback(
+                            newExtractorLink(
+                                source = serverSourceLabel,
+                                name = name,
+                                url = link.url,
+                                type = ExtractorLinkType.M3U8,
+                            ) {
+                                this.referer = "$SITE/"
+                                this.quality = link.quality
+                                this.headers = API_HEADERS
+                            }
+                        )
+                    }
+                    return true
+                }
+                safeUrl.contains(".mp4", true) || safeUrl.contains(".mkv", true) ||
+                    safeUrl.contains(".webm", true) -> {
+                    callback(
+                        newExtractorLink(
+                            source = serverSourceLabel,
+                            name = name,
+                            url = safeUrl,
+                            type = ExtractorLinkType.VIDEO,
+                        ) {
+                            this.referer = "$SITE/"
+                            this.quality = qualityFromName(safeUrl).takeIf { it > 0 }
+                                ?: qualityFromName(qualityRaw)
+                            this.headers = API_HEADERS
+                        }
+                    )
+                    return true
+                }
+                safeUrl.contains(".mpd", true) -> {
+                    callback(
+                        newExtractorLink(
+                            source = serverSourceLabel,
+                            name = name,
+                            url = safeUrl,
+                            type = ExtractorLinkType.DASH,
+                        ) {
+                            this.referer = "$SITE/"
+                            this.quality = qualityFromName(safeUrl).takeIf { it > 0 }
+                                ?: qualityFromName(qualityRaw)
+                            this.headers = API_HEADERS
+                        }
+                    )
+                    return true
+                }
+            }
+            return false
+        }
+
+        /** Emit a subtitles JSON array with the "[Tag] Lang" labelling convention. */
+        private fun emitSubtitles(
+            arr: JSONArray?,
+            tag: String,
+            subtitleCallback: (SubtitleFile) -> Unit,
+        ) {
+            if (arr == null) return
+            for (i in 0 until arr.length()) {
+                val s = arr.optJSONObject(i) ?: continue
+                val subUrl = s.optStringOrNullCp("url") ?: s.optStringOrNullCp("file")
+                    ?: s.optStringOrNullCp("src") ?: continue
+                val rawSubLabel = s.optStringOrNullCp("language") ?: s.optStringOrNullCp("label")
+                    ?: s.optStringOrNullCp("lang") ?: s.optStringOrNullCp("name") ?: "Subtitle"
+                subtitleCallback(SubtitleFile("[$tag] $rawSubLabel", subUrl))
+            }
+        }
+
+        /** v30: the site's player fetches subtitles from subs.videasy.to. */
+        private suspend fun fetchVideasySubs(
+            app: Requests,
+            tmdbId: Int,
+            isMovie: Boolean,
+            seasonId: String,
+            episodeId: String,
+            subtitleCallback: (SubtitleFile) -> Unit,
+        ) {
+            val url = buildString {
+                append(SUBS_API).append("?id=").append(tmdbId)
+                if (!isMovie) append("&season=").append(seasonId).append("&episode=").append(episodeId)
+            }
+            val txt = runCatching {
+                app.get(url, headers = API_HEADERS, cacheTime = 0, timeout = 8_000).text
+            }.getOrNull().orEmpty().trim()
+            if (!txt.startsWith("[")) return
+            val arr = runCatching { JSONArray(txt) }.getOrNull() ?: return
+            for (i in 0 until arr.length()) {
+                val s = arr.optJSONObject(i) ?: continue
+                val subUrl = s.optStringOrNullCp("url") ?: continue
+                val display = s.optStringOrNullCp("display") ?: s.optStringOrNullCp("language")
+                    ?: s.optStringOrNullCp("label") ?: "Subtitle"
+                subtitleCallback(SubtitleFile("[Videasy] $display", subUrl))
+            }
+        }
+
+        private val KNOWN_SERVER_TAGS = listOf(
+            "neon" to "Neon", "yoru" to "Yoru", "breach" to "Breach",
+            "vyse" to "Vyse", "gekko" to "Gekko", "kayo" to "Kayo",
+            "jett" to "Jett", "sage" to "Sage", "omen" to "Omen",
+            "cypher" to "Cypher", "tejo" to "Tejo", "chamber" to "Chamber",
+            "harbor" to "Harbor", "killjoy" to "Killjoy", "fade" to "Fade",
+            "raze" to "Raze",
+        )
+
+        /** Identify which backend server an aggregate source came from — explicit
+         *  JSON keys when present, CDN host fingerprints otherwise. */
+        private fun serverTagOf(src: JSONObject, url: String): String? {
+            for (key in listOf("server", "provider", "source", "site")) {
+                val v = src.optStringOrNullCp(key) ?: continue
+                val low = v.lowercase()
+                if (low.contains("http") || v.length > 24) continue
+                KNOWN_SERVER_TAGS.firstOrNull { it.first in low }?.let { return it.second }
+            }
+            val host = runCatching { java.net.URI(url).host.orEmpty().lowercase() }
+                .getOrDefault("")
+            return when {
+                "ironwall" in host || "interkh" in host -> "Neon"
+                "cdntv" in host -> "Yoru"
+                else -> null
+            }
+        }
+
+        private val LANGUAGE_WORDS = listOf(
+            "hindi" to "Hindi", "german" to "German", "spanish" to "Spanish",
+            "portuguese" to "Portuguese", "french" to "French", "english" to "English",
+        )
+
+        /** On this backend a "quality" string can carry an audio language
+         *  ("Hindi", "English") instead of a resolution — surface that in the
+         *  link NAME (resolutions belong to link.quality, never the name). */
+        private fun languageTagOf(quality: String): String {
+            val low = quality.lowercase()
+            val lang = LANGUAGE_WORDS.firstOrNull { it.first in low }?.second
+            val dub = "dub" in low
+            return when {
+                lang != null && dub -> " · $lang DUB"
+                dub -> " · DUB"
+                lang != null -> " · $lang"
+                else -> ""
+            }
+        }
+
+        // ── mvm1 payload cipher (v30) ────────────────────────────────────────
+        // 1:1 port of the live cineby.at frontend cipher (chunk 831, module
+        // 84737). Verified byte-for-byte against node executions of the site's
+        // own JavaScript on multiple (seed, mediaId, plaintext) vectors.
+        private object Mvm1 {
+            private val K: Int = 2654435769L.toInt() // golden-ratio multiplier
+            private val MAGIC = byteArrayOf(109, 118, 109, 49) // "mvm1"
+
+            private fun f(e0: Int): Int {
+                var e = e0
+                e = e xor (e ushr 16); e *= 2246822507L.toInt()
+                e = e xor (e ushr 13); e *= 3266489909L.toInt()
+                e = e xor (e ushr 16)
+                return e
+            }
+
+            private fun rotl(e: Int, t: Int): Int {
+                val s = t and 31
+                return if (s == 0) e else (e shl s) or (e ushr (32 - s))
+            }
+
+            private fun fnv(s: String): Int {
+                var t = 2166136261L.toInt()
+                for (ch in s) t = (t xor ch.code) * 16777619
+                return f(t)
+            }
+
+            private class State(
+                val s: IntArray = IntArray(61),
+                val assigned: BooleanArray = BooleanArray(61),
+                var acc: Int = 0,
+            )
+
+            private fun schedule(seed: String, mediaId: Int): State {
+                val st = State()
+                var n = f(fnv(seed) xor f(mediaId xor K))
+                // In the site JS the c(e)-branch is always taken for e in 0..7
+                // (e*(e+1) is always even) — the KSA alternative is dead code.
+                for (e in 0 until 8) {
+                    val t = ((n.toLong() and 0xFFFFFFFFL) % 61L).toInt()
+                    n = rotl(n + K, 7 + (7 and e))
+                    st.s[t] = n xor f(n)
+                    st.assigned[t] = true
+                    n = f(n + t)
+                }
+                st.acc = f(2779096485L.toInt() xor n)
+                return st
+            }
+
+            private fun step(st: State, counter: Int): Int {
+                var a = st.acc
+                val i = ((a.toLong() and 0xFFFFFFFFL) % 61L).toInt()
+                val uBit = if (st.assigned[i]) -1 else 0
+                val n = st.s[i] xor (K * (counter + 1))
+                val r = a
+                var c = (r xor n) or (r and n and uBit)
+                c = rotl(c + a, i and 31) xor rotl(a, (31 * (i * 7)) and 31)
+                c += K
+                a = f(c)
+                st.s[i] = a
+                st.assigned[i] = true
+                st.acc = a
+                return a
+            }
+
+            private val B64REV = IntArray(256) { -1 }.apply {
+                "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+                    .forEachIndexed { idx, ch -> this[ch.code] = idx }
+            }
+
+            private fun b64UrlDecode(s: String): ByteArray {
+                val out = java.io.ByteArrayOutputStream(s.length * 3 / 4)
+                var acc = 0
+                var bits = 0
+                for (ch in s) {
+                    val v = if (ch.code < 256) B64REV[ch.code] else -1
+                    if (v < 0) continue
+                    acc = (acc shl 6) or v
+                    bits += 6
+                    if (bits >= 8) {
+                        bits -= 8
+                        out.write((acc ushr bits) and 0xFF)
+                    }
+                }
+                return out.toByteArray()
+            }
+
+            /** Decrypt a base64url payload: XOR keystream, verify "mvm1" magic,
+             *  return the UTF-8 JSON body. Throws on tampered/wrong-seed data. */
+            fun decryptToString(b64: String, mediaId: Int, seed: String): String {
+                val raw = b64UrlDecode(b64.trim())
+                if (raw.isEmpty()) throw IllegalArgumentException("mvm1: empty payload")
+                val st = schedule(seed, mediaId)
+                var counter = 0
+                var cur = 0
+                var curBits = 0
+                for (i in raw.indices) {
+                    if (curBits == 0) {
+                        cur = step(st, counter++)
+                        curBits = 32
+                    }
+                    raw[i] = (raw[i].toInt() xor cur).toByte()
+                    cur = cur ushr 8
+                    curBits -= 8
+                }
+                for (m in MAGIC.indices) {
+                    if (raw.size <= m || raw[m] != MAGIC[m]) {
+                        throw IllegalStateException("mvm1: bad magic (stale seed?)")
+                    }
+                }
+                return String(raw, MAGIC.size, raw.size - MAGIC.size, Charsets.UTF_8)
+            }
         }
 
         private suspend fun resolveOneServer(
@@ -1906,51 +2328,14 @@ object WizstreamSources {
             // Step 1 (seed) is already done by the caller — reuse the same
             // seed for all 8 servers to avoid 8x rate-limit on the seed endpoint.
 
-            // Step 2: Fetch encrypted sources.
-            val titleDoubled = doubleEncode(title)
-            val srcUrl = buildString {
-                append(API_BASE).append('/').append(server.path).append("/sources-with-title")
-                append("?title=").append(titleDoubled)
-                append("&mediaType=").append(mediaType)
-                append("&year=").append(encodeUrl(yearStr))
-                append("&episodeId=").append(episodeId)
-                append("&seasonId=").append(seasonId)
-                append("&tmdbId=").append(tmdbId)
-                append("&enc=2")
-                append("&seed=").append(encodeUrl(seed))
-                if (imdbIdStr.isNotBlank()) append("&imdbId=").append(encodeUrl(imdbIdStr))
-                server.language?.let { append("&language=").append(it) }
-            }
-            val srcResp = runCatching {
-                app.get(srcUrl, headers = API_HEADERS, cacheTime = 0, timeout = 15_000)
-            }.getOrNull() ?: return false
-            if (srcResp.code !in 200..299 || srcResp.text.isBlank()) return false
-            val encryptedText = srcResp.text
-            // Detect error JSON — skip if it's an error.
-            if (encryptedText.trimStart().startsWith("{") &&
-                (encryptedText.contains("\"error\"") || encryptedText.contains("STREAMCRYPTO_SEED_INVALID"))
-            ) {
-                return false
-            }
-
-            // Step 3: Decrypt via enc-dec.app.
-            val decBody = JSONObject().apply {
-                put("text", encryptedText)
-                put("id", tmdbId.toString())
-                put("seed", seed)
-            }.toString()
-            val decResp = runCatching {
-                app.post(
-                    DECRYPT_API,
-                    headers = API_HEADERS + ("Content-Type" to "application/json"),
-                    requestBody = decBody.toRequestBody("application/json".toMediaTypeOrNull()),
-                    cacheTime = 0,
-                    timeout = 15_000,
-                )
-            }.getOrNull() ?: return false
-            if (decResp.code !in 200..299 || decResp.text.isBlank()) return false
-            val decJson = runCatching { JSONObject(decResp.text) }.getOrNull() ?: return false
-            val result = decJson.optJSONObject("result") ?: return false
+            // Steps 2+3 (v30): fetch the mvm1-encrypted payload and decrypt
+            // it LOCALLY — the enc-dec.app service was retired by the site.
+            val query = buildSourcesQuery(
+                server.path, tmdbId, doubleEncode(title), mediaType, yearStr,
+                imdbIdStr, seasonId, episodeId, server.language,
+            )
+            val plaintext = fetchAndDecrypt(app, query, tmdbId, seed) ?: return false
+            val result = unwrapResult(plaintext) ?: return false
 
             // Step 4: Emit sources + subtitles.
             val subtitles = result.optJSONArray("subtitles")
@@ -2194,6 +2579,15 @@ object WizstreamSources {
             when {
                 safeUrl.contains(".m3u8", true) -> {
                     val hlsText = fetchHlsText(app, safeUrl)
+                    // (v30) A 200/OK that isn't a playlist means a parked CDN
+                    // or an ad-wall "lander" page (this is what killed Yoru when
+                    // cdntv.one expired). Emitting such a URL is a guaranteed
+                    // player-side 3003, so drop the link entirely. Blank bodies
+                    // (timeouts/geo-blocks) still keep the link, per policy.
+                    if (hlsText.isNotBlank() && !hlsText.startsWith("#EXTM3U")) {
+                        Log.d(TAG, "Cineby: dropped non-playlist body for $safeUrl")
+                        return true
+                    }
                     // Demuxed A/V (separate audio groups): emit the master
                     // itself — never its video-only variants (silent video!).
                     if (hlsText.startsWith("#EXTM3U") &&

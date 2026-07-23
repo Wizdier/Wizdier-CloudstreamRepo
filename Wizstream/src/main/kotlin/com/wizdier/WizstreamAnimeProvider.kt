@@ -360,16 +360,16 @@ class WizstreamAnimeProvider : MainAPI() {
         val epList = when (type) {
             TvType.AnimeMovie -> listOf(newEpisode(LinkContext(
                 anilistId = id, imdbId = imdbId, tmdbId = tmdbId, malId = detail.malId,
-                season = null, episode = null, title = title, isMovie = true,
-                year = detail.year,
+                season = null, episode = null, title = title, altTitle = detail.altTitle,
+                isMovie = true, year = detail.year,
                 dub = DubStatus.Subbed,
             ).toJson()) { name = "Movie" })
             else -> (1..episodes).map { epNum ->
                 val epMeta = detail.episodeMeta[epNum]
                 newEpisode(LinkContext(
                     anilistId = id, imdbId = imdbId, tmdbId = tmdbId, malId = detail.malId,
-                    season = 1, episode = epNum, title = title, isMovie = false,
-                    year = detail.year,
+                    season = 1, episode = epNum, title = title, altTitle = detail.altTitle,
+                    isMovie = false, year = detail.year,
                     dub = DubStatus.Subbed,
                 ).toJson()) {
                     name = epMeta?.title ?: "Episode $epNum"
@@ -529,6 +529,7 @@ class WizstreamAnimeProvider : MainAPI() {
                 WizstreamAnimeSources.resolveAnime(
                     app = app,
                     title = ctx.title ?: "",
+                    altTitle = ctx.altTitle,
                     anilistId = ctx.anilistId,
                     malId = ctx.malId,
                     isMovie = ctx.isMovie,
@@ -570,6 +571,7 @@ class WizstreamAnimeProvider : MainAPI() {
 
     private data class AniDetail(
         val title: String,
+        val altTitle: String? = null,
         val year: Int?,
         val plot: String?,
         val posterUrl: String?,
@@ -670,6 +672,15 @@ class WizstreamAnimeProvider : MainAPI() {
             ?: titles?.aOptStr("romaji")
             ?: titles?.aOptStr("native")
             ?: return null
+        // (v29) The best *alternative* title for source-site searches.
+        // Romaji first — the AllAnime family ("Sousou no Frieren", "1P")
+        // indexes romaji while our primary title is English.
+        val altTitle = sequenceOf(
+            titles?.aOptStr("romaji"),
+            titles?.aOptStr("english"),
+            titles?.aOptStr("userPreferred"),
+            titles?.aOptStr("native"),
+        ).filterNotNull().firstOrNull { !it.equals(title, ignoreCase = true) }
         val cover = media.optJSONObject("coverImage")?.aOptStr("extraLarge")
             ?: media.optJSONObject("coverImage")?.aOptStr("large")
         val banner = media.aOptStr("bannerImage")
@@ -806,6 +817,7 @@ class WizstreamAnimeProvider : MainAPI() {
 
         val detail = AniDetail(
             title = title,
+            altTitle = altTitle,
             year = year,
             plot = plot,
             posterUrl = cover,
@@ -886,6 +898,7 @@ class WizstreamAnimeProvider : MainAPI() {
         val season: Int? = null,
         val episode: Int? = null,
         val title: String? = null,
+        val altTitle: String? = null,
         val isMovie: Boolean = false,
         val year: Int? = null,   // (v18) identity matching for BDIX resolvers
         val dub: DubStatus = DubStatus.Subbed,
@@ -898,6 +911,7 @@ class WizstreamAnimeProvider : MainAPI() {
             season?.let { put("season", it) }
             episode?.let { put("episode", it) }
             title?.let { put("title", it) }
+            altTitle?.let { put("alt_title", it) }
             year?.let { put("year", it) }
             put("is_movie", isMovie)
             put("dub", dub.ordinal)
@@ -914,6 +928,7 @@ class WizstreamAnimeProvider : MainAPI() {
                     season = o.aOptInt("season"),
                     episode = o.aOptInt("episode"),
                     title = o.aOptStr("title"),
+                    altTitle = o.aOptStr("alt_title"),
                     year = o.aOptInt("year"),
                     isMovie = o.optBoolean("is_movie", false),
                     dub = DubStatus.values().getOrElse(o.optInt("dub", 0)) { DubStatus.Subbed },
