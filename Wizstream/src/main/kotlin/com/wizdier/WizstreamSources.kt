@@ -1,5 +1,7 @@
 package com.wizdier
 
+import android.media.MediaCodecInfo
+import android.media.MediaCodecList
 import android.util.Log
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
@@ -245,6 +247,173 @@ object WizstreamSources {
             "480" in n -> Qualities.P480.value
             "360" in n -> Qualities.P360.value
             else -> Qualities.Unknown.value
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  Device decoder capability gate  (v27 — the "TV 4003" fix)
+    //
+    //  HTTP 4003 = ExoPlayer DECODING_FAILED: the device's hardware decoder
+    //  refused (or died on) the stream. Phones swallow almost anything via
+    //  lenient vendor codecs; TVs and TV boxes (Amlogic/Realtek/Broadcom)
+    //  enforce limits strictly and throw instead. Verified triggers in the
+    //  wild (2026-07-23):
+    //    • Adaptive "Auto" master playlists begin with a 2160p variant; on a
+    //      TV whose H.264 decoder caps at ~1080p, starting 3840×2160 → 4003.
+    //    • Yoru's widescreen-crop ladders (e.g. 2580×1080 declared as AVC
+    //      level 3.2, or 2576/3832px widths) violate the declared AVC level —
+    //      strict TV decoders refuse at configure, phones don't care.
+    //    • Genuine HEVC/AV1 content (Bingr / Moonflix CH / VidNest) on
+    //      hardware without those decoders.
+    //
+    //  MediaCodecList tells us EXACTLY what the device can decode, so instead
+  //  of warning users with a ⚠ tag and hoping they choose wisely, we simply
+    //  never offer a link the decoder says it cannot play. Unknown verdicts
+    //  keep the link (we only skip on an explicit NO).
+    // ═══════════════════════════════════════════════════════════════════════
+
+    internal enum class VCodec { H264, HEVC, AV1, VP9, UNKNOWN }
+
+    /** Identify the video codec from an RFC-6381 CODECS attribute
+     *  ("avc1.640028,mp4a.40.2") or a verbal name ("H264", "HEVC"). */
+    internal fun videoCodecOf(codecsOrName: String?): VCodec {
+        if (codecsOrName.isNullOrBlank()) return VCodec.UNKNOWN
+        val c = codecsOrName.lowercase()
+        return when {
+            c.contains("hvc1") || c.contains("hev1") || c.contains("dvh1") ||
+                c.contains("hevc") || c.contains("h.265") || c.contains("h265") ||
+                c.contains("x265") || c.contains("265") -> VCodec.HEVC
+            c.contains("av01") || c.contains("av1") -> VCodec.AV1
+            c.contains("vp09") || c.contains("vp9") -> VCodec.VP9
+            c.contains("avc1") || c.contains("avc3") || c.contains("avc") ||
+                c.contains("h.264") || c.contains("h264") || c.contains("x264") ||
+                c.contains("264") -> VCodec.H264
+            else -> VCodec.UNKNOWN
+        }
+    }
+
+    /** Human tag appended to link names: " · H.264" / " · HEVC" / " · AV1". */
+    internal fun codecDisplayTag(codecsOrName: String?): String {
+        if (codecsOrName.isNullOrBlank()) return ""
+        val v = when (videoCodecOf(codecsOrName)) {
+            VCodec.H264 -> " · H.264"
+            VCodec.HEVC -> " · HEVC"
+            VCodec.AV1 -> " · AV1"
+            VCodec.VP9 -> " · VP9"
+            VCodec.UNKNOWN -> ""
+        }
+        val c = codecsOrName.lowercase()
+        val a = when {
+            c.contains("ec-3") || c.contains("eac3") -> " · EAC3"
+            c.contains("ac-3") || c.contains("ac3") -> " · AC3"
+            else -> ""
+        }
+        return v + a
+    }
+
+    /** Map an actual pixel size to the quality chip the user expects.
+     *  Width matters for widescreen-crop ladders: 3832×1604 IS the "4K"
+     *  variant (not "1604p"); 2580×1080 is "1080p". */
+    internal fun qualityFromDimensions(width: Int, height: Int): Int {
+        val w = maxOf(width, 0)
+        val h = maxOf(height, 0)
+        return when {
+            h >= 1900 || w >= 3400 -> Qualities.P2160.value
+            h >= 1300 || w >= 2500 -> Qualities.P1440.value
+            h >= 1000 || w >= 1750 -> Qualities.P1080.value
+            h >= 650 || w >= 1100 -> Qualities.P720.value
+            h >= 430 || w >= 700 -> Qualities.P480.value
+            h in 1..649 -> Qualities.P360.value
+            else -> Qualities.Unknown.value
+        }
+    }
+
+    /** One quality variant out of an HLS master playlist. */
+    internal data class HlsVariantEntry(
+        val url: String,
+        val width: Int,
+        val height: Int,
+        val codecs: String?,
+    )
+
+    /** Parse the variant renditions out of master-playlist text. */
+    internal fun parseHlsMasterVariants(text: String, baseUrl: String): List<HlsVariantEntry> {
+        if (!text.startsWith("#EXTM3U") || !text.contains("#EXT-X-STREAM-INF")) {
+            return emptyList()
+        }
+        val out = mutableListOf<HlsVariantEntry>()
+        val lines = text.lines().map { it.trim() }
+        var i = 0
+        while (i < lines.size) {
+            val l = lines[i]
+            if (l.startsWith("#EXT-X-STREAM-INF")) {
+                val codecs = Regex("""CODECS="([^"]+)"""").find(l)?.groupValues?.get(1)
+                val res = Regex("""RESOLUTION=(\d+)x(\d+)""").find(l)
+                val w = res?.groupValues?.get(1)?.toIntOrNull() ?: 0
+                val h = res?.groupValues?.get(2)?.toIntOrNull() ?: 0
+                val uri = lines.getOrNull(i + 1)?.takeIf { it.isNotBlank() && !it.startsWith("#") }
+                if (uri != null) {
+                    out += HlsVariantEntry(resolveAbs(baseUrl, uri), w, h, codecs)
+                }
+            }
+            i++
+        }
+        return out
+    }
+
+    internal object DeviceDecoderProbe {
+        private const val MIME_AVC = "video/avc"
+        private const val MIME_HEVC = "video/hevc"
+        private const val MIME_AV1 = "video/av01"
+        private const val MIME_VP9 = "video/x-vnd.on2.vp9"
+
+        private data class Dec(
+            val mime: String,
+            val caps: MediaCodecInfo.CodecCapabilities?,
+        )
+
+        /** All platform decoder entries; null → couldn't enumerate at all. */
+        private val decoders: List<Dec>? by lazy {
+            runCatching {
+                MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos
+                    .filter { !it.isEncoder }
+                    .flatMap { info ->
+                        info.supportedTypes.map { t ->
+                            Dec(t.lowercase(), runCatching { info.getCapabilitiesForType(t) }.getOrNull())
+                        }
+                    }
+            }.onFailure { Log.d(TAG, "DeviceDecoderProbe: enumeration failed: ${it.message}") }
+                .getOrNull()
+        }
+
+        private fun mimeOf(c: VCodec): String = when (c) {
+            VCodec.H264 -> MIME_AVC
+            VCodec.HEVC -> MIME_HEVC
+            VCodec.AV1 -> MIME_AV1
+            VCodec.VP9 -> MIME_VP9
+            VCodec.UNKNOWN -> ""
+        }
+
+        /**
+         * null   → keep the link (this device says it can play it, or we
+         *          could not determine a verdict)
+         * String → SKIP the link; value is the human-readable reason.
+         */
+        fun skipReason(codec: VCodec, width: Int, height: Int): String? {
+            if (codec == VCodec.UNKNOWN) return null
+            val list = decoders ?: return null
+            val mime = mimeOf(codec)
+            val matches = list.filter { it.mime == mime }
+            if (matches.isEmpty()) return "no ${codec.name} decoder on this device"
+            if (width <= 0 || height <= 0) return null
+            var sawCaps = false
+            for (m in matches) {
+                val vc = m.caps?.videoCapabilities ?: continue
+                sawCaps = true
+                val ok = runCatching { vc.isSizeSupported(width, height) }.getOrNull()
+                if (ok == true) return null // one decoder claims it — playable
+            }
+            return if (sawCaps) "${width}x$height exceeds this device's ${codec.name} decoder" else null
         }
     }
 
@@ -1929,67 +2098,27 @@ object WizstreamSources {
          *     └── 720p · Original audio
          */
 
-        // ── Codec probing (v18) ─────────────────────────────────────────────
-        // Some Cineby mirrors serve HEVC / AV1 / 10-bit encodes. Many smart
-        // TVs have no hardware decoder for those, so ExoPlayer dies with
-        // error 4003 (DECODING_FAILED) while phones happily software-decode.
+        // ── Codec probing + device gate (v18 tags / v27 skip-unplayable) ────
         // The API response doesn't say which codec a source uses, so we
         // fetch the HLS master / DASH MPD (one small request — it replaces
         // the fetch M3u8Helper would do anyway) and probe MP4 headers, then
-        // tag every emitted link: "· H.264" is TV-safe, "· HEVC ⚠" / "· AV1 ⚠"
-        // tells the user to pick another server/quality on TV.
-
-        private fun codecTagFromCodecs(codecs: String?): String {
-            if (codecs.isNullOrBlank()) return ""
-            val c = codecs.lowercase()
-            val v = when {
-                c.contains("hvc1") || c.contains("hev1") || c.contains("dvh1") -> " · HEVC ⚠"
-                c.contains("av01") -> " · AV1 ⚠"
-                c.contains("vp09") || c.contains("vp9") -> " · VP9 ⚠"
-                c.contains("avc1") || c.contains("avc3") -> " · H.264"
-                else -> ""
-            }
-            val a = when {
-                c.contains("ec-3") || c.contains("ec3") -> " · EAC3"
-                c.contains("ac-3") -> " · AC3"
-                else -> ""
-            }
-            return v + a
-        }
-
-        private data class HlsVariant(val url: String, val height: Int, val codecTag: String)
+        // tag every emitted link ("· H.264" etc.) and — since v27 — silently
+        // drop any variant MediaCodecList says this device cannot decode.
+        // That kills ExoPlayer 4003 on TVs: 2160p variants and over-level
+        // H.264 never reach the picker on hardware that can't play them.
 
         /** Fetch an HLS master playlist and parse its variant streams. Empty
          *  list returned → not a master playlist (or unreachable). */
-        private suspend fun parseHlsMaster(app: Requests, masterUrl: String): List<HlsVariant> {
+        private suspend fun parseHlsMaster(app: Requests, masterUrl: String): List<HlsVariantEntry> {
             val text = runCatching {
                 app.get(masterUrl, headers = API_HEADERS, cacheTime = 0, timeout = 12_000).text
             }.getOrNull() ?: return emptyList()
-            if (!text.startsWith("#EXTM3U") || !text.contains("#EXT-X-STREAM-INF")) {
-                return emptyList()
-            }
-            val out = mutableListOf<HlsVariant>()
-            val lines = text.lines().map { it.trim() }
-            var i = 0
-            while (i < lines.size) {
-                val l = lines[i]
-                if (l.startsWith("#EXT-X-STREAM-INF")) {
-                    val codecs = Regex("CODECS=\"([^\"]+)\"").find(l)?.groupValues?.get(1)
-                    val height = Regex("RESOLUTION=\\d+x(\\d+)").find(l)
-                        ?.groupValues?.get(1)?.toIntOrNull() ?: 0
-                    val uri = lines.getOrNull(i + 1)?.takeIf { it.isNotBlank() && !it.startsWith("#") }
-                    if (uri != null) {
-                        out += HlsVariant(resolveAbs(masterUrl, uri), height, codecTagFromCodecs(codecs))
-                    }
-                }
-                i++
-            }
-            return out
+            return parseHlsMasterVariants(text, masterUrl)
         }
 
         /** Probe the first bytes of a progressive MP4 for its ftyp brands /
-         *  sample-entry fourccs to guess the video codec. */
-        private suspend fun probeMp4Codec(app: Requests, url: String): String {
+         *  sample-entry fourccs; returns the codec token found, if any. */
+        private suspend fun probeMp4Codecs(app: Requests, url: String): String? {
             val resp = runCatching {
                 app.get(
                     url,
@@ -1997,15 +2126,15 @@ object WizstreamSources {
                     cacheTime = 0,
                     timeout = 10_000,
                 )
-            }.getOrNull() ?: return ""
-            if (resp.code !in 200..299 && resp.code != 206) return ""
-            val body = resp.text
+            }.getOrNull() ?: return null
+            if (resp.code !in 200..299 && resp.code != 206) return null
             val rx = Regex("hvc1|hev1|dvh1|av01|vp09|avc1|avc3")
-            val found = rx.find(body)?.value ?: return ""
-            return codecTagFromCodecs(found)
+            return rx.find(resp.text)?.value
         }
 
-        /** Emit one HLS/DASH/progressive link with codec tagging. */
+        /** Emit one HLS/DASH/progressive link with codec tagging, dropping
+         *  every variant this device's hardware decoder says it cannot play
+         *  (v27 — see DeviceDecoderProbe; this is the TV 4003 fix). */
         private suspend fun emitTaggedMedia(
             app: Requests,
             safeUrl: String,
@@ -2032,16 +2161,25 @@ object WizstreamSources {
                         )
                         return true
                     }
-                    variants.distinctBy { Pair(it.url, it.codecTag) }.forEach { v ->
+                    variants.distinctBy { it.url }.forEach { v ->
+                        val skip = DeviceDecoderProbe.skipReason(
+                            videoCodecOf(v.codecs), v.width, v.height
+                        )
+                        if (skip != null) {
+                            Log.d(TAG, "Cineby: skipped ${v.width}x${v.height} (${v.codecs}) for $serverSourceLabel: $skip")
+                            return@forEach
+                        }
                         callback(
                             newExtractorLink(
                                 source = serverSourceLabel,
-                                name = name + v.codecTag,
+                                name = name + codecDisplayTag(v.codecs),
                                 url = v.url,
                                 type = ExtractorLinkType.M3U8,
                             ) {
                                 this.referer = "$SITE/"
-                                this.quality = if (v.height > 0) v.height else qualityFromName(safeUrl)
+                                this.quality = if (v.height > 0) {
+                                    qualityFromDimensions(v.width, v.height)
+                                } else qualityFromName(safeUrl)
                                 this.headers = API_HEADERS
                             }
                         )
@@ -2053,14 +2191,18 @@ object WizstreamSources {
                     val mpd = runCatching {
                         app.get(safeUrl, headers = API_HEADERS, cacheTime = 0, timeout = 12_000).text
                     }.getOrNull().orEmpty()
-                    val videoCodecs = Regex("codecs=\"([^\"]+)\"").findAll(mpd)
+                    val videoCodecs = Regex("""codecs="([^"]+)"""").findAll(mpd)
                         .map { it.groupValues[1] }
-                        .firstOrNull { codecTagFromCodecs(it).isNotBlank() }
-                    val tag = codecTagFromCodecs(videoCodecs)
+                        .firstOrNull { videoCodecOf(it) != VCodec.UNKNOWN }
+                    val skip = DeviceDecoderProbe.skipReason(videoCodecOf(videoCodecs), 0, 0)
+                    if (skip != null) {
+                        Log.d(TAG, "Cineby: skipped DASH ($videoCodecs) for $serverSourceLabel: $skip")
+                        return true
+                    }
                     callback(
                         newExtractorLink(
                             source = serverSourceLabel,
-                            name = name + tag,
+                            name = name + codecDisplayTag(videoCodecs),
                             url = safeUrl,
                             type = ExtractorLinkType.DASH,
                         ) {
@@ -2073,11 +2215,16 @@ object WizstreamSources {
                 }
                 safeUrl.contains(".mp4", true) || safeUrl.contains(".mkv", true) ||
                     safeUrl.contains(".webm", true) -> {
-                    val tag = if (safeUrl.contains(".mp4", true)) probeMp4Codec(app, safeUrl) else ""
+                    val codecs = if (safeUrl.contains(".mp4", true)) probeMp4Codecs(app, safeUrl) else null
+                    val skip = DeviceDecoderProbe.skipReason(videoCodecOf(codecs), 0, 0)
+                    if (skip != null) {
+                        Log.d(TAG, "Cineby: skipped progressive ($codecs) for $serverSourceLabel: $skip")
+                        return true
+                    }
                     callback(
                         newExtractorLink(
                             source = serverSourceLabel,
-                            name = name + tag,
+                            name = name + codecDisplayTag(codecs),
                             url = safeUrl,
                             type = ExtractorLinkType.VIDEO,
                         ) {
@@ -2344,13 +2491,49 @@ object WizstreamSources {
                         if (masterText == null || masterText.code !in 200..299 && masterText.code != 206) continue
                         val text = masterText.text
                         if (!text.contains("#EXTM3U")) continue
-                        val codecTag = codecTagFromCodecs(
-                            Regex("""CODECS=\"([^\"]+)\"""").find(text)?.groupValues?.get(1)
-                        )
+                        // (v27) Expand masters into per-resolution variants so
+                        // no adaptive "Auto" link can smuggle 2160p/etc onto a
+                        // TV that can't decode it; gate every variant against
+                        // the device's MediaCodecList capabilities.
+                        val variants = parseHlsMasterVariants(text, url)
+                        if (variants.isNotEmpty()) {
+                            variants.distinctBy { it.url }.forEach { v ->
+                                val skip = DeviceDecoderProbe.skipReason(
+                                    videoCodecOf(v.codecs), v.width, v.height
+                                )
+                                if (skip != null) {
+                                    Log.d(TAG, "Bingr: skipped ${v.width}x${v.height} (${v.codecs}) on $srvName: $skip")
+                                    return@forEach
+                                }
+                                callback(
+                                    newExtractorLink(
+                                        source = serverSourceLabel,
+                                        name = bingrName(srvName, langPart, codecDisplayTag(v.codecs)),
+                                        url = v.url,
+                                        type = ExtractorLinkType.M3U8,
+                                    ) {
+                                        this.referer = "$SITE/"
+                                        this.quality = if (v.height > 0) {
+                                            qualityFromDimensions(v.width, v.height)
+                                        } else qualityFromName(quality)
+                                        this.headers = HEADERS
+                                    }
+                                )
+                                any = true
+                            }
+                            continue
+                        }
+                        // Single-rendition media playlist.
+                        val codecs = Regex("""CODECS=\"([^\"]+)\"""").find(text)?.groupValues?.get(1)
+                        val skip = DeviceDecoderProbe.skipReason(videoCodecOf(codecs), 0, 0)
+                        if (skip != null) {
+                            Log.d(TAG, "Bingr: skipped media playlist ($codecs) on $srvName: $skip")
+                            continue
+                        }
                         callback(
                             newExtractorLink(
                                 source = serverSourceLabel,
-                                name = bingrName(srvName, langPart, codecTag),
+                                name = bingrName(srvName, langPart, codecDisplayTag(codecs)),
                                 url = url,
                                 type = ExtractorLinkType.M3U8,
                             ) {
@@ -2385,18 +2568,6 @@ object WizstreamSources {
                 }
             }
             return any
-        }
-
-        private fun codecTagFromCodecs(codecs: String?): String {
-            if (codecs.isNullOrBlank()) return ""
-            val c = codecs.lowercase()
-            return when {
-                c.contains("hvc1") || c.contains("hev1") || c.contains("dvh1") -> " · HEVC ⚠"
-                c.contains("av01") -> " · AV1 ⚠"
-                c.contains("vp09") || c.contains("vp9") -> " · VP9 ⚠"
-                c.contains("avc1") || c.contains("avc3") -> " · H.264"
-                else -> ""
-            }
         }
 
         private fun bingrName(srvName: String, langPart: String, codecTag: String): String {
@@ -2540,9 +2711,17 @@ object WizstreamSources {
             var any = false
             for (l in links) {
                 val pretty = l.lang.replaceFirstChar { it.uppercase() }
+                // (v27) skip anything this device's decoder can't play
+                // (CH serves HEVC mp4s on some titles — TV 4003 otherwise).
+                val resH = Regex("""(\d{3,4})""").find(l.resolution)?.groupValues?.get(1)?.toIntOrNull() ?: 0
+                val skip = DeviceDecoderProbe.skipReason(videoCodecOf(l.codec), 0, resH)
+                if (skip != null) {
+                    Log.d(TAG, "Moonflix CH: skipped $pretty ${l.resolution} (${l.codec}): $skip")
+                    continue
+                }
                 // (v26) resolution omitted from the name — the player UI
                 // appends link.quality itself ("1080p 1080p" otherwise).
-                val name = "Moonflix · $pretty" + chCodecTag(l.codec)
+                val name = "Moonflix · $pretty" + codecDisplayTag(l.codec)
                 callback(
                     newExtractorLink(
                         source = "$srcLabel · $pretty",
@@ -2558,17 +2737,6 @@ object WizstreamSources {
                 any = true
             }
             return any
-        }
-
-        private fun chCodecTag(codec: String): String {
-            val c = codec.lowercase()
-            return when {
-                c.contains("265") || c.contains("hevc") || c.contains("hvc1") -> " · HEVC ⚠"
-                c.contains("av1") -> " · AV1 ⚠"
-                c.contains("vp9") -> " · VP9 ⚠"
-                c.contains("264") || c.contains("avc") -> " · H.264"
-                else -> ""
-            }
         }
 
         // ── HV backend: per-quality HLS ──────────────────────────────────────
@@ -2589,20 +2757,53 @@ object WizstreamSources {
                 if (!url.startsWith("http")) continue
                 val quality = st.optStringOrNullCp("quality") ?: "Auto"
                 if (url.contains(".m3u8", true)) {
-                    // Probe the master (single GET doubles as the codec probe).
+                    // Probe the playlist (single GET doubles as the codec probe).
                     val master = runCatching {
                         app.get(url, headers = HEADERS, cacheTime = 0, timeout = 12_000)
                     }.getOrNull()
                     if (master == null || master.code !in 200..299 && master.code != 206 ||
                         !master.text.contains("#EXTM3U")
                     ) continue
-                    val codecTag = chCodecTagFromCodecs(
-                        Regex("""CODECS=\"([^\"]+)\"""").find(master.text)?.groupValues?.get(1)
-                    )
+                    // (v27) Expand masters into per-resolution variants and
+                    // drop anything this device's decoder can't handle.
+                    val variants = parseHlsMasterVariants(master.text, url)
+                    if (variants.isNotEmpty()) {
+                        variants.distinctBy { it.url }.forEach { v ->
+                            val skip = DeviceDecoderProbe.skipReason(
+                                videoCodecOf(v.codecs), v.width, v.height
+                            )
+                            if (skip != null) {
+                                Log.d(TAG, "Moonflix HV: skipped ${v.width}x${v.height} (${v.codecs}): $skip")
+                                return@forEach
+                            }
+                            callback(
+                                newExtractorLink(
+                                    source = serverSourceLabel,
+                                    name = "Moonflix · HDGhar" + codecDisplayTag(v.codecs),
+                                    url = v.url,
+                                    type = ExtractorLinkType.M3U8,
+                                ) {
+                                    this.referer = "$PLAYER/"
+                                    this.quality = if (v.height > 0) {
+                                        qualityFromDimensions(v.width, v.height)
+                                    } else qualityFromName(quality)
+                                    this.headers = HEADERS
+                                }
+                            )
+                            any = true
+                        }
+                        continue
+                    }
+                    val codecs = Regex("""CODECS=\"([^\"]+)\"""").find(master.text)?.groupValues?.get(1)
+                    val skip = DeviceDecoderProbe.skipReason(videoCodecOf(codecs), 0, 0)
+                    if (skip != null) {
+                        Log.d(TAG, "Moonflix HV: skipped media playlist ($codecs): $skip")
+                        continue
+                    }
                     callback(
                         newExtractorLink(
                             source = serverSourceLabel,
-                            name = "Moonflix · HDGhar$codecTag",
+                            name = "Moonflix · HDGhar" + codecDisplayTag(codecs),
                             url = url,
                             type = ExtractorLinkType.M3U8,
                         ) {
@@ -2629,18 +2830,6 @@ object WizstreamSources {
                 }
             }
             return any
-        }
-
-        private fun chCodecTagFromCodecs(codecs: String?): String {
-            if (codecs.isNullOrBlank()) return ""
-            val c = codecs.lowercase()
-            return when {
-                c.contains("hvc1") || c.contains("hev1") || c.contains("dvh1") -> " · HEVC ⚠"
-                c.contains("av01") -> " · AV1 ⚠"
-                c.contains("vp09") || c.contains("vp9") -> " · VP9 ⚠"
-                c.contains("avc1") || c.contains("avc3") -> " · H.264"
-                else -> ""
-            }
         }
 
         // ── SE backend: named VIP/LUL HLS servers (TV only) ─────────────────
@@ -2673,6 +2862,37 @@ object WizstreamSources {
                 if (probe.text.isNotBlank() && !probe.text.startsWith("#EXTM3U") &&
                     !probe.text.contains("mpegurl", true) && probe.text.length < 40
                 ) continue
+                // (v27) Expand masters into variants + device-decoder gate.
+                val variants = if (probe.text.startsWith("#EXTM3U")) {
+                    parseHlsMasterVariants(probe.text, url)
+                } else emptyList()
+                if (variants.isNotEmpty()) {
+                    variants.distinctBy { it.url }.forEach { v ->
+                        val skip = DeviceDecoderProbe.skipReason(
+                            videoCodecOf(v.codecs), v.width, v.height
+                        )
+                        if (skip != null) {
+                            Log.d(TAG, "Moonflix SE: skipped ${v.width}x${v.height} (${v.codecs}) on $name: $skip")
+                            return@forEach
+                        }
+                        callback(
+                            newExtractorLink(
+                                source = "$srcLabel · $name",
+                                name = "Moonflix · $name" + codecDisplayTag(v.codecs),
+                                url = v.url,
+                                type = ExtractorLinkType.M3U8,
+                            ) {
+                                this.referer = "$PLAYER/"
+                                this.quality = if (v.height > 0) {
+                                    qualityFromDimensions(v.width, v.height)
+                                } else qualityFromName(url)
+                                this.headers = HEADERS
+                            }
+                        )
+                        any = true
+                    }
+                    continue
+                }
                 callback(
                     newExtractorLink(
                         source = "$srcLabel · $name",
