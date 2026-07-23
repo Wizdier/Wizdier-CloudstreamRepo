@@ -7,7 +7,7 @@
 
 [![Cloudstream](https://img.shields.io/badge/Cloudstream-extension-blueviolet?logo=android)](https://github.com/recloudstream/cloudstream)
 [![Extensions](https://img.shields.io/badge/extensions-6-success)](#-extensions-index)
-[![Latest build](https://img.shields.io/badge/Wizstream-v27-orange)](#-changelog)
+[![Latest build](https://img.shields.io/badge/Wizstream-v28-orange)](#-changelog)
 
 ---
 
@@ -29,7 +29,7 @@ and all `.cs3` files) on every push.
 
 | # | Extension | Version | Lang | Content types | Source host(s) | Today's health |
 |---|-----------|:-------:|:----:|---------------|----------------|:--------------:|
-| 1 | **Wizstream** ⭐ | v27 | en | Movie · TvSeries · Anime · AnimeMovie · OVA | Multi-source (see below) | ✅ |
+| 1 | **Wizstream** ⭐ | v28 | en | Movie · TvSeries · Anime · AnimeMovie · OVA | Multi-source (see below) | ✅ |
 | 2 | **Cineplex BD** | v8 | bn | Movie · TvSeries · Anime · AnimeMovie · Cartoon | `cineplexbd.net` | ✅ BDIX |
 | 3 | **Circle FTP** | v8 | en | Movie · TvSeries · Anime · AnimeMovie · Cartoon · AsianDrama · Documentary · OVA | `new.circleftp.net` | ✅ BDIX |
 | 4 | **CTGMovies** | v4 | bn | Movie · TvSeries · Anime · AnimeMovie | `ctgmovies.com` | ✅ |
@@ -163,6 +163,7 @@ Repo layout:
 
 | Version | Highlights |
 |---------|-----------|
+| **v28** (2026-07-23) | **Neon resurrection + buffering insight**: fixed scheme-less junk-CDN playlist URIs (`host.tld/…`) that had been mangled by the URL resolver — Cineby's Neon (and any sibling server using them) emitted 404 links for weeks and silently left Yoru as the only working server; demuxed HLS masters (separate `#EXT-X-MEDIA` audio groups) are now emitted as the adaptive master so video+audio stay muxed (expanding those variant-by-variant would have produced silent video); failover duplicate variants collapsed. **Homepage fix**: `tv/popular`-style paths have no leading slash, so 3 of 4 TV rows were parsed as movies and rendered empty — homepage now shows Trending/Popular/Top Rated/Airing Today/On The Air TV rows. **Anime episodes un-capped**: AniList reports `episodes=null` for long runners (One Piece, Conan); the `?: 12` fallback chopped them to one cour — episode count now comes from max(final count, nextAiring−1, streamingEpisodes) and an "Airing Now" row was added |
 | **v27** (2026-07-23) | **TV 4003 fix**: the extension now asks the device's `MediaCodecList` which codecs *and resolutions* it can hardware-decode, and simply never offers a link the device can't play (2160p variants on 1080p TVs, over-level widescreen H.264 like 2580×1080@L3.2, HEVC/AV1 on hardware without those decoders). All HLS masters (Cineby · Bingr · Moonflix HDGhar/VIP) are expanded into explicit per-resolution rows so adaptive "Auto" links can't smuggle 4K onto old TVs. Codec tags simplified (`· H.264`/`· HEVC` — the ⚠ is gone because unplayable ones are filtered out instead) |
 | **v26** (2026-07-23) | Self-descriptive link names: every stream now shows "Source · Server — audio/codec tags" in the player switcher; duplicate quality text removed |
 | **v25** (2026-07-22) | Full-repo health sweep: removed 4 dead embed hosts + SmashyStream extractor; removed embed-page fallback links (3003 fixes); FlixHub icon added; README & repo.json reorganised |

@@ -336,7 +336,9 @@ object WizstreamSources {
         val codecs: String?,
     )
 
-    /** Parse the variant renditions out of master-playlist text. */
+    /** Parse the variant renditions out of master-playlist text. Exact
+     *  failover duplicates (same size+codec on a second junk host — Cineby
+     *  Neon ships two of every variant) are collapsed to the first one. */
     internal fun parseHlsMasterVariants(text: String, baseUrl: String): List<HlsVariantEntry> {
         if (!text.startsWith("#EXTM3U") || !text.contains("#EXT-X-STREAM-INF")) {
             return emptyList()
@@ -358,11 +360,55 @@ object WizstreamSources {
             }
             i++
         }
-        return out
+        return out.distinctBy { Triple(it.width, it.height, it.codecs.orEmpty().substringBefore(",")) }
     }
 
-    internal object DeviceDecoderProbe {
-        private const val MIME_AVC = "video/avc"
+    /**
+     * (v28) Demuxed HLS masters — variants whose audio lives in separate
+     * `#EXT-X-MEDIA` groups (Cineby Neon's `index-v1.m3u8` video-only
+     * playlists + `index-a1.m3u8` audio). Emitted per-variant they would
+     * play SILENT, so instead we emit the master itself once: ExoPlayer
+     * muxes the audio group and adaptively steps down over-level variants
+     * on its own (we still skip the whole master when its video codec is
+     * missing on this device). The quality chip shows "Auto" deliberately.
+     * Returns true when the master was demuxed (handled), false otherwise.
+     */
+    internal suspend fun emitDemuxedMaster(
+        masterUrl: String,
+        playlistText: String,
+        source: String,
+        name: String,
+        referer: String,
+        headers: Map<String, String>,
+        callback: (ExtractorLink) -> Unit,
+    ): Boolean {
+        if (!playlistText.contains("#EXT-X-MEDIA:") || !playlistText.contains("TYPE=AUDIO")) {
+            return false
+        }
+        val variants = parseHlsMasterVariants(playlistText, masterUrl)
+        if (variants.isEmpty()) return false
+        val top = variants.maxByOrNull { it.width * it.height } ?: return false
+        val skip = DeviceDecoderProbe.skipReason(videoCodecOf(top.codecs), 0, 0)
+        if (skip != null) {
+            Log.d(TAG, "demuxed master skipped ($source, ${top.codecs}): $skip")
+            return true
+        }
+        callback(
+            newExtractorLink(
+                source = source,
+                name = name + codecDisplayTag(top.codecs),
+                url = masterUrl,
+                type = ExtractorLinkType.M3U8,
+            ) {
+                this.referer = referer
+                this.quality = Qualities.Unknown.value
+                this.headers = headers
+            }
+        )
+        return true
+    }
+
+    internal object DeviceDecoderProbe {        private const val MIME_AVC = "video/avc"
         private const val MIME_HEVC = "video/hevc"
         private const val MIME_AV1 = "video/av01"
         private const val MIME_VP9 = "video/x-vnd.on2.vp9"
@@ -429,6 +475,12 @@ object WizstreamSources {
         if (u.isBlank()) return u
         if (u.startsWith("http://") || u.startsWith("https://")) return u
         if (u.startsWith("//")) return "https:$u"
+        // (v28) Scheme-less absolute references are common in the junk-CDN
+        // playlists Cineby's Neon/Breach servers serve (e.g.
+        // "fzgbzcajzbbb.interkh.com/12_30/…/index-v1.m3u8?key=…"). Without
+        // this they were concatenated onto the playlist path and every
+        // emitted Neon variant 404'd — silently killing the server.
+        if (Regex("""^[\w.-]+\.[a-zA-Z]{2,}/\S*$""").matches(u)) return "https://$u"
         val base = baseUrl.trimEnd('/')
         return if (u.startsWith("/")) "$base$u" else "$base/$u"
     }
@@ -2107,14 +2159,11 @@ object WizstreamSources {
         // That kills ExoPlayer 4003 on TVs: 2160p variants and over-level
         // H.264 never reach the picker on hardware that can't play them.
 
-        /** Fetch an HLS master playlist and parse its variant streams. Empty
-         *  list returned → not a master playlist (or unreachable). */
-        private suspend fun parseHlsMaster(app: Requests, masterUrl: String): List<HlsVariantEntry> {
-            val text = runCatching {
-                app.get(masterUrl, headers = API_HEADERS, cacheTime = 0, timeout = 12_000).text
-            }.getOrNull() ?: return emptyList()
-            return parseHlsMasterVariants(text, masterUrl)
-        }
+        /** Fetch HLS playlist text (master or media playlist). */
+        private suspend fun fetchHlsText(app: Requests, url: String): String =
+            runCatching {
+                app.get(url, headers = API_HEADERS, cacheTime = 0, timeout = 12_000).text
+            }.getOrNull().orEmpty()
 
         /** Probe the first bytes of a progressive MP4 for its ftyp brands /
          *  sample-entry fourccs; returns the codec token found, if any. */
@@ -2144,7 +2193,13 @@ object WizstreamSources {
         ): Boolean {
             when {
                 safeUrl.contains(".m3u8", true) -> {
-                    val variants = parseHlsMaster(app, safeUrl)
+                    val hlsText = fetchHlsText(app, safeUrl)
+                    // Demuxed A/V (separate audio groups): emit the master
+                    // itself — never its video-only variants (silent video!).
+                    if (hlsText.startsWith("#EXTM3U") &&
+                        emitDemuxedMaster(safeUrl, hlsText, serverSourceLabel, name, "$SITE/", API_HEADERS, callback)
+                    ) return true
+                    val variants = parseHlsMasterVariants(hlsText, safeUrl)
                     if (variants.isEmpty()) {
                         // Media playlist (no variants) or unreachable — emit as-is.
                         callback(
@@ -2233,6 +2288,63 @@ object WizstreamSources {
                             this.headers = API_HEADERS
                         }
                     )
+                    return true
+                }
+                else -> {
+                    // (v28) Extension-less URLs — some Cineby servers hand out
+                    // bare paths (e.g. "…/nodash/12_30_23/…") that are really
+                    // HLS playlists. One small sniff request: if the body is
+                    // a playlist, expand + gate it like any other master.
+                    val text = runCatching {
+                        app.get(
+                            safeUrl,
+                            headers = API_HEADERS + ("Range" to "bytes=0-16384"),
+                            cacheTime = 0, timeout = 12_000,
+                        ).text
+                    }.getOrNull() ?: return false
+                    if (!text.startsWith("#EXTM3U")) return false
+                    if (emitDemuxedMaster(safeUrl, text, serverSourceLabel, name, "$SITE/", API_HEADERS, callback)) {
+                        return true
+                    }
+                    val variants = parseHlsMasterVariants(text, safeUrl)
+                    if (variants.isEmpty()) {
+                        callback(
+                            newExtractorLink(
+                                source = serverSourceLabel,
+                                name = name,
+                                url = safeUrl,
+                                type = ExtractorLinkType.M3U8,
+                            ) {
+                                this.referer = "$SITE/"
+                                this.quality = qualityFromName(safeUrl)
+                                this.headers = API_HEADERS
+                            }
+                        )
+                        return true
+                    }
+                    variants.forEach { v ->
+                        val skip = DeviceDecoderProbe.skipReason(
+                            videoCodecOf(v.codecs), v.width, v.height
+                        )
+                        if (skip != null) {
+                            Log.d(TAG, "Cineby: skipped ${v.width}x${v.height} (${v.codecs}) for $serverSourceLabel: $skip")
+                            return@forEach
+                        }
+                        callback(
+                            newExtractorLink(
+                                source = serverSourceLabel,
+                                name = name + codecDisplayTag(v.codecs),
+                                url = v.url,
+                                type = ExtractorLinkType.M3U8,
+                            ) {
+                                this.referer = "$SITE/"
+                                this.quality = if (v.height > 0) {
+                                    qualityFromDimensions(v.width, v.height)
+                                } else qualityFromName(safeUrl)
+                                this.headers = API_HEADERS
+                            }
+                        )
+                    }
                     return true
                 }
             }
@@ -2491,6 +2603,13 @@ object WizstreamSources {
                         if (masterText == null || masterText.code !in 200..299 && masterText.code != 206) continue
                         val text = masterText.text
                         if (!text.contains("#EXTM3U")) continue
+                        // (v28) Demuxed A/V masters: emit the master itself.
+                        if (emitDemuxedMaster(url, text, serverSourceLabel,
+                                bingrName(srvName, langPart, ""), "$SITE/", HEADERS, callback)
+                        ) {
+                            any = true
+                            continue
+                        }
                         // (v27) Expand masters into per-resolution variants so
                         // no adaptive "Auto" link can smuggle 2160p/etc onto a
                         // TV that can't decode it; gate every variant against
@@ -2764,6 +2883,13 @@ object WizstreamSources {
                     if (master == null || master.code !in 200..299 && master.code != 206 ||
                         !master.text.contains("#EXTM3U")
                     ) continue
+                    // (v28) Demuxed A/V masters: emit the master itself.
+                    if (emitDemuxedMaster(url, master.text, serverSourceLabel,
+                            "Moonflix · HDGhar", "$PLAYER/", HEADERS, callback)
+                    ) {
+                        any = true
+                        continue
+                    }
                     // (v27) Expand masters into per-resolution variants and
                     // drop anything this device's decoder can't handle.
                     val variants = parseHlsMasterVariants(master.text, url)
@@ -2862,6 +2988,14 @@ object WizstreamSources {
                 if (probe.text.isNotBlank() && !probe.text.startsWith("#EXTM3U") &&
                     !probe.text.contains("mpegurl", true) && probe.text.length < 40
                 ) continue
+                // (v28) Demuxed A/V masters: emit the master itself.
+                if (probe.text.startsWith("#EXTM3U") &&
+                    emitDemuxedMaster(url, probe.text, "$srcLabel · $name",
+                        "Moonflix · $name", "$PLAYER/", HEADERS, callback)
+                ) {
+                    any = true
+                    continue
+                }
                 // (v27) Expand masters into variants + device-decoder gate.
                 val variants = if (probe.text.startsWith("#EXTM3U")) {
                     parseHlsMasterVariants(probe.text, url)

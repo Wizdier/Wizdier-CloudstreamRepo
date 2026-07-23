@@ -252,19 +252,23 @@ class WizstreamProvider : MainAPI() {
 
     override val mainPage = mainPageOf(
         "trending/movie/day" to "Trending Movies",
-        "trending/tv/day" to "Trending TV",
+        "trending/tv/day" to "Trending TV Shows",
         "movie/popular" to "Popular Movies",
-        "tv/popular" to "Popular TV",
+        "tv/popular" to "Popular TV Shows",
         "movie/top_rated" to "Top Rated Movies",
-        "tv/top_rated" to "Top Rated TV",
+        "tv/top_rated" to "Top Rated TV Shows",
+        "tv/airing_today" to "Airing Today",
+        "tv/on_the_air" to "Currently On The Air",
+        "movie/now_playing" to "Now Playing In Cinemas",
         "movie/upcoming" to "Upcoming Movies",
-        "movie/now_playing" to "Now Playing",
-        "tv/on_the_air" to "On The Air",
     )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val path = request.data
-        val isTv = path.contains("/tv/")
+        // (v28) Segment-based check — "tv/popular" has NO leading slash, so
+        // the old contains("/tv/") test missed Popular/TopRated/OnTheAir and
+        // those rows were parsed as movies (title=null) → always empty.
+        val isTv = path.split("/").contains("tv")
         val json = tmdbGet("/$path", mapOf("page" to page, "language" to "en-US"))
             ?: return newHomePageResponse(request.name, emptyList(), false)
         val results = json.optJSONArray("results") ?: JSONArray()

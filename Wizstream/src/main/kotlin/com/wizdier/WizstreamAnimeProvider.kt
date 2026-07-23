@@ -250,6 +250,7 @@ class WizstreamAnimeProvider : MainAPI() {
 
     override val mainPage = mainPageOf(
         "trending" to "Trending Anime",
+        "airing" to "Airing Now (Ongoing Series)",
         "popular" to "Popular This Season",
         "top" to "Top Rated Anime",
         "upcoming" to "Upcoming (Next Season)",
@@ -260,6 +261,7 @@ class WizstreamAnimeProvider : MainAPI() {
         val perPage = 30
         val cfg: PageCfg = when (request.data) {
             "trending" -> PageCfg(sort = listOf("TRENDING_DESC"))
+            "airing" -> PageCfg(sort = listOf("POPULARITY_DESC"), status = "RELEASING")
             "popular" -> currentSeasonFilter().let { PageCfg(sort = listOf("POPULARITY_DESC"), season = it.first, seasonYear = it.second) }
             "top" -> PageCfg(sort = listOf("SCORE_DESC"))
             "upcoming" -> nextSeasonFilter().let { PageCfg(sort = listOf("POPULARITY_DESC"), season = it.first, seasonYear = it.second, status = "NOT_YET_RELEASED") }
@@ -641,6 +643,8 @@ class WizstreamAnimeProvider : MainAPI() {
                 averageScore meanScore
                 genres tags { name }
                 episodes duration format status season seasonYear
+                nextAiringEpisode { episode }
+                streamingEpisodes { title site }
                 startDate { year month day }
                 endDate { year month day }
                 trailer { id site }
@@ -674,7 +678,16 @@ class WizstreamAnimeProvider : MainAPI() {
             ?.replace(Regex("\\s+"), " ")
             ?.trim()
         val score = media.optInt("averageScore", 0).takeIf { it > 0 }?.let { it / 10.0 }
-        val episodes = media.optInt("episodes", 12).takeIf { it > 0 } ?: 12
+        // (v28) AniList's `episodes` is NULL for long-running airing shows
+        // (One Piece, Detective Conan, …) — the old `?: 12` silently cut
+        // those to a single cour. Take the best-known total from every
+        // signal AniList offers: final count, next airing episode − 1, or
+        // the streamingEpisodes list length; only then fall back to 12.
+        val anilistTotal = media.aOptInt("episodes")?.takeIf { it > 0 } ?: 0
+        val nextAiring = media.optJSONObject("nextAiringEpisode")
+            ?.aOptInt("episode")?.minus(1) ?: 0
+        val streamingCount = media.optJSONArray("streamingEpisodes")?.length() ?: 0
+        val episodes = maxOf(anilistTotal, nextAiring, streamingCount, 12)
         val format = media.aOptStr("format")
         val year = media.optJSONObject("startDate")?.optInt("year")?.takeIf { it != 0 }
         val genres = media.optJSONArray("genres")?.let { arr ->
