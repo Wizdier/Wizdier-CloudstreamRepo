@@ -515,6 +515,7 @@ class WizstreamAnimeProvider : MainAPI() {
                     },
                     tmdbId = ctx.tmdbId,
                     imdbId = ctx.imdbId,
+                    altTitle = ctx.altTitle,
                 )
             }.getOrDefault(false)
         }
@@ -650,10 +651,12 @@ class WizstreamAnimeProvider : MainAPI() {
                 startDate { year month day }
                 endDate { year month day }
                 trailer { id site }
-                characters(sort: [ROLE, RELEVANCE], perPage: 10, role: MAIN) {
+                characters(sort: [ROLE, RELEVANCE], perPage: 25) {
                   edges {
+                    role
                     node { name { full } image { large } }
-                    voiceActors(language: JAPANESE, sort: [RELEVANCE]) { name { full } image { large } }
+                    voiceActorsJapanese: voiceActors(language: JAPANESE, sort: [RELEVANCE]) { name { full } image { large } }
+                    voiceActorsEnglish: voiceActors(language: ENGLISH, sort: [RELEVANCE]) { name { full } image { large } }
                   }
                 }
                 relations { edges { node { id type title { romaji english } coverImage { large } format } relationType } }
@@ -756,26 +759,35 @@ class WizstreamAnimeProvider : MainAPI() {
         // We use Cloudstream's ActorData with `actor` = voice actor,
         // `roleString` = "Voice Actor", and `voiceActor` field for the
         // dual-avatar display Cloudstream supports.
+        // (v31) Expanded cast: 25 MAIN+SUPPORTING characters (was 10 MAIN
+        // only), each with BOTH their Japanese and English voice actor when
+        // AniList has one. roleString is the character's actual role
+        // (Main/Supporting) instead of the flat "Voice Actor" label.
         actors = media.optJSONObject("characters")?.optJSONArray("edges")?.let { edges ->
-            (0 until edges.length()).mapNotNull { i ->
-                val edge = edges.optJSONObject(i) ?: return@mapNotNull null
-                val node = edge.optJSONObject("node") ?: return@mapNotNull null
-                val charName = node.optJSONObject("name")?.aOptStr("full") ?: return@mapNotNull null
+            val out = mutableListOf<ActorData>()
+            for (i in 0 until edges.length()) {
+                val edge = edges.optJSONObject(i) ?: continue
+                val node = edge.optJSONObject("node") ?: continue
+                val charName = node.optJSONObject("name")?.aOptStr("full") ?: continue
                 val charImage = node.optJSONObject("image")?.aOptStr("large")
-                val vaArr = edge.optJSONArray("voiceActors") ?: return@mapNotNull null
-                val va = vaArr.optJSONObject(0) ?: return@mapNotNull null
-                val vaName = va.optJSONObject("name")?.aOptStr("full") ?: return@mapNotNull null
-                val vaImage = va.optJSONObject("image")?.aOptStr("large")
-                // Cloudstream's ActorData:
-                //   actor      = the character (shown as the main avatar)
-                //   roleString = "Voice Actor"
-                //   voiceActor = the actual voice actor (shown as secondary avatar)
-                ActorData(
-                    actor = Actor(charName, charImage),
-                    roleString = "Voice Actor",
-                    voiceActor = Actor(vaName, vaImage),
-                )
-            }.take(15)
+                val roleText = edge.aOptStr("role")
+                    ?.lowercase()?.replaceFirstChar { it.uppercase() } ?: "Main"
+                for (arrKey in listOf("voiceActorsJapanese", "voiceActorsEnglish")) {
+                    val va = edge.optJSONArray(arrKey)?.optJSONObject(0) ?: continue
+                    val vaName = va.optJSONObject("name")?.aOptStr("full") ?: continue
+                    val vaImage = va.optJSONObject("image")?.aOptStr("large")
+                    // Cloudstream's ActorData:
+                    //   actor      = the character (main avatar)
+                    //   roleString = Main / Supporting
+                    //   voiceActor = the actual voice actor (secondary avatar)
+                    out += ActorData(
+                        actor = Actor(charName, charImage),
+                        roleString = roleText,
+                        voiceActor = Actor(vaName, vaImage),
+                    )
+                }
+            }
+            out.ifEmpty { null }
         }
 
         if (tmdbId != null) {

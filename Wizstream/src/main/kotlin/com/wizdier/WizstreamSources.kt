@@ -44,6 +44,7 @@ object WizstreamSources {
         callback: (ExtractorLink) -> Unit,
         tmdbId: Int? = null,
         imdbId: String? = null,
+        altTitle: String? = null,
     ): Boolean = coroutineScope {
         if (title.isBlank() && tmdbId == null && imdbId == null) {
             return@coroutineScope false
@@ -81,7 +82,42 @@ object WizstreamSources {
                 }
             }
         }
-        jobs.awaitAll().any { it }
+        var found = jobs.awaitAll().any { it }
+
+        // ── (v31) Alternate-title pass for the BDIX resolvers ─────────────
+        // AniList feeds romaji/English titles that BDIX catalogues may index
+        // under the OTHER name ("Sousou no Frieren" vs "Frieren: Beyond
+        // Journey's End"). Only the four BDIX resolvers search by raw title,
+        // so only they are re-run with the alias; the API-backed sources
+        // (Cineby/Bingr/Moonflix) key on TMDB IDs and would just duplicate.
+        if (!altTitle.isNullOrBlank() && !altTitle.equals(title, ignoreCase = true)) {
+            val bdix = listOf(
+                CineplexBdResolver, FtpBdResolver, CircleFtpResolver, CtgMoviesResolver,
+            )
+            val altJobs = bdix.map { src ->
+                async(Dispatchers.IO) {
+                    gate.withPermit {
+                        runCatching {
+                            src.resolve(
+                                app = app,
+                                title = altTitle,
+                                year = year,
+                                isMovie = isMovie,
+                                season = season,
+                                episode = episode,
+                                labelPrefix = labelPrefix,
+                                subtitleCallback = subtitleCallback,
+                                callback = callback,
+                                tmdbId = tmdbId,
+                                imdbId = imdbId,
+                            )
+                        }.getOrDefault(false)
+                    }
+                }
+            }
+            if (altJobs.awaitAll().any { it }) found = true
+        }
+        found
     }
 
     // ───────────────────────────────────────────────────────────────────────
@@ -168,12 +204,25 @@ object WizstreamSources {
     internal val EDITION_TOKENS = setOf(
         "extended", "directors", "director", "cut", "final", "unrated", "uncut",
         "remastered", "remaster", "theatrical", "edition", "imax", "restored",
-        "definitive", "ultimate", "anniversary", "special", "redux"
+        "definitive", "ultimate", "anniversary", "special", "redux",
+        // (v31) audio/language/rip decorations that do NOT make a post a
+        // different film — BDIX catalogues tag almost everything with these
+        // ("ONE PIECE Hindi Dubbed", "Dune Bengali Dubbed 720p" → still the
+        // same media). Without them the identity gate silently rejected most
+        // FTPBD/CineplexBD/CircleFTP posts.
+        "hindi", "dubbed", "dub", "sub", "subbed", "dual", "multi", "audio",
+        "bengali", "bangla", "english", "japanese", "korean", "chinese",
+        "org", "proper", "complete", "added", "hevc", "x264", "x265", "avc",
+        "aac", "eac3", "ac3", "hdrip", "webrip", "webdl", "web", "bluray",
+        "x", "movie", "film",
+        "bdrip", "brrip", "hdtv", "camrip", "hd", "hq", "uncensored",
     )
 
     private val ROMAN_EQUIV = mapOf(
-        "i" to "1", "ii" to "2", "iii" to "3", "iv" to "4", "v" to "5",
-        "vi" to "6", "vii" to "7", "viii" to "8", "ix" to "9", "x" to "10",
+        // (v31) single-letter romans ("i", "v", "x") removed — they collide
+        // with real words in titles ("SPY x FAMILY" is not "SPY 10 FAMILY").
+        "ii" to "2", "iii" to "3", "iv" to "4",
+        "vi" to "6", "vii" to "7", "viii" to "8", "ix" to "9",
     )
 
     internal data class TitleMeta(val tokens: Set<String>, val year: Int?)
@@ -192,6 +241,8 @@ object WizstreamSources {
             .replace(Regex("(?i)\\be\\d{1,3}\\b"), " ")
             .replace(Regex("(?i)\\b(?:ep|episode)\\s*\\d{1,3}\\b"), " ")
             .replace(Regex("(?i)\\b\\d+(?:[.,]\\d+)?\\s*(?:gb|mb|tb)\\b"), " ")
+            .replace(Regex("(?i)\\b\\d{3,4}p\\b"), " ")
+            .replace(Regex("(?i)\\b(?:8|10)bit\\b"), " ")
         val toks = t.lowercase()
             .replace(Regex("[^a-z0-9]+"), " ")
             .split(Regex("\\s+"))
@@ -796,41 +847,84 @@ object WizstreamSources {
                 best.first.substringAfter("id=").substringBefore("&")
             }
             val seasonToUse = season ?: 1
-            val metaUrl = "$SITE/watch.php?$seriesIdKey=$seriesIdVal&season=$seasonToUse&meta=1"
-            val metaText = runCatching {
-                app.get(metaUrl, headers = HEADERS, timeout = 12_000).text
-            }.getOrNull() ?: return false
-
-            val root = runCatching { JSONObject(metaText) }.getOrNull() ?: return false
-            val episodesNode: Any? = root.opt("episodes") ?: root.opt("data") ?: root
-
-            // Collect all episode paths so we can also try neighbouring
-            // episodes if the exact episode number isn't found.
-            val allPaths = mutableListOf<Pair<Int, String>>() // (epNum, path)
-            when (episodesNode) {
-                is JSONObject -> {
-                    val keys = episodesNode.keys()
-                    while (keys.hasNext()) {
-                        val k = keys.next()
-                        val v = episodesNode.optJSONObject(k) ?: continue
-                        val epNum = v.optStringOrNullCp("episode_number")?.toIntOrNull()
-                            ?: v.optInt("episode_number", 0).takeIf { it != 0 }
-                            ?: k.toIntOrNull()
-                            ?: 0
-                        val path = v.optStringOrNullCp("path") ?: v.optStringOrNullCp("url")
-                            ?: v.optStringOrNullCp("src") ?: v.optStringOrNullCp("file")
-                        if (path != null) allPaths += epNum to path
+            // (v31) Episode-path collection extracted into a local helper so
+            // the season-probe fallback can reuse it. Adds are synchronized
+            // because season probes run concurrently.
+            fun collectEpisodePaths(metaText: String, out: MutableList<Pair<Int, String>>) {
+                val root = runCatching { JSONObject(metaText) }.getOrNull() ?: return
+                val episodesNode: Any? = root.opt("episodes") ?: root.opt("data") ?: root
+                when (episodesNode) {
+                    is JSONObject -> {
+                        val keys = episodesNode.keys()
+                        while (keys.hasNext()) {
+                            val k = keys.next()
+                            val v = episodesNode.optJSONObject(k) ?: continue
+                            val epNum = v.optStringOrNullCp("episode_number")?.toIntOrNull()
+                                ?: v.optInt("episode_number", 0).takeIf { it != 0 }
+                                ?: k.toIntOrNull()
+                                ?: 0
+                            val path = v.optStringOrNullCp("path") ?: v.optStringOrNullCp("url")
+                                ?: v.optStringOrNullCp("src") ?: v.optStringOrNullCp("file")
+                            if (path != null) synchronized(out) { out += epNum to path }
+                        }
+                    }
+                    is JSONArray -> {
+                        for (i in 0 until episodesNode.length()) {
+                            val v = episodesNode.optJSONObject(i) ?: continue
+                            val epNum = v.optStringOrNullCp("episode_number")?.toIntOrNull()
+                                ?: v.optInt("episode_number", 0).takeIf { it != 0 }
+                                ?: (i + 1)
+                            val path = v.optStringOrNullCp("path") ?: v.optStringOrNullCp("url")
+                                ?: v.optStringOrNullCp("src") ?: v.optStringOrNullCp("file")
+                            if (path != null) synchronized(out) { out += epNum to path }
+                        }
                     }
                 }
-                is JSONArray -> {
-                    for (i in 0 until episodesNode.length()) {
-                        val v = episodesNode.optJSONObject(i) ?: continue
-                        val epNum = v.optStringOrNullCp("episode_number")?.toIntOrNull()
-                            ?: v.optInt("episode_number", 0).takeIf { it != 0 }
-                            ?: (i + 1)
-                        val path = v.optStringOrNullCp("path") ?: v.optStringOrNullCp("url")
-                            ?: v.optStringOrNullCp("src") ?: v.optStringOrNullCp("file")
-                        if (path != null) allPaths += epNum to path
+            }
+
+            val allPaths = mutableListOf<Pair<Int, String>>() // (epNum, path)
+
+            val metaUrl = "$SITE/watch.php?$seriesIdKey=$seriesIdVal&season=$seasonToUse&meta=1"
+            runCatching {
+                app.get(metaUrl, headers = HEADERS, timeout = 12_000).text
+            }.getOrNull()?.let { collectEpisodePaths(it, allPaths) }
+
+            // ── (v31) Fallbacks mirrored from the standalone provider ─────
+            // (a) Single-season shows are sometimes filed under the wrong
+            //     season number server-side (common for anime). Only safe to
+            //     probe other seasons when the REQUESTED season is 1 —
+            //     otherwise we'd risk taking "S1E4" paths for an "S2E4"
+            //     request. Adds are thread-safe via collectEpisodePaths.
+            val epAsk = episode ?: 1
+            if (seasonToUse == 1 && allPaths.none { it.first == epAsk }) {
+                coroutineScope {
+                    (2..8).map { s ->
+                        async(Dispatchers.IO) {
+                            val u = "$SITE/watch.php?$seriesIdKey=$seriesIdVal&season=$s&meta=1"
+                            runCatching {
+                                app.get(u, headers = HEADERS, timeout = 10_000).text
+                            }.getOrNull()?.let { t -> collectEpisodePaths(t, allPaths) }
+                        }
+                    }.awaitAll()
+                }
+            }
+            // (b) Scrape numbered episode anchors straight off the watch page
+            //     (standalone's parseEpisodesFromWatchPage).
+            if (allPaths.isEmpty()) {
+                runCatching {
+                    app.get(best.first, headers = HEADERS, timeout = 12_000).text
+                }.getOrNull()?.let { watchHtml ->
+                    val wdoc = Jsoup.parse(watchHtml, best.first)
+                    val anchors = wdoc.select(
+                        "a[href*='ep='], a[href*='episode='], a[href*='/Data/'], " +
+                            "a.episode, a[data-episode], .episode-list a, .episodes a"
+                    )
+                    anchors.forEachIndexed { idx, a ->
+                        val href = a.attr("href").takeIf { it.isNotBlank() } ?: return@forEachIndexed
+                        val epNum = Regex("""(?i)(?:ep(?:isode)?[=\s]*|\bE)(\d+)""")
+                            .find(href + " " + a.text())?.groupValues?.getOrNull(1)?.toIntOrNull()
+                            ?: (idx + 1)
+                        allPaths += epNum to href
                     }
                 }
             }
@@ -1060,7 +1154,7 @@ object WizstreamSources {
 
             // For TV: find the episode's permalink via /episodes/ path.
             val episodePageUrl: String? = if (!isMovie && season != null && episode != null) {
-                pickEpisodePageUrl(detailHtml, best.first, season, episode)
+                findEpisodePageUrl(app, detailHtml, best.first, season, episode)
             } else {
                 null
             }
@@ -1081,31 +1175,69 @@ object WizstreamSources {
             return any
         }
 
-        private fun pickEpisodePageUrl(
+        /** (v31) FTPBD TV fix: episode permalinks are slug-based
+         *  (/episodes/romance-dawn/) with NO S/E numbers in the URL, so the
+         *  old href-pattern matcher never matched anything and FTPBD emitted
+         *  nothing for series. The standalone provider scrapes the numbered
+         *  grid at <series>/episodes/?season=N (span.episodes-number badges),
+         *  which is what we now do first; the detail page's own slider is
+         *  the last-resort fallback. Verified live against /tv_shows/one-piece. */
+        private suspend fun findEpisodePageUrl(
+            app: Requests,
             detailHtml: String,
             detailUrl: String,
             season: Int,
             episode: Int,
         ): String? {
-            val doc = Jsoup.parse(detailHtml, detailUrl)
-            val anchors = doc.select(
-                "a[href*='/episodes/'], a[href*='episode='], a[href*='ep='], " +
-                    ".episode a, .episodes a, .episode-list a"
-            )
-            val exact = anchors.firstOrNull { a ->
-                val href = a.attr("href")
-                (href.contains("season=$season") || href.contains("s=$season")) &&
-                    (href.contains("episode=$episode") || href.contains("ep=$episode"))
+            // 1) Numbered episode grid on the dedicated episodes page.
+            val gridUrl = "${detailUrl.trimEnd('/')}/episodes/?season=$season"
+            runCatching {
+                app.get(gridUrl, headers = HEADERS, timeout = 15_000).text
+            }.getOrNull()?.takeIf { it.isNotBlank() }?.let { gridHtml ->
+                val doc = Jsoup.parse(gridHtml, gridUrl)
+                doc.select("span.episodes-number").forEach { badge ->
+                    val n = badge.text().trim().toIntOrNull() ?: return@forEach
+                    if (n != episode) return@forEach
+                    val a = badge.parent()?.selectFirst("a[href*='/episodes/']")
+                    val href = a?.attr("href")?.takeIf { it.isNotBlank() }
+                    if (href != null) return resolveAbs(gridUrl, href)
+                }
+                // Card fallback: numbering from the surrounding card.
+                doc.select("a[href*='/episodes/']").forEach { a ->
+                    val href = a.attr("href").takeIf { it.isNotBlank() } ?: return@forEach
+                    val holder = a.closest(".jws-post-item, .post-inner, .episode-item, li")
+                    val num = holder?.selectFirst(".episodes-number")?.text()?.trim()?.toIntOrNull()
+                        ?: Regex("""(?i)S\d+E(\d+)""").find(holder?.text().orEmpty())
+                            ?.groupValues?.get(1)?.toIntOrNull()
+                    if (num == episode) return resolveAbs(gridUrl, href)
+                }
             }
-            val href = exact?.attr("href")?.ifBlank { null }
-                ?: anchors.firstOrNull { a ->
-                    val href = a.attr("href")
-                    val epNum = Regex("""(?i)(?:ep(?:isode)?[=\s]*|\bE)(\d+)""")
-                        .find(href + " " + a.text())?.groupValues?.get(1)?.toIntOrNull()
-                    epNum == episode
-                }?.attr("href")?.ifBlank { null }
-                ?: return null
-            return resolveAbs(detailUrl, href)
+
+            // 2) Detail page slider fallback — SxxEyy / badge numbering.
+            val doc = Jsoup.parse(detailHtml, detailUrl)
+            val anchors = doc.select("a[href*='/episodes/']")
+                .distinctBy { it.attr("href") }
+            anchors.forEach { a ->
+                val holder = a.closest(".jws-post-item, li, div") ?: a
+                val text = holder.text()
+                val sm = Regex("""(?i)S(\d+)E(\d+)""").find(text)
+                val num = if (sm != null && sm.groupValues[1].toIntOrNull() == season) {
+                    sm.groupValues[2].toIntOrNull()
+                } else {
+                    holder.selectFirst(".episodes-number")?.text()?.trim()?.toIntOrNull()
+                }
+                if (num == episode) {
+                    val href = a.attr("href").takeIf { it.isNotBlank() }
+                    if (href != null) return resolveAbs(detailUrl, href)
+                }
+            }
+            // DOM-order last resort: on single-season pages the episode
+            // slider lists Season 1 in order.
+            if (season == 1) {
+                val ord = anchors.getOrNull(episode - 1)?.attr("href")
+                if (!ord.isNullOrBlank()) return resolveAbs(detailUrl, ord)
+            }
+            return null
         }
     }
 
