@@ -986,36 +986,18 @@ object WizstreamSources {
                     put("Referer", playerUrl)
                 }.toMap()
 
-                // (v34) player-page subtitles — CineplexBDProvider.collectSubtitles.
-                collectPageSubs(playerHtml, playerUrl, subtitleCallback)
+                // (v40) One helper does the whole player-page scrape:
+                // page subtitles, media URLs (incl. JS/relative player-config
+                // shapes), HLS fan-out into per-quality links with real chips
+                // and master subtitle/audio tracks, Quetta fallback, and a
+                // one-level recursion into player.php-style sub-pages.
+                var any = scrapeCineplexPageHtml(
+                    app, playerUrl, playerHtml, videoHeaders, srcLabel,
+                    subtitleCallback, callback, depth = 0,
+                )
 
-                val mediaUrls = extractMediaUrlsFromHtml(playerHtml, playerUrl)
-                var any = false
-                // (v38) Subtitle-manifest scan limited to the FIRST m3u8 —
-                // scanning every variant doubles the resolve latency.
-                var subScanDone = false
-                mediaUrls.forEach { u ->
-                    if (!subScanDone && u.contains(".m3u8", ignoreCase = true)) {
-                        subScanDone = true
-                        collectM3u8Subs(app, u, playerUrl, subtitleCallback)
-                    }
-                    if (emitDirect(app, u, srcLabel, playerUrl, videoHeaders, subtitleCallback, callback)) any = true
-                }
-
-                // ── Quetta player extraction ──────────────────────────────
-                // If no direct sources were found but the page contains a
-                // data-quetta-video-id, try the Quetta API endpoints.
-                if (!any) {
-                    val quettaId: String? = Regex(
-                        """data-quetta-video-id=["']?(qv_[a-z0-9_]+)["']?""",
-                        RegexOption.IGNORE_CASE
-                    ).find(playerHtml)?.groupValues?.getOrNull(1)
-                    if (quettaId != null && quettaId.isNotBlank()) {
-                        if (emitQuettaVideo(app, quettaId, playerUrl, videoHeaders, srcLabel, subtitleCallback, callback)) {
-                            any = true
-                        }
-                    }
-                }
+                // (v40 — was the standalone-style Quetta extraction; the
+                // scrape helper now runs Quetta for every page it processes.)
 
                 // ── download.php fallback ─────────────────────────────────
                 // /download.php?id=<id> often has a direct <a href="/Data/…">
@@ -1024,22 +1006,28 @@ object WizstreamSources {
                     val dlUrl = "$SITE/download.php?id=$id"
                     runCatching {
                         val dlHtml = app.get(dlUrl, headers = videoHeaders, timeout = 15_000).text
-                        val dlUrls = extractMediaUrlsFromHtml(dlHtml, dlUrl)
+                        val dlUrls = extractCineplexMedia(dlHtml, dlUrl)
                         dlUrls.forEach { u ->
-                            if (emitDirect(app, u, srcLabel, dlUrl, videoHeaders, subtitleCallback, callback)) any = true
+                            if (emitCineplexAny(app, u, srcLabel, dlUrl, videoHeaders, subtitleCallback, callback)) any = true
                         }
                     }
                 }
 
-                // Also try the view.php page itself (sometimes the player is inline).
+                // Also try the view.php page itself (sometimes the player is
+                // inline) — same smart scrape.
                 if (!any) {
-                    runCatching {
-                        app.get(best.first, headers = HEADERS, timeout = 15_000).text
-                    }.getOrNull()?.let { viewHtml ->
-                        val urls2 = extractMediaUrlsFromHtml(viewHtml, best.first)
-                        urls2.forEach { u ->
-                            if (emitDirect(app, u, srcLabel, best.first, HEADERS, subtitleCallback, callback)) any = true
-                        }
+                    val viewResp = runCatching {
+                        app.get(best.first, headers = HEADERS, timeout = 15_000)
+                    }.getOrNull()
+                    if (viewResp != null && viewResp.code in 200..299) {
+                        val viewHeaders = HEADERS.toMutableMap().apply {
+                            put("Referer", best.first)
+                        }.toMap()
+                        if (scrapeCineplexPageHtml(
+                                app, best.first, viewResp.text, viewHeaders, srcLabel,
+                                subtitleCallback, callback, depth = 0,
+                            )
+                        ) any = true
                     }
                 }
                 if (!any) {
@@ -1228,10 +1216,10 @@ object WizstreamSources {
             //     every episode silently died → "CineplexBD not working at
             //     all" while the standalone scraped the very same pages.
             if (isDirectMedia(absPath) || absPath.contains("/Data/")) {
-                if (absPath.contains(".m3u8", ignoreCase = true)) {
-                    collectM3u8Subs(app, absPath, "$SITE/", subtitleCallback)
-                }
-                return emitDirect(app, absPath, srcLabel, "$SITE/", HEADERS, subtitleCallback, callback)
+                // (v40) emitCineplexAny — an m3u8 master fans out into real
+                // per-quality links here too, and its embedded subtitle
+                // tracks reach the player.
+                return emitCineplexAny(app, absPath, srcLabel, "$SITE/", HEADERS, subtitleCallback, callback)
             }
             return run {
                     val playerResp = runCatching {
@@ -1252,32 +1240,47 @@ object WizstreamSources {
                         put("Referer", absPath)
                     }.toMap()
 
-                    // (v34) subtitles embedded in the episode page —
-                    // CineplexBDProvider.collectSubtitles.
-                    collectPageSubs(playerHtml, absPath, subtitleCallback)
+                    // (v40) Smart scrape of the episode page — page subs,
+                    // JS/relative player-config media, HLS fan-out with real
+                    // quality chips + master tracks, Quetta, and ONE level of
+                    // recursion into player.php-style sub-pages. v39 scraped
+                    // only the surface HTML: on series, whose stream lives a
+                    // second server round-trip away (mirroring the movie
+                    // flow's player.php hop), that meant 0 media every time.
+                    var any = scrapeCineplexPageHtml(
+                        app, absPath, playerHtml, videoHeaders, srcLabel,
+                        subtitleCallback, callback, depth = 0,
+                    )
 
-                    val mediaUrls = extractMediaUrlsFromHtml(playerHtml, absPath)
-                    var any = false
-                    // (v38) Subtitle-manifest scan limited to the FIRST m3u8.
-                    var subScanDone = false
-                    mediaUrls.forEach { u ->
-                        if (!subScanDone && u.contains(".m3u8", ignoreCase = true)) {
-                            subScanDone = true
-                            collectM3u8Subs(app, u, absPath, subtitleCallback)
-                        }
-                        if (emitDirect(app, u, srcLabel, absPath, videoHeaders, subtitleCallback, callback)) any = true
-                    }
-
-                    // Quetta player fallback for TV episodes.
+                    // (v40) Constructed player-page candidates. The movie
+                    // path proves the stream lives in /player.php?id=…, so
+                    // the same CGI with season/ep params is the likeliest
+                    // SERIES target when the episode page embeds nothing.
                     if (!any) {
-                        val quettaId: String? = Regex(
-                            """data-quetta-video-id=["']?(qv_[a-z0-9_]+)["']?""",
-                            RegexOption.IGNORE_CASE
-                        ).find(playerHtml)?.groupValues?.getOrNull(1)
-                        if (quettaId != null && quettaId.isNotBlank()) {
-                            if (emitQuettaVideo(app, quettaId, absPath, videoHeaders, srcLabel, subtitleCallback, callback)) {
-                                any = true
-                            }
+                        val playerCands = listOf(
+                            "$SITE/player.php?$seriesIdKey=$seriesIdVal&season=$seasonToUse&ep=$epToUse",
+                            "$SITE/player.php?$seriesIdKey=$seriesIdVal&season=$seasonToUse&episode=$epToUse",
+                            "$SITE/tplayer.php?$seriesIdKey=$seriesIdVal&season=$seasonToUse&ep=$epToUse",
+                        )
+                        for (cand in playerCands) {
+                            if (any) break
+                            val candResp = runCatching {
+                                app.get(cand, headers = HEADERS, timeout = 12_000)
+                            }.getOrNull() ?: continue
+                            if (candResp.code !in 200..299) continue
+                            val candHtml = candResp.text
+                            if (candHtml.isBlank() || candHtml == playerHtml) continue
+                            val cookieStr = candResp.cookies.entries
+                                .joinToString("; ") { e -> e.key + "=" + e.value }
+                            val candHeaders = HEADERS.toMutableMap().apply {
+                                if (cookieStr.isNotBlank()) put("Cookie", cookieStr)
+                                put("Referer", cand)
+                            }.toMap()
+                            if (scrapeCineplexPageHtml(
+                                    app, cand, candHtml, candHeaders, srcLabel,
+                                    subtitleCallback, callback, depth = 0,
+                                )
+                            ) any = true
                         }
                     }
 
@@ -1288,14 +1291,14 @@ object WizstreamSources {
                             val dlUrl = "$SITE/download.php?id=$id"
                             runCatching {
                                 val dlHtml = app.get(dlUrl, headers = videoHeaders, timeout = 15_000).text
-                                val dlUrls = extractMediaUrlsFromHtml(dlHtml, dlUrl)
+                                val dlUrls = extractCineplexMedia(dlHtml, dlUrl)
                                 dlUrls.forEach { u ->
-                                    if (emitDirect(app, u, srcLabel, dlUrl, videoHeaders, subtitleCallback, callback)) any = true
+                                    if (emitCineplexAny(app, u, srcLabel, dlUrl, videoHeaders, subtitleCallback, callback)) any = true
                                 }
                             }
                         }
                     }
-                    if (!any) diag("tv: episode page scraped, 0 media found", srcLabel, callback)
+                    if (!any) diag("tv: episode+player pages scraped, 0 media found", srcLabel, callback)
                     any
             }
         }
@@ -1339,6 +1342,27 @@ object WizstreamSources {
                         subtitleCallback(newSubtitleFile("[$LABEL] $label", raw))
                     }
                 }
+
+            // (v40) Player-config subtitles — JWPlayer `tracks:[{file:…}]`,
+            // artplayer/DPlayer `subtitle: {url:…}` / `subtitle: '…'` styles.
+            // These sit inside inline scripts, invisible to the HTML selector
+            // pass above; without them a title whose subs only exist in the
+            // player config shows NO selectable text track.
+            val unescaped = html.replace("""\/""", "/")
+            suspend fun emitRawSub(raw: String) {
+                val subUrl = resolveAbs(baseUrl, raw.replace("&amp;", "&"))
+                if (subUrl.isBlank() || !seen.add(subUrl)) return
+                val label = subUrl.substringAfterLast('/').substringBefore('?')
+                    .substringBeforeLast('.')
+                subtitleCallback(newSubtitleFile("[$LABEL] $label", subUrl))
+            }
+            Regex("""(?i)tracks\s*:\s*\[([^\]]*)\]""")
+                .findAll(unescaped).forEach { block ->
+                    Regex("""file\s*:\s*["']([^"']+\.(?:srt|vtt|ass)[^"']*)["']""", RegexOption.IGNORE_CASE)
+                        .findAll(block.groupValues[1]).forEach { m -> emitRawSub(m.groupValues[1]) }
+                }
+            Regex("""(?i)["']?(?:subtitle|captions?|subs?)["']?\s*:\s*\{?\s*(?:url\s*:\s*)?["']([^"']+\.(?:srt|vtt|ass)[^"']*)["']""")
+                .findAll(unescaped).forEach { m -> emitRawSub(m.groupValues[1]) }
         }
 
         /**
@@ -1376,6 +1400,219 @@ object WizstreamSources {
         private fun m3u8Attr(attrs: String, key: String): String? =
             Regex("$key=\"([^\"]*)\"").find(attrs)?.groupValues?.getOrNull(1)
                 ?.takeIf { it.isNotBlank() }
+
+        // ════════════════════════════════════════════════════════════════════
+        //  (v40) CineplexBD smart emission + recursive page scraping
+        //  v39 problems addressed here:
+        //   1. "No quality tag" — every .m3u8 went straight to M3u8Helper, so
+        //      a single-rendition media playlist became ONE chip-less link;
+        //      a master playlist's per-quality fan-out never happened either.
+        //   2. "No track selection" — subtitle/audio groups embedded in the
+        //      HLS master (#EXT-X-MEDIA) and player-config subtitle entries
+        //      (JWP `tracks:[{file:…}]` / artplayer `subtitle: '…'`) were
+        //      never parsed.
+        //   3. "Nothing for series" — the episode page was scraped ONLY at
+        //      its surface HTML. The movie flow proves CineplexBD keeps the
+        //      real stream one further server round-trip away (player.php);
+        //      episode pages follow the same pattern, so we now recurse ONE
+        //      level into player.php-style sub-pages when the surface has no
+        //      media.
+        // ════════════════════════════════════════════════════════════════════
+
+        /** extractMediaUrlsFromHtml plus the JS/relative shapes CineplexBD's
+         *  player config actually uses: quoted relative media
+         *  ("ondemand/<hash>/index.m3u8", "/Data/film.mkv") and JSON-escaped
+         *  slashes inside inline scripts. */
+        private fun extractCineplexMedia(html: String, baseUrl: String): LinkedHashSet<String> {
+            val unescaped = html.replace("""\/""", "/")
+            val out = extractMediaUrlsFromHtml(unescaped, baseUrl)
+            Regex("""(?i)["'](/?[\w\-./%]+\.(?:m3u8|mp4|mkv|webm|m4v|mov)(?:\?[^"']*)?)["']""")
+                .findAll(unescaped).forEach { m ->
+                    val abs = resolveAbs(baseUrl, m.groupValues[1].replace("&amp;", "&"))
+                    if (!isLikelyThumbnailMediaUrl(abs)) out += abs
+                }
+            return out
+        }
+
+        /** .php sub-page URLs referenced by a CineplexBD page — the second
+         *  server round-trip where the stream actually lives. watch.php is
+         *  EXCLUDED on purpose: those links are episode neighbours, and
+         *  scraping ep=2's page while resolving ep=1 would emit the WRONG
+         *  episode's stream. Auth/nav/report pages are excluded too. */
+        private fun extractCineplexPageLinks(html: String, baseUrl: String, selfUrl: String): List<String> {
+            val out = linkedSetOf<String>()
+            Regex("""(?i)(?:src|href)\s*=\s*["']([^"']*\.php[^"']*)["']""")
+                .findAll(html).forEach { out += it.groupValues[1] }
+            Regex("""(?i)["']((?:https?://[\w.\-]+)?/?[a-z0-9_\-]*(?:player|embed|get_stream|stream|video|vod|ajax)[a-z0-9_\-]*\.php\?[^"']+)["']""")
+                .findAll(html).forEach { out += it.groupValues[1] }
+            val ban = Regex("""(?i)search\.php|index\.php|login|logout|signup|register|report|comment|contact|request|watch\.php""")
+            val selfNorm = selfUrl.removePrefix("$SITE/").trimEnd('/')
+            return out.map { resolveAbs(baseUrl, it.replace("&amp;", "&")) }
+                .filter { u ->
+                    u.contains(SITE, ignoreCase = true) &&
+                        !ban.containsMatchIn(u) &&
+                        u.removePrefix("$SITE/").trimEnd('/') != selfNorm
+                }
+                .distinct()
+                .take(4)
+        }
+
+        /** HLS emission with REAL quality chips + selectable tracks: fetch the
+         *  manifest, forward TYPE=SUBTITLES groups to subtitleCallback, route
+         *  TYPE=AUDIO demuxed masters through emitDemuxedMaster (top-variant
+         *  chip, ExoPlayer muxes the audio group), otherwise emit each variant
+         *  with its own resolution chip. A single-rendition media playlist
+         *  emits one link (chip only when the URL itself hints a quality).
+         *  Fetch failure → v39 behaviour (M3u8Helper) so nothing regresses.
+         *  A 200 that is NOT a playlist is the site's catch-all junk — drop. */
+        private suspend fun emitCineplexHls(
+            app: Requests,
+            url: String,
+            srcLabel: String,
+            referer: String,
+            headers: Map<String, String>,
+            subtitleCallback: (SubtitleFile) -> Unit,
+            callback: (ExtractorLink) -> Unit,
+        ): Boolean {
+            val h = headers.toMutableMap().apply { put("Referer", referer) }
+            val resp = runCatching { app.get(url, headers = h, timeout = 10_000) }.getOrNull()
+                ?: return emitDirect(app, url, srcLabel, referer, headers, subtitleCallback, callback)
+            if (resp.code !in 200..299) return false
+            val text = resp.text
+            if (!text.trimStart().startsWith("#EXTM3U")) {
+                Log.d(TAG, "CineplexBD: $url answered HTTP ${resp.code} but is not a playlist — dropped")
+                return false
+            }
+            Regex("""#EXT-X-MEDIA:([^\r\n]+)""", RegexOption.IGNORE_CASE)
+                .findAll(text).forEach { match ->
+                    val attrs = match.groupValues[1]
+                    if (!attrs.contains("TYPE=SUBTITLES", ignoreCase = true)) return@forEach
+                    val uri = m3u8Attr(attrs, "URI") ?: return@forEach
+                    val subUrl = resolveAbs(url, uri)
+                    val label = m3u8Attr(attrs, "NAME") ?: m3u8Attr(attrs, "LANGUAGE")
+                        ?: subUrl.substringAfterLast('/').substringBefore('?').substringBeforeLast('.')
+                    subtitleCallback(newSubtitleFile("[$LABEL] $label", subUrl))
+                }
+            if (emitDemuxedMaster(url, text, srcLabel, "$srcLabel — HLS", referer, headers, callback)) {
+                return true
+            }
+            val variants = parseHlsMasterVariants(text, url)
+            if (variants.isEmpty()) {
+                callback(
+                    newExtractorLink(
+                        source = srcLabel,
+                        name = "$srcLabel — HLS",
+                        url = url,
+                        type = ExtractorLinkType.M3U8,
+                    ) {
+                        this.referer = referer
+                        this.headers = headers
+                        this.quality = qualityFromName(url)
+                    }
+                )
+                return true
+            }
+            var any = false
+            variants.forEach { v ->
+                val skip = DeviceDecoderProbe.skipReason(videoCodecOf(v.codecs), v.width, v.height)
+                if (skip != null) {
+                    Log.d(TAG, "CineplexBD: variant skipped (${v.width}x${v.height}, ${v.codecs}): $skip")
+                    return@forEach
+                }
+                callback(
+                    newExtractorLink(
+                        source = srcLabel,
+                        name = "$srcLabel — HLS" + codecDisplayTag(v.codecs),
+                        url = v.url,
+                        type = ExtractorLinkType.M3U8,
+                    ) {
+                        this.referer = referer
+                        this.headers = headers
+                        this.quality = if (v.height > 0) {
+                            qualityFromDimensions(v.width, v.height)
+                        } else {
+                            Qualities.Unknown.value
+                        }
+                    }
+                )
+                any = true
+            }
+            return any
+        }
+
+        /** What the CineplexBD resolvers call INSTEAD of emitDirect (v40):
+         *  .m3u8 gets the smart-chips path; everything else is exactly v39's
+         *  emitDirect (direct-video links with cookie headers, extractor
+         *  delegation for foreign pages). */
+        private suspend fun emitCineplexAny(
+            app: Requests,
+            url: String,
+            srcLabel: String,
+            referer: String,
+            headers: Map<String, String>,
+            subtitleCallback: (SubtitleFile) -> Unit,
+            callback: (ExtractorLink) -> Unit,
+        ): Boolean {
+            val clean = url.trim()
+            return if (clean.contains(".m3u8", ignoreCase = true)) {
+                emitCineplexHls(app, clean, srcLabel, referer, headers, subtitleCallback, callback)
+            } else {
+                emitDirect(app, clean, srcLabel, referer, headers, subtitleCallback, callback)
+            }
+        }
+
+        /** Scrape ONE already-fetched CineplexBD page: page subtitles → media
+         *  URLs via the smart emitter → Quetta fallback → (surface level only)
+         *  recurse into player.php-style sub-pages, refreshing cookies and
+         *  the Referer chain on the way down. */
+        private suspend fun scrapeCineplexPageHtml(
+            app: Requests,
+            pageUrl: String,
+            pageHtml: String,
+            videoHeaders: Map<String, String>,
+            srcLabel: String,
+            subtitleCallback: (SubtitleFile) -> Unit,
+            callback: (ExtractorLink) -> Unit,
+            depth: Int,
+        ): Boolean {
+            collectPageSubs(pageHtml, pageUrl, subtitleCallback)
+            var any = false
+            extractCineplexMedia(pageHtml, pageUrl).forEach { u ->
+                if (emitCineplexAny(app, u, srcLabel, pageUrl, videoHeaders, subtitleCallback, callback)) any = true
+            }
+            if (!any) {
+                val quettaId: String? = Regex(
+                    """data-quetta-video-id=["']?(qv_[a-z0-9_]+)["']?""",
+                    RegexOption.IGNORE_CASE
+                ).find(pageHtml)?.groupValues?.getOrNull(1)
+                if (!quettaId.isNullOrBlank()) {
+                    if (emitQuettaVideo(app, quettaId, pageUrl, videoHeaders, srcLabel, subtitleCallback, callback)) {
+                        any = true
+                    }
+                }
+            }
+            if (!any && depth < 1) {
+                extractCineplexPageLinks(pageHtml, pageUrl, pageUrl).forEach { sub ->
+                    val sr = runCatching {
+                        app.get(sub, headers = videoHeaders, timeout = 12_000)
+                    }.getOrNull() ?: return@forEach
+                    if (sr.code !in 200..299) return@forEach
+                    val sHtml = sr.text
+                    if (sHtml.isBlank() || sHtml == pageHtml) return@forEach
+                    val cookieStr = sr.cookies.entries.joinToString("; ") { e -> e.key + "=" + e.value }
+                    val subHeaders = videoHeaders.toMutableMap().apply {
+                        if (cookieStr.isNotBlank()) put("Cookie", cookieStr)
+                        put("Referer", sub)
+                    }.toMap()
+                    if (scrapeCineplexPageHtml(
+                            app, sub, sHtml, subHeaders, srcLabel,
+                            subtitleCallback, callback, depth = depth + 1,
+                        )
+                    ) any = true
+                }
+            }
+            return any
+        }
 
         /**
          * Try multiple candidate Quetta API endpoints to resolve a
@@ -1440,7 +1677,9 @@ object WizstreamSources {
                 var any = false
                 for (u in mediaUrls) {
                     val abs = if (u.startsWith("http")) u else "$SITE/${u.trimStart('/')}"
-                    if (emitDirect(app, abs, sourceLabel, playerUrl, videoHeaders, subtitleCallback, callback)) {
+                    // (v40) smart path — Quetta HLS answers get the same
+                    // quality chips + track parsing as everything else.
+                    if (emitCineplexAny(app, abs, sourceLabel, playerUrl, videoHeaders, subtitleCallback, callback)) {
                         any = true
                     }
                 }
