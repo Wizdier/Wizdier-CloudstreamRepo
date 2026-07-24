@@ -608,8 +608,31 @@ object WizstreamSources {
         // this they were concatenated onto the playlist path and every
         // emitted Neon variant 404'd — silently killing the server.
         if (Regex("""^[\w.-]+\.[a-zA-Z]{2,}/\S*$""").matches(u)) return "https://$u"
-        val base = baseUrl.trimEnd('/')
-        return if (u.startsWith("/")) "$base$u" else "$base/$u"
+
+        // (v39) RFC 3986 resolution — THE movie-2004/series-death fix.
+        // The old code appended relative refs onto the FULL page URL,
+        // query string included:
+        //   base "http://cineplexbd.net/player.php?id=76263"
+        //   ref  "/ondemand/<hash>/index.m3u8"
+        //   OLD  "http://cineplexbd.net/player.php?id=76263/ondemand/<hash>/index.m3u8"  ← junk
+        //   NEW  "http://cineplexbd.net/ondemand/<hash>/index.m3u8"                      ← real
+        // The site answers such junk paths with HTTP 200 + HTML (catch-all
+        // rewrite), the player can't parse HTML as video → HTTP 2004.
+        // Semantics: root-relative refs resolve against the ORIGIN
+        // (scheme://host[:port]); document-relative refs resolve against the
+        // base path's parent directory with query/fragment stripped (which
+        // also fixes HLS variant resolution for token-signed masters).
+        val b = baseUrl.trim()
+        val originMatch = Regex("""^(https?://[^/?#]+)""").find(b)
+        if (originMatch == null) {
+            val base = b.trimEnd('/')
+            return if (u.startsWith("/")) "$base$u" else "$base/$u"
+        }
+        val origin = originMatch.groupValues[1]
+        if (u.startsWith("/")) return origin + u
+        val pathPart = b.removePrefix(origin).substringBefore('#').substringBefore('?')
+        val parent = pathPart.substringBeforeLast('/', "")
+        return "$origin$parent/$u"
     }
 
     internal fun extractMediaUrlsFromHtml(html: String, baseUrl: String): LinkedHashSet<String> {
@@ -1021,27 +1044,6 @@ object WizstreamSources {
                 }
                 if (!any) {
                     diag("movie: player+view scraped, 0 media found", srcLabel, callback)
-                } else {
-                    // (v38) Self-diagnosis for the movie 2004: probe the
-                    // first emitted media URL with the SAME headers the link
-                    // carries and report the server verdict + the URL prefix,
-                    // so one screenshot tells us whether the URL itself is
-                    // dead or the player's request differs.
-                    val mediaFirst = mediaUrls.firstOrNull()
-                    if (mediaFirst != null) {
-                        val probe = runCatching {
-                            app.get(
-                                mediaFirst,
-                                headers = videoHeaders + ("Range" to "bytes=0-0"),
-                                cacheTime = 0,
-                                timeout = 8_000,
-                            )
-                        }.getOrNull()
-                        diag(
-                            "movie probe 1/${mediaUrls.size} → HTTP ${probe?.code} · ${mediaFirst.take(90)}",
-                            srcLabel, callback,
-                        )
-                    }
                 }
                 return any
             }
@@ -1293,25 +1295,7 @@ object WizstreamSources {
                             }
                         }
                     }
-                    if (!any) {
-                        diag("tv: episode page scraped, 0 media found", srcLabel, callback)
-                    } else {
-                        val mediaFirst = mediaUrls.firstOrNull()
-                        if (mediaFirst != null) {
-                            val probe = runCatching {
-                                app.get(
-                                    mediaFirst,
-                                    headers = videoHeaders + ("Range" to "bytes=0-0"),
-                                    cacheTime = 0,
-                                    timeout = 8_000,
-                                )
-                            }.getOrNull()
-                            diag(
-                                "tv probe → HTTP ${probe?.code} · ${mediaFirst.take(90)}",
-                                srcLabel, callback,
-                            )
-                        }
-                    }
+                    if (!any) diag("tv: episode page scraped, 0 media found", srcLabel, callback)
                     any
             }
         }
