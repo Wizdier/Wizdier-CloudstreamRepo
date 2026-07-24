@@ -55,6 +55,8 @@ object WizstreamSources {
             FtpBdResolver,
             CircleFtpResolver,
             CtgMoviesResolver,
+            FmFtpResolver,
+            MediaserverResolver,
             CinebyResolver,
             BingrResolver,
             MoonflixResolver,
@@ -79,24 +81,11 @@ object WizstreamSources {
                             imdbId = imdbId,
                         )
                     }.onFailure { t ->
-                        // (v36) Never let a resolver die silently: opted-in
-                        // resolvers get a visible crash chip naming the
-                        // exception class. (CineplexBD "not even showing up"
-                        // hunt — if resolve() throws before its own diag
-                        // points, this is the chip that still speaks.)
-                        val lbl = src.crashDiagLabel()
-                        if (lbl.isNotBlank()) {
-                            Log.w(TAG, "$lbl resolver crashed: ${t.javaClass.simpleName}: ${t.message}")
-                            runCatching {
-                                callback(
-                                    newExtractorLink(
-                                        source = "$labelPrefix • $lbl",
-                                        name = "$labelPrefix • $lbl ⓘ DIAG: resolver crashed (${t.javaClass.simpleName})",
-                                        url = "https://wizstream.invalid/__crash__/${t.javaClass.simpleName}",
-                                    ) { this.quality = Qualities.P2160.value /* (v37) pin diag to TOP */ }
-                                )
-                            }
-                        }
+                        // (v42) ⓘ DIAG probes retired — CineplexBD is
+                        // confirmed healthy on the user's device, so a
+                        // resolver crash now leaves a log line only, never
+                        // a chip in the user's source list.
+                        Log.w(TAG, "resolver crashed: ${t.javaClass.simpleName}: ${t.message}")
                     }.getOrDefault(false)
                 }
             }
@@ -112,6 +101,7 @@ object WizstreamSources {
         if (!altTitle.isNullOrBlank() && !altTitle.equals(title, ignoreCase = true)) {
             val bdix = listOf(
                 CineplexBdResolver, FtpBdResolver, CircleFtpResolver, CtgMoviesResolver,
+                FmFtpResolver, MediaserverResolver,
             )
             val altJobs = bdix.map { src ->
                 async(Dispatchers.IO) {
@@ -743,12 +733,6 @@ object WizstreamSources {
     }
 
     internal interface SourceResolver {
-        /**
-         * (v36) Short label used by resolveAll to surface an unescapable
-         * resolver crash as a visible ⓘ DIAG chip. Empty string = opt out.
-         */
-        fun crashDiagLabel(): String = ""
-
         suspend fun resolve(
             app: Requests,
             title: String,
@@ -774,7 +758,6 @@ object WizstreamSources {
         private const val SITE = "http://cineplexbd.net"
         private const val LABEL = "CineplexBD"
 
-        override fun crashDiagLabel(): String = LABEL
         private val HEADERS = mapOf(
             // (v35) Byte-identical to CineplexBDProvider.cfHeaders — the
             // standalone's exact Chrome/121 UA, not the generic UA.
@@ -783,28 +766,7 @@ object WizstreamSources {
             "Referer" to "$SITE/",
         )
 
-        /**
-         * (v35 — TEMPORARY DIAGNOSTICS) CineplexBD fails silently on the
-         * user's device (zero links anywhere) while the standalone works.
-         * With no logcat access, the resolver explains WHERE it stops by
-         * emitting a clearly-labelled, never-playable diagnostic chip
-         * ("Wizstream • CineplexBD ⓘ DIAG …", quality 0, dummy URL) the
-         * user can read on phone/TV. Removed once fixed for real.
-         */
-        private suspend fun diag(stage: String, fullLabel: String, callback: (ExtractorLink) -> Unit) {
-            Log.d(TAG, "CineplexBD DIAG: $stage")
-            runCatching {
-                callback(
-                    newExtractorLink(
-                        source = fullLabel,
-                        name = "$fullLabel ⓘ DIAG: $stage",
-                        url = "$SITE/__diag__/" + stage.take(24).replace(" ", "-"),
-                    ) { this.quality = Qualities.P2160.value /* (v37) pin diag to TOP */ }
-                )
-            }
-        }
-
-        override suspend fun resolve(
+override suspend fun resolve(
             app: Requests,
             title: String,
             year: Int?,
@@ -822,14 +784,8 @@ object WizstreamSources {
             val searchResp = runCatching {
                 app.get(searchUrl, headers = HEADERS, timeout = 10_000)
             }.getOrNull()
-            if (searchResp == null) {
-                diag("search request failed (network/timeout/CF)", "$labelPrefix • $LABEL", callback)
-                return false
-            }
-            if (searchResp.code !in 200..299) {
-                diag("search HTTP ${searchResp.code}", "$labelPrefix • $LABEL", callback)
-                return false
-            }
+            if (searchResp == null) return false
+            if (searchResp.code !in 200..299) return false
             val html = searchResp.text
 
             val doc = Jsoup.parse(html, searchUrl)
@@ -862,10 +818,7 @@ object WizstreamSources {
                 candidates += absHref to candTitle
             }
 
-            if (candidates.isEmpty()) {
-                diag("search page parsed but 0 result cards found", "$labelPrefix • $LABEL", callback)
-                return false
-            }
+            if (candidates.isEmpty()) return false
 
             // Filter: prefer series page for TV, view page for movie.
             //
@@ -910,8 +863,7 @@ object WizstreamSources {
             // multi-round-trip and costly), dedupes identical stream URLs
             // across posts, and passes each post's title-derived quality
             // label down as the chip for streams whose own URL/manifest
-            // can't prove one. Stage diags are emitted for the first
-            // candidate only, so duplicates can't pile up pinned chips.
+            // can't prove one.
             val identityMatches = filtered.filter { (_, ct) -> isSameMediaTitle(ct, title, year) }
             val pool = identityMatches.ifEmpty {
                 filtered.filter { (_, ct) -> isFuzzySameMedia(ct, title, year) }
@@ -920,10 +872,7 @@ object WizstreamSources {
                 .sortedByDescending { (_, ct) -> titleSimilarity(ct, title) }
                 .distinctBy { it.first }
                 .take(if (isMovie) 6 else 4)
-            if (tryList.isEmpty()) {
-                diag("'$title' vs ${candidates.size} cards: no match (top '${candidates.firstOrNull()?.second?.take(40)}')", "$labelPrefix • $LABEL", callback)
-                return false
-            }
+            if (tryList.isEmpty()) return false
 
             val srcLabel = "$labelPrefix • $LABEL"
             val seenStreamUrls = linkedSetOf<String>()
@@ -932,28 +881,26 @@ object WizstreamSources {
             }
 
             var anyEmitted = false
-            tryList.forEachIndexed { idx, cand ->
+            tryList.forEach { cand ->
                 val ok = try {
                     if (isMovie) {
                         resolveMovieOne(
                             app, cand, srcLabel, subtitleCallback, dedupCallback,
-                            qualityHint = qualityFromName(cand.second), allowDiag = idx == 0,
+                            qualityHint = qualityFromName(cand.second),
                         )
                     } else {
                         resolveTvOne(
                             app, cand, season, episode, srcLabel, subtitleCallback, dedupCallback,
-                            qualityHint = qualityFromName(cand.second), allowDiag = idx == 0,
+                            qualityHint = qualityFromName(cand.second),
                         )
                     }
                 } catch (t: Throwable) {
-                    diag("crash in ${if (isMovie) "movie" else "tv"}: ${t.javaClass.simpleName}", "$labelPrefix • $LABEL", callback)
+                    Log.d(TAG, "CineplexBD: resolve crashed: ${t.javaClass.simpleName}")
                     false
                 }
                 if (ok) anyEmitted = true
             }
-            if (anyEmitted) return true
-            diag("all ${tryList.size} candidates tried, 0 links (movie=$isMovie)", "$labelPrefix • $LABEL", callback)
-            return false
+            return anyEmitted
         }
 
         private suspend fun resolveMovieOne(
@@ -963,7 +910,6 @@ object WizstreamSources {
             subtitleCallback: (SubtitleFile) -> Unit,
             callback: (ExtractorLink) -> Unit,
             qualityHint: Int = Qualities.Unknown.value,
-            allowDiag: Boolean = false,
         ): Boolean {
             // (moved under resolveMovieOne in v32; body otherwise unchanged)
 
@@ -985,7 +931,6 @@ object WizstreamSources {
                 // /player.php?id=<series_id> would return a series page, not
                 // a movie player, and extraction would fail silently.
                 if (!best.first.contains("view.php")) {
-                    if (allowDiag) diag("movie: candidate is not a view.php page", srcLabel, callback)
                     return false
                 }
 
@@ -996,7 +941,6 @@ object WizstreamSources {
                     app.get(playerUrl, headers = HEADERS, timeout = 15_000)
                 }.getOrNull()
                 if (playerResp == null) {
-                    if (allowDiag) diag("movie: player.php fetch failed", srcLabel, callback)
                     return false
                 }
                 val playerHtml = playerResp.text
@@ -1058,7 +1002,7 @@ object WizstreamSources {
                     }
                 }
                 if (!any) {
-                    if (allowDiag) diag("movie: player+view scraped, 0 media found", srcLabel, callback)
+                    Log.d(TAG, "CineplexBD: movie player+view scraped, 0 media found")
                 }
                 return any
             }
@@ -1078,7 +1022,6 @@ object WizstreamSources {
             subtitleCallback: (SubtitleFile) -> Unit,
             callback: (ExtractorLink) -> Unit,
             qualityHint: Int = Qualities.Unknown.value,
-            allowDiag: Boolean = false,
         ): Boolean {
             val seriesIdKey = if (best.first.contains("series_id=")) "series_id" else "id"
             val seriesIdVal = if (seriesIdKey == "series_id") {
@@ -1209,7 +1152,7 @@ object WizstreamSources {
             }
 
             if (allPaths.isEmpty()) {
-                if (allowDiag) diag("tv S$seasonToUse: meta+sweep+watch-anchors yielded 0 episode paths", srcLabel, callback)
+                Log.d(TAG, "CineplexBD: tv S$seasonToUse meta+sweep+anchors yielded 0 episode paths")
             }
             val epToUse = episode ?: 1
             // (v33) exact episode only — the old first-episode fallback meant
@@ -1225,7 +1168,7 @@ object WizstreamSources {
                 matchPath = best.first
             }
             if (matchPath == null) {
-                if (allowDiag) diag("tv: E$epToUse not among ${allPaths.size} paths — check the title's seasons", srcLabel, callback)
+                Log.d(TAG, "CineplexBD: tv E$epToUse not among ${allPaths.size} paths")
                 return false
             }
 
@@ -1267,7 +1210,7 @@ object WizstreamSources {
                         app.get(absPath, headers = HEADERS, timeout = 15_000)
                     }.getOrNull()
                     if (playerResp == null) {
-                        if (allowDiag) diag("tv: episode page fetch failed", srcLabel, callback)
+                        Log.d(TAG, "CineplexBD: tv episode page fetch failed")
                         return false
                     }
                     val playerHtml = playerResp.text
@@ -1342,7 +1285,7 @@ object WizstreamSources {
                         }
                     }
                     if (!any) {
-                        if (allowDiag) diag("tv: episode+player pages scraped, 0 media found", srcLabel, callback)
+                        Log.d(TAG, "CineplexBD: tv episode+player pages scraped, 0 media found")
                     }
                     any
             }
@@ -4383,6 +4326,378 @@ object WizstreamSources {
             }.getOrNull() ?: return null
             if (resp.code !in 200..299 || resp.text.isBlank()) return null
             return runCatching { JSONObject(resp.text) }.getOrNull()
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    //  Resolver 8: FM FTP  (https://fmftp.net)
+    //
+    //  Parser ported 1:1 from FmFtpProvider.kt (v43). Site = React SPA over a
+    //  public "Cinefy" REST API (/api/) + nginx autoindex file listings:
+    //    • GET /api/search?search={q} → BARE JSON array, movies+shows mixed;
+    //      item.Library.type=="TV_SHOW" marks series (movies carry file_path).
+    //    • GET /api/movies/{id} → detail; "url" = public FILE path (raw
+    //      spaces → percent-encoded before emit). One row PER FILE, so one
+    //      film often has several rows = several quality renditions.
+    //    • GET /api/tv-shows/{id} → detail; "url" = public DIRECTORY →
+    //      autoindex lists "Season N 1080p/" folders holding files named
+    //      "Title (Year) - SxxEyy - Name.mkv"; quality tag lives on the
+    //      FOLDER name. Episode files verified HTTP 206 direct-playable.
+    // ════════════════════════════════════════════════════════════════════════
+    internal object FmFtpResolver : SourceResolver {
+        private const val SITE = "https://fmftp.net"
+        private const val API = "$SITE/api"
+        private const val LABEL = "FM FTP"
+        private val HEADERS = mapOf(
+            "User-Agent" to UA,
+            "Referer" to "$SITE/",
+        )
+        private val VIDEO_EXT = listOf(".mp4", ".mkv", ".avi", ".m4v", ".mov", ".webm", ".ts")
+        private val SUB_EXT = listOf(".srt", ".vtt", ".ass", ".ssa")
+
+        private data class Cand(val url: String, val candTitle: String)
+
+        override suspend fun resolve(
+            app: Requests,
+            title: String,
+            year: Int?,
+            isMovie: Boolean,
+            season: Int?,
+            episode: Int?,
+            labelPrefix: String,
+            subtitleCallback: (SubtitleFile) -> Unit,
+            callback: (ExtractorLink) -> Unit,
+            tmdbId: Int?,
+            imdbId: String?,
+        ): Boolean {
+            val text = runCatching {
+                app.get("$API/search?search=${encodeUrl(title)}", headers = HEADERS, timeout = 12_000)
+            }.getOrNull()?.takeIf { it.code in 200..299 }?.text ?: return false
+            val arr = runCatching { JSONArray(text) }.getOrNull() ?: return false
+
+            val wantShow = !isMovie
+            val candidates = mutableListOf<Cand>()
+            for (i in 0 until arr.length()) {
+                val o = arr.optJSONObject(i) ?: continue
+                val id = o.optInt("id", 0)
+                if (id == 0) continue
+                val lib = o.optJSONObject("Library")
+                val isShow = (lib?.optString("type") == "TV_SHOW") ||
+                    (!o.has("file_path") && o.has("path"))
+                if (isShow != wantShow) continue
+                val t = o.optString("title").trim()
+                if (t.isBlank()) continue
+                candidates += Cand(if (isShow) "$API/tv-shows/$id" else "$API/movies/$id", t)
+            }
+            if (candidates.isEmpty()) return false
+
+            // Identity tier → fuzzy tier (same two-tier gate as CTG/CineplexBD),
+            // sorted by similarity. Movies: keep up to 6 (each film row = one
+            // file = one quality rendition → multi-quality chips). Shows: 4.
+            val distinct = candidates.distinctBy { it.url }
+            val tier1 = distinct.filter { isSameMediaTitle(it.candTitle, title, year) }
+            val picks = (tier1.ifEmpty {
+                distinct.filter { isFuzzySameMedia(it.candTitle, title, year) }
+            }).sortedByDescending { titleSimilarity(it.candTitle, title) }
+                .take(if (isMovie) 6 else 4)
+            if (picks.isEmpty()) return false
+
+            val srcLabel = "$labelPrefix • $LABEL"
+            var any = false
+            picks.forEach { pick ->
+                val detail = fetchJson(app, pick.url) ?: return@forEach
+                val rel = detail.optString("url").trim()
+                if (rel.isBlank()) return@forEach
+                if (isMovie) {
+                    val abs = SITE + encodeFmPath(rel)
+                    runCatching {
+                        callback(
+                            newExtractorLink(
+                                srcLabel, "$srcLabel - Direct", abs, ExtractorLinkType.VIDEO
+                            ) {
+                                this.referer = "$SITE/"
+                                this.headers = HEADERS
+                                this.quality = qualityFromName(rel)
+                            }
+                        )
+                    }.onSuccess { any = true }
+                } else if (season != null && episode != null) {
+                    if (emitFmEpisode(
+                            app, rel, season, episode, srcLabel, subtitleCallback, callback
+                        )
+                    ) any = true
+                }
+            }
+            return any
+        }
+
+        /** Mirror of FmFtpProvider.emitEpisodeFiles: walk the show dir →
+         *  matching "Season N …" folder(s) → SxxEyy file(s); bare-Exx only
+         *  as a last resort (covers flat show roots). */
+        private suspend fun emitFmEpisode(
+            app: Requests,
+            dir: String,
+            season: Int,
+            episode: Int,
+            srcLabel: String,
+            subtitleCallback: (SubtitleFile) -> Unit,
+            callback: (ExtractorLink) -> Unit,
+        ): Boolean {
+            val base = SITE + encodeFmPath(dir.trimEnd('/') + "/")
+            val seasonRe = Regex("""(?i)season[\s._-]*0*""" + season + """(\D|$)""")
+            val epRe = Regex("""(?i)S0*""" + season + """E0*""" + episode + """(\D|$)""")
+            val eOnlyRe = Regex("""(?i)(\s|\.|_|-|^)E0*""" + episode + """(\D|$)""")
+
+            val topDoc = fetchDoc(app, base) ?: return false
+            val topLinks = fmIndexLinks(topDoc)
+            val seasonDirs = topLinks
+                .filter { it.endsWith("/") }
+                .filter { seasonRe.containsMatchIn(fmDecode(it)) }
+
+            var any = false
+            var sawSxxEyy = false
+
+            seasonDirs.forEach { dirHref ->
+                val folderName = fmDecode(dirHref).trimEnd('/')
+                val folderUrl = base + dirHref
+                val doc = fetchDoc(app, folderUrl) ?: return@forEach
+                fmIndexLinks(doc).filter { !it.endsWith("/") }.forEach { fileHref ->
+                    val decoded = fmDecode(fileHref)
+                    if (!epRe.containsMatchIn(decoded)) return@forEach
+                    val abs = folderUrl + fileHref
+                    if (SUB_EXT.any { decoded.endsWith(it, ignoreCase = true) }) {
+                        runCatching { subtitleCallback(newSubtitleFile("[$LABEL] Subtitle", abs)) }
+                        return@forEach
+                    }
+                    if (!VIDEO_EXT.any { decoded.endsWith(it, ignoreCase = true) }) return@forEach
+                    sawSxxEyy = true
+                    runCatching {
+                        callback(
+                            newExtractorLink(
+                                srcLabel, "$srcLabel - Direct", abs, ExtractorLinkType.VIDEO
+                            ) {
+                                this.referer = "$SITE/"
+                                this.headers = HEADERS
+                                this.quality = qualityFromName(folderName + "/" + decoded)
+                            }
+                        )
+                    }.onSuccess { any = true }
+                }
+            }
+
+            if (!sawSxxEyy) {
+                val flat = mutableListOf<Triple<String, String, String>>()
+                topLinks.filter { !it.endsWith("/") }
+                    .forEach { flat += Triple(base, it, fmDecode(it)) }
+                seasonDirs.forEach { dirHref ->
+                    val folderUrl = base + dirHref
+                    fetchDoc(app, folderUrl)?.let { doc ->
+                        fmIndexLinks(doc).filter { !it.endsWith("/") }
+                            .forEach { flat += Triple(folderUrl, it, fmDecode(it)) }
+                    }
+                }
+                flat.forEach { (folderUrl, href, decoded) ->
+                    if (!eOnlyRe.containsMatchIn(decoded)) return@forEach
+                    if (!VIDEO_EXT.any { decoded.endsWith(it, ignoreCase = true) }) return@forEach
+                    runCatching {
+                        callback(
+                            newExtractorLink(
+                                srcLabel, "$srcLabel - Direct", folderUrl + href,
+                                ExtractorLinkType.VIDEO
+                            ) {
+                                this.referer = "$SITE/"
+                                this.headers = HEADERS
+                                this.quality = qualityFromName(decoded)
+                            }
+                        )
+                    }.onSuccess { any = true }
+                }
+            }
+            return any
+        }
+
+        private fun fmIndexLinks(doc: Document): List<String> =
+            doc.select("a[href]")
+                .mapNotNull { a ->
+                    val href = a.attr("href").trim()
+                    if (href.isBlank() || href.startsWith("../") || href.startsWith("?") ||
+                        href.startsWith("/")) null
+                    else href
+                }
+                .distinct()
+
+        private suspend fun fetchJson(app: Requests, url: String): JSONObject? {
+            val resp = runCatching { app.get(url, headers = HEADERS, timeout = 15_000) }.getOrNull()
+                ?: return null
+            if (resp.code !in 200..299 || resp.text.isBlank()) return null
+            return runCatching { JSONObject(resp.text) }.getOrNull()
+        }
+
+        private suspend fun fetchDoc(app: Requests, url: String): Document? {
+            val resp = runCatching { app.get(url, headers = HEADERS, timeout = 15_000) }.getOrNull()
+                ?: return null
+            if (resp.code !in 200..299 || resp.text.isBlank()) return null
+            return runCatching { Jsoup.parse(resp.text, url) }.getOrNull()
+        }
+
+        private fun encodeFmPath(p: String): String = buildString(p.length + 16) {
+            for (c in p) {
+                when (c) {
+                    ' ' -> append("%20")
+                    '#' -> append("%23")
+                    '?' -> append("%3F")
+                    '%' -> append("%25")
+                    else -> append(c)
+                }
+            }
+        }
+
+        private fun fmDecode(s: String): String =
+            runCatching { java.net.URLDecoder.decode(s, "UTF-8") }.getOrDefault(s)
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    //  Resolver 9: Mediaserver  (http://103.225.94.27/mediaserver)
+    //
+    //  Parser ported 1:1 from MediaserverProvider.kt (v43). Plain server-
+    //  rendered WordPress (streamTube), no login; ONE flat post type under
+    //  /index.php/video/<id>/ — movies AND single episodes ("One Piece
+    //  S01E08") are sibling posts. Player = inline <video-js data-settings
+    //  ="JSON"> whose sources[] are direct mp4 URLs (206-verified).
+    //  Series matching: post title must carry the requested SxxEyy token,
+    //  and the title with that token stripped must pass the title gate.
+    // ════════════════════════════════════════════════════════════════════════
+    internal object MediaserverResolver : SourceResolver {
+        private const val SITE = "http://103.225.94.27/mediaserver"
+        private const val LABEL = "Mediaserver"
+        private val HEADERS = mapOf(
+            "User-Agent" to UA,
+            "Referer" to "$SITE/",
+        )
+        private val MEDIA_URL_RE = Regex(
+            """https?://[^\s"'<>\\]+\.(?:mp4|mkv|m3u8|webm|m4v)(?:\?[^\s"'<>\\]*)?""",
+            RegexOption.IGNORE_CASE
+        )
+
+        private data class Cand(val url: String, val postTitle: String)
+
+        override suspend fun resolve(
+            app: Requests,
+            title: String,
+            year: Int?,
+            isMovie: Boolean,
+            season: Int?,
+            episode: Int?,
+            labelPrefix: String,
+            subtitleCallback: (SubtitleFile) -> Unit,
+            callback: (ExtractorLink) -> Unit,
+            tmdbId: Int?,
+            imdbId: String?,
+        ): Boolean {
+            val searchUrl = "$SITE/index.php/?s=${encodeUrl(title)}"
+            val resp = runCatching {
+                app.get(searchUrl, headers = HEADERS, timeout = 12_000)
+            }.getOrNull() ?: return false
+            if (resp.code !in 200..299 || resp.text.isBlank()) return false
+            val doc = Jsoup.parse(resp.text, searchUrl)
+
+            val cards = doc.select("h2.post-meta__title a[href], h2.post-title a[href]")
+                .mapNotNull { a ->
+                    val href = a.absUrl("href").ifBlank { a.attr("href") }.trim()
+                    val t = a.text().trim()
+                    if (href.isBlank() || t.isBlank()) null else Cand(href, t)
+                }
+                .distinctBy { it.url }
+            if (cards.isEmpty()) return false
+
+            val picks: List<Cand> = if (!isMovie && season != null && episode != null) {
+                val sxeRe = Regex("""(?i)S0*""" + season + """E0*""" + episode + """(\D|$)""")
+                cards.mapNotNull { c ->
+                    val m = sxeRe.find(c.postTitle) ?: return@mapNotNull null
+                    // Base title = post title with the SxxEyy token (and the
+                    // episode name after it) removed → "One Piece S01E08
+                    // Romance Dawn" → "One Piece".
+                    val base = c.postTitle.substring(0, m.range.first)
+                        .trim(' ', '-', '_', ':', '.', '(', ')', '[', ']')
+                    if (base.isBlank()) return@mapNotNull null
+                    c.copy(postTitle = base)
+                }.let { epCards ->
+                    val tier1 = epCards.filter { isSameMediaTitle(it.postTitle, title, year) }
+                    (tier1.ifEmpty {
+                        epCards.filter { isFuzzySameMedia(it.postTitle, title, year) }
+                    }).sortedByDescending { titleSimilarity(it.postTitle, title) }.take(4)
+                }
+            } else {
+                val tier1 = cards.filter { isSameMediaTitle(it.postTitle, title, year) }
+                (tier1.ifEmpty {
+                    cards.filter { isFuzzySameMedia(it.postTitle, title, year) }
+                }).sortedByDescending { titleSimilarity(it.postTitle, title) }.take(4)
+            }
+            if (picks.isEmpty()) return false
+
+            val srcLabel = "$labelPrefix • $LABEL"
+            var any = false
+            picks.forEach { pick ->
+                val page = runCatching {
+                    app.get(pick.url, headers = HEADERS, timeout = 15_000)
+                }.getOrNull() ?: return@forEach
+                if (page.code !in 200..299) return@forEach
+                val pdoc = Jsoup.parse(page.text, pick.url)
+                val emitted = LinkedHashSet<String>()
+
+                // 1) Primary: inline video-js settings JSON.
+                pdoc.select("video-js[data-settings]").forEach { vj ->
+                    val settings = runCatching { JSONObject(vj.attr("data-settings")) }.getOrNull()
+                        ?: return@forEach
+                    val sources = settings.optJSONArray("sources") ?: JSONArray()
+                    for (i in 0 until sources.length()) {
+                        val s = sources.optJSONObject(i) ?: continue
+                        val src = s.optString("src").trim()
+                        if (src.isBlank() || !emitted.add(src)) continue
+                        if (emitMsMedia(src, srcLabel, callback)) any = true
+                    }
+                }
+                // 2) Plain <video><source> fallback.
+                pdoc.select("video source[src], video[src]").forEach { el ->
+                    val src = el.absUrl("src").ifBlank { el.attr("src") }.trim()
+                    if (src.isBlank() || !emitted.add(src)) return@forEach
+                    if (emitMsMedia(src, srcLabel, callback)) any = true
+                }
+                // 3) Regex last resort (lazy-init players).
+                if (emitted.isEmpty()) {
+                    MEDIA_URL_RE.findAll(page.text).forEach { m ->
+                        val src = m.value
+                        if (src.contains("/wp-content/uploads/")) return@forEach
+                        if (!emitted.add(src)) return@forEach
+                        if (emitMsMedia(src, srcLabel, callback)) any = true
+                    }
+                }
+            }
+            return any
+        }
+
+        private suspend fun emitMsMedia(
+            src: String,
+            srcLabel: String,
+            callback: (ExtractorLink) -> Unit,
+        ): Boolean {
+            val isHls = src.contains(".m3u8", ignoreCase = true)
+            return try {
+                callback(
+                    newExtractorLink(
+                        srcLabel, "$srcLabel - Direct", src,
+                        if (isHls) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+                    ) {
+                        this.referer = "$SITE/"
+                        this.headers = HEADERS
+                        this.quality = qualityFromName(src)
+                    }
+                )
+                true
+            } catch (t: Throwable) {
+                Log.d(TAG, "Mediaserver emit: ${t.message}")
+                false
+            }
         }
     }
 }

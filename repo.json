@@ -1,6 +1,6 @@
 {
     "name": "Wizdier BDIX Repository",
-    "description": "6 extensions: Wizstream (unified TMDB + AniList catalogue with BDIX + web sources) plus Circle FTP, Cineplex BD, CTGMovies, FTPBD & FlixHub standalone BDIX sources. MAL, AniList, Kitsu & Simkl tracking. Health-checked 2026-07-24.",
+    "description": "8 extensions: Wizstream (unified TMDB + AniList catalogue with BDIX + web sources) plus Circle FTP, Cineplex BD, CTGMovies, FTPBD, FlixHub, FM FTP & Mediaserver standalone BDIX sources. MAL, AniList, Kitsu & Simkl tracking. Health-checked 2026-07-25.",
     "manifestVersion": 1,
     "pluginLists": [
         "https://raw.githubusercontent.com/Wizdier/Wizdier-CloudstreamRepo/builds/plugins.json"
