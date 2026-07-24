@@ -869,9 +869,15 @@ object WizstreamSources {
                     put("Referer", playerUrl)
                 }.toMap()
 
+                // (v34) player-page subtitles — CineplexBDProvider.collectSubtitles.
+                collectPageSubs(playerHtml, playerUrl, subtitleCallback)
+
                 val mediaUrls = extractMediaUrlsFromHtml(playerHtml, playerUrl)
                 var any = false
                 mediaUrls.forEach { u ->
+                    if (u.contains(".m3u8", ignoreCase = true)) {
+                        collectM3u8Subs(app, u, playerUrl, subtitleCallback)
+                    }
                     if (emitDirect(app, u, srcLabel, playerUrl, videoHeaders, subtitleCallback, callback)) any = true
                 }
 
@@ -1044,6 +1050,15 @@ object WizstreamSources {
                     )
                     anchors.forEachIndexed { idx, a ->
                         val href = a.attr("href").takeIf { it.isNotBlank() } ?: return@forEachIndexed
+                        // (v34) The watch page lists ONE season's episodes and
+                        // every anchor carries &season=N. Keep only the
+                        // requested season's anchors (or unmarked ones) so a
+                        // leftover S1 strip can never answer an S2 request.
+                        val anchorSeason = Regex("""season=(\d+)""")
+                            .find(href)?.groupValues?.getOrNull(1)?.toIntOrNull()
+                        if (anchorSeason != null && anchorSeason != seasonToUse) {
+                            return@forEachIndexed
+                        }
                         val epNum = Regex("""(?i)(?:ep(?:isode)?[=\s]*|\bE)(\d+)""")
                             .find(href + " " + a.text())?.groupValues?.getOrNull(1)?.toIntOrNull()
                             ?: (idx + 1)
@@ -1063,12 +1078,23 @@ object WizstreamSources {
             //   • /view.php?id=… or /player.php?id=… → indirection page
             //   • Quetta player page → data-quetta-video-id="qv_…"
             val absPath = resolveAbs(SITE, matchPath)
-            return when {
-                // (v33) /Data/ links are direct files even extensionless —
-                // CineplexBDProvider.loadLinksWithLabel treats them as VIDEO.
-                isDirectMedia(absPath) || absPath.contains("/Data/") ->
-                    emitDirect(app, absPath, srcLabel, "$SITE/", HEADERS, subtitleCallback, callback)
-                absPath.contains("player.php") || absPath.contains("view.php") -> {
+            // (v34) 1:1 with CineplexBDProvider.loadLinksWithLabel:
+            //   • .m3u8/.mp4/.mkv … (or /Data/) → emit directly;
+            //   • EVERYTHING else — player.php, view.php AND the watch-page
+            //     episode anchors (watch.php?id=…&season=…&ep=N) — is an
+            //     HTML PAGE that must be fetched and scraped for the real
+            //     media URL.
+            //     v33's `else -> emitDirect` routed page URLs into
+            //     loadExtractor, which knows no cineplexbd extractor, so
+            //     every episode silently died → "CineplexBD not working at
+            //     all" while the standalone scraped the very same pages.
+            if (isDirectMedia(absPath) || absPath.contains("/Data/")) {
+                if (absPath.contains(".m3u8", ignoreCase = true)) {
+                    collectM3u8Subs(app, absPath, "$SITE/", subtitleCallback)
+                }
+                return emitDirect(app, absPath, srcLabel, "$SITE/", HEADERS, subtitleCallback, callback)
+            }
+            return run {
                     val playerResp = runCatching {
                         app.get(absPath, headers = HEADERS, timeout = 15_000)
                     }.getOrNull() ?: return false
@@ -1083,9 +1109,18 @@ object WizstreamSources {
                         put("Referer", absPath)
                     }.toMap()
 
+                    // (v34) subtitles embedded in the episode page —
+                    // CineplexBDProvider.collectSubtitles.
+                    collectPageSubs(playerHtml, absPath, subtitleCallback)
+
                     val mediaUrls = extractMediaUrlsFromHtml(playerHtml, absPath)
                     var any = false
                     mediaUrls.forEach { u ->
+                        // (v34) standalone also scans each m3u8 manifest
+                        // for #EXT-X-MEDIA subtitle tracks.
+                        if (u.contains(".m3u8", ignoreCase = true)) {
+                            collectM3u8Subs(app, u, absPath, subtitleCallback)
+                        }
                         if (emitDirect(app, u, srcLabel, absPath, videoHeaders, subtitleCallback, callback)) any = true
                     }
 
@@ -1117,10 +1152,83 @@ object WizstreamSources {
                         }
                     }
                     any
-                }
-                else -> emitDirect(app, absPath, srcLabel, "$SITE/", HEADERS, subtitleCallback, callback)
             }
         }
+
+        /**
+         * (v34) Port of CineplexBDProvider.collectSubtitles — subtitle files
+         * referenced directly by an episode/player page (<track> tags,
+         * download anchors, or any absolute .srt/.vtt/.ass URL in the
+         * markup).
+         */
+        private suspend fun collectPageSubs(
+            html: String,
+            baseUrl: String,
+            subtitleCallback: (SubtitleFile) -> Unit,
+        ) {
+            val seen = linkedSetOf<String>()
+            val doc = runCatching { Jsoup.parse(html, baseUrl) }.getOrNull()
+            doc?.select("track[src], a[href*='.srt'], a[href*='.vtt'], a[href*='.ass']")
+                ?.forEach { el ->
+                    val raw = el.attr("src").ifBlank { el.attr("href") }.ifBlank { return@forEach }
+                    val subUrl = resolveAbs(baseUrl, raw)
+                    if (subUrl.isBlank() || !seen.add(subUrl)) return@forEach
+                    val label = el.attr("label")
+                        .ifBlank { el.attr("srclang") }
+                        .ifBlank { el.text() }
+                        .ifBlank {
+                            subUrl.substringAfterLast('/').substringBefore('?')
+                                .substringBeforeLast('.')
+                        }
+                    subtitleCallback(newSubtitleFile("[$LABEL] $label", subUrl))
+                }
+            Regex(
+                """https?://[^\s"'<>]+\.(?:srt|vtt|ass)(?:\?[^\s"'<>]*)?""",
+                RegexOption.IGNORE_CASE
+            ).findAll(html)
+                .map { it.value.replace("&amp;", "&") }
+                .forEach { raw ->
+                    if (raw.isNotBlank() && seen.add(raw)) {
+                        val label = raw.substringAfterLast('/').substringBefore('?')
+                            .substringBeforeLast('.')
+                        subtitleCallback(newSubtitleFile("[$LABEL] $label", raw))
+                    }
+                }
+        }
+
+        /**
+         * (v34) Port of CineplexBDProvider.collectM3u8Subtitles — scans an
+         * HLS master manifest for #EXT-X-MEDIA:TYPE=SUBTITLES tracks and
+         * forwards them as subtitle files.
+         */
+        private suspend fun collectM3u8Subs(
+            app: Requests,
+            manifestUrl: String,
+            referer: String,
+            subtitleCallback: (SubtitleFile) -> Unit,
+        ) {
+            val h = HEADERS.toMutableMap().apply { put("Referer", referer) }
+            val manifest = runCatching {
+                app.get(manifestUrl, headers = h, timeout = 10_000).text
+            }.getOrNull() ?: return
+            if (!manifest.startsWith("#EXTM3U")) return
+            Regex("""#EXT-X-MEDIA:([^\r\n]+)""", RegexOption.IGNORE_CASE)
+                .findAll(manifest)
+                .forEach { match ->
+                    val attrs = match.groupValues[1]
+                    if (!attrs.contains("TYPE=SUBTITLES", ignoreCase = true)) return@forEach
+                    val uri = m3u8Attr(attrs, "URI") ?: return@forEach
+                    val subUrl = resolveAbs(manifestUrl, uri)
+                    val label = m3u8Attr(attrs, "NAME") ?: m3u8Attr(attrs, "LANGUAGE")
+                        ?: subUrl.substringAfterLast('/').substringBefore('?')
+                            .substringBeforeLast('.')
+                    subtitleCallback(newSubtitleFile("[$LABEL] $label", subUrl))
+                }
+        }
+
+        private fun m3u8Attr(attrs: String, key: String): String? =
+            Regex("$key=\"([^\"]*)\"").find(attrs)?.groupValues?.getOrNull(1)
+                ?.takeIf { it.isNotBlank() }
 
         /**
          * Try multiple candidate Quetta API endpoints to resolve a
@@ -1501,11 +1609,32 @@ object WizstreamSources {
             imdbId: String?,
         ): Boolean {
             // 1. Search posts — fetch all results, not just the best one.
-            val searchText = fetchWithFallback(
+            val searchResp = fetchWithFallback(
                 app,
                 primary = "$PRIMARY_API/api/posts?searchTerm=${encodeUrl(title)}&order=desc",
                 fallback = "$FALLBACK_API/api/posts?searchTerm=${encodeUrl(title)}&order=desc",
             ) ?: return false
+            val searchText = searchResp.first
+
+            // (v34) Hostname-vs-IP parity with CircleFtpProvider. The
+            // standalone only swaps *.circleftp.net hosts for their raw BDIX
+            // IPs when the loaded URL itself carries the raw-IP API host
+            // (urlCheck = !url.contains(apiUrl)) — and its grouped
+            // "load?data=" URLs never contain the IP, so in practice the
+            // standalone ALWAYS emits the hostname form
+            // (http://ftp17.circleftp.net/…), which is exactly what the
+            // site's own web player and the user's working standalone play.
+            // v19–v33 rewrote the host to the raw IP UNCONDITIONALLY
+            // (http://15.1.3.8/…) — the CDN doesn't serve those files on
+            // vhost-less/IP requests on the user's ISP, so the player got a
+            // 404 → HTTP 2004 while standalone/web played the same episode
+            // clean (verified against post 102185 + the site's watch page:
+            // every stream/download anchor uses the hostname form; no
+            // 15.1.x.x IP appears anywhere).
+            // Now: rewrite ONLY when the raw-IP API mirror actually answered
+            // — the situation where the user's DNS can't resolve
+            // circleftp.net and the IP is the working route.
+            val ipRewriteLinks = searchResp.second
 
             val postsArr = runCatching { JSONObject(searchText).optJSONArray("posts") }
                 .getOrNull() ?: return false
@@ -1584,7 +1713,7 @@ object WizstreamSources {
                             app,
                             primary = "$PRIMARY_API/api/posts/$id",
                             fallback = "$FALLBACK_API/api/posts/$id",
-                        ) ?: return@async null
+                        )?.first ?: return@async null
                         runCatching { JSONObject(text) }.getOrNull()
                     }
                 }.awaitAll().filterNotNull()
@@ -1730,9 +1859,9 @@ object WizstreamSources {
                 if (u.contains("movie?data=") || u.contains("episode?data=") ||
                     u.contains("circleftp://")
                 ) {
-                    if (emitCircleFtpEncoded(u, srcLabel, callback)) any = true
+                    if (emitCircleFtpEncoded(u, srcLabel, ipRewriteLinks, callback)) any = true
                 } else {
-                    val resolvedUrl = linkToIp(u)
+                    val resolvedUrl = if (ipRewriteLinks) linkToIp(u) else u
                     if (resolvedUrl.isNotBlank()) {
                         callback(
                             newExtractorLink(
@@ -1776,6 +1905,7 @@ object WizstreamSources {
         private suspend fun emitCircleFtpEncoded(
             data: String,
             sourceLabel: String,
+            ipRewrite: Boolean,
             callback: (ExtractorLink) -> Unit,
         ): Boolean {
             val raw = data.substringAfter("data=").substringBefore("&")
@@ -1792,9 +1922,9 @@ object WizstreamSources {
                 val o = arr.optJSONObject(i) ?: continue
                 val u = o.optString("url").ifBlank { o.optString("link") }
                 if (u.isBlank()) continue
-                // Apply linkToIp — the encoded URL may contain a
-                // circleftp.net hostname that needs BDIX IP swap.
-                val resolvedUrl = linkToIp(u)
+                // (v34) Only rewrite to the BDIX IP when the raw-IP API
+                // mirror served this resolve (see the v34 note above).
+                val resolvedUrl = if (ipRewrite) linkToIp(u) else u
                 val audio = o.optString("audio").takeIf { it.isNotBlank() }
                 val name = if (audio != null) "$sourceLabel [$audio]" else sourceLabel
                 // (v33) Standalone parity: no referer, no headers, no explicit
@@ -1814,24 +1944,30 @@ object WizstreamSources {
             return any
         }
 
+        /**
+         * (v34) Returns (body, usedFallback). The usedFallback flag drives
+         * the hostname-vs-IP decision downstream — see the v34 note at the
+         * search call site.
+         *
+         * CRITICAL: verify=false and cacheTime=60 are REQUIRED for the
+         * CircleFTP API to work — the standalone CircleFtpHttp uses
+         * these exact flags. Without verify=false, the API returns
+         * empty/error responses on BDIX networks. Without cacheTime,
+         * every request hits the server (no caching).
+         */
         private suspend fun fetchWithFallback(
             app: Requests,
             primary: String,
             fallback: String,
-        ): String? {
-            // CRITICAL: verify=false and cacheTime=60 are REQUIRED for the
-            // CircleFTP API to work — the standalone CircleFtpHttp uses
-            // these exact flags. Without verify=false, the API returns
-            // empty/error responses on BDIX networks. Without cacheTime,
-            // every request hits the server (no caching).
+        ): Pair<String, Boolean>? {
             val a = runCatching {
                 app.get(primary, headers = HEADERS, verify = false, cacheTime = 60, timeout = 10_000)
             }.getOrNull()
-            if (a != null && a.code in 200..299 && a.text.isNotBlank()) return a.text
+            if (a != null && a.code in 200..299 && a.text.isNotBlank()) return a.text to false
             val b = runCatching {
                 app.get(fallback, headers = HEADERS, verify = false, cacheTime = 60, timeout = 10_000)
             }.getOrNull()
-            if (b != null && b.code in 200..299 && b.text.isNotBlank()) return b.text
+            if (b != null && b.code in 200..299 && b.text.isNotBlank()) return b.text to true
             return null
         }
     }
