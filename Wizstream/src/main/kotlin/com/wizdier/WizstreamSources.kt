@@ -273,6 +273,35 @@ object WizstreamSources {
         return false
     }
 
+    /** Token-set Jaccard over toTitleMeta() tokens (stop-words ignored). */
+    internal fun metaSimilarity(postTitle: String, queryTitle: String): Double {
+        val p = postTitle.toTitleMeta().tokens - IDENTITY_STOPWORDS
+        val q = queryTitle.toTitleMeta().tokens - IDENTITY_STOPWORDS
+        if (p.isEmpty() || q.isEmpty()) return 0.0
+        val inter = p.intersect(q).size.toDouble()
+        val union = p.union(q).size.toDouble()
+        return if (union == 0.0) 0.0 else inter / union
+    }
+
+    /**
+     * (v32) Softer sibling of [isSameMediaTitle] used as a SECOND tier when
+     * the strict identity gate rejects every search hit. BDIX catalogues
+     * decorate post titles so loosely ("Avengers Endgame 2019 BDRip 10bit
+     * HEVC DTS-HD MA 7.1-ESub") that legitimate posts occasionally carry a
+     * token the strict gate treats as "different film". A post passes the
+     * fuzzy gate when its meta-token Jaccard with the query is ≥ 0.6 AND
+     * any year both sides expose agrees (±1). Used only after the strict
+     * gate produced zero matches, so franchise separation (Dune vs Dune:
+     * Part Two → 0.33, years clash) still holds whenever it can.
+     */
+    internal fun isFuzzySameMedia(postTitle: String, queryTitle: String, queryYear: Int?): Boolean {
+        val q = queryTitle.toTitleMeta()
+        val p = postTitle.toTitleMeta()
+        if (q.tokens.isEmpty() || p.tokens.isEmpty()) return false
+        if (q.year != null && p.year != null && kotlin.math.abs(q.year - p.year) > 1) return false
+        return metaSimilarity(postTitle, queryTitle) >= 0.6
+    }
+
     internal fun ExtractorLink.relabel(newSource: String, newName: String): ExtractorLink =
         runBlocking {
             newExtractorLink(
@@ -521,6 +550,23 @@ object WizstreamSources {
             u.contains(".m3u8?") || u.contains(".mp4?") || u.contains(".mkv?")
     }
 
+    /**
+     * (v32) WordPress image thumbnails masquerading as media files. FTPBD's
+     * pages embed attachment thumbnails like
+     * `…/wp-content/uploads/2026/05/rings-of-power-280x176.avi` — a tiny
+     * IMAGE with an .avi name — which the generic media-URL regex happily
+     * collected, then handed to loadExtractor (always fails) or, when the
+     * real stream wasn't found, made an entire episode look broken.
+     * Only URLs under /wp-content/uploads/ whose filename carries the WP
+     * resized-image "-{w}x{h}" suffix are dropped; real videos on CDN
+     * hosts (server2.*, /wp-content/hls-file/) are untouched.
+     */
+    internal fun isLikelyThumbnailMediaUrl(url: String): Boolean {
+        if (!url.contains("/wp-content/uploads/", ignoreCase = true)) return false
+        return Regex("""-\d{2,4}x\d{2,4}\.[a-zA-Z0-9]{2,4}(?:\?|$)""")
+            .containsMatchIn(url)
+    }
+
     internal fun resolveAbs(baseUrl: String, maybeRelative: String): String {
         val u = maybeRelative.trim().replace("&amp;", "&")
         if (u.isBlank()) return u
@@ -546,7 +592,8 @@ object WizstreamSources {
                 "a[href*='.webm'], a[href*='.m4v']"
         ).forEach { el ->
             val src = el.attr("src").ifBlank { el.attr("href") }
-            if (src.isNotBlank()) out += resolveAbs(baseUrl, src)
+            val abs = resolveAbs(baseUrl, src)
+            if (src.isNotBlank() && !isLikelyThumbnailMediaUrl(abs)) out += abs
         }
 
         // iframe srcs — many vid hosts wrap the actual video in an iframe.
@@ -579,7 +626,8 @@ object WizstreamSources {
             """https?://[^\s"'<>]+(?:\.m3u8|\.mp4|\.mkv|\.webm|\.avi|\.mov|\.m4v)(?:\?[^\s"'<>]*)?""",
             RegexOption.IGNORE_CASE
         ).findAll(html).forEach { m ->
-            out += m.value.replace("&amp;", "&")
+            val u = m.value.replace("&amp;", "&")
+            if (!isLikelyThumbnailMediaUrl(u)) out += u
         }
 
         return out
@@ -739,14 +787,49 @@ object WizstreamSources {
             // (no auto-match gate, the user picks by hand) worked fine.
             // Multiple candidates of the same film (quality variants) are
             // still tried in best-similarity order.
+            // (v32) Tiered matching + multi-candidate tries. The v18 strict
+            // identity gate silently rejected legitimate BDIX posts whose
+            // titles carried extra cut/rip tokens, which is why CineplexBD
+            // looked dead inside Wizstream. Tier 1 = strict identity (keeps
+            // franchise separation first). Tier 2 = fuzzy meta match (year-
+            // compatible, ≥0.6) — only used when tier 1 finds nothing.
+            // The top-3 survivors are tried in order until one emits links,
+            // so a quality-duplicate post picked first no longer poisons
+            // the whole resolve when its player page is broken.
             val identityMatches = filtered.filter { (_, ct) -> isSameMediaTitle(ct, title, year) }
-            val best = identityMatches.maxByOrNull { (_, ct) -> titleSimilarity(ct, title) }
-                ?: run {
-                    Log.d(TAG, "CineplexBD: no identity match for '$title' (year=$year)")
-                    return false
-                }
+            val pool = identityMatches.ifEmpty {
+                filtered.filter { (_, ct) -> isFuzzySameMedia(ct, title, year) }
+            }
+            val tryList = pool
+                .sortedByDescending { (_, ct) -> titleSimilarity(ct, title) }
+                .distinctBy { it.first }
+                .take(3)
+            if (tryList.isEmpty()) {
+                Log.d(TAG, "CineplexBD: no match for '$title' (year=$year)")
+                return false
+            }
 
             val srcLabel = "$labelPrefix • $LABEL"
+
+            for (cand in tryList) {
+                val ok = if (isMovie) {
+                    resolveMovieOne(app, cand, srcLabel, subtitleCallback, callback)
+                } else {
+                    resolveTvOne(app, cand, season, episode, srcLabel, subtitleCallback, callback)
+                }
+                if (ok) return true
+            }
+            return false
+        }
+
+        private suspend fun resolveMovieOne(
+            app: Requests,
+            best: Pair<String, String>,
+            srcLabel: String,
+            subtitleCallback: (SubtitleFile) -> Unit,
+            callback: (ExtractorLink) -> Unit,
+        ): Boolean {
+            // (moved under resolveMovieOne in v32; body otherwise unchanged)
 
             // ── MOVIE PATH ──────────────────────────────────────────────────
             // CineplexBDProvider.load() builds the data URL as
@@ -760,7 +843,7 @@ object WizstreamSources {
             // We capture cookies from the response and forward them as a
             // Cookie header — this is required for protected video URLs and
             // matches the Aniyomi CineplexBD extension's pattern.
-            if (isMovie) {
+                return run {
                 // Defensive check: if the best match is NOT a /view.php URL
                 // (e.g. it's a /watch.php series page), bail out — fetching
                 // /player.php?id=<series_id> would return a series page, not
@@ -834,12 +917,22 @@ object WizstreamSources {
                 }
                 return any
             }
+        }
 
-            // ── TV PATH ─────────────────────────────────────────────────────
-            // Use the watch.php?…&season=N&meta=1 JSON endpoint that
-            // CineplexBDProvider.parseEpisodesFromMetaJson uses. Each
-            // episode object has a `path` field pointing to a /Data/… direct
-            // media URL OR a /player.php?id=… indirection.
+        // ── TV PATH ─────────────────────────────────────────────────────
+        // Use the watch.php?…&season=N&meta=1 JSON endpoint that
+        // CineplexBDProvider.parseEpisodesFromMetaJson uses. Each
+        // episode object has a `path` field pointing to a /Data/… direct
+        // media URL OR a /player.php?id=… indirection.
+        private suspend fun resolveTvOne(
+            app: Requests,
+            best: Pair<String, String>,
+            season: Int?,
+            episode: Int?,
+            srcLabel: String,
+            subtitleCallback: (SubtitleFile) -> Unit,
+            callback: (ExtractorLink) -> Unit,
+        ): Boolean {
             val seriesIdKey = if (best.first.contains("series_id=")) "series_id" else "id"
             val seriesIdVal = if (seriesIdKey == "series_id") {
                 best.first.substringAfter("series_id=").substringBefore("&")
@@ -1400,6 +1493,9 @@ object WizstreamSources {
             //    are kept. If NOTHING matches, we emit nothing from Circle
             //    FTP — wrong links are worse than missing links.
             val identityFiltered = mutableListOf<Pair<Int, String>>()
+            // (v32) second-chance pool for loosely-decorated anime/BDIX
+            // posts that the strict gate kills; used ONLY when tier 1 empty.
+            val fuzzyFiltered = mutableListOf<Pair<Int, String>>()
             //
             //    FIX (v17): The previous code filtered posts by title similarity
             //    (score >= 0.5 AND pNorm.contains(qNorm)) which was TOO STRICT.
@@ -1429,11 +1525,13 @@ object WizstreamSources {
                 val effectiveYear = year ?: postYear
                 if (isSameMediaTitle(ptitle, title, effectiveYear)) {
                     identityFiltered += p.optInt("id", -1) to ptitle
+                } else if (isFuzzySameMedia(ptitle, title, effectiveYear)) {
+                    fuzzyFiltered += p.optInt("id", -1) to ptitle
                 }
             }
-            val matchingPostIds = identityFiltered
+            val matchingPostIds = identityFiltered.ifEmpty { fuzzyFiltered }
             if (matchingPostIds.isEmpty()) {
-                Log.d(TAG, "CircleFTP: no identity match for '$title' (year=$year) — skipping")
+                Log.d(TAG, "CircleFTP: no match for '$title' (year=$year) — skipping")
                 return false
             }
 
@@ -1772,7 +1870,9 @@ object WizstreamSources {
             for (i in 0 until linksArr.length()) {
                 val link = linksArr.optJSONObject(i) ?: continue
                 if (link.optBoolean("broken", false)) continue
-                val rawUrl = link.optString("url").ifBlank {
+                val rawUrl = link.optString("hls_url").ifBlank {
+                    link.optString("url")
+                }.ifBlank {
                     link.optString("file")
                 }.ifBlank {
                     link.optString("src")
@@ -1786,21 +1886,60 @@ object WizstreamSources {
             }
 
             if (!isMovie && season != null && episode != null) {
-                detail.optJSONArray("seasons")?.let { seasonsArr ->
-                    for (si in 0 until seasonsArr.length()) {
-                        val seasonObj = seasonsArr.optJSONObject(si) ?: continue
-                        val sn = seasonObj.optInt("season", si + 1)
-                        if (sn != season) continue
-                        val epsArr = seasonObj.optJSONArray("episodes") ?: continue
-                        val epObj = epsArr.optJSONObject(episode - 1) ?: continue
-                        val epLinks = epObj.optJSONArray("links") ?: continue
+                // (v32) CTG serves episodes in TWO shapes depending on the
+                // catalogue (verified live 2026-07-24):
+                //   • /tv and /anime detail → FLAT "episodes":[{season_number,
+                //     episode_number, links:[{url, hls_url?, quality}]}, …]
+                //     (the legacy seasons[] tree is metadata-only there)
+                //   • older shape → seasons[]→episodes[]→links[] tree
+                // Handle the flat array first (it is what real /tv and
+                // /anime responses carry today), keep the tree as fallback —
+                // this is why CTG worked for movies but never for TV/anime.
+                val flat = detail.optJSONArray("episodes")
+                if (flat != null && flat.length() > 0) {
+                    val seasonEps = (0 until flat.length())
+                        .mapNotNull { flat.optJSONObject(it) }
+                        .filter { ep ->
+                            val s2 = ep.optInt("season_number", 0)
+                            // season_number==0/absent → single-season entry;
+                            // accept it only when season 1 was requested.
+                            s2 == season || (season == 1 && s2 == 0)
+                        }
+                    val epObj = seasonEps.firstOrNull { ep ->
+                        ep.optInt("episode_number", 0) == episode
+                    } ?: seasonEps.getOrNull(episode - 1)
+                    epObj?.optJSONArray("links")?.let { epLinks ->
                         for (i in 0 until epLinks.length()) {
                             val link = epLinks.optJSONObject(i) ?: continue
-                            val u = link.optString("url").ifBlank { link.optString("file") }
+                            val u = link.optString("hls_url").ifBlank {
+                                link.optString("url")
+                            }.ifBlank { link.optString("file") }
                                 .ifBlank { link.optString("src") }
                             if (u.isNotBlank() &&
                                 emitDirect(app, u, srcLabel, "$SITE/", HEADERS, subtitleCallback, callback)
                             ) any = true
+                        }
+                    }
+                } else {
+                    detail.optJSONArray("seasons")?.let { seasonsArr ->
+                        for (si in 0 until seasonsArr.length()) {
+                            val seasonObj = seasonsArr.optJSONObject(si) ?: continue
+                            val sn = seasonObj.optInt("season",
+                                seasonObj.optInt("season_number", si + 1))
+                            if (sn != season) continue
+                            val epsArr = seasonObj.optJSONArray("episodes") ?: continue
+                            val epObj = epsArr.optJSONObject(episode - 1) ?: continue
+                            val epLinks = epObj.optJSONArray("links") ?: continue
+                            for (i in 0 until epLinks.length()) {
+                                val link = epLinks.optJSONObject(i) ?: continue
+                                val u = link.optString("hls_url").ifBlank {
+                                    link.optString("url")
+                                }.ifBlank { link.optString("file") }
+                                    .ifBlank { link.optString("src") }
+                                if (u.isNotBlank() &&
+                                    emitDirect(app, u, srcLabel, "$SITE/", HEADERS, subtitleCallback, callback)
+                                ) any = true
+                            }
                         }
                     }
                 }
@@ -1809,9 +1948,16 @@ object WizstreamSources {
         }
 
         private fun parseSearchResults(text: String, kind: String): List<Triple<String, String, String>>? {
-            val obj = runCatching { JSONObject(text) }.getOrNull() ?: return null
-            val arr = obj.optJSONArray("data") ?: obj.optJSONArray("results")
-                ?: obj.optJSONArray(kind) ?: return null
+            // (v32) The CTG API is inconsistent per catalogue: /movies wraps
+            // hits in an envelope ({"page":…,"movies":[…]}) while /tv and
+            // /anime return a BARE JSON ARRAY at the top level. The old
+            // object-only parse therefore returned null for every TV/anime
+            // search and CTG silently worked for movies only.
+            val arr: JSONArray = runCatching { JSONArray(text) }.getOrNull()
+                ?: runCatching { JSONObject(text) }.getOrNull()?.let { obj ->
+                    obj.optJSONArray("data") ?: obj.optJSONArray("results")
+                        ?: obj.optJSONArray(kind)
+                } ?: return null
             val out = mutableListOf<Triple<String, String, String>>()
             for (i in 0 until arr.length()) {
                 val it = arr.optJSONObject(i) ?: continue

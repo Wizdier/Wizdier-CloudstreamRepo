@@ -666,11 +666,17 @@ object WizstreamAnimeSources {
         // produce AA_CRYPTO_STALE and that host is now mostly dead anyway).
         private const val SITE = "https://mkissa.to"
         private const val API = "https://api.mkissa.net/api"
-        // clock.json hosts, tried in order — canonical host first, the
-        // api-t fallback second (both currently 5xx operator-side; the code
-        // path stays so it revives automatically when the servers recover).
+        private const val API_BOOTSTRAP = "https://api.mkissa.net/client-crypto/v1/bootstrap"
+        // clock.json hosts, tried in order — canonical host first, then the
+        // api-t edges (api-t.mkissa.net added v32; the current mkissa.to
+        // frontend defines it as its apivtwo host). As of 2026-07-24 all of
+        // them 5xx/11xx-crash operator-side (Express "error" / Cloudflare
+        // Worker 1101), i.e. the internal CDN streams are dead for the
+        // website itself too. The code path stays so the sources revive
+        // automatically the moment the operator fixes the endpoints.
         private val CLOCK_BASES = listOf(
             "https://allanime.day",
+            "https://api-t.mkissa.net",
             "https://api-t.allanime.day",
         )
         private const val CDN_IMMUTABLE = "https://cdn.allanime.day/all/mk/_app/immutable/"
@@ -687,6 +693,15 @@ object WizstreamAnimeSources {
             "f4662f4b7510b26795dd53ef824a0bf1740fbbc5d1273fab18222ac831bca8d0"
         private const val FALLBACK_BUILD = "51"
         private const val STATIC_KEY = "Xot36i3lK3:v1"
+        // (v32) /client-crypto/v1/bootstrap — the CURRENT frontend's own
+        // one-request crypto bootstrap (mkissa.to chunk DB0rFWAa.js):
+        // GET ?buildId=64 → {epoch, partB, switchAt, graceMs}; the 32-byte
+        // key = b64decode(partB) XOR this hardcoded mask (the chunk's `Ba`
+        // constant). Verified live 2026-07-24: yields the same key as the
+        // page/chunk scrape below.
+        private const val BOOTSTRAP_BUILD_ID = "64"
+        private const val BOOTSTRAP_MASK_HEX =
+            "70bb5e6260e19a806b3609dc0b6eb718899b09edbd0c23703a5de00e544de128"
 
         private val HEADERS = mapOf(
             "User-Agent" to UA,
@@ -895,6 +910,35 @@ object WizstreamAnimeSources {
                     }
                 }
             }.onFailure { Log.d(TAG, "Allmanga live bootstrap failed: ${it.message}") }
+
+            // 1.5 (v32) Server-side crypto bootstrap — one request, the
+            //     exact endpoint today's frontend uses (partB XOR mask).
+            runCatching {
+                val resp = app.get(
+                    "$API_BOOTSTRAP?buildId=$BOOTSTRAP_BUILD_ID",
+                    headers = HEADERS + mapOf("x-build-id" to BOOTSTRAP_BUILD_ID),
+                    timeout = 10_000,
+                ).text
+                val bs = JSONObject(resp)
+                val partB = bs.optStringOrNull("partB")
+                val epoch = if (bs.has("epoch")) bs.optLong("epoch") else null
+                val switchAt = bs.optLong("switchAt", 0L)
+                val graceMs = bs.optLong("graceMs", 0L)
+                val materialDead = switchAt > 0 &&
+                    System.currentTimeMillis() >= switchAt + graceMs
+                if (partB != null && epoch != null && !materialDead) {
+                    val key = xorBytes(
+                        hexToBytes(BOOTSTRAP_MASK_HEX),
+                        Base64.getDecoder().decode(partB),
+                    )
+                    if (key.size == 32) {
+                        // The query hash is build-independent (it hashes the
+                        // episode GraphQL template); keygen snapshot value
+                        // still matches the live template as of 2026-07.
+                        return AaCrypto(epoch, key, FALLBACK_QH, BOOTSTRAP_BUILD_ID)
+                    }
+                }
+            }.onFailure { Log.d(TAG, "Allmanga API bootstrap failed: ${it.message}") }
 
             // 2. anipy-cli keygen.json mirror (CI-updated every few hours).
             runCatching {
