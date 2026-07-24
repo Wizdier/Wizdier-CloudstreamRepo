@@ -526,24 +526,55 @@ class CineplexBD : MainAPI() {
             return true
         }
 
-        val html = app.get(url, headers = cfHeaders, timeout = 15_000).text
+        // ── Fetch the player page and capture cookies ──────────────────────
+        // The player.php page sets session cookies required to access the
+        // underlying video URL. We forward those cookies + a Referer that
+        // matches the player page (not just mainUrl/) — this matches the
+        // pattern used by the Aniyomi CineplexBD extension.
+        val response = runCatching {
+            app.get(url, headers = cfHeaders, timeout = 15_000)
+        }.getOrNull() ?: return false
+        val html = response.text
+
+        // NiceResponse.cookies is a Map<String, String> of cookie name → value.
+        val responseCookieHeader = try {
+            response.cookies.entries.joinToString("; ") { "${it.key}=${it.value}" }
+        } catch (_: Throwable) { "" }
+        val videoHeaders = cfHeaders.toMutableMap().apply {
+            if (responseCookieHeader.isNotBlank()) put("Cookie", responseCookieHeader)
+            put("Referer", url)
+        }.toMap()
+
         val sources = linkedSetOf<String>()
 
+        // Pattern 1: const videoSrc = "..." (legacy player style)
         Regex("""const\s+videoSrc\s*=\s*["'](.*?)["']""")
             .find(html)?.groupValues?.getOrNull(1)?.let(sources::add)
 
         val parsed = org.jsoup.Jsoup.parse(html, url)
         collectSubtitles(parsed, html, url, subtitleCallback)
 
+        // Pattern 2: <video src>, <source src>, <a href=".m3u8|.mp4|.mkv">
         parsed.select("video[src], source[src], a[href*='.m3u8'], a[href*='.mp4'], a[href*='.mkv']")
             .forEach { el ->
                 val src = el.attr("src").ifBlank { el.attr("href") }
                 if (src.isNotBlank()) sources += src
             }
 
+        // Pattern 3: any direct media URL in the HTML
         Regex("""https?://[^\s"'<>]+(?:\.m3u8|\.mp4|\.mkv|\.webm|\.avi|\.m4v)(?:/index\.m3u8|\?[^\s"'<>]*)?""", RegexOption.IGNORE_CASE)
             .findAll(html)
             .mapTo(sources) { it.value.replace("&amp;", "&") }
+
+        // Pattern 4: Quetta video player — data-quetta-video-id="qv_xxx_xxx"
+        // CineplexBD migrated to the Quetta player which loads videos
+        // dynamically via JS. We extract the qv_id and try multiple
+        // candidate Quetta API endpoints. (The exact endpoint is not
+        // publicly documented; we try the most common shapes.)
+        val quettaId = Regex(
+            """data-quetta-video-id=["']?(qv_[a-z0-9_]+)["']?""",
+            RegexOption.IGNORE_CASE
+        ).find(html)?.groupValues?.getOrNull(1)
 
         var found = false
         sources.map { it.toAbsoluteMediaUrl(url) }
@@ -558,7 +589,7 @@ class CineplexBD : MainAPI() {
                             source = sourceName,
                             streamUrl = finalUrl,
                             referer = url,
-                            headers = cfHeaders
+                            headers = videoHeaders
                         ).forEach(callback)
                         found = true
                     }
@@ -572,6 +603,7 @@ class CineplexBD : MainAPI() {
                             ) {
                                 this.referer = url
                                 this.quality = getQualityFromName(finalUrl)
+                                this.headers = videoHeaders
                             }
                         )
                         found = true
@@ -587,7 +619,193 @@ class CineplexBD : MainAPI() {
                 }
             }
 
+        // ── Quetta player extraction ──────────────────────────────────────
+        // If we found a Quetta video ID and no direct sources worked, try
+        // the Quetta API. We attempt multiple candidate endpoints because
+        // the actual endpoint host/path is embedded in a JS file we can't
+        // easily reach.
+        if (quettaId != null && !found) {
+            if (extractQuettaVideo(quettaId, url, videoHeaders, explicitSourceName, subtitleCallback, callback)) {
+                found = true
+            }
+        }
+
+        // ── download.php fallback ─────────────────────────────────────────
+        // If nothing else worked, try /download.php?id=<id> — this page
+        // often has a direct <a href="/Data/…"> link we can scrape.
+        if (!found && url.contains("player.php")) {
+            val id = url.substringAfter("id=", "").substringBefore("&")
+            if (id.isNotBlank()) {
+                val dlUrl = "$mainUrl/download.php?id=$id"
+                runCatching {
+                    val dlHtml = app.get(dlUrl, headers = videoHeaders, timeout = 15_000).text
+                    val dlDoc = org.jsoup.Jsoup.parse(dlHtml, dlUrl)
+                    dlDoc.select("a[href*='/Data/'], a[href*='.mp4'], a[href*='.mkv'], a[href*='.m3u8']").forEach { a ->
+                        val href = a.attr("href").ifBlank { return@forEach }
+                        val abs = href.toAbsoluteMediaUrl(dlUrl)
+                        if (abs.isNotBlank() && sources.add(abs)) {
+                            val sourceName = buildStreamSourceName(label, abs, dlUrl)
+                            if (abs.contains(".m3u8", true)) {
+                                collectM3u8Subtitles(abs, dlUrl, subtitleCallback)
+                                M3u8Helper.generateM3u8(
+                                    source = sourceName,
+                                    streamUrl = abs,
+                                    referer = dlUrl,
+                                    headers = videoHeaders
+                                ).forEach(callback)
+                                found = true
+                            } else if (abs.isDirectVideoUrl() || abs.contains("/Data/", true)) {
+                                callback.invoke(
+                                    newExtractorLink(
+                                        source = sourceName,
+                                        name = "$sourceName - Direct",
+                                        url = abs,
+                                        type = ExtractorLinkType.VIDEO,
+                                    ) {
+                                        this.referer = dlUrl
+                                        this.quality = getQualityFromName(abs)
+                                        this.headers = videoHeaders
+                                    }
+                                )
+                                found = true
+                            }
+                        }
+                    }
+                    // Also regex-scan the download.php HTML for any media URLs.
+                    Regex("""https?://[^\s"'<>]+(?:\.m3u8|\.mp4|\.mkv|\.webm|\.avi|\.m4v)(?:\?[^\s"'<>]*)?""", RegexOption.IGNORE_CASE)
+                        .findAll(dlHtml)
+                        .map { it.value.replace("&amp;", "&") }
+                        .forEach { raw ->
+                            val abs = raw.toAbsoluteMediaUrl(dlUrl)
+                            if (abs.isNotBlank() && sources.add(abs)) {
+                                val sourceName = buildStreamSourceName(label, abs, dlUrl)
+                                if (abs.contains(".m3u8", true)) {
+                                    M3u8Helper.generateM3u8(
+                                        source = sourceName,
+                                        streamUrl = abs,
+                                        referer = dlUrl,
+                                        headers = videoHeaders
+                                    ).forEach(callback)
+                                    found = true
+                                } else if (abs.isDirectVideoUrl()) {
+                                    callback.invoke(
+                                        newExtractorLink(
+                                            source = sourceName,
+                                            name = "$sourceName - Direct",
+                                            url = abs,
+                                            type = ExtractorLinkType.VIDEO,
+                                        ) {
+                                            this.referer = dlUrl
+                                            this.quality = getQualityFromName(abs)
+                                            this.headers = videoHeaders
+                                        }
+                                    )
+                                    found = true
+                                }
+                            }
+                        }
+                }
+            }
+        }
+
         return found
+    }
+
+    /**
+     * Try multiple candidate Quetta API endpoints to resolve a
+     * `data-quetta-video-id` to a playable URL.
+     *
+     * The actual Quetta API endpoint is embedded in a JS file loaded by
+     * player.php and isn't publicly documented. We try the most common
+     * shapes used by similar player frameworks.
+     */
+    private suspend fun extractQuettaVideo(
+        quettaId: String,
+        playerUrl: String,
+        videoHeaders: Map<String, String>,
+        sourceName: String,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit,
+    ): Boolean {
+        // Candidate API endpoints — try each until one returns a playable URL.
+        val candidates = listOf(
+            "https://vidquettaplayer.com/api/?id=$quettaId",
+            "https://vidquettaplayer.com/api/source/$quettaId",
+            "https://vidquettaplayer.com/Quetta/?id=$quettaId",
+            "https://quetta.com/api/?id=$quettaId",
+            "https://api.quetta.io/v1/video/$quettaId",
+            "$mainUrl/api/quetta/?id=$quettaId",
+            "$mainUrl/Quetta/api/?id=$quettaId",
+        )
+        for (apiUrl in candidates) {
+            val resp = runCatching {
+                app.get(apiUrl, headers = videoHeaders, timeout = 10_000)
+            }.getOrNull() ?: continue
+            if (resp.code !in 200..299 || resp.text.isBlank()) continue
+            // Skip HTML responses (likely 404 pages or CF challenge pages).
+            if (resp.text.startsWith("<") || resp.text.contains("<!DOCTYPE", true)) continue
+            val json = runCatching { JSONObject(resp.text) }.getOrNull() ?: continue
+            // Try common JSON shapes:
+            //   {"status":true,"data":{"src":"...","type":"hls"}}
+            //   {"url":"..."}
+            //   {"sources":[{"file":"...","label":"1080p"},...]}
+            //   {"data":[{"file":"...","label":"..."},...]}
+            val mediaUrls = linkedSetOf<String>()
+            json.optJSONObject("data")?.let { dataObj ->
+                dataObj.optStringOrNull("src")?.let { mediaUrls += it }
+                dataObj.optStringOrNull("url")?.let { mediaUrls += it }
+                dataObj.optStringOrNull("file")?.let { mediaUrls += it }
+                dataObj.optJSONArray("sources")?.let { arr ->
+                    for (i in 0 until arr.length()) {
+                        val s = arr.optJSONObject(i) ?: continue
+                        s.optStringOrNull("file")?.let { mediaUrls += it }
+                        s.optStringOrNull("src")?.let { mediaUrls += it }
+                        s.optStringOrNull("url")?.let { mediaUrls += it }
+                    }
+                }
+            }
+            json.optStringOrNull("url")?.let { mediaUrls += it }
+            json.optStringOrNull("src")?.let { mediaUrls += it }
+            json.optJSONArray("sources")?.let { arr ->
+                for (i in 0 until arr.length()) {
+                    val s = arr.optJSONObject(i) ?: continue
+                    s.optStringOrNull("file")?.let { mediaUrls += it }
+                    s.optStringOrNull("src")?.let { mediaUrls += it }
+                    s.optStringOrNull("url")?.let { mediaUrls += it }
+                }
+            }
+            if (mediaUrls.isEmpty()) continue
+            var any = false
+            for (u in mediaUrls) {
+                val abs = if (u.startsWith("http")) u else "$mainUrl/${u.trimStart('/')}"
+                if (abs.contains(".m3u8", true)) {
+                    collectM3u8Subtitles(abs, playerUrl, subtitleCallback)
+                    M3u8Helper.generateM3u8(
+                        source = sourceName,
+                        streamUrl = abs,
+                        referer = playerUrl,
+                        headers = videoHeaders
+                    ).forEach(callback)
+                    any = true
+                } else if (abs.isDirectVideoUrl() || abs.contains("/Data/", true)) {
+                    callback.invoke(
+                        newExtractorLink(
+                            source = sourceName,
+                            name = "$sourceName - Quetta",
+                            url = abs,
+                            type = ExtractorLinkType.VIDEO,
+                        ) {
+                            this.referer = playerUrl
+                            this.quality = getQualityFromName(abs)
+                            this.headers = videoHeaders
+                        }
+                    )
+                    any = true
+                }
+            }
+            if (any) return true
+        }
+        return false
     }
 
     // ----------------------------- Helpers -------------------------------
