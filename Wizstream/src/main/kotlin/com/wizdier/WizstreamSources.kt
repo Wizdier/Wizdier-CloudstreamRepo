@@ -691,6 +691,13 @@ object WizstreamSources {
                     type = ExtractorLinkType.VIDEO,
                 ) {
                     this.referer = referer
+                    // (v38) Propagate resolver-supplied headers (notably the
+                    // session Cookie captured from the player page) onto the
+                    // link itself. Without this the player requests the file
+                    // bare → CineplexBD's CDN rejects it → HTTP 2004 while
+                    // the resolver's own scrape (which HAS the cookie)
+                    // succeeds.
+                    this.headers = headers
                     this.quality = qualityFromName(clean)
                 }
                 callback(link)
@@ -961,8 +968,12 @@ object WizstreamSources {
 
                 val mediaUrls = extractMediaUrlsFromHtml(playerHtml, playerUrl)
                 var any = false
+                // (v38) Subtitle-manifest scan limited to the FIRST m3u8 —
+                // scanning every variant doubles the resolve latency.
+                var subScanDone = false
                 mediaUrls.forEach { u ->
-                    if (u.contains(".m3u8", ignoreCase = true)) {
+                    if (!subScanDone && u.contains(".m3u8", ignoreCase = true)) {
+                        subScanDone = true
                         collectM3u8Subs(app, u, playerUrl, subtitleCallback)
                     }
                     if (emitDirect(app, u, srcLabel, playerUrl, videoHeaders, subtitleCallback, callback)) any = true
@@ -1008,7 +1019,30 @@ object WizstreamSources {
                         }
                     }
                 }
-                if (!any) diag("movie: player+view scraped, 0 media found", srcLabel, callback)
+                if (!any) {
+                    diag("movie: player+view scraped, 0 media found", srcLabel, callback)
+                } else {
+                    // (v38) Self-diagnosis for the movie 2004: probe the
+                    // first emitted media URL with the SAME headers the link
+                    // carries and report the server verdict + the URL prefix,
+                    // so one screenshot tells us whether the URL itself is
+                    // dead or the player's request differs.
+                    val mediaFirst = mediaUrls.firstOrNull()
+                    if (mediaFirst != null) {
+                        val probe = runCatching {
+                            app.get(
+                                mediaFirst,
+                                headers = videoHeaders + ("Range" to "bytes=0-0"),
+                                cacheTime = 0,
+                                timeout = 8_000,
+                            )
+                        }.getOrNull()
+                        diag(
+                            "movie probe 1/${mediaUrls.size} → HTTP ${probe?.code} · ${mediaFirst.take(90)}",
+                            srcLabel, callback,
+                        )
+                    }
+                }
                 return any
             }
         }
@@ -1222,10 +1256,11 @@ object WizstreamSources {
 
                     val mediaUrls = extractMediaUrlsFromHtml(playerHtml, absPath)
                     var any = false
+                    // (v38) Subtitle-manifest scan limited to the FIRST m3u8.
+                    var subScanDone = false
                     mediaUrls.forEach { u ->
-                        // (v34) standalone also scans each m3u8 manifest
-                        // for #EXT-X-MEDIA subtitle tracks.
-                        if (u.contains(".m3u8", ignoreCase = true)) {
+                        if (!subScanDone && u.contains(".m3u8", ignoreCase = true)) {
+                            subScanDone = true
                             collectM3u8Subs(app, u, absPath, subtitleCallback)
                         }
                         if (emitDirect(app, u, srcLabel, absPath, videoHeaders, subtitleCallback, callback)) any = true
@@ -1258,7 +1293,25 @@ object WizstreamSources {
                             }
                         }
                     }
-                    if (!any) diag("tv: episode page scraped, 0 media found", srcLabel, callback)
+                    if (!any) {
+                        diag("tv: episode page scraped, 0 media found", srcLabel, callback)
+                    } else {
+                        val mediaFirst = mediaUrls.firstOrNull()
+                        if (mediaFirst != null) {
+                            val probe = runCatching {
+                                app.get(
+                                    mediaFirst,
+                                    headers = videoHeaders + ("Range" to "bytes=0-0"),
+                                    cacheTime = 0,
+                                    timeout = 8_000,
+                                )
+                            }.getOrNull()
+                            diag(
+                                "tv probe → HTTP ${probe?.code} · ${mediaFirst.take(90)}",
+                                srcLabel, callback,
+                            )
+                        }
+                    }
                     any
             }
         }
@@ -1317,7 +1370,9 @@ object WizstreamSources {
         ) {
             val h = HEADERS.toMutableMap().apply { put("Referer", referer) }
             val manifest = runCatching {
-                app.get(manifestUrl, headers = h, timeout = 10_000).text
+                // (v38) 6s cap — series resolves chain several of these and
+                // a dead manifest host must not stall the whole resolve.
+                app.get(manifestUrl, headers = h, timeout = 6_000).text
             }.getOrNull() ?: return
             if (!manifest.startsWith("#EXTM3U")) return
             Regex("""#EXT-X-MEDIA:([^\r\n]+)""", RegexOption.IGNORE_CASE)
