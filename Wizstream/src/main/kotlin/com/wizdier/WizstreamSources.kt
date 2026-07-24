@@ -952,9 +952,16 @@ object WizstreamSources {
                         while (keys.hasNext()) {
                             val k = keys.next()
                             val v = episodesNode.optJSONObject(k) ?: continue
+                            // (v33) epNum also from the episode's own title
+                            // ("Episode 4", "E04") — CineplexBDProvider's
+                            // buildEpisode does the same.
+                            val rawName = v.optStringOrNullCp("title")
+                                ?: v.optStringOrNullCp("name") ?: ""
                             val epNum = v.optStringOrNullCp("episode_number")?.toIntOrNull()
                                 ?: v.optInt("episode_number", 0).takeIf { it != 0 }
                                 ?: k.toIntOrNull()
+                                ?: Regex("(?i)E(\\d+)").find(rawName)
+                                    ?.groupValues?.getOrNull(1)?.toIntOrNull()
                                 ?: 0
                             val path = v.optStringOrNullCp("path") ?: v.optStringOrNullCp("url")
                                 ?: v.optStringOrNullCp("src") ?: v.optStringOrNullCp("file")
@@ -964,8 +971,12 @@ object WizstreamSources {
                     is JSONArray -> {
                         for (i in 0 until episodesNode.length()) {
                             val v = episodesNode.optJSONObject(i) ?: continue
+                            val rawName = v.optStringOrNullCp("title")
+                                ?: v.optStringOrNullCp("name") ?: ""
                             val epNum = v.optStringOrNullCp("episode_number")?.toIntOrNull()
                                 ?: v.optInt("episode_number", 0).takeIf { it != 0 }
+                                ?: Regex("(?i)E(\\d+)").find(rawName)
+                                    ?.groupValues?.getOrNull(1)?.toIntOrNull()
                                 ?: (i + 1)
                             val path = v.optStringOrNullCp("path") ?: v.optStringOrNullCp("url")
                                 ?: v.optStringOrNullCp("src") ?: v.optStringOrNullCp("file")
@@ -982,23 +993,42 @@ object WizstreamSources {
                 app.get(metaUrl, headers = HEADERS, timeout = 12_000).text
             }.getOrNull()?.let { collectEpisodePaths(it, allPaths) }
 
-            // ── (v31) Fallbacks mirrored from the standalone provider ─────
-            // (a) Single-season shows are sometimes filed under the wrong
-            //     season number server-side (common for anime). Only safe to
-            //     probe other seasons when the REQUESTED season is 1 —
-            //     otherwise we'd risk taking "S1E4" paths for an "S2E4"
-            //     request. Adds are thread-safe via collectEpisodePaths.
-            val epAsk = episode ?: 1
-            if (seasonToUse == 1 && allPaths.none { it.first == epAsk }) {
+            // ── (v31/v33) Fallbacks mirrored from the standalone provider ─
+            // (a) Numeric season sweep — the standalone fires seasons 1..12
+            //     concurrently whenever the JSON path has so far produced
+            //     nothing (its "3-extra" numeric fallback). v31 probed only
+            //     2..8 and only when season 1 was requested, which mis-served
+            //     shows whose server-side season numbers drift. v33: if the
+            //     requested season's meta yielded zero paths AT ALL, sweep
+            //     every *other* season in parallel; episode identity still
+            //     requires the exact (epNum) match below, and paths from a
+            //     different season can only surface when the requested
+            //     season had no matches (guard at `matchPath` sites).
+            // Sweep results land in a per-season map first — flat-merging
+            // them into allPaths would let an S1 path masquerade as the
+            // requested S2 episode. Only ONE non-empty alternate season is
+            // accepted (the common "single-season show filed under a wrong
+            // number" case); several non-empty seasons means the site has
+            // genuine multi-season data and the empty requested season is a
+            // server glitch — auto-picking there would serve the wrong
+            // season, so we bail and let the next candidate post try.
+            if (allPaths.isEmpty()) {
+                val bySeason = java.util.concurrent.ConcurrentHashMap<Int, MutableList<Pair<Int, String>>>()
                 coroutineScope {
-                    (2..8).map { s ->
+                    ((1..12) - seasonToUse).map { s ->
                         async(Dispatchers.IO) {
                             val u = "$SITE/watch.php?$seriesIdKey=$seriesIdVal&season=$s&meta=1"
-                            runCatching {
+                            val text = runCatching {
                                 app.get(u, headers = HEADERS, timeout = 10_000).text
-                            }.getOrNull()?.let { t -> collectEpisodePaths(t, allPaths) }
+                            }.getOrNull() ?: return@async
+                            val tmp = mutableListOf<Pair<Int, String>>()
+                            collectEpisodePaths(text, tmp)
+                            if (tmp.isNotEmpty()) bySeason[s] = tmp
                         }
                     }.awaitAll()
+                }
+                if (bySeason.size == 1) {
+                    allPaths += bySeason.values.first()
                 }
             }
             // (b) Scrape numbered episode anchors straight off the watch page
@@ -1023,9 +1053,9 @@ object WizstreamSources {
             }
 
             val epToUse = episode ?: 1
-            // Find the exact episode, else fall back to the first one.
+            // (v33) exact episode only — the old first-episode fallback meant
+            // asking for S2E10 could silently serve S1E1 (wrong content).
             val matchPath = allPaths.firstOrNull { it.first == epToUse }?.second
-                ?: allPaths.firstOrNull()?.second
                 ?: return false
 
             // The path can be:
@@ -1034,7 +1064,9 @@ object WizstreamSources {
             //   • Quetta player page → data-quetta-video-id="qv_…"
             val absPath = resolveAbs(SITE, matchPath)
             return when {
-                isDirectMedia(absPath) ->
+                // (v33) /Data/ links are direct files even extensionless —
+                // CineplexBDProvider.loadLinksWithLabel treats them as VIDEO.
+                isDirectMedia(absPath) || absPath.contains("/Data/") ->
                     emitDirect(app, absPath, srcLabel, "$SITE/", HEADERS, subtitleCallback, callback)
                 absPath.contains("player.php") || absPath.contains("view.php") -> {
                     val playerResp = runCatching {
@@ -1664,24 +1696,13 @@ object WizstreamSources {
                     }
                 }
 
-                // Last-resort fallback: if no exact episode matched across
-                // all posts, dump ALL episode links from ALL seasons of ALL
-                // posts. The user will see a long list of episode links but
-                // at least something will play.
-                if (mediaUrls.isEmpty()) {
-                    filteredDetails.forEach { detail ->
-                        val contentArray = detail.optJSONArray("content") ?: return@forEach
-                        for (si in 0 until contentArray.length()) {
-                            val so = contentArray.optJSONObject(si) ?: continue
-                            val eps = so.optJSONArray("episodes") ?: continue
-                            for (ei in 0 until eps.length()) {
-                                val eo = eps.optJSONObject(ei) ?: continue
-                                val link = eo.optStringOrNullCp("link") ?: continue
-                                if (link.isNotEmpty()) mediaUrls += link
-                            }
-                        }
-                    }
-                }
+                // (v33) REMOVED the old "dump every episode link from every
+                // season" last resort. When the requested (season, episode)
+                // is not in the post, emitting a random season's links meant
+                // the user silently got the WRONG episodes (and the dead CDN
+                // boxes among them produced the HTTP 2004/timeout wave the
+                // standalone never shows — the standalone has no such
+                // fallback; it lists seasons and lets you pick the real one).
             }
 
             // 6. Also pick up any direct download links arrays.
@@ -1695,23 +1716,33 @@ object WizstreamSources {
                 }
             }
 
-            // 7. Emit. Apply linkToIp to swap *.circleftp.net hostnames
-            //    for BDIX IPs so media URLs are reachable on BDIX networks.
+            // 7. Emit — v33: 1:1 with CircleFtpProvider.loadLinks.
+            //    Every link goes out as a PLAIN link: no referer, no extra
+            //    headers, no player-page probing, no payload fetch. The old
+            //    version routed raw URLs through emitDirect, which (a)
+            //    attached Referer/headers the CDN rejects (→ HTTP 2004 in
+            //    Wizstream while the standalone, which attaches nothing,
+            //    played fine) and (b) fetched m3u8 playlists up-front via
+            //    generateM3u8, so a slow/dead CDN box surfaced as a load-time
+            //    timeout instead of a player decision.
             var any = false
             mediaUrls.forEach { u ->
-                // Circle FTP encodes TV/movie URLs as
-                // "circleftp://movie?data=<base64>" or
-                // "circleftp://episode?data=<base64>" — base64 of a JSON
-                // array of {url, audio?} objects. (Handled by
-                // CircleFtpProvider.loadLinks lines 1507-1561.)
                 if (u.contains("movie?data=") || u.contains("episode?data=") ||
                     u.contains("circleftp://")
                 ) {
                     if (emitCircleFtpEncoded(u, srcLabel, callback)) any = true
                 } else {
-                    // Apply linkToIp for raw URLs containing circleftp.net hosts.
                     val resolvedUrl = linkToIp(u)
-                    if (emitDirect(app, resolvedUrl, srcLabel, "$SITE/", HEADERS, subtitleCallback, callback)) {
+                    if (resolvedUrl.isNotBlank()) {
+                        callback(
+                            newExtractorLink(
+                                source = srcLabel,
+                                name = srcLabel,
+                                url = resolvedUrl,
+                            ) {
+                                this.quality = qualityFromName(resolvedUrl)
+                            }
+                        )
                         any = true
                     }
                 }
@@ -1766,13 +1797,15 @@ object WizstreamSources {
                 val resolvedUrl = linkToIp(u)
                 val audio = o.optString("audio").takeIf { it.isNotBlank() }
                 val name = if (audio != null) "$sourceLabel [$audio]" else sourceLabel
+                // (v33) Standalone parity: no referer, no headers, no explicit
+                // type — the player infers HLS/mp4 itself. (The old
+                // referer=SITE was what made the CDN answer 403/404 = player
+                // HTTP 2004 while the standalone played the same URL clean.)
                 val link = newExtractorLink(
                     source = sourceLabel,
                     name = name,
                     url = resolvedUrl,
-                    type = INFER_TYPE,
                 ) {
-                    this.referer = SITE
                     this.quality = qualityFromName(resolvedUrl)
                 }
                 callback(link)

@@ -370,6 +370,8 @@ class WizstreamAnimeProvider : MainAPI() {
                     anilistId = id, imdbId = imdbId, tmdbId = tmdbId, malId = detail.malId,
                     season = 1, episode = epNum, title = title, altTitle = detail.altTitle,
                     isMovie = false, year = detail.year,
+                    // (v33) the site's season number for source lookups
+                    sourceSeason = if (detail.seasonOffset > 0) detail.seasonOffset + 1 else null,
                     dub = DubStatus.Subbed,
                 ).toJson()) {
                     name = epMeta?.title ?: "Episode $epNum"
@@ -454,10 +456,11 @@ class WizstreamAnimeProvider : MainAPI() {
             idList.map { id ->
                 async(Dispatchers.IO) {
                     gate.withPermit {
-                        val embedUrl = if (ctx.isMovie || ctx.season == null || ctx.episode == null) {
+                        val seasonForSources = ctx.sourceSeason ?: ctx.season
+                        val embedUrl = if (ctx.isMovie || seasonForSources == null || ctx.episode == null) {
                             host.movie(id)
                         } else {
-                            host.tv(id, ctx.season, ctx.episode)
+                            host.tv(id, seasonForSources, ctx.episode)
                         }
                         try {
                             val before = anyFound
@@ -500,7 +503,9 @@ class WizstreamAnimeProvider : MainAPI() {
                     title = ctx.title ?: "",
                     year = ctx.year,
                     isMovie = ctx.isMovie,
-                    season = ctx.season,
+                    // (v33) franchise-mapped season — the number the source
+                    // site actually files this season under.
+                    season = ctx.sourceSeason ?: ctx.season,
                     episode = ctx.episode,
                     labelPrefix = "Wizstream-A",
                     subtitleCallback = { sub ->
@@ -591,6 +596,11 @@ class WizstreamAnimeProvider : MainAPI() {
         val trailerUrl: String?,
         val episodeMeta: Map<Int, EpisodeMeta>,
         val recommendations: List<JSONObject>,
+        // (v33) How many broadcast TV entries precede this one in its
+        // AniList prequel chain (0 for single-entry shows / S1). Used to map
+        // "separate-entry seasons" (Demon Slayer S2 = its own AniList entry)
+        // onto the season numbers the streaming sites actually use.
+        val seasonOffset: Int = 0,
     )
 
     private fun parseAnilistUrl(url: String): Int? {
@@ -825,6 +835,18 @@ class WizstreamAnimeProvider : MainAPI() {
             }
         }
 
+        // (v33) Franchise season mapping for source sites. AniList models
+        // each anime season as a SEPARATE entry ("Demon Slayer S2" is its
+        // own entry with episodes numbered 1..11), while streaming sites
+        // file those episodes under "<Show> — Season 2". Walking the
+        // PREQUEL chain tells us "this entry is the site's Season N+1".
+        // Cours splits ("… Part 2") are traversed but NOT counted, so
+        // cours-inflated AniList numbering stays aligned with TMDB/site
+        // season numbers (AoT "Final Season" → site Season 4).
+        val seasonOffset = franchiseSeasonOffset(
+            id, media.optJSONObject("relations")?.optJSONArray("edges")
+        )
+
         val malId = media.optInt("idMal", 0).takeIf { it != 0 }
 
         val detail = AniDetail(
@@ -848,9 +870,59 @@ class WizstreamAnimeProvider : MainAPI() {
             trailerUrl = trailerUrl,
             episodeMeta = episodeMeta,
             recommendations = recs,
+            seasonOffset = seasonOffset,
         )
         META_CACHE[id] = now to detail
         return detail
+    }
+
+    private val franchiseBroadcastFormats = setOf("TV", "TV_SHORT", "ONA")
+    private val coursSplitRegex = Regex("""(?i)\b(part|cour)\s*\d+|\bpart\s+[ivxlcdm]+\b""")
+
+    /**
+     * Count broadcast-format TV entries preceding [id] in its AniList
+     * PREQUEL chain. Each extra hop costs one tiny AniList query (≤6 hops;
+     * single-season shows stop after the first edge scan with no prequel).
+     */
+    private suspend fun franchiseSeasonOffset(id: Int, initialEdges: JSONArray?): Int {
+        var offset = 0
+        val visited = hashSetOf(id)
+        var edges = initialEdges
+        var hops = 0
+        while (edges != null && hops < 6) {
+            hops++
+            var traverseId: Int? = null
+            var countId: Int? = null
+            for (i in 0 until edges.length()) {
+                val e = edges.optJSONObject(i) ?: continue
+                if (!e.optString("relationType").equals("PREQUEL", true)) continue
+                val node = e.optJSONObject("node") ?: continue
+                if (!node.optString("type").equals("ANIME", true)) continue
+                val nid = node.optInt("id", 0).takeIf { it != 0 } ?: continue
+                if (nid in visited) continue
+                if (traverseId == null) traverseId = nid
+                val fmt = node.optString("format")
+                val nTitle = node.optJSONObject("title")
+                val tstr = nTitle?.aOptStr("english") ?: nTitle?.aOptStr("romaji") ?: ""
+                if (fmt in franchiseBroadcastFormats && !coursSplitRegex.containsMatchIn(tstr)) {
+                    countId = nid
+                    break
+                }
+            }
+            val nextId = countId ?: traverseId ?: break
+            if (countId != null) offset++
+            visited += nextId
+            val gql = """
+            query (${'$'}id: Int) {
+              Media(id: ${'$'}id, type: ANIME) {
+                relations { edges { node { id type format title { english romaji } } relationType } }
+              }
+            }
+        """.trimIndent()
+            val resp = anilistQuery(gql, JSONObject().put("id", nextId)) ?: break
+            edges = resp.optJSONObject("Media")?.optJSONObject("relations")?.optJSONArray("edges")
+        }
+        return offset
     }
 
     private suspend fun anilistQuery(query: String, variables: JSONObject): JSONObject? =
@@ -913,6 +985,9 @@ class WizstreamAnimeProvider : MainAPI() {
         val altTitle: String? = null,
         val isMovie: Boolean = false,
         val year: Int? = null,   // (v18) identity matching for BDIX resolvers
+        // (v33) season number as the SOURCE SITE sees it (franchise offset
+        // applied). null → use `season`.
+        val sourceSeason: Int? = null,
         val dub: DubStatus = DubStatus.Subbed,
     ) {
         fun toJson(): String = JSONObject().apply {
@@ -925,6 +1000,7 @@ class WizstreamAnimeProvider : MainAPI() {
             title?.let { put("title", it) }
             altTitle?.let { put("alt_title", it) }
             year?.let { put("year", it) }
+            sourceSeason?.let { put("src_season", it) }
             put("is_movie", isMovie)
             put("dub", dub.ordinal)
         }.toString()
@@ -943,6 +1019,7 @@ class WizstreamAnimeProvider : MainAPI() {
                     altTitle = o.aOptStr("alt_title"),
                     year = o.aOptInt("year"),
                     isMovie = o.optBoolean("is_movie", false),
+                    sourceSeason = o.aOptInt("src_season"),
                     dub = DubStatus.values().getOrElse(o.optInt("dub", 0)) { DubStatus.Subbed },
                 ).also { require(it.anilistId != 0) }
             }
