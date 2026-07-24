@@ -78,6 +78,25 @@ object WizstreamSources {
                             tmdbId = tmdbId,
                             imdbId = imdbId,
                         )
+                    }.onFailure { t ->
+                        // (v36) Never let a resolver die silently: opted-in
+                        // resolvers get a visible crash chip naming the
+                        // exception class. (CineplexBD "not even showing up"
+                        // hunt — if resolve() throws before its own diag
+                        // points, this is the chip that still speaks.)
+                        val lbl = src.crashDiagLabel()
+                        if (lbl.isNotBlank()) {
+                            Log.w(TAG, "$lbl resolver crashed: ${t.javaClass.simpleName}: ${t.message}")
+                            runCatching {
+                                callback(
+                                    newExtractorLink(
+                                        source = "$labelPrefix • $lbl",
+                                        name = "$labelPrefix • $lbl ⓘ DIAG: resolver crashed (${t.javaClass.simpleName})",
+                                        url = "https://wizstream.invalid/__crash__/${t.javaClass.simpleName}",
+                                    ) { this.quality = 0 }
+                                )
+                            }
+                        }
                     }.getOrDefault(false)
                 }
             }
@@ -481,7 +500,18 @@ object WizstreamSources {
                 type = ExtractorLinkType.M3U8,
             ) {
                 this.referer = referer
-                this.quality = Qualities.Unknown.value
+                // (v36) Quality tag for demuxed masters. These CDNs (Bingr
+                // Sirius, Moonflix HDGhar, both on the streamraiwind family)
+                // serve PER-QUALITY masters — a "1080p" source's master tops
+                // out at that rung — so tagging with the top variant's
+                // resolution restores the same quality chip every other
+                // source shows. (Was Qualities.Unknown — the user asked:
+                // "add the quality tags for MoonTV and Bingr Sirius".)
+                this.quality = if (top.height > 0) {
+                    qualityFromDimensions(top.width, top.height)
+                } else {
+                    Qualities.Unknown.value
+                }
                 this.headers = headers
             }
         )
@@ -682,6 +712,12 @@ object WizstreamSources {
     }
 
     internal interface SourceResolver {
+        /**
+         * (v36) Short label used by resolveAll to surface an unescapable
+         * resolver crash as a visible ⓘ DIAG chip. Empty string = opt out.
+         */
+        fun crashDiagLabel(): String = ""
+
         suspend fun resolve(
             app: Requests,
             title: String,
@@ -706,6 +742,8 @@ object WizstreamSources {
     internal object CineplexBdResolver : SourceResolver {
         private const val SITE = "http://cineplexbd.net"
         private const val LABEL = "CineplexBD"
+
+        override fun crashDiagLabel(): String = LABEL
         private val HEADERS = mapOf(
             // (v35) Byte-identical to CineplexBDProvider.cfHeaders — the
             // standalone's exact Chrome/121 UA, not the generic UA.
