@@ -480,6 +480,7 @@ object WizstreamSources {
         referer: String,
         headers: Map<String, String>,
         callback: (ExtractorLink) -> Unit,
+        qualityHint: Int = Qualities.Unknown.value,
     ): Boolean {
         if (!playlistText.contains("#EXT-X-MEDIA:") || !playlistText.contains("TYPE=AUDIO")) {
             return false
@@ -510,7 +511,7 @@ object WizstreamSources {
                 this.quality = if (top.height > 0) {
                     qualityFromDimensions(top.width, top.height)
                 } else {
-                    Qualities.Unknown.value
+                    qualityHint
                 }
                 this.headers = headers
             }
@@ -900,6 +901,17 @@ object WizstreamSources {
             // The top-3 survivors are tried in order until one emits links,
             // so a quality-duplicate post picked first no longer poisons
             // the whole resolve when its player page is broken.
+            // (v41) Multiple QUALITY copies of the same title are filed as
+            // SEPARATE posts on CineplexBD (user-confirmed: "if a movie has
+            // multiple quality then all the quality of those movies are
+            // separate items"). Trying only the single best-matching post
+            // therefore surfaces only ONE quality. v41 fetches EVERY matching
+            // post (movies up to 6, series up to 4 — series resolutions are
+            // multi-round-trip and costly), dedupes identical stream URLs
+            // across posts, and passes each post's title-derived quality
+            // label down as the chip for streams whose own URL/manifest
+            // can't prove one. Stage diags are emitted for the first
+            // candidate only, so duplicates can't pile up pinned chips.
             val identityMatches = filtered.filter { (_, ct) -> isSameMediaTitle(ct, title, year) }
             val pool = identityMatches.ifEmpty {
                 filtered.filter { (_, ct) -> isFuzzySameMedia(ct, title, year) }
@@ -907,27 +919,39 @@ object WizstreamSources {
             val tryList = pool
                 .sortedByDescending { (_, ct) -> titleSimilarity(ct, title) }
                 .distinctBy { it.first }
-                .take(3)
+                .take(if (isMovie) 6 else 4)
             if (tryList.isEmpty()) {
                 diag("'$title' vs ${candidates.size} cards: no match (top '${candidates.firstOrNull()?.second?.take(40)}')", "$labelPrefix • $LABEL", callback)
                 return false
             }
 
             val srcLabel = "$labelPrefix • $LABEL"
+            val seenStreamUrls = linkedSetOf<String>()
+            val dedupCallback: (ExtractorLink) -> Unit = { link ->
+                if (seenStreamUrls.add(link.url)) callback(link)
+            }
 
-            for (cand in tryList) {
+            var anyEmitted = false
+            tryList.forEachIndexed { idx, cand ->
                 val ok = try {
                     if (isMovie) {
-                        resolveMovieOne(app, cand, srcLabel, subtitleCallback, callback)
+                        resolveMovieOne(
+                            app, cand, srcLabel, subtitleCallback, dedupCallback,
+                            qualityHint = qualityFromName(cand.second), allowDiag = idx == 0,
+                        )
                     } else {
-                        resolveTvOne(app, cand, season, episode, srcLabel, subtitleCallback, callback)
+                        resolveTvOne(
+                            app, cand, season, episode, srcLabel, subtitleCallback, dedupCallback,
+                            qualityHint = qualityFromName(cand.second), allowDiag = idx == 0,
+                        )
                     }
                 } catch (t: Throwable) {
                     diag("crash in ${if (isMovie) "movie" else "tv"}: ${t.javaClass.simpleName}", "$labelPrefix • $LABEL", callback)
                     false
                 }
-                if (ok) return true
+                if (ok) anyEmitted = true
             }
+            if (anyEmitted) return true
             diag("all ${tryList.size} candidates tried, 0 links (movie=$isMovie)", "$labelPrefix • $LABEL", callback)
             return false
         }
@@ -938,6 +962,8 @@ object WizstreamSources {
             srcLabel: String,
             subtitleCallback: (SubtitleFile) -> Unit,
             callback: (ExtractorLink) -> Unit,
+            qualityHint: Int = Qualities.Unknown.value,
+            allowDiag: Boolean = false,
         ): Boolean {
             // (moved under resolveMovieOne in v32; body otherwise unchanged)
 
@@ -959,7 +985,7 @@ object WizstreamSources {
                 // /player.php?id=<series_id> would return a series page, not
                 // a movie player, and extraction would fail silently.
                 if (!best.first.contains("view.php")) {
-                    diag("movie: candidate is not a view.php page", srcLabel, callback)
+                    if (allowDiag) diag("movie: candidate is not a view.php page", srcLabel, callback)
                     return false
                 }
 
@@ -970,7 +996,7 @@ object WizstreamSources {
                     app.get(playerUrl, headers = HEADERS, timeout = 15_000)
                 }.getOrNull()
                 if (playerResp == null) {
-                    diag("movie: player.php fetch failed", srcLabel, callback)
+                    if (allowDiag) diag("movie: player.php fetch failed", srcLabel, callback)
                     return false
                 }
                 val playerHtml = playerResp.text
@@ -993,7 +1019,7 @@ object WizstreamSources {
                 // one-level recursion into player.php-style sub-pages.
                 var any = scrapeCineplexPageHtml(
                     app, playerUrl, playerHtml, videoHeaders, srcLabel,
-                    subtitleCallback, callback, depth = 0,
+                    subtitleCallback, callback, depth = 0, qualityHint = qualityHint,
                 )
 
                 // (v40 — was the standalone-style Quetta extraction; the
@@ -1008,7 +1034,7 @@ object WizstreamSources {
                         val dlHtml = app.get(dlUrl, headers = videoHeaders, timeout = 15_000).text
                         val dlUrls = extractCineplexMedia(dlHtml, dlUrl)
                         dlUrls.forEach { u ->
-                            if (emitCineplexAny(app, u, srcLabel, dlUrl, videoHeaders, subtitleCallback, callback)) any = true
+                            if (emitCineplexAny(app, u, srcLabel, dlUrl, videoHeaders, subtitleCallback, callback, qualityHint)) any = true
                         }
                     }
                 }
@@ -1026,12 +1052,13 @@ object WizstreamSources {
                         if (scrapeCineplexPageHtml(
                                 app, best.first, viewResp.text, viewHeaders, srcLabel,
                                 subtitleCallback, callback, depth = 0,
+                                qualityHint = qualityHint,
                             )
                         ) any = true
                     }
                 }
                 if (!any) {
-                    diag("movie: player+view scraped, 0 media found", srcLabel, callback)
+                    if (allowDiag) diag("movie: player+view scraped, 0 media found", srcLabel, callback)
                 }
                 return any
             }
@@ -1050,6 +1077,8 @@ object WizstreamSources {
             srcLabel: String,
             subtitleCallback: (SubtitleFile) -> Unit,
             callback: (ExtractorLink) -> Unit,
+            qualityHint: Int = Qualities.Unknown.value,
+            allowDiag: Boolean = false,
         ): Boolean {
             val seriesIdKey = if (best.first.contains("series_id=")) "series_id" else "id"
             val seriesIdVal = if (seriesIdKey == "series_id") {
@@ -1180,7 +1209,7 @@ object WizstreamSources {
             }
 
             if (allPaths.isEmpty()) {
-                diag("tv S$seasonToUse: meta+sweep+watch-anchors yielded 0 episode paths", srcLabel, callback)
+                if (allowDiag) diag("tv S$seasonToUse: meta+sweep+watch-anchors yielded 0 episode paths", srcLabel, callback)
             }
             val epToUse = episode ?: 1
             // (v33) exact episode only — the old first-episode fallback meant
@@ -1196,7 +1225,7 @@ object WizstreamSources {
                 matchPath = best.first
             }
             if (matchPath == null) {
-                diag("tv: E$epToUse not among ${allPaths.size} paths — check the title's seasons", srcLabel, callback)
+                if (allowDiag) diag("tv: E$epToUse not among ${allPaths.size} paths — check the title's seasons", srcLabel, callback)
                 return false
             }
 
@@ -1204,7 +1233,7 @@ object WizstreamSources {
             //   • /Data/…/movie.mkv  → direct media URL
             //   • /view.php?id=… or /player.php?id=… → indirection page
             //   • Quetta player page → data-quetta-video-id="qv_…"
-            val absPath = resolveAbs(SITE, matchPath)
+            var absPath = resolveAbs(SITE, matchPath)
             // (v34) 1:1 with CineplexBDProvider.loadLinksWithLabel:
             //   • .m3u8/.mp4/.mkv … (or /Data/) → emit directly;
             //   • EVERYTHING else — player.php, view.php AND the watch-page
@@ -1219,14 +1248,26 @@ object WizstreamSources {
                 // (v40) emitCineplexAny — an m3u8 master fans out into real
                 // per-quality links here too, and its embedded subtitle
                 // tracks reach the player.
-                return emitCineplexAny(app, absPath, srcLabel, "$SITE/", HEADERS, subtitleCallback, callback)
+                if (emitCineplexAny(app, absPath, srcLabel, "$SITE/", HEADERS, subtitleCallback, callback, qualityHint)) {
+                    return true
+                }
+                // (v41) DON'T give up: meta-JSON/stored episode paths can be
+                // stale (expired token, moved file) — the server answers
+                // them with catch-all junk that the v40 hygiene rightfully
+                // DROPS. On the user's device this exact shape surfaced as a
+                // single "all 1 candidates tried, 0 links" diag chip with no
+                // inner stage chip. Fall through to scraping the REAL episode
+                // page instead — that's where the fresh player URL lives.
+                // (Guessed shape: the same watch.php CGI the anchors use,
+                // with this episode's season/ep params.)
+                absPath = "$SITE/watch.php?$seriesIdKey=$seriesIdVal&season=$seasonToUse&ep=$epToUse"
             }
             return run {
                     val playerResp = runCatching {
                         app.get(absPath, headers = HEADERS, timeout = 15_000)
                     }.getOrNull()
                     if (playerResp == null) {
-                        diag("tv: episode page fetch failed", srcLabel, callback)
+                        if (allowDiag) diag("tv: episode page fetch failed", srcLabel, callback)
                         return false
                     }
                     val playerHtml = playerResp.text
@@ -1250,6 +1291,7 @@ object WizstreamSources {
                     var any = scrapeCineplexPageHtml(
                         app, absPath, playerHtml, videoHeaders, srcLabel,
                         subtitleCallback, callback, depth = 0,
+                        qualityHint = qualityHint,
                     )
 
                     // (v40) Constructed player-page candidates. The movie
@@ -1279,6 +1321,7 @@ object WizstreamSources {
                             if (scrapeCineplexPageHtml(
                                     app, cand, candHtml, candHeaders, srcLabel,
                                     subtitleCallback, callback, depth = 0,
+                                    qualityHint = qualityHint,
                                 )
                             ) any = true
                         }
@@ -1293,12 +1336,14 @@ object WizstreamSources {
                                 val dlHtml = app.get(dlUrl, headers = videoHeaders, timeout = 15_000).text
                                 val dlUrls = extractCineplexMedia(dlHtml, dlUrl)
                                 dlUrls.forEach { u ->
-                                    if (emitCineplexAny(app, u, srcLabel, dlUrl, videoHeaders, subtitleCallback, callback)) any = true
+                                    if (emitCineplexAny(app, u, srcLabel, dlUrl, videoHeaders, subtitleCallback, callback, qualityHint)) any = true
                                 }
                             }
                         }
                     }
-                    if (!any) diag("tv: episode+player pages scraped, 0 media found", srcLabel, callback)
+                    if (!any) {
+                        if (allowDiag) diag("tv: episode+player pages scraped, 0 media found", srcLabel, callback)
+                    }
                     any
             }
         }
@@ -1473,6 +1518,7 @@ object WizstreamSources {
             headers: Map<String, String>,
             subtitleCallback: (SubtitleFile) -> Unit,
             callback: (ExtractorLink) -> Unit,
+            qualityHint: Int = Qualities.Unknown.value,
         ): Boolean {
             val h = headers.toMutableMap().apply { put("Referer", referer) }
             val resp = runCatching { app.get(url, headers = h, timeout = 10_000) }.getOrNull()
@@ -1493,7 +1539,7 @@ object WizstreamSources {
                         ?: subUrl.substringAfterLast('/').substringBefore('?').substringBeforeLast('.')
                     subtitleCallback(newSubtitleFile("[$LABEL] $label", subUrl))
                 }
-            if (emitDemuxedMaster(url, text, srcLabel, "$srcLabel — HLS", referer, headers, callback)) {
+            if (emitDemuxedMaster(url, text, srcLabel, "$srcLabel — HLS", referer, headers, callback, qualityHint)) {
                 return true
             }
             val variants = parseHlsMasterVariants(text, url)
@@ -1507,7 +1553,11 @@ object WizstreamSources {
                     ) {
                         this.referer = referer
                         this.headers = headers
-                        this.quality = qualityFromName(url)
+                        // (v41) Single-rendition playlists can't prove their
+                        // own quality — the post title the stream came from
+                        // carries it (each quality is a separate site item).
+                        this.quality = qualityFromName(url).takeIf { it != Qualities.Unknown.value }
+                            ?: qualityHint
                     }
                 )
                 return true
@@ -1531,7 +1581,7 @@ object WizstreamSources {
                         this.quality = if (v.height > 0) {
                             qualityFromDimensions(v.width, v.height)
                         } else {
-                            Qualities.Unknown.value
+                            qualityHint
                         }
                     }
                 )
@@ -1543,7 +1593,9 @@ object WizstreamSources {
         /** What the CineplexBD resolvers call INSTEAD of emitDirect (v40):
          *  .m3u8 gets the smart-chips path; everything else is exactly v39's
          *  emitDirect (direct-video links with cookie headers, extractor
-         *  delegation for foreign pages). */
+         *  delegation for foreign pages). (v41) qualityHint — the post
+         *  title's quality label — fills the chip when the stream itself
+         *  can't prove one (each quality is a separate item on this site). */
         private suspend fun emitCineplexAny(
             app: Requests,
             url: String,
@@ -1552,12 +1604,29 @@ object WizstreamSources {
             headers: Map<String, String>,
             subtitleCallback: (SubtitleFile) -> Unit,
             callback: (ExtractorLink) -> Unit,
+            qualityHint: Int = Qualities.Unknown.value,
         ): Boolean {
             val clean = url.trim()
-            return if (clean.contains(".m3u8", ignoreCase = true)) {
-                emitCineplexHls(app, clean, srcLabel, referer, headers, subtitleCallback, callback)
-            } else {
-                emitDirect(app, clean, srcLabel, referer, headers, subtitleCallback, callback)
+            return when {
+                clean.contains(".m3u8", ignoreCase = true) ->
+                    emitCineplexHls(app, clean, srcLabel, referer, headers, subtitleCallback, callback, qualityHint)
+                isDirectMedia(clean) || clean.contains("/Data/") -> {
+                    callback(
+                        newExtractorLink(
+                            source = srcLabel,
+                            name = "$srcLabel - Direct",
+                            url = clean,
+                            type = ExtractorLinkType.VIDEO,
+                        ) {
+                            this.referer = referer
+                            this.headers = headers
+                            this.quality = qualityFromName(clean).takeIf { it != Qualities.Unknown.value }
+                                ?: qualityHint
+                        }
+                    )
+                    true
+                }
+                else -> emitDirect(app, clean, srcLabel, referer, headers, subtitleCallback, callback)
             }
         }
 
@@ -1574,11 +1643,12 @@ object WizstreamSources {
             subtitleCallback: (SubtitleFile) -> Unit,
             callback: (ExtractorLink) -> Unit,
             depth: Int,
+            qualityHint: Int = Qualities.Unknown.value,
         ): Boolean {
             collectPageSubs(pageHtml, pageUrl, subtitleCallback)
             var any = false
             extractCineplexMedia(pageHtml, pageUrl).forEach { u ->
-                if (emitCineplexAny(app, u, srcLabel, pageUrl, videoHeaders, subtitleCallback, callback)) any = true
+                if (emitCineplexAny(app, u, srcLabel, pageUrl, videoHeaders, subtitleCallback, callback, qualityHint)) any = true
             }
             if (!any) {
                 val quettaId: String? = Regex(
@@ -1586,7 +1656,7 @@ object WizstreamSources {
                     RegexOption.IGNORE_CASE
                 ).find(pageHtml)?.groupValues?.getOrNull(1)
                 if (!quettaId.isNullOrBlank()) {
-                    if (emitQuettaVideo(app, quettaId, pageUrl, videoHeaders, srcLabel, subtitleCallback, callback)) {
+                    if (emitQuettaVideo(app, quettaId, pageUrl, videoHeaders, srcLabel, subtitleCallback, callback, qualityHint)) {
                         any = true
                     }
                 }
@@ -1607,6 +1677,7 @@ object WizstreamSources {
                     if (scrapeCineplexPageHtml(
                             app, sub, sHtml, subHeaders, srcLabel,
                             subtitleCallback, callback, depth = depth + 1,
+                            qualityHint = qualityHint,
                         )
                     ) any = true
                 }
@@ -1630,6 +1701,7 @@ object WizstreamSources {
             sourceLabel: String,
             subtitleCallback: (SubtitleFile) -> Unit,
             callback: (ExtractorLink) -> Unit,
+            qualityHint: Int = Qualities.Unknown.value,
         ): Boolean {
             val candidates = listOf(
                 "https://vidquettaplayer.com/api/?id=$quettaId",
@@ -1679,7 +1751,7 @@ object WizstreamSources {
                     val abs = if (u.startsWith("http")) u else "$SITE/${u.trimStart('/')}"
                     // (v40) smart path — Quetta HLS answers get the same
                     // quality chips + track parsing as everything else.
-                    if (emitCineplexAny(app, abs, sourceLabel, playerUrl, videoHeaders, subtitleCallback, callback)) {
+                    if (emitCineplexAny(app, abs, sourceLabel, playerUrl, videoHeaders, subtitleCallback, callback, qualityHint)) {
                         any = true
                     }
                 }
