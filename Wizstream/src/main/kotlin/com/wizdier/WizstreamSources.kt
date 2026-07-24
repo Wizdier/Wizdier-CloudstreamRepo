@@ -93,7 +93,7 @@ object WizstreamSources {
                                         source = "$labelPrefix • $lbl",
                                         name = "$labelPrefix • $lbl ⓘ DIAG: resolver crashed (${t.javaClass.simpleName})",
                                         url = "https://wizstream.invalid/__crash__/${t.javaClass.simpleName}",
-                                    ) { this.quality = 0 }
+                                    ) { this.quality = Qualities.P2160.value /* (v37) pin diag to TOP */ }
                                 )
                             }
                         }
@@ -767,8 +767,8 @@ object WizstreamSources {
                     newExtractorLink(
                         source = fullLabel,
                         name = "$fullLabel ⓘ DIAG: $stage",
-                        url = "$SITE/__diag__",
-                    ) { this.quality = 0 }
+                        url = "$SITE/__diag__/" + stage.take(24).replace(" ", "-"),
+                    ) { this.quality = Qualities.P2160.value /* (v37) pin diag to TOP */ }
                 )
             }
         }
@@ -1161,7 +1161,16 @@ object WizstreamSources {
             val epToUse = episode ?: 1
             // (v33) exact episode only — the old first-episode fallback meant
             // asking for S2E10 could silently serve S1E1 (wrong content).
-            val matchPath = allPaths.firstOrNull { it.first == epToUse }?.second
+            var matchPath = allPaths.firstOrNull { it.first == epToUse }?.second
+            // (v37) Last-resort: scrape the show's LANDING watch page for the
+            // stream, mirroring the standalone's "Watch" placeholder episode
+            // (CineplexBDProvider.collectEpisodesForGroup step 5). BOUNDED to
+            // S1E1 requests only: the landing page always plays season 1, so
+            // it can never masquerade as a higher season/episode.
+            if (matchPath == null && seasonToUse == 1 && epToUse == 1) {
+                Log.d(TAG, "CineplexBD: no ep paths — trying landing-page scrape for S1E1")
+                matchPath = best.first
+            }
             if (matchPath == null) {
                 diag("tv: E$epToUse not among ${allPaths.size} paths — check the title's seasons", srcLabel, callback)
                 return false

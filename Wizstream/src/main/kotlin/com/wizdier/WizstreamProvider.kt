@@ -168,7 +168,7 @@ class WizstreamProvider : MainAPI() {
 
     override var mainUrl = "https://www.themoviedb.org"
     override var name = "Wizstream"
-    override var lang = "en"
+    override var lang = "bn"
     override val hasMainPage = true
     override val hasQuickSearch = true
     override val hasDownloadSupport = true

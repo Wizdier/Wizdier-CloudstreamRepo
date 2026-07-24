@@ -160,7 +160,7 @@ class WizstreamAnimeProvider : MainAPI() {
 
     override var mainUrl = "https://anilist.co"
     override var name = "Wizstream-Anime"
-    override var lang = "en"
+    override var lang = "bn"
     override val hasMainPage = true
     override val hasQuickSearch = true
     override val hasDownloadSupport = true
