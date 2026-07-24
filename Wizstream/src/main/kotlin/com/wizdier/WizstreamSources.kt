@@ -707,9 +707,33 @@ object WizstreamSources {
         private const val SITE = "http://cineplexbd.net"
         private const val LABEL = "CineplexBD"
         private val HEADERS = mapOf(
-            "User-Agent" to UA,
+            // (v35) Byte-identical to CineplexBDProvider.cfHeaders — the
+            // standalone's exact Chrome/121 UA, not the generic UA.
+            "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
             "Referer" to "$SITE/",
         )
+
+        /**
+         * (v35 — TEMPORARY DIAGNOSTICS) CineplexBD fails silently on the
+         * user's device (zero links anywhere) while the standalone works.
+         * With no logcat access, the resolver explains WHERE it stops by
+         * emitting a clearly-labelled, never-playable diagnostic chip
+         * ("Wizstream • CineplexBD ⓘ DIAG …", quality 0, dummy URL) the
+         * user can read on phone/TV. Removed once fixed for real.
+         */
+        private suspend fun diag(stage: String, fullLabel: String, callback: (ExtractorLink) -> Unit) {
+            Log.d(TAG, "CineplexBD DIAG: $stage")
+            runCatching {
+                callback(
+                    newExtractorLink(
+                        source = fullLabel,
+                        name = "$fullLabel ⓘ DIAG: $stage",
+                        url = "$SITE/__diag__",
+                    ) { this.quality = 0 }
+                )
+            }
+        }
 
         override suspend fun resolve(
             app: Requests,
@@ -726,9 +750,18 @@ object WizstreamSources {
         ): Boolean {
             // 1. Search via search.php — same selectors as CineplexBDProvider.
             val searchUrl = "$SITE/search.php?q=${encodeUrl(title)}&page=1"
-            val html = runCatching {
-                app.get(searchUrl, headers = HEADERS, timeout = 12_000).text
-            }.getOrNull() ?: return false
+            val searchResp = runCatching {
+                app.get(searchUrl, headers = HEADERS, timeout = 10_000)
+            }.getOrNull()
+            if (searchResp == null) {
+                diag("search request failed (network/timeout/CF)", "$labelPrefix • $LABEL", callback)
+                return false
+            }
+            if (searchResp.code !in 200..299) {
+                diag("search HTTP ${searchResp.code}", "$labelPrefix • $LABEL", callback)
+                return false
+            }
+            val html = searchResp.text
 
             val doc = Jsoup.parse(html, searchUrl)
             val candidates = mutableListOf<Pair<String, String>>()
@@ -760,7 +793,10 @@ object WizstreamSources {
                 candidates += absHref to candTitle
             }
 
-            if (candidates.isEmpty()) return false
+            if (candidates.isEmpty()) {
+                diag("search page parsed but 0 result cards found", "$labelPrefix • $LABEL", callback)
+                return false
+            }
 
             // Filter: prefer series page for TV, view page for movie.
             //
@@ -805,20 +841,26 @@ object WizstreamSources {
                 .distinctBy { it.first }
                 .take(3)
             if (tryList.isEmpty()) {
-                Log.d(TAG, "CineplexBD: no match for '$title' (year=$year)")
+                diag("'$title' vs ${candidates.size} cards: no match (top '${candidates.firstOrNull()?.second?.take(40)}')", "$labelPrefix • $LABEL", callback)
                 return false
             }
 
             val srcLabel = "$labelPrefix • $LABEL"
 
             for (cand in tryList) {
-                val ok = if (isMovie) {
-                    resolveMovieOne(app, cand, srcLabel, subtitleCallback, callback)
-                } else {
-                    resolveTvOne(app, cand, season, episode, srcLabel, subtitleCallback, callback)
+                val ok = try {
+                    if (isMovie) {
+                        resolveMovieOne(app, cand, srcLabel, subtitleCallback, callback)
+                    } else {
+                        resolveTvOne(app, cand, season, episode, srcLabel, subtitleCallback, callback)
+                    }
+                } catch (t: Throwable) {
+                    diag("crash in ${if (isMovie) "movie" else "tv"}: ${t.javaClass.simpleName}", "$labelPrefix • $LABEL", callback)
+                    false
                 }
                 if (ok) return true
             }
+            diag("all ${tryList.size} candidates tried, 0 links (movie=$isMovie)", "$labelPrefix • $LABEL", callback)
             return false
         }
 
@@ -848,14 +890,21 @@ object WizstreamSources {
                 // (e.g. it's a /watch.php series page), bail out — fetching
                 // /player.php?id=<series_id> would return a series page, not
                 // a movie player, and extraction would fail silently.
-                if (!best.first.contains("view.php")) return false
+                if (!best.first.contains("view.php")) {
+                    diag("movie: candidate is not a view.php page", srcLabel, callback)
+                    return false
+                }
 
                 val id = best.first.substringAfter("id=").substringBefore("&")
                 if (id.isBlank()) return false
                 val playerUrl = "$SITE/player.php?id=$id"
                 val playerResp = runCatching {
                     app.get(playerUrl, headers = HEADERS, timeout = 15_000)
-                }.getOrNull() ?: return false
+                }.getOrNull()
+                if (playerResp == null) {
+                    diag("movie: player.php fetch failed", srcLabel, callback)
+                    return false
+                }
                 val playerHtml = playerResp.text
 
                 // Forward Set-Cookie values + Referer to downstream requests.
@@ -921,6 +970,7 @@ object WizstreamSources {
                         }
                     }
                 }
+                if (!any) diag("movie: player+view scraped, 0 media found", srcLabel, callback)
                 return any
             }
         }
@@ -1067,11 +1117,17 @@ object WizstreamSources {
                 }
             }
 
+            if (allPaths.isEmpty()) {
+                diag("tv S$seasonToUse: meta+sweep+watch-anchors yielded 0 episode paths", srcLabel, callback)
+            }
             val epToUse = episode ?: 1
             // (v33) exact episode only — the old first-episode fallback meant
             // asking for S2E10 could silently serve S1E1 (wrong content).
             val matchPath = allPaths.firstOrNull { it.first == epToUse }?.second
-                ?: return false
+            if (matchPath == null) {
+                diag("tv: E$epToUse not among ${allPaths.size} paths — check the title's seasons", srcLabel, callback)
+                return false
+            }
 
             // The path can be:
             //   • /Data/…/movie.mkv  → direct media URL
@@ -1097,7 +1153,11 @@ object WizstreamSources {
             return run {
                     val playerResp = runCatching {
                         app.get(absPath, headers = HEADERS, timeout = 15_000)
-                    }.getOrNull() ?: return false
+                    }.getOrNull()
+                    if (playerResp == null) {
+                        diag("tv: episode page fetch failed", srcLabel, callback)
+                        return false
+                    }
                     val playerHtml = playerResp.text
 
                     // Forward cookies + Referer to downstream video requests.
@@ -1151,6 +1211,7 @@ object WizstreamSources {
                             }
                         }
                     }
+                    if (!any) diag("tv: episode page scraped, 0 media found", srcLabel, callback)
                     any
             }
         }
