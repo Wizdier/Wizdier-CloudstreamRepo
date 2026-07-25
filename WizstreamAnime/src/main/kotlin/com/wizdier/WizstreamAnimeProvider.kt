@@ -30,8 +30,6 @@ import java.util.concurrent.ConcurrentHashMap
 
 // ─── File-level constants & helpers ───
 private const val ANILIST_ENDPOINT = "https://graphql.anilist.co"
-private const val A_TMDB_API = "https://api.themoviedb.org/3"
-private const val A_TMDB_KEY = "98ae14df2b8d8f8f8136499daf79f0e0"
 private const val A_IMG = "https://image.tmdb.org/t/p"
 private const val A_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
@@ -161,7 +159,9 @@ private fun nextSeasonFilter(): Pair<String, Int> {
 class WizstreamAnimeProvider : MainAPI() {
 
     override var mainUrl = "https://anilist.co"
-    override var name = "Wizstream-Anime"
+    // Distinct name so this pure module can never collide with the
+    // "Wizstream-Anime" provider inside the unified Wizstream package.
+    override var name = "Wizstream-AniList"
     override var lang = "bn"
     override val hasMainPage = true
     override val hasQuickSearch = true
@@ -831,15 +831,10 @@ class WizstreamAnimeProvider : MainAPI() {
             kitsuId = mappings?.aOptStr("kitsu_id")
         }
 
-        if (imdbId == null && tmdbId != null) {
-            val kind = if (format == "MOVIE") "movie" else "tv"
-            runCatching {
-                val ext = tmdbGet("/$kind/${tmdbId}", mapOf(
-                    "append_to_response" to "external_ids"
-                ))?.optJSONObject("external_ids")
-                imdbId = ext?.aOptStr("imdb_id")
-            }
-        }
+        // (v55, PURE ANILIST) AniList itself supplies all metadata — the
+        // ani.zip call above is only an ID-MAP for the link engines
+        // (imdb/tmdb/kitsu ids), never a TMDB metadata fetch. The old
+        // imdb-id-via-TMDB fallback fetch is intentionally gone.
 
         var backdropUrl: String? = banner
         var logoUrl: String? = null
@@ -963,83 +958,13 @@ class WizstreamAnimeProvider : MainAPI() {
             nextStart = m.seasonStart + m.episodes
         }
 
-        // (v48) If ani.zip has no TMDB id for this entry, try a bare TMDB
-        // title search (Japanese-original preference) — soft enrichment,
-        // only ever touches metadata, never which links play.
-        if (tmdbId == null && format != "MOVIE") {
-            tmdbId = tmdbSearchAnime(title, altTitle)
-        }
-
+        // (v55, PURE ANILIST module) No TMDB calls anywhere in this
+        // module: no title search, no details fetch, no per-season episode
+        // table. AniList's own streaming-feed rows already supply episode
+        // titles/thumbs in load(); everything else stays bare-but-honest
+        // ("Episode N" + the show poster). Logo stays empty (AniList has
+        // no logo data); backdrop stays the AniList banner (or nothing).
         val seasonMeta = HashMap<Int, Map<Int, EpisodeMeta>>()
-        if (tmdbId != null) {
-            val kind = if (format == "MOVIE") "movie" else "tv"
-            val extDetails = tmdbGet("/$kind/${tmdbId}", mapOf(
-                "append_to_response" to "external_ids,images,videos,recommendations",
-                "include_image_language" to "en,null"
-            ))
-            if (extDetails != null) {
-                // (v50, re-applied in v52) AniList banner art wins; the TMDB
-                // backdrop is only a fallback when AniList has no banner.
-                backdropUrl = backdropUrl
-                    ?: extDetails.aOptStr("backdrop_path").aToTmdbImg("original")
-                logoUrl = aPickLogo(extDetails.optJSONObject("images")?.optJSONArray("logos"))
-                    ?: imdbId?.let { "https://live.metahub.space/logo/medium/$it/img" }
-                // NOTE: do NOT override `actors` from TMDB credits — anime
-                // cast comes from AniList (extracted above).
-                aPickTrailer(extDetails.optJSONObject("videos")?.optJSONArray("results"))
-                simklId = fetchSimklId(imdbId, kind)
-                if (kind == "tv") {
-                    // ONE TMDB season fetch per stacked season on the page.
-                    val runtimeHint = media.aOptInt("duration")
-                    val neededSeasons = members.map { it.siteSeason }.distinct().filter { it > 0 }
-                    // Absolute-index seeds per stacked season (for the
-                    // absolute-packed fallback below).
-                    val absStartBySeason = HashMap<Int, Int>()
-                    var absRun = 1
-                    neededSeasons.sorted().forEach { s ->
-                        absStartBySeason[s] = absRun
-                        absRun += members.filter { it.siteSeason == s }.sumOf { it.episodes }
-                    }
-                    // (v48) Absolute-style TMDB shows ("Rent-a-Girlfriend"
-                    // files all 60 episodes under season 1 — season 3
-                    // simply doesn't exist there, which is why those pages
-                    // showed bare "Episode N" rows). Detectable: the show
-                    // has NO real season above 1 while we need one, and
-                    // season 1's list is long enough to cover the absolute
-                    // index. Then meta maps stacked-absolute instead.
-                    val realTmdbSeasons = extDetails.optJSONArray("seasons")?.let { arr ->
-                        (0 until arr.length()).mapNotNull {
-                            arr.optJSONObject(it)?.optInt("season_number")?.takeIf { n -> n > 0 }
-                        }
-                    } ?: emptyList()
-                    val absolutePacked = realTmdbSeasons.isNotEmpty() &&
-                        realTmdbSeasons.all { it == 1 } && neededSeasons.any { it > 1 }
-                    var absoluteSeason1: Map<Int, EpisodeMeta>? = null
-                    neededSeasons.forEach { s ->
-                        var meta = tmdbSeasonMeta(tmdbId!!, s, runtimeHint)
-                        if (meta.isEmpty() && s > 1 && absolutePacked) {
-                            if (absoluteSeason1 == null) {
-                                absoluteSeason1 = tmdbSeasonMeta(tmdbId!!, 1, runtimeHint)
-                            }
-                            val s1 = absoluteSeason1 ?: emptyMap()
-                            val absStart = absStartBySeason[s] ?: Int.MAX_VALUE
-                            if (absStart != Int.MAX_VALUE) {
-                                val shifted = HashMap<Int, EpisodeMeta>()
-                                members.filter { it.siteSeason == s }.forEach { m ->
-                                    for (local in 1..m.episodes) {
-                                        val stackedPos = m.seasonStart + local - 1
-                                        val absPos = absStart + stackedPos - 1
-                                        s1[absPos]?.let { shifted[stackedPos] = it }
-                                    }
-                                }
-                                meta = shifted
-                            }
-                        }
-                        seasonMeta[s] = meta
-                    }
-                }
-            }
-        }
 
         val malId = media.optInt("idMal", 0).takeIf { it != 0 }
 
@@ -1285,67 +1210,6 @@ class WizstreamAnimeProvider : MainAPI() {
         val deduped = members.filter { seenIds.add(it.id) }
         return deduped to rootTitles
     }
-
-    /** Fetch + map one TMDB season's episodes (empty map on 404/outage). */
-    private suspend fun tmdbSeasonMeta(
-        tmdbId: Int,
-        season: Int,
-        runtime: Int?,
-    ): Map<Int, EpisodeMeta> {
-        val seasonJson = tmdbGet("/tv/$tmdbId/season/$season")
-        return seasonJson?.optJSONArray("episodes")?.let { arr ->
-            (0 until arr.length()).mapNotNull { i ->
-                val ep = arr.optJSONObject(i) ?: return@mapNotNull null
-                val n = ep.aOptInt("episode_number") ?: return@mapNotNull null
-                n to EpisodeMeta(
-                    title = ep.aOptStr("name"),
-                    overview = ep.aOptStr("overview"),
-                    stillUrl = ep.aOptStr("still_path").aToTmdbImg("original"),
-                    rating = ep.aOptDbl("vote_average"),
-                    airDate = ep.aOptStr("air_date")?.let(::aParseAirDate),
-                    runtime = runtime,
-                )
-            }.toMap()
-        } ?: emptyMap()
-    }
-
-    /** (v48) Session cache for the bare-TMDB-search fallback; -1 = miss. */
-    private val tmdbSearchCache = ConcurrentHashMap<String, Int>()
-
-    /**
-     * (v48) Bare TMDB TV search for anime entries ani.zip doesn't map
-     * (e.g. Rent-a-Girlfriend S3 carried a TVDB-id-only mapping, which
-     * left its page with bare "Episode N" rows). Japanese-language results
-     * win over same-named overseas adaptations. Never affects which links
-     * play — worst case it enriches the wrong page with decorative blurbs.
-     */
-    private suspend fun tmdbSearchAnime(title: String, altTitle: String?): Int? {
-        val candidates = listOf(title, altTitle ?: "").filter { it.isNotBlank() }.distinct()
-        for (q in candidates) {
-            val key = q.lowercase()
-            tmdbSearchCache[key]?.let { cached -> if (cached > 0) return cached else continue }
-            val id = runCatching {
-                val resp = tmdbGet("/search/tv", mapOf("query" to q)) ?: return@runCatching null
-                val results = resp.optJSONArray("results") ?: return@runCatching null
-                var firstId: Int? = null
-                var jaId: Int? = null
-                for (i in 0 until results.length()) {
-                    val r = results.optJSONObject(i) ?: continue
-                    val rid = r.optInt("id", 0).takeIf { it != 0 } ?: continue
-                    if (firstId == null) firstId = rid
-                    if (r.optString("original_language").equals("ja", true)) {
-                        jaId = rid
-                        break
-                    }
-                }
-                jaId ?: firstId
-            }.getOrNull()
-            tmdbSearchCache[key] = id ?: -1
-            if (id != null) return id
-        }
-        return null
-    }
-
     private val partNumberRegex = Regex(
         """(?i)\b(?:part|cour)\s*(\d{1,2})\b|\bpart\s+([ivxlcdm]{1,5})\b"""
     )
@@ -1376,7 +1240,10 @@ class WizstreamAnimeProvider : MainAPI() {
             ?: 2
     }
 
-    private suspend fun anilistQuery(
+    // (v54) module-internal (not private) so the unified WizstreamProvider
+    // can reuse it for StreamPlay-style AniList enrichment on TMDB anime
+    // pages after the re-merge.
+    internal suspend fun anilistQuery(
         query: String,
         variables: JSONObject,
         bearerToken: String? = null,
@@ -1480,21 +1347,6 @@ class WizstreamAnimeProvider : MainAPI() {
         }
         return out
     }
-
-    private suspend fun tmdbGet(path: String, q: Map<String, Any?> = emptyMap()): JSONObject? =
-        runCatching {
-            val params = (mapOf("api_key" to A_TMDB_KEY, "language" to "en-US") + q)
-                .filter { it.value != null }
-                .entries.joinToString("&") { (k, v) ->
-                    "${URLEncoder.encode(k, "UTF-8")}=${URLEncoder.encode(v.toString(), "UTF-8")}"
-                }
-            val url = "$A_TMDB_API${if (path.startsWith("/")) path else "/$path"}?$params"
-            val res = app.get(url, headers = mapOf(
-                "User-Agent" to A_UA, "Accept" to "application/json"
-            ), timeout = 8_000)
-            if (res.code in 200..299) JSONObject(res.text) else null
-        }.getOrNull()
-
     private suspend fun fetchSimklId(imdbId: String?, kind: String): Int? {
         if (imdbId.isNullOrBlank()) return null
         val type = if (kind == "movie") "movies" else "tv"

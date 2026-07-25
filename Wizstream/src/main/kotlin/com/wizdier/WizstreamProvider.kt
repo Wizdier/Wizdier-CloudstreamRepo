@@ -2,7 +2,10 @@ package com.wizdier
 
 import android.util.Log
 import com.lagradost.cloudstream3.*
+import com.lagradost.cloudstream3.LoadResponse.Companion.addAniListId
 import com.lagradost.cloudstream3.LoadResponse.Companion.addImdbId
+import com.lagradost.cloudstream3.LoadResponse.Companion.addKitsuId
+import com.lagradost.cloudstream3.LoadResponse.Companion.addMalId
 import com.lagradost.cloudstream3.LoadResponse.Companion.addSimklId
 import com.lagradost.cloudstream3.LoadResponse.Companion.addTrailer
 import com.lagradost.cloudstream3.Score
@@ -11,6 +14,8 @@ import com.lagradost.cloudstream3.utils.*
 import kotlinx.coroutines.*
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
+import okhttp3.MediaType.Companion.toMediaTypeOrNull
+import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
 import java.net.URLEncoder
@@ -261,10 +266,32 @@ class WizstreamProvider : MainAPI() {
         "tv/on_the_air" to "Currently On The Air",
         "movie/now_playing" to "Now Playing In Cinemas",
         "movie/upcoming" to "Upcoming Movies",
+        // (v54) StreamPlay-style anime row on the TMDB catalogue.
+        "anime/trending" to "Trending Anime (JP Animation)",
     )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val path = request.data
+        // (v54) StreamPlay-style anime row: TMDB discover, Japanese
+        // animation by popularity; typed Anime by tvToSearch.
+        if (path == "anime/trending") {
+            val json = tmdbGet("/discover/tv", mapOf(
+                "page" to page,
+                "language" to "en-US",
+                "with_genres" to "16",
+                "with_origin_country" to "JP",
+                "sort_by" to "popularity.desc",
+            )) ?: return newHomePageResponse(request.name, emptyList(), false)
+            val results = json.optJSONArray("results") ?: JSONArray()
+            val items = (0 until results.length()).mapNotNull { i ->
+                results.optJSONObject(i)?.let { tvToSearch(it) }
+            }
+            val hasNext = page < (json.optInt("total_pages", 1))
+            return newHomePageResponse(
+                HomePageList(request.name, items, isHorizontalImages = false),
+                hasNext
+            )
+        }
         // (v28) Segment-based check — "tv/popular" has NO leading slash, so
         // the old contains("/tv/") test missed Popular/TopRated/OnTheAir and
         // those rows were parsed as movies (title=null) → always empty.
@@ -377,6 +404,11 @@ class WizstreamProvider : MainAPI() {
         val simklId = detail.simklId
 
 
+        // (v54) One decision up front: TMDB entry = Japanese animation →
+        // Anime page enriched from AniList (StreamPlay style).
+        val isAnime = detail.isAnime
+        val enrich = if (isAnime) fetchAnimeEnrich(tmdbId) else null
+
         return if (mediaType == "movie") {
             val data = LinkContext(
                 imdbId = imdbId,
@@ -387,20 +419,25 @@ class WizstreamProvider : MainAPI() {
                 isMovie = true,
                 year = year,
             ).toJson()
-            newMovieLoadResponse(title, url, TvType.Movie, data) {
+            newMovieLoadResponse(
+                title, url, if (isAnime) TvType.AnimeMovie else TvType.Movie, data
+            ) {
                 this.posterUrl = posterUrl
-                this.backgroundPosterUrl = backdropUrl
+                this.backgroundPosterUrl = enrich?.bannerUrl ?: backdropUrl
                 this.plot = plot
                 this.year = year
                 this.duration = detail.runtime
                 this.tags = tags
                 this.recommendations = detail.recommendations
                 runCatching { rating?.let { score = Score.from10(it) } }
-                runCatching { actors?.let { this.actors = it } }
+                runCatching { (enrich?.actors ?: actors)?.let { this.actors = it } }
                 runCatching { trailerUrl?.let { addTrailer(it) } }
                 runCatching { logoUrl?.let { this.logoUrl = it } }
                 runCatching { imdbId?.let { addImdbId(it) } }
                 runCatching { simklId?.let { addSimklId(it) } }
+                runCatching { enrich?.malId?.let { addMalId(it) } }
+                runCatching { enrich?.kitsuId?.let { addKitsuId(it) } }
+                runCatching { enrich?.anilistId?.let { addAniListId(it) } }
             }
         } else {
             val seasons = detail.seasons.ifEmpty { listOf(1) }
@@ -409,19 +446,43 @@ class WizstreamProvider : MainAPI() {
             }.flatten().distinctBy { (it.season ?: 1) to (it.episode ?: 0) }
                 .sortedWith(compareBy({ it.season ?: 1 }, { it.episode ?: 0 }))
 
-            newTvSeriesLoadResponse(title, url, TvType.TvSeries, episodesAll) {
-                this.posterUrl = posterUrl
-                this.backgroundPosterUrl = backdropUrl
-                this.plot = plot
-                this.year = year
-                this.tags = tags
-                this.recommendations = detail.recommendations
-                runCatching { rating?.let { score = Score.from10(it) } }
-                runCatching { actors?.let { this.actors = it } }
-                runCatching { trailerUrl?.let { addTrailer(it) } }
-                runCatching { logoUrl?.let { this.logoUrl = it } }
-                runCatching { imdbId?.let { addImdbId(it) } }
-                runCatching { simklId?.let { addSimklId(it) } }
+            if (isAnime) {
+                // Anime: TMDB hosts the episode table (its packed-cours
+                // numbering is exactly what BDIX sites use), AniList lends
+                // tracking ids, banner art and the JA cast.
+                newAnimeLoadResponse(title, url, TvType.Anime) {
+                    this.posterUrl = posterUrl
+                    this.backgroundPosterUrl = enrich?.bannerUrl ?: backdropUrl
+                    this.plot = plot
+                    this.year = year
+                    this.tags = tags
+                    this.recommendations = detail.recommendations
+                    runCatching { rating?.let { score = Score.from10(it) } }
+                    runCatching { (enrich?.actors ?: actors)?.let { this.actors = it } }
+                    runCatching { trailerUrl?.let { addTrailer(it) } }
+                    runCatching { logoUrl?.let { this.logoUrl = it } }
+                    runCatching { imdbId?.let { addImdbId(it) } }
+                    runCatching { simklId?.let { addSimklId(it) } }
+                    runCatching { enrich?.malId?.let { addMalId(it) } }
+                    runCatching { enrich?.kitsuId?.let { addKitsuId(it) } }
+                    runCatching { enrich?.anilistId?.let { addAniListId(it) } }
+                    addEpisodes(DubStatus.Subbed, episodesAll)
+                }
+            } else {
+                newTvSeriesLoadResponse(title, url, TvType.TvSeries, episodesAll) {
+                    this.posterUrl = posterUrl
+                    this.backgroundPosterUrl = backdropUrl
+                    this.plot = plot
+                    this.year = year
+                    this.tags = tags
+                    this.recommendations = detail.recommendations
+                    runCatching { rating?.let { score = Score.from10(it) } }
+                    runCatching { actors?.let { this.actors = it } }
+                    runCatching { trailerUrl?.let { addTrailer(it) } }
+                    runCatching { logoUrl?.let { this.logoUrl = it } }
+                    runCatching { imdbId?.let { addImdbId(it) } }
+                    runCatching { simklId?.let { addSimklId(it) } }
+                }
             }
         }
     }
@@ -597,6 +658,8 @@ class WizstreamProvider : MainAPI() {
         val trailerUrl: String?,
         val seasons: List<Int>,
         val recommendations: List<SearchResponse>,
+        // (v54) Japanese animation = AniList-enriched Anime page.
+        val isAnime: Boolean = false,
     )
 
     private suspend fun fetchDetail(mediaType: String, tmdbId: Int): TmdbDetail? {
@@ -657,6 +720,21 @@ class WizstreamProvider : MainAPI() {
                 }.take(15)
             }.orEmpty()
 
+        // (v54) StreamPlay-style anime detection on the DETAIL payload
+        // (detail carries genres-with-ids + origin_country, unlike
+        // multi-search rows).
+        val isAnime = run {
+            val g = detail.optJSONArray("genres")
+            val animated = g?.let { arr ->
+                (0 until arr.length()).any { arr.optJSONObject(it)?.optInt("id") == 16 }
+            } == true
+            val oc = detail.optJSONArray("origin_country")
+            val jp = oc?.let { arr ->
+                (0 until arr.length()).any { arr.optString(it) == "JP" }
+            } == true
+            animated && (jp || detail.optStringOrNullWz("original_language") == "ja")
+        }
+
         val d = TmdbDetail(
             title = title,
             year = year,
@@ -673,9 +751,109 @@ class WizstreamProvider : MainAPI() {
             trailerUrl = trailerUrl,
             seasons = seasons.ifEmpty { if (mediaType == "tv") listOf(1) else emptyList() },
             recommendations = recs,
+            isAnime = isAnime,
         )
         metaCache[cacheKey] = now to d
         return d
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  (v54) StreamPlay-style AniList enrichment for TMDB anime pages
+    // ═══════════════════════════════════════════════════════════════════════
+    //  Catalogue and identity stay TMDB (exactly like StreamPlay); when the
+    //  TMDB entry is Japanese animation we additionally borrow from AniList:
+    //  tracking ids (AniList/MAL/Kitsu via api.ani.zip mapping), banner art
+    //  and the Japanese voice-actor cast. One mapping call + one GraphQL
+    //  call per anime page, fully best-effort (nulls on any failure).
+    private data class AnimeEnrich(
+        val anilistId: Int?,
+        val malId: Int?,
+        val kitsuId: String?,
+        val bannerUrl: String?,
+        val actors: List<ActorData>?,
+    )
+
+    // Small local AniList GraphQL client (self-contained copy of the one
+    // in WizstreamAnimeProvider — that one is a provider MEMBER function,
+    // so it can't be borrowed across classes).
+    private suspend fun anilistGraph(query: String, variables: JSONObject): JSONObject? =
+        runCatching {
+            val body = JSONObject().apply {
+                put("query", query); put("variables", variables)
+            }.toString().toRequestBody("application/json".toMediaTypeOrNull())
+            val res = app.post(
+                "https://graphql.anilist.co",
+                headers = mapOf(
+                    "User-Agent" to USER_AGENT,
+                    "Content-Type" to "application/json",
+                    "Accept" to "application/json",
+                ),
+                requestBody = body,
+                timeout = 12_000,
+            )
+            if (res.code !in 200..299) null
+            else JSONObject(res.text).optJSONObject("data")
+        }.getOrNull()
+
+    private suspend fun fetchAnimeEnrich(tmdbId: Int): AnimeEnrich? {
+        return runCatching {
+            val map = JSONObject(
+                app.get(
+                    "https://api.ani.zip/mappings?tmdb_id=$tmdbId",
+                    timeout = 8000,
+                ).text
+            )
+            val anilistId = map.optIntOrNullWz("anilist_id")
+            val malId = map.optIntOrNullWz("mal_id")
+            val kitsuId = map.optStringOrNullWz("kitsu_id")
+
+            var bannerUrl: String? = null
+            var actors: List<ActorData>? = null
+            if (anilistId != null) {
+                val gql = """
+                    query (${'$'}id: Int) {
+                      Media(id: ${'$'}id, type: ANIME) {
+                        bannerImage
+                        characters(sort: [ROLE, RELEVANCE], perPage: 25) {
+                          edges {
+                            role
+                            node { name { full } image { large } }
+                            voiceActorsJapanese: voiceActors(language: JAPANESE, sort: [RELEVANCE]) { name { full } image { large } }
+                          }
+                        }
+                      }
+                    }
+                """.trimIndent()
+                val media = anilistGraph(gql, JSONObject().put("id", anilistId))
+                    ?.optJSONObject("Media")
+                bannerUrl = media?.optStringOrNullWz("bannerImage")
+                actors = media?.optJSONObject("characters")
+                    ?.optJSONArray("edges")?.let { edges ->
+                        (0 until edges.length()).mapNotNull { i ->
+                            val e = edges.optJSONObject(i) ?: return@mapNotNull null
+                            val node = e.optJSONObject("node") ?: return@mapNotNull null
+                            val charName = node.optJSONObject("name")
+                                ?.optStringOrNullWz("full") ?: return@mapNotNull null
+                            val charImg = node.optJSONObject("image")
+                                ?.optStringOrNullWz("large")
+                            val jaVa = e.optJSONArray("voiceActorsJapanese")
+                                ?.optJSONObject(0)?.let { va ->
+                                    va.optJSONObject("name")?.optStringOrNullWz("full")
+                                        ?.let { n ->
+                                            Actor(n, va.optJSONObject("image")
+                                                ?.optStringOrNullWz("large"))
+                                        }
+                                }
+                            ActorData(
+                                actor = Actor(charName, charImg),
+                                roleString = e.optString("role").ifBlank { null },
+                                voiceActor = jaVa,
+                            )
+                        }.ifEmpty { null }
+                    }
+            }
+            AnimeEnrich(anilistId, malId, kitsuId, bannerUrl, actors)
+        }.getOrNull()
     }
 
     private suspend fun fetchSeasonEpisodes(

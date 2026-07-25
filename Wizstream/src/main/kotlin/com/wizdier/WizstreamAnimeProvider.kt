@@ -392,7 +392,12 @@ class WizstreamAnimeProvider : MainAPI() {
         val detail = fetchAniDetail(id)
             ?: throw ErrorLoadingException("Could not load AniList media $id")
 
-        val title = detail.title
+        // (v50, re-applied in v52) Merged franchise pages wear the ROOT
+        // title, and MAL/AniList sync binds to the root entry — progress
+        // lands on the same tracker entry whichever part was opened.
+        val rootMember =
+            if (detail.members.size > 1) detail.members.firstOrNull { it.episodes > 0 } else null
+        val title = rootMember?.title ?: detail.title
         val episodes = detail.episodes
         val type = when (detail.format) {
             "MOVIE", "SPECIAL" -> if (episodes <= 1) TvType.AnimeMovie else TvType.Anime
@@ -422,6 +427,13 @@ class WizstreamAnimeProvider : MainAPI() {
                 (1..m.episodes).map { localEp ->
                     val stackedEp = m.seasonStart + localEp - 1
                     val epMeta = detail.seasonMeta[m.siteSeason]?.get(stackedEp)
+                    // (v53) AniList metadata first: this entry's own
+                    // streaming-episode title/thumb. Guard: AniList sometimes
+                    // attaches the WHOLE season's list to a split-cour entry —
+                    // an overlong list would shift titles, so refuse it.
+                    val sEp = m.streamEps
+                        .takeIf { it.size <= m.episodes + 3 }
+                        ?.getOrNull(localEp - 1)
                     newEpisode(LinkContext(
                         anilistId = m.id, imdbId = imdbId, tmdbId = tmdbId, malId = m.malId,
                         season = m.siteSeason, episode = stackedEp, entryEpisode = localEp,
@@ -431,10 +443,10 @@ class WizstreamAnimeProvider : MainAPI() {
                         franchiseTitles = detail.franchiseTitles,
                         dub = DubStatus.Subbed,
                     ).toJson()) {
-                        name = epMeta?.title ?: "Episode $stackedEp"
+                        name = sEp?.title ?: epMeta?.title ?: "Episode $stackedEp"
                         season = m.siteSeason
                         episode = stackedEp
-                        posterUrl = epMeta?.stillUrl ?: detail.posterUrl
+                        posterUrl = sEp?.thumb ?: epMeta?.stillUrl ?: detail.posterUrl
                         description = epMeta?.overview
                         runCatching { epMeta?.rating?.let { score = Score.from10(it) } }
                         runTime = epMeta?.runtime
@@ -477,9 +489,9 @@ class WizstreamAnimeProvider : MainAPI() {
                 runCatching { detail.trailerUrl?.let { addTrailer(it) } }
                 runCatching { detail.logoUrl?.let { this.logoUrl = it } }
                 runCatching { imdbId?.let { addImdbId(it) } }
-                runCatching { detail.malId?.let { addMalId(it) } }
+                runCatching { (rootMember?.malId ?: detail.malId)?.let { addMalId(it) } }
                 runCatching { detail.kitsuId?.let { addKitsuId(it) } }
-                addAniListId(id)
+                addAniListId(rootMember?.id ?: id)
                 runCatching { detail.simklId?.let { addSimklId(it) } }
                 addEpisodes(DubStatus.Subbed, epList)
             }
@@ -701,14 +713,17 @@ class WizstreamAnimeProvider : MainAPI() {
             format == "OVA" || format == "ONA" -> TvType.OVA
             else -> TvType.Anime
         }
+        // (v52) Real anilist.co URLs: the app resolves clicked cards by
+        // provider URL-prefix too (fallback when the name lookup fails),
+        // which wiz:// custom-scheme URLs could never satisfy.
         return when (tvType) {
-            TvType.AnimeMovie -> newMovieSearchResponse(title, "wiz://anilist/$id", TvType.AnimeMovie) {
+            TvType.AnimeMovie -> newMovieSearchResponse(title, "https://anilist.co/anime/$id", TvType.AnimeMovie) {
                 this.posterUrl = cover; this.year = year
             }
-            TvType.OVA -> newAnimeSearchResponse(title, "wiz://anilist/$id", TvType.OVA) {
+            TvType.OVA -> newAnimeSearchResponse(title, "https://anilist.co/anime/$id", TvType.OVA) {
                 this.posterUrl = cover; this.year = year
             }
-            else -> newAnimeSearchResponse(title, "wiz://anilist/$id", TvType.Anime) {
+            else -> newAnimeSearchResponse(title, "https://anilist.co/anime/$id", TvType.Anime) {
                 this.posterUrl = cover; this.year = year
             }
         }
@@ -732,7 +747,7 @@ class WizstreamAnimeProvider : MainAPI() {
                 genres tags { name }
                 episodes duration format status season seasonYear
                 nextAiringEpisode { episode }
-                streamingEpisodes { title site }
+                streamingEpisodes { title thumbnail }
                 startDate { year month day }
                 endDate { year month day }
                 trailer { id site }
@@ -743,7 +758,7 @@ class WizstreamAnimeProvider : MainAPI() {
                     voiceActorsJapanese: voiceActors(language: JAPANESE, sort: [RELEVANCE]) { name { full } image { large } }
                   }
                 }
-                relations { edges { node { id type format episodes idMal title { english romaji native } coverImage { large } } relationType } }
+                relations { edges { node { id type format episodes idMal title { english romaji native } coverImage { large } streamingEpisodes { title thumbnail } } relationType } }
                 recommendations(sort: [RATING_DESC], perPage: 15) {
                   nodes { mediaRecommendation { id idMal title { romaji english native } coverImage { extraLarge large } bannerImage episodes format averageScore genres startDate { year } status } }
                 }
@@ -922,6 +937,7 @@ class WizstreamAnimeProvider : MainAPI() {
             episodes = episodes,
             malId = media.optInt("idMal", 0).takeIf { it != 0 },
             format = format,
+            streamEps = media.toStreamEps(),
         )
         val (members, franchiseTitles) = if (format == "MOVIE") {
             listOf(openedMember) to emptyList()
@@ -962,8 +978,10 @@ class WizstreamAnimeProvider : MainAPI() {
                 "include_image_language" to "en,null"
             ))
             if (extDetails != null) {
-                backdropUrl = extDetails.aOptStr("backdrop_path").aToTmdbImg("original")
-                    ?: backdropUrl
+                // (v50, re-applied in v52) AniList banner art wins; the TMDB
+                // backdrop is only a fallback when AniList has no banner.
+                backdropUrl = backdropUrl
+                    ?: extDetails.aOptStr("backdrop_path").aToTmdbImg("original")
                 logoUrl = aPickLogo(extDetails.optJSONObject("images")?.optJSONArray("logos"))
                     ?: imdbId?.let { "https://live.metahub.space/logo/medium/$it/img" }
                 // NOTE: do NOT override `actors` from TMDB credits — anime
@@ -1068,6 +1086,8 @@ class WizstreamAnimeProvider : MainAPI() {
         val episodes: Int,
         val malId: Int?,
         val format: String?,
+        // (v53) AniList streaming-episode rows of THIS entry (title+thumb).
+        val streamEps: List<StreamEp> = emptyList(),
         // Stacked-site position, filled in by the caller:
         var siteSeason: Int = 0,
         // First stacked episode position of this member inside siteSeason
@@ -1076,6 +1096,19 @@ class WizstreamAnimeProvider : MainAPI() {
         var seasonStart: Int = 1,
     )
 
+    /** (v53) One row of AniList's streamingEpisodes (licensed-stream feed
+     *  data — Crunchyroll/Hulu) — the ONLY per-episode title/thumbnail
+     *  AniList has. Used first on episode rows; TMDB fills gaps. */
+    private data class StreamEp(val title: String?, val thumb: String?)
+
+    private fun JSONObject.toStreamEps(): List<StreamEp> =
+        optJSONArray("streamingEpisodes")?.let { arr ->
+            (0 until arr.length()).map { i ->
+                val o = arr.optJSONObject(i)
+                StreamEp(o?.aOptStr("title"), o?.aOptStr("thumbnail"))
+            }
+        } ?: emptyList()
+
     private data class RelCand(
         val id: Int,
         val title: String,
@@ -1083,6 +1116,7 @@ class WizstreamAnimeProvider : MainAPI() {
         val eps: Int,
         val malId: Int?,
         val fmt: String?,
+        val streamEps: List<StreamEp> = emptyList(),
     )
 
     private fun JSONObject.toRelCand(): RelCand {
@@ -1098,6 +1132,7 @@ class WizstreamAnimeProvider : MainAPI() {
             eps = optInt("episodes", 0),
             malId = aOptInt("idMal"),
             fmt = aOptStr("format"),
+            streamEps = toStreamEps(),
         )
     }
 
@@ -1106,7 +1141,7 @@ class WizstreamAnimeProvider : MainAPI() {
         val gql = """
             query (${'$'}id: Int) {
               Media(id: ${'$'}id, type: ANIME) {
-                relations { edges { node { id type format episodes idMal title { english romaji native } } relationType } }
+                relations { edges { node { id type format episodes idMal title { english romaji native } streamingEpisodes { title thumbnail } } relationType } }
               }
             }
         """.trimIndent()
@@ -1233,6 +1268,7 @@ class WizstreamAnimeProvider : MainAPI() {
                 id = c.id, title = c.title, altTitle = c.alt,
                 episodes = if (c.eps > 0) c.eps else 12,
                 malId = c.malId, format = c.fmt,
+                streamEps = c.streamEps,
             )
         }
         members += opened
@@ -1241,6 +1277,7 @@ class WizstreamAnimeProvider : MainAPI() {
                 id = c.id, title = c.title, altTitle = c.alt,
                 episodes = if (c.eps > 0) c.eps else 12,
                 malId = c.malId, format = c.fmt,
+                streamEps = c.streamEps,
             )
         }
         // Belt & suspenders: relation loops can't double-list an entry.
@@ -1339,7 +1376,10 @@ class WizstreamAnimeProvider : MainAPI() {
             ?: 2
     }
 
-    private suspend fun anilistQuery(
+    // (v54) module-internal (not private) so the unified WizstreamProvider
+    // can reuse it for StreamPlay-style AniList enrichment on TMDB anime
+    // pages after the re-merge.
+    internal suspend fun anilistQuery(
         query: String,
         variables: JSONObject,
         bearerToken: String? = null,

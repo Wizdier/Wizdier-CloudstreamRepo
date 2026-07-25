@@ -1,16 +1,19 @@
-version = 53
+version = 55
 
 cloudstream {
-    description = "Wizstream Anime — the AniList catalogue as its own plugin. " +
-        "AniList powers identity (titles, posters, cast, MAL/AniList/Kitsu/Simkl " +
-        "tracking) and multi-season franchises render as stacked CircleFTP-style " +
-        "mega pages (cours merged, e.g. Attack on Titan Season 3 = 22 episodes). " +
-        "Links come from the same resolver engine as the Wizstream (TMDB) " +
-        "plugin: BDIX lookups (Cineplex BD, FTPBD, Circle FTP, CTGMovies, " +
-        "FM FTP, Mediaserver) plus web sources (Cineby, Bingr, Moonflix), " +
-        "the Vid[x] embed family and dedicated anime streaming sources " +
-        "(AniZone, Mkissa via AllAnime API, Miruro secure-pipe, AniChi via " +
-        "mapper.nekostream.site)."
+    description = "WizstreamAniList — the PURE AniList catalogue plugin: " +
+        "every piece of metadata (titles, posters, banners, summaries, " +
+        "genres, scores, trailers, full Japanese voice-actor cast, " +
+        "MAL/AniList tracking) comes from AniList alone — zero TMDB calls, " +
+        "zero TMDB fields. Episode titles/thumbnails use AniList's own " +
+        "licensed-streaming feed per entry; where that feed is missing " +
+        "rows honestly show \"Episode N\" with the show poster. Stacked " +
+        "CircleFTP-style multi-season mega pages intact (cours merged: " +
+        "Attack on Titan Season 3 = all 22 episodes). Links resolve " +
+        "through the same engine as Wizstream: BDIX sources (Cineplex BD, " +
+        "FTPBD, Circle FTP, CTGMovies, FM FTP, Mediaserver) + web sources " +
+        "(Cineby, Bingr, Moonflix) + the Vid[x] embed family + anime " +
+        "streaming sources (AniZone, Mkissa-AllAnime, Miruro, AniChi)."
     authors = listOf("Wizdier")
     status = 1
     tvTypes = listOf(
@@ -27,10 +30,11 @@ android {
 
 // ── Shared resolver engine ─────────────────────────────────────────────────
 // WizstreamSources.kt + WizstreamExtractors.kt are the SAME link-scraping
-// engine bundled by the Wizstream (TMDB) plugin. The single source of
-// truth lives in ../Wizstream/src/main/kotlin/com/wizdier/ — this task
-// mirrors the committed copies here before every build so the two plugins
-// can never drift apart.
+// engine bundled by the Wizstream plugin. The single source of truth lives
+// in ../Wizstream/src/main/kotlin/com/wizdier/ — this task mirrors the
+// committed copies here before every build so the two plugins can never
+// drift apart. (WizstreamAnimeSources.kt and WizstreamAnimeProvider.kt are
+// THIS module's own: the provider is stripped to PURE AniList metadata.)
 val syncSharedSources = tasks.register("syncSharedSources") {
     doLast {
         listOf("WizstreamSources.kt", "WizstreamExtractors.kt").forEach { f ->
