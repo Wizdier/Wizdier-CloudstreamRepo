@@ -2047,6 +2047,15 @@ override suspend fun resolve(
                 .trim()
                 .replace(Regex("\\s+"), " ")
 
+        /** (v46) Query hygiene for the site search: drop punctuation the
+         *  server's substring matcher chokes on ("Haikyuu!!", "Re:ZERO",
+         *  "Don't Toy with Me, Miss Nagatoro"). Only used to widen the
+         *  SEARCH call — matching runs on the original title. */
+        private fun cleanedSearchTerm(t: String): String =
+            t.replace(Regex("""[!?,.:;'""" + '"' + """()\-–—~*]+"""), " ")
+                .replace(Regex("""\s+"""), " ")
+                .trim()
+
         /** (v45) Decoration-stripped post title for the tier-3 multi-season
          *  rescue match: drops "(TV Series 2024-)"/"[Dual Audio]" wrappers,
          *  season numbers, part/cour/final markers, quality/audio junk and
@@ -2085,11 +2094,30 @@ override suspend fun resolve(
             imdbId: String?,
         ): Boolean {
             // 1. Search posts — fetch all results, not just the best one.
-            val searchResp = fetchWithFallback(
-                app,
-                primary = "$PRIMARY_API/api/posts?searchTerm=${encodeUrl(title)}&order=desc",
-                fallback = "$FALLBACK_API/api/posts?searchTerm=${encodeUrl(title)}&order=desc",
-            ) ?: return false
+            // (v46) Search-term variants: site search is a naive substring
+            // match, so franchise titles carrying leftovers from AniList
+            // ("Haikyuu!!", "Re:ZERO") starve it — "Haikyuu" finds the
+            // posts, "Haikyuu!!" finds nothing. Retry once with punctuation
+            // / symbol junk stripped when the raw query yields zero posts.
+            // Downstream matching is unaffected (tier gates run on the
+            // original query title).
+            var searchResp: Pair<String, Boolean>? = null
+            val queryVariants = listOf(title, cleanedSearchTerm(title))
+                .filter { it.isNotBlank() }.distinct()
+            for (q in queryVariants) {
+                val resp = fetchWithFallback(
+                    app,
+                    primary = "$PRIMARY_API/api/posts?searchTerm=${encodeUrl(q)}&order=desc",
+                    fallback = "$FALLBACK_API/api/posts?searchTerm=${encodeUrl(q)}&order=desc",
+                ) ?: continue
+                val arr = runCatching { JSONObject(resp.first).optJSONArray("posts") }
+                    .getOrNull()
+                if (arr != null && arr.length() > 0) {
+                    searchResp = resp
+                    break
+                }
+            }
+            if (searchResp == null) return false
             val searchText = searchResp.first
 
             // (v34) Hostname-vs-IP parity with CircleFtpProvider. The

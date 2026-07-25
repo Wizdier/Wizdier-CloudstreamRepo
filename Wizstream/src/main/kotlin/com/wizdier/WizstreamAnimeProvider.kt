@@ -269,15 +269,34 @@ class WizstreamAnimeProvider : MainAPI() {
     )
 
     override val mainPage: List<MainPageData>
-        get() = if (anilistAuthToken() != null) userMainPages + defaultMainPages
-            else defaultMainPages
+        get() = if (anilistAuthToken() != null || anilistLoginName() != null) {
+            userMainPages + defaultMainPages
+        } else {
+            defaultMainPages
+        }
 
     /** Access token for the Cloudstream-logged-in AniList account (null
-     *  when logged out). Reads the app's account store via SyncRepo;
-     *  wrapped in runCatching so any auth-layer API change simply behaves
-     *  as "logged out" instead of crashing the homepage. */
+     *  when logged out). Reads the app's account store via SyncRepo — the
+     *  repo-based auth layer exists only in Cloudstream ≥ 4.8, so on older
+     *  app builds the class is absent, NoClassDefFoundError is caught here,
+     *  and we fall back to the username path (see below). */
     private fun anilistAuthToken(): String? = runCatching {
         SyncRepo(AccountManager.aniListApi).authToken()?.accessToken
+            ?.takeIf { it.isNotBlank() }
+    }.getOrNull()
+
+    /** (v46) App-generation-proof login detection. `loginInfo()` exists in
+     *  BOTH the pre-4.8 auth layer and the current one (compile-time
+     *  deprecated, but present at runtime) — invoked via reflection so this
+     *  compiles against either stub. Returns the AniList username when
+     *  logged in, else null. A username lets us fetch the list through
+     *  AniList's PUBLIC profile endpoint — no token needed for the
+     *  (default-public) list. */
+    private fun anilistLoginName(): String? = runCatching {
+        val api = AccountManager.aniListApi
+        val info = api.javaClass.getMethod("loginInfo").invoke(api)
+            ?: return@runCatching null
+        (info.javaClass.getMethod("getName").invoke(info) as? String)
             ?.takeIf { it.isNotBlank() }
     }.getOrNull()
 
@@ -861,6 +880,14 @@ class WizstreamAnimeProvider : MainAPI() {
             out.ifEmpty { null }
         }
 
+        // (v46) Franchise season mapping runs BEFORE the TMDB season fetch
+        // inside the block below so episode metadata comes from the season
+        // this AniList entry actually IS (hardcoded /season/1 used to show
+        // Season-1 names/stills for every sequel season).
+        val (seasonOffsetEarly, franchiseTitlesEarly) = franchiseInfo(
+            id, media.optJSONObject("relations")?.optJSONArray("edges")
+        )
+
         if (tmdbId != null) {
             val kind = if (format == "MOVIE") "movie" else "tv"
             val extDetails = tmdbGet("/$kind/${tmdbId}", mapOf(
@@ -877,7 +904,16 @@ class WizstreamAnimeProvider : MainAPI() {
                 aPickTrailer(extDetails.optJSONObject("videos")?.optJSONArray("results"))
                 simklId = fetchSimklId(imdbId, kind)
                 if (kind == "tv") {
-                    val seasonJson = tmdbGet("/tv/$tmdbId/season/1")
+                    // (v46) Which TMDB season is this AniList entry?
+                    // Plain sequel entry (AoT S2) → offset+1; a COURS part
+                    // ("… Season 3 Part 2") belongs to the season it splits
+                    // → offset (its parent season's own number). When TMDB
+                    // has no such season the meta simply stays empty —
+                    // never the wrong season's 25 episodes.
+                    val tmdbSeason = if (seasonOffsetEarly > 0 &&
+                        coursSplitRegex.containsMatchIn(title)
+                    ) seasonOffsetEarly else seasonOffsetEarly + 1
+                    val seasonJson = tmdbGet("/tv/$tmdbId/season/$tmdbSeason")
                     episodeMeta = seasonJson?.optJSONArray("episodes")?.let { arr ->
                         (0 until arr.length()).mapNotNull { i ->
                             val ep = arr.optJSONObject(i) ?: return@mapNotNull null
@@ -908,9 +944,9 @@ class WizstreamAnimeProvider : MainAPI() {
         // BDIX sites file everything under the franchise ROOT ("Attack on
         // Titan", never "Attack on Titan: The Final Season"), so the
         // root/ancestor titles are resolvers' best search keys.
-        val (seasonOffset, franchiseTitles) = franchiseInfo(
-            id, media.optJSONObject("relations")?.optJSONArray("edges")
-        )
+        // (v46) Hoisted above the TMDB fetch; reuse its values here.
+        val seasonOffset = seasonOffsetEarly
+        val franchiseTitles = franchiseTitlesEarly
 
         val malId = media.optInt("idMal", 0).takeIf { it != 0 }
 
@@ -1039,16 +1075,21 @@ class WizstreamAnimeProvider : MainAPI() {
     private suspend fun myAnilistPage(page: Int, request: MainPageRequest): HomePageResponse {
         val perPage = 30
         val status = if (request.data == "my_watching") "CURRENT" else "PLANNING"
+        // Token (private-list-proof, app ≥4.8) preferred; username (public
+        // profile query, every app generation) as fallback. Neither → hide.
         val token = anilistAuthToken()
-            ?: return newHomePageResponse(request.name, emptyList(), hasNext = false)
+        val loginName = if (token == null) anilistLoginName() else null
+        if (token == null && loginName == null) {
+            return newHomePageResponse(request.name, emptyList(), hasNext = false)
+        }
 
-        val cacheKey = "$status:" + token.takeLast(6)
+        val cacheKey = status + ":" + (token?.takeLast(6) ?: ("@" + loginName))
         val now = System.currentTimeMillis()
         val cached = myListCache[cacheKey]
         val all: List<SearchResponse> = if (cached != null && now - cached.first < 5 * 60_000) {
             cached.second
         } else {
-            fetchMyList(status, token).also { myListCache[cacheKey] = now to it }
+            fetchMyList(status, token, loginName).also { myListCache[cacheKey] = now to it }
         }
         val from = (page - 1) * perPage
         val items = all.drop(from).take(perPage)
@@ -1057,11 +1098,20 @@ class WizstreamAnimeProvider : MainAPI() {
         )
     }
 
-    private suspend fun fetchMyList(status: String, token: String): List<SearchResponse> {
+    private suspend fun fetchMyList(
+        status: String,
+        token: String?,
+        userName: String?,
+    ): List<SearchResponse> {
         val gql = """
-            query (${'$'}status: [MediaListStatus]) {
+            query (${'$'}status: [MediaListStatus], ${'$'}userName: String) {
               Viewer { id }
-              MediaListCollection(type: ANIME, status_in: ${'$'}status, sort: UPDATED_TIME_DESC) {
+              MediaListCollection(
+                userName: ${'$'}userName,
+                type: ANIME,
+                status_in: ${'$'}status,
+                sort: UPDATED_TIME_DESC
+              ) {
                 lists {
                   entries {
                     progress status updatedAt
@@ -1076,7 +1126,12 @@ class WizstreamAnimeProvider : MainAPI() {
               }
             }
         """.trimIndent()
-        val variables = JSONObject().apply { put("status", JSONArray(listOf(status))) }
+        val variables = JSONObject().apply {
+            put("status", JSONArray(listOf(status)))
+            // Authenticated viewer flow ignores userName (AniList resolves
+            // the viewer automatically); the public fallback supplies it.
+            userName?.let { put("userName", it) } ?: put("userName", JSONObject.NULL)
+        }
         val data = anilistQuery(gql, variables, token) ?: return emptyList()
         val out = mutableListOf<SearchResponse>()
         data.optJSONObject("MediaListCollection")?.optJSONArray("lists")?.let { lists ->
