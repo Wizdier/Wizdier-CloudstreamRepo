@@ -1,4 +1,4 @@
-version = 51
+version = 52
 
 cloudstream {
     description = "Wizstream Anime — the AniList catalogue as its own plugin. " +

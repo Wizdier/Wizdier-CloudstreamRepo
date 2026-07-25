@@ -305,7 +305,8 @@ class WizstreamProvider : MainAPI() {
         }
     }
 
-    private suspend fun tmdbSearch(query: String): List<SearchResponse> {
+    // (v50, re-applied in v52) One plain /search/multi pass.
+    private suspend fun tmdbMultiSearch(query: String): List<SearchResponse> {
         val json = tmdbGet("/search/multi", mapOf(
             "query" to query,
             "include_adult" to false,
@@ -321,6 +322,34 @@ class WizstreamProvider : MainAPI() {
             }
         }
         return out
+    }
+
+    // (v50) Collapse rōmaji long vowels the user commonly doubles
+    // ("haikyuu" → "haikyu"); uu/oo/ee/aa only — skip ou/oh, too many
+    // false positives.
+    private fun romajiVowelVariant(query: String): String {
+        var s = query
+        for ((a, b) in listOf("uu" to "u", "oo" to "o", "ee" to "e", "aa" to "a")) {
+            s = s.replace(a, b, ignoreCase = true)
+        }
+        return s.trim()
+    }
+
+    // (v50) Plain pass, plus ONE variant pass when the query actually has
+    // collapsible vowels. Variant hits whose title matches the variant
+    // query exactly are promoted to the front — TMDB files Haikyu!! under
+    // single-u, so a bare "haikyuu" search only headlined a recap movie
+    // (verified live). Ordinary titles (no doubled vowels) cost zero extra
+    // requests and are reordered zero.
+    private suspend fun tmdbSearch(query: String): List<SearchResponse> {
+        val primary = tmdbMultiSearch(query)
+        val variant = romajiVowelVariant(query)
+        if (variant.isBlank() || variant.equals(query, ignoreCase = true)) return primary
+        val secondary = tmdbMultiSearch(variant)
+        if (secondary.isEmpty()) return primary
+        val vNorm = variant.normalizedWz()
+        val (exact, rest) = secondary.partition { it.name.normalizedWz() == vNorm }
+        return exact + primary + rest
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -491,10 +520,25 @@ class WizstreamProvider : MainAPI() {
     //  TMDB helpers
     // ═══════════════════════════════════════════════════════════════════════
 
+    // (v50) Japanese animation detector: TMDB genre 16 (Animation) plus a
+    // Japanese origin — origin_country on TV results, original_language
+    // fallback for movies (multi-search movie payloads often omit
+    // origin_country).
+    private fun isJpAnimation(r: JSONObject): Boolean {
+        val genres = r.optJSONArray("genre_ids")
+        val animated = genres?.let { g -> (0 until g.length()).any { g.optInt(it) == 16 } } == true
+        if (!animated) return false
+        val oc = r.optJSONArray("origin_country")
+        val jpCountry = oc?.let { a -> (0 until a.length()).any { a.optString(it) == "JP" } } == true
+        return jpCountry || r.optString("original_language") == "ja"
+    }
+
     private fun parseTmdbUrl(url: String): Pair<Int, String>? {
         val u = url.trim()
         val m = Regex("wiz://tmdb/(movie|tv)/(\\d+)").find(u)
             ?: Regex("tmdb/(movie|tv)/(\\d+)").find(u)
+            // (v52) real themoviedb.org URLs are what we emit now.
+            ?: Regex("themoviedb\\.org/(movie|tv)/(\\d+)").find(u)
             ?: return null
         val type = m.groupValues[1]
         val id = m.groupValues[2].toIntOrNull() ?: return null
@@ -507,21 +551,33 @@ class WizstreamProvider : MainAPI() {
             ?: return null
         val year = yearFromDate(r.optString("release_date"))
         val poster = r.optString("poster_path").toTmdbImg("w500")
-        return newMovieSearchResponse(title, "wiz://tmdb/movie/$id", TvType.Movie) {
+        // (v50) anime typing for Japanese animation; (v52) real TMDB URLs.
+        val type = if (isJpAnimation(r)) TvType.AnimeMovie else TvType.Movie
+        return newMovieSearchResponse(title, "https://www.themoviedb.org/movie/$id", type) {
             this.posterUrl = poster
             this.year = year
         }
     }
 
-    private fun tvToSearch(r: JSONObject): TvSeriesSearchResponse? {
+    // (v50) return type widened: Japanese animation TV results are emitted
+    // as AnimeSearchResponse so they blend with anime rows correctly.
+    private fun tvToSearch(r: JSONObject): SearchResponse? {
         val id = r.optInt("id", 0).takeIf { it != 0 } ?: return null
         val title = r.optString("name").ifBlank { r.optString("original_name") }.ifBlank { null }
             ?: return null
         val year = yearFromDate(r.optString("first_air_date"))
         val poster = r.optString("poster_path").toTmdbImg("w500")
-        return newTvSeriesSearchResponse(title, "wiz://tmdb/tv/$id", TvType.TvSeries) {
-            this.posterUrl = poster
-            this.year = year
+        // (v52) real TMDB URLs (see parseTmdbUrl's fallback).
+        return if (isJpAnimation(r)) {
+            newAnimeSearchResponse(title, "https://www.themoviedb.org/tv/$id", TvType.Anime) {
+                this.posterUrl = poster
+                this.year = year
+            }
+        } else {
+            newTvSeriesSearchResponse(title, "https://www.themoviedb.org/tv/$id", TvType.TvSeries) {
+                this.posterUrl = poster
+                this.year = year
+            }
         }
     }
 

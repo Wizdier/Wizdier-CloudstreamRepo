@@ -392,7 +392,12 @@ class WizstreamAnimeProvider : MainAPI() {
         val detail = fetchAniDetail(id)
             ?: throw ErrorLoadingException("Could not load AniList media $id")
 
-        val title = detail.title
+        // (v50, re-applied in v52) Merged franchise pages wear the ROOT
+        // title, and MAL/AniList sync binds to the root entry — progress
+        // lands on the same tracker entry whichever part was opened.
+        val rootMember =
+            if (detail.members.size > 1) detail.members.firstOrNull { it.episodes > 0 } else null
+        val title = rootMember?.title ?: detail.title
         val episodes = detail.episodes
         val type = when (detail.format) {
             "MOVIE", "SPECIAL" -> if (episodes <= 1) TvType.AnimeMovie else TvType.Anime
@@ -477,9 +482,9 @@ class WizstreamAnimeProvider : MainAPI() {
                 runCatching { detail.trailerUrl?.let { addTrailer(it) } }
                 runCatching { detail.logoUrl?.let { this.logoUrl = it } }
                 runCatching { imdbId?.let { addImdbId(it) } }
-                runCatching { detail.malId?.let { addMalId(it) } }
+                runCatching { (rootMember?.malId ?: detail.malId)?.let { addMalId(it) } }
                 runCatching { detail.kitsuId?.let { addKitsuId(it) } }
-                addAniListId(id)
+                addAniListId(rootMember?.id ?: id)
                 runCatching { detail.simklId?.let { addSimklId(it) } }
                 addEpisodes(DubStatus.Subbed, epList)
             }
@@ -701,14 +706,17 @@ class WizstreamAnimeProvider : MainAPI() {
             format == "OVA" || format == "ONA" -> TvType.OVA
             else -> TvType.Anime
         }
+        // (v52) Real anilist.co URLs: the app resolves clicked cards by
+        // provider URL-prefix too (fallback when the name lookup fails),
+        // which wiz:// custom-scheme URLs could never satisfy.
         return when (tvType) {
-            TvType.AnimeMovie -> newMovieSearchResponse(title, "wiz://anilist/$id", TvType.AnimeMovie) {
+            TvType.AnimeMovie -> newMovieSearchResponse(title, "https://anilist.co/anime/$id", TvType.AnimeMovie) {
                 this.posterUrl = cover; this.year = year
             }
-            TvType.OVA -> newAnimeSearchResponse(title, "wiz://anilist/$id", TvType.OVA) {
+            TvType.OVA -> newAnimeSearchResponse(title, "https://anilist.co/anime/$id", TvType.OVA) {
                 this.posterUrl = cover; this.year = year
             }
-            else -> newAnimeSearchResponse(title, "wiz://anilist/$id", TvType.Anime) {
+            else -> newAnimeSearchResponse(title, "https://anilist.co/anime/$id", TvType.Anime) {
                 this.posterUrl = cover; this.year = year
             }
         }
@@ -962,8 +970,10 @@ class WizstreamAnimeProvider : MainAPI() {
                 "include_image_language" to "en,null"
             ))
             if (extDetails != null) {
-                backdropUrl = extDetails.aOptStr("backdrop_path").aToTmdbImg("original")
-                    ?: backdropUrl
+                // (v50, re-applied in v52) AniList banner art wins; the TMDB
+                // backdrop is only a fallback when AniList has no banner.
+                backdropUrl = backdropUrl
+                    ?: extDetails.aOptStr("backdrop_path").aToTmdbImg("original")
                 logoUrl = aPickLogo(extDetails.optJSONObject("images")?.optJSONArray("logos"))
                     ?: imdbId?.let { "https://live.metahub.space/logo/medium/$it/img" }
                 // NOTE: do NOT override `actors` from TMDB credits — anime
