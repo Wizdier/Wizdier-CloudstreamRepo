@@ -2064,6 +2064,9 @@ override suspend fun resolve(
             t.replace(Regex("""\[[^\]]*\]"""), " ")
                 .replace(Regex("""\([^)]*\)"""), " ")
                 .replace(Regex("""(?i)\b(tv series|tv anime|anime|animation|cartoon|series)\b"""), " ")
+                // (v47) ordinal season wording: "HAIKYU!! 2nd Season" must
+                // bare down to "HAIKYU!!", not "HAIKYU!! 2nd".
+                .replace(Regex("""(?i)\b\d{1,2}(?:st|nd|rd|th)\b"""), " ")
                 .replace(Regex("""(?i)\bseasons?\b\.?\s*\d{0,2}"""), " ")
                 .replace(Regex("""(?i)\bs\d{1,2}\b"""), " ")
                 .replace(Regex("""(?i)\b(final|part|cour)\b\.?\s*\d{0,2}"""), " ")
@@ -2101,9 +2104,21 @@ override suspend fun resolve(
             // / symbol junk stripped when the raw query yields zero posts.
             // Downstream matching is unaffected (tier gates run on the
             // original query title).
+            // (v47) Third variant — the DECORATION-STRIPPED query itself.
+            // AniList uses TITLE-FORM season wording ("HAIKYU!! 2nd
+            // Season", "Shingeki no Kyojin Season 3 Part 2") while the
+            // site files FILE-FORM ("Haikyuu Season 2", "Shingeki no
+            // Kyojin S3"): no word-order/punctuation cleanup ever makes
+            // one a substring of the other, so even the punct-stripped
+            // term came back empty for every Haikyuu season. Reducing the
+            // query to its bare franchise words ("HAIKYU", "Shingeki no
+            // Kyojin") is what the tier-3 rescue then matches against.
             var searchResp: Pair<String, Boolean>? = null
-            val queryVariants = listOf(title, cleanedSearchTerm(title))
-                .filter { it.isNotBlank() }.distinct()
+            val queryVariants = listOf(
+                title,
+                cleanedSearchTerm(title),
+                cleanedSearchTerm(bareSeriesTitle(title)),
+            ).filter { it.isNotBlank() }.distinct()
             for (q in queryVariants) {
                 val resp = fetchWithFallback(
                     app,
@@ -2436,6 +2451,10 @@ override suspend fun resolve(
          *   "One Piece"          → null
          */
         private fun extractSeasonFromTitle(title: String): Int? {
+            // (v47) Match ordinal wording first: "Haikyuu 2nd Season" → 2.
+            Regex("(?i)\\b(\\d{1,2})(?:st|nd|rd|th)\\s+season\\b").find(title)?.let {
+                return it.groupValues.getOrNull(1)?.toIntOrNull()
+            }
             // Match "Season N" or "SeasonN" (case-insensitive).
             Regex("(?i)\\bseason\\s*(\\d+)\\b").find(title)?.let {
                 return it.groupValues.getOrNull(1)?.toIntOrNull()

@@ -413,13 +413,16 @@ class WizstreamAnimeProvider : MainAPI() {
                 dub = DubStatus.Subbed,
             ).toJson()) { name = "Movie" })
             else -> (1..episodes).map { epNum ->
-                val epMeta = detail.episodeMeta[epNum]
+                // (v47) Cours parts index into the SHARED season's meta:
+                // AoT S3 Part 2 row "1" wears TMDB s3 ep 13's name/still.
+                val epMeta = detail.episodeMeta[epNum + detail.sourceEpOffset]
                 newEpisode(LinkContext(
                     anilistId = id, imdbId = imdbId, tmdbId = tmdbId, malId = detail.malId,
                     season = 1, episode = epNum, title = title, altTitle = detail.altTitle,
                     isMovie = false, year = detail.year,
-                    // (v33) the site's season number for source lookups
-                    sourceSeason = if (detail.seasonOffset > 0) detail.seasonOffset + 1 else null,
+                    // (v47) the site-facing season + cours episode shift
+                    sourceSeason = detail.sourceSeason,
+                    sourceEpisodeOffset = detail.sourceEpOffset,
                     franchiseTitles = detail.franchiseTitles,
                     dub = DubStatus.Subbed,
                 ).toJson()) {
@@ -506,10 +509,14 @@ class WizstreamAnimeProvider : MainAPI() {
                 async(Dispatchers.IO) {
                     gate.withPermit {
                         val seasonForSources = ctx.sourceSeason ?: ctx.season
+                        // (v47) embed/TMDB-style hosts number episodes
+                        // inside the SHARED season pack — cours parts
+                        // shift by sourceEpisodeOffset (AoT S3 P2 ep 1 →
+                        // s3e13).
                         val embedUrl = if (ctx.isMovie || seasonForSources == null || ctx.episode == null) {
                             host.movie(id)
                         } else {
-                            host.tv(id, seasonForSources, ctx.episode)
+                            host.tv(id, seasonForSources, ctx.episode + ctx.sourceEpisodeOffset)
                         }
                         try {
                             val before = anyFound
@@ -555,7 +562,11 @@ class WizstreamAnimeProvider : MainAPI() {
                     // (v33) franchise-mapped season — the number the source
                     // site actually files this season under.
                     season = ctx.sourceSeason ?: ctx.season,
-                    episode = ctx.episode,
+                    // (v47) cours parts shift INTO the shared season pack
+                    // (AoT S3 Part 2 ep 1 → CircleFTP "Season 3" ep 13).
+                    // Anime-web resolvers below keep the RAW episode: they
+                    // key on the AniList entry itself, which splits cours.
+                    episode = ctx.episode?.let { it + ctx.sourceEpisodeOffset },
                     labelPrefix = "Wizstream-A",
                     subtitleCallback = { sub ->
                         if (seenSubs.add(sub.url)) subtitleCallback(sub)
@@ -649,11 +660,15 @@ class WizstreamAnimeProvider : MainAPI() {
         val trailerUrl: String?,
         val episodeMeta: Map<Int, EpisodeMeta>,
         val recommendations: List<JSONObject>,
-        // (v33) How many broadcast TV entries precede this one in its
-        // AniList prequel chain (0 for single-entry shows / S1). Used to map
-        // "separate-entry seasons" (Demon Slayer S2 = its own AniList entry)
-        // onto the season numbers the streaming sites actually use.
-        val seasonOffset: Int = 0,
+        // (v47, replaces v33's seasonOffset) The season number the SOURCE
+        // SITES and TMDB file this entry under, cours-aware: a "… Part 2"
+        // entry collapses onto its parent season instead of the next
+        // season slot (AoT S3 Part 2 → season 3, not 4).
+        val sourceSeason: Int? = null,
+        // (v47) Episode shift inside a cours-split season pack: Sum of the
+        // preceding cours' episode counts. AoT S3 Part 2 ep 1 → site/TMDB
+        // episode 13 of the shared 22-episode Season-3 pack. 0 otherwise.
+        val sourceEpOffset: Int = 0,
         // (v45) English+romaji titles of every counted prequel ancestor,
         // walk order (franchise root LAST). BDIX sites file multi-season
         // anime under the root title — these are the resolver search keys
@@ -726,7 +741,7 @@ class WizstreamAnimeProvider : MainAPI() {
                     voiceActorsJapanese: voiceActors(language: JAPANESE, sort: [RELEVANCE]) { name { full } image { large } }
                   }
                 }
-                relations { edges { node { id type title { romaji english } coverImage { large } format } relationType } }
+                relations { edges { node { id type episodes title { romaji english } coverImage { large } format } relationType } }
                 recommendations(sort: [RATING_DESC], perPage: 15) {
                   nodes { mediaRecommendation { id idMal title { romaji english native } coverImage { extraLarge large } bannerImage episodes format averageScore genres startDate { year } status } }
                 }
@@ -764,11 +779,18 @@ class WizstreamAnimeProvider : MainAPI() {
         // those to a single cour. Take the best-known total from every
         // signal AniList offers: final count, next airing episode − 1, or
         // the streamingEpisodes list length; only then fall back to 12.
+        // (v47) …but the streamingEpisodes list is NOT entry-scoped: for
+        // split cours (AoT S3 = 12 eps) Hulu/Crunchyroll attach the WHOLE
+        // temporada's 25-episode list, and maxOf() then inflated the page
+        // to 25 rows ("episode count stayed 25"). AniList's own total is
+        // authoritative whenever it exists; the fallbacks are ONLY for
+        // shows whose final count AniList genuinely doesn't know yet.
         val anilistTotal = media.aOptInt("episodes")?.takeIf { it > 0 } ?: 0
         val nextAiring = media.optJSONObject("nextAiringEpisode")
             ?.aOptInt("episode")?.minus(1) ?: 0
         val streamingCount = media.optJSONArray("streamingEpisodes")?.length() ?: 0
-        val episodes = maxOf(anilistTotal, nextAiring, streamingCount, 12)
+        val episodes = if (anilistTotal > 0) anilistTotal
+            else maxOf(nextAiring, streamingCount, 12)
         val format = media.aOptStr("format")
         val year = media.optJSONObject("startDate")?.optInt("year")?.takeIf { it != 0 }
         val genres = media.optJSONArray("genres")?.let { arr ->
@@ -884,9 +906,26 @@ class WizstreamAnimeProvider : MainAPI() {
         // inside the block below so episode metadata comes from the season
         // this AniList entry actually IS (hardcoded /season/1 used to show
         // Season-1 names/stills for every sequel season).
-        val (seasonOffsetEarly, franchiseTitlesEarly) = franchiseInfo(
+        // (v47) The walk now also yields per-hop episode counts so COURS
+        // entries ("… Season 3 Part 2") can map into the SHARED TMDB/site
+        // season they split: the season is the part's parent season, and
+        // episodes shift by the previous cours' totals.
+        val (seasonOffsetEarly, franchiseTitlesEarly, hopEpsEarly) = franchiseInfo(
             id, media.optJSONObject("relations")?.optJSONArray("edges")
         )
+        val partNumberEarly = titlePartNumber(title)
+        // The season number the SITES and TMDB actually file this entry
+        // under. Plain sequel (AoT S3) → offset+1; a cours part
+        // (AoT S3 Part 2) → offset, i.e. its parent season's own number.
+        val sourceSeasonEarly = (
+            if (partNumberEarly != null) seasonOffsetEarly else seasonOffsetEarly + 1
+        ).takeIf { it > 0 }
+        // Episode shift inside that shared season pack: sum of the
+        // (partNumber−1) immediately-preceding cours (AoT S3 P2 → +12,
+        // Haikyuu TO THE TOP P2 → +13). 0 for non-cours entries.
+        val sourceEpOffsetEarly = if (partNumberEarly != null && partNumberEarly > 1) {
+            hopEpsEarly.take(partNumberEarly - 1).filter { it > 0 }.sum()
+        } else 0
 
         if (tmdbId != null) {
             val kind = if (format == "MOVIE") "movie" else "tv"
@@ -904,15 +943,15 @@ class WizstreamAnimeProvider : MainAPI() {
                 aPickTrailer(extDetails.optJSONObject("videos")?.optJSONArray("results"))
                 simklId = fetchSimklId(imdbId, kind)
                 if (kind == "tv") {
-                    // (v46) Which TMDB season is this AniList entry?
-                    // Plain sequel entry (AoT S2) → offset+1; a COURS part
-                    // ("… Season 3 Part 2") belongs to the season it splits
-                    // → offset (its parent season's own number). When TMDB
-                    // has no such season the meta simply stays empty —
-                    // never the wrong season's 25 episodes.
-                    val tmdbSeason = if (seasonOffsetEarly > 0 &&
-                        coursSplitRegex.containsMatchIn(title)
-                    ) seasonOffsetEarly else seasonOffsetEarly + 1
+                    // (v47) Which TMDB season is this AniList entry? The
+                    // same sourceSeason the resolvers use: plain sequel
+                    // (AoT S3) → offset+1; a COURS part ("… Season 3
+                    // Part 2") → the parent season it splits (AoT S3 P2 →
+                    // TMDB s3, and its rows shift +12 via sourceEpOffset so
+                    // ep 1 wears the name/still of TMDB s3 ep 13). When
+                    // TMDB has no such season the meta simply stays empty
+                    // — never the wrong season's 25 episodes.
+                    val tmdbSeason = sourceSeasonEarly ?: (seasonOffsetEarly + 1)
                     val seasonJson = tmdbGet("/tv/$tmdbId/season/$tmdbSeason")
                     episodeMeta = seasonJson?.optJSONArray("episodes")?.let { arr ->
                         (0 until arr.length()).mapNotNull { i ->
@@ -945,7 +984,10 @@ class WizstreamAnimeProvider : MainAPI() {
         // Titan", never "Attack on Titan: The Final Season"), so the
         // root/ancestor titles are resolvers' best search keys.
         // (v46) Hoisted above the TMDB fetch; reuse its values here.
-        val seasonOffset = seasonOffsetEarly
+        // (v47) sourceSeason/sourceEpOffset come from the same walk via
+        // the cours-aware rule above.
+        val sourceSeason = sourceSeasonEarly
+        val sourceEpOffset = sourceEpOffsetEarly
         val franchiseTitles = franchiseTitlesEarly
 
         val malId = media.optInt("idMal", 0).takeIf { it != 0 }
@@ -971,7 +1013,8 @@ class WizstreamAnimeProvider : MainAPI() {
             trailerUrl = trailerUrl,
             episodeMeta = episodeMeta,
             recommendations = recs,
-            seasonOffset = seasonOffset,
+            sourceSeason = sourceSeason,
+            sourceEpOffset = sourceEpOffset,
             franchiseTitles = franchiseTitles,
         )
         META_CACHE[id] = now to detail
@@ -987,18 +1030,30 @@ class WizstreamAnimeProvider : MainAPI() {
      * titles (root franchise comes last in the list). Each extra hop costs
      * one tiny AniList query (≤6 hops; single-season shows stop after the
      * first edge scan with no prequel).
+     * (v47) Also returns the episode count of EVERY traversed hop in walk
+     * order (nearest prequel first). Cours entries ("… Season 3 Part 2")
+     * sit INSIDE the same TMDB/site season as their immediate prequel, so
+     * the sum of the first (partNumber−1) hop counts is exactly how far
+     * this entry's episode 1 is shifted inside that shared season pack
+     * (AoT S3 Part 2 → +12 → links/meta point at episodes 13-22).
      */
-    private suspend fun franchiseInfo(id: Int, initialEdges: JSONArray?): Pair<Int, List<String>> {
+    private suspend fun franchiseInfo(
+        id: Int,
+        initialEdges: JSONArray?,
+    ): Triple<Int, List<String>, List<Int>> {
         var offset = 0
         val titles = mutableListOf<String>()
+        val hopEps = mutableListOf<Int>()
         val visited = hashSetOf(id)
         var edges = initialEdges
         var hops = 0
         while (edges != null && hops < 6) {
             hops++
             var traverseId: Int? = null
+            var traverseEps: Int = 0
             var countId: Int? = null
             var countTitles: List<String>? = null
+            var countEps: Int = 0
             for (i in 0 until edges.length()) {
                 val e = edges.optJSONObject(i) ?: continue
                 if (!e.optString("relationType").equals("PREQUEL", true)) continue
@@ -1006,7 +1061,10 @@ class WizstreamAnimeProvider : MainAPI() {
                 if (!node.optString("type").equals("ANIME", true)) continue
                 val nid = node.optInt("id", 0).takeIf { it != 0 } ?: continue
                 if (nid in visited) continue
-                if (traverseId == null) traverseId = nid
+                if (traverseId == null) {
+                    traverseId = nid
+                    traverseEps = node.optInt("episodes", 0)
+                }
                 val fmt = node.optString("format")
                 val nTitle = node.optJSONObject("title")
                 val en = nTitle?.aOptStr("english")
@@ -1015,10 +1073,12 @@ class WizstreamAnimeProvider : MainAPI() {
                 if (fmt in franchiseBroadcastFormats && !coursSplitRegex.containsMatchIn(tstr)) {
                     countId = nid
                     countTitles = listOfNotNull(en, ro)
+                    countEps = node.optInt("episodes", 0)
                     break
                 }
             }
             val nextId = countId ?: traverseId ?: break
+            hopEps += (if (countId != null) countEps else traverseEps).takeIf { it > 0 } ?: 0
             if (countId != null) {
                 offset++
                 countTitles?.let { t ->
@@ -1033,14 +1093,44 @@ class WizstreamAnimeProvider : MainAPI() {
             val gql = """
             query (${'$'}id: Int) {
               Media(id: ${'$'}id, type: ANIME) {
-                relations { edges { node { id type format title { english romaji } } relationType } }
+                relations { edges { node { id type format episodes title { english romaji } } relationType } }
               }
             }
         """.trimIndent()
             val resp = anilistQuery(gql, JSONObject().put("id", nextId)) ?: break
             edges = resp.optJSONObject("Media")?.optJSONObject("relations")?.optJSONArray("edges")
         }
-        return offset to titles
+        return Triple(offset, titles, hopEps)
+    }
+
+    private val partNumberRegex = Regex(
+        """(?i)\b(?:part|cour)\s*(\d{1,2})\b|\bpart\s+([ivxlcdm]{1,5})\b"""
+    )
+
+    private fun romanToInt(s: String): Int? {
+        val vals = mapOf('i' to 1, 'v' to 5, 'x' to 10, 'l' to 50, 'c' to 100, 'd' to 500, 'm' to 1000)
+        var total = 0
+        var prev = 0
+        for (ch in s.lowercase().reversed()) {
+            val v = vals[ch] ?: return null
+            total += if (v < prev) -v else v
+            prev = v
+        }
+        return total.takeIf { it > 0 }
+    }
+
+    /**
+     * Which cour of a shared season is this AniList entry? "… Season 3
+     * Part 2" → 2, "2nd Cour" → 2. Cours marker without a readable
+     * number defaults to 2 (AniList never ships a "Part 1" entry name —
+     * part 1 is the counted base season itself). null = not a cours part.
+     */
+    private fun titlePartNumber(title: String): Int? {
+        if (!coursSplitRegex.containsMatchIn(title)) return null
+        val m = partNumberRegex.find(title) ?: return 2
+        return m.groupValues.getOrNull(1)?.takeIf { it.isNotBlank() }?.toIntOrNull()
+            ?: m.groupValues.getOrNull(2)?.takeIf { it.isNotBlank() }?.let(::romanToInt)
+            ?: 2
     }
 
     private suspend fun anilistQuery(
@@ -1194,6 +1284,10 @@ class WizstreamAnimeProvider : MainAPI() {
         // (v33) season number as the SOURCE SITE sees it (franchise offset
         // applied). null → use `season`.
         val sourceSeason: Int? = null,
+        // (v47) cours-split episode shift for site/TMDB addressing: added
+        // to `episode` at source-lookup time only (display/meta numbering
+        // stays 1-based per entry). 0 for non-cours entries.
+        val sourceEpisodeOffset: Int = 0,
         // (v45) counted prequel-ancestor titles (root last) — extra BDIX
         // search keys for multi-season franchise entries.
         val franchiseTitles: List<String>? = null,
@@ -1210,6 +1304,7 @@ class WizstreamAnimeProvider : MainAPI() {
             altTitle?.let { put("alt_title", it) }
             year?.let { put("year", it) }
             sourceSeason?.let { put("src_season", it) }
+            if (sourceEpisodeOffset != 0) put("src_epoff", sourceEpisodeOffset)
             franchiseTitles?.takeIf { it.isNotEmpty() }
                 ?.let { put("src_franchise", JSONArray(it)) }
             put("is_movie", isMovie)
@@ -1231,6 +1326,7 @@ class WizstreamAnimeProvider : MainAPI() {
                     year = o.aOptInt("year"),
                     isMovie = o.optBoolean("is_movie", false),
                     sourceSeason = o.aOptInt("src_season"),
+                    sourceEpisodeOffset = o.optInt("src_epoff", 0),
                     franchiseTitles = o.optJSONArray("src_franchise")?.let { arr ->
                         (0 until arr.length()).mapNotNull { arr.optString(it).takeIf { s -> s.isNotBlank() } }
                     },
