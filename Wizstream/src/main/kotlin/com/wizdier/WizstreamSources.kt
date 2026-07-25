@@ -45,6 +45,11 @@ object WizstreamSources {
         tmdbId: Int? = null,
         imdbId: String? = null,
         altTitle: String? = null,
+        // (v45) additional alternate titles from the Wizstream-Anime
+        // franchise-prequel walk (root season title etc.). Resolved as
+        // extra BDIX passes, each gated on "nothing found yet" so happy
+        // titles never pay extra network cost.
+        extraAltTitles: List<String> = emptyList(),
     ): Boolean = coroutineScope {
         if (title.isBlank() && tmdbId == null && imdbId == null) {
             return@coroutineScope false
@@ -126,6 +131,52 @@ object WizstreamSources {
             }
             if (altJobs.awaitAll().any { it }) found = true
         }
+
+        // ── (v45) Franchise-root passes for multi-season anime ──────────
+        // Sequel AniList entries ("Attack on Titan: The Final Season") are
+        // filed on BDIX sites under the franchise ROOT title ("Attack on
+        // Titan"). Wizstream-Anime supplies those root titles here; each
+        // extra pass re-runs ONLY while nothing has matched yet, so normal
+        // titles never pay for them.
+        extraAltTitles
+            .asSequence()
+            .filter { it.isNotBlank() }
+            .filterNot { it.equals(title, ignoreCase = true) }
+            .filterNot { it.equals(altTitle ?: "", ignoreCase = true) }
+            .distinctBy { it.lowercase() }
+            .take(3)
+            .toList()
+            .forEach { alt ->
+                if (found) return@forEach
+                val bdix = listOf(
+                    CineplexBdResolver, FtpBdResolver, CircleFtpResolver, CtgMoviesResolver,
+                    FmFtpResolver, MediaserverResolver,
+                )
+                val altJobs = bdix.map { src ->
+                    async(Dispatchers.IO) {
+                        gate.withPermit {
+                            runCatching {
+                                src.resolve(
+                                    app = app,
+                                    title = alt,
+                                    year = year,
+                                    isMovie = isMovie,
+                                    season = season,
+                                    episode = episode,
+                                    labelPrefix = labelPrefix,
+                                    subtitleCallback = subtitleCallback,
+                                    callback = callback,
+                                    tmdbId = tmdbId,
+                                    imdbId = imdbId,
+                                )
+                            }.onFailure { t ->
+                                Log.w(TAG, "franchise-alt resolver crashed: ${t.message}")
+                            }.getOrDefault(false)
+                        }
+                    }
+                }
+                if (altJobs.awaitAll().any { it }) found = true
+            }
         found
     }
 
@@ -1996,6 +2047,30 @@ override suspend fun resolve(
                 .trim()
                 .replace(Regex("\\s+"), " ")
 
+        /** (v45) Decoration-stripped post title for the tier-3 multi-season
+         *  rescue match: drops "(TV Series 2024-)"/"[Dual Audio]" wrappers,
+         *  season numbers, part/cour/final markers, quality/audio junk and
+         *  years — the residual string is the site's bare show name. */
+        private fun bareSeriesTitle(t: String): String =
+            t.replace(Regex("""\[[^\]]*\]"""), " ")
+                .replace(Regex("""\([^)]*\)"""), " ")
+                .replace(Regex("""(?i)\b(tv series|tv anime|anime|animation|cartoon|series)\b"""), " ")
+                .replace(Regex("""(?i)\bseasons?\b\.?\s*\d{0,2}"""), " ")
+                .replace(Regex("""(?i)\bs\d{1,2}\b"""), " ")
+                .replace(Regex("""(?i)\b(final|part|cour)\b\.?\s*\d{0,2}"""), " ")
+                .replace(
+                    Regex("""(?i)\b(dual|multi)[- ]?audio\b|\b\w{2,9}[- ](dub|dubbed|sub|subbed|audio)\b|\bdubbed\b"""),
+                    " "
+                )
+                .replace(
+                    Regex("""(?i)\b(480p|576p|720p|1080p|2160p|4k|uhd|hdrip|webrip|web-?dl|bluray|bdrip|brrip|hdtc|x264|x265|hevc|h\.?26[45]|aac|ac3|eac3|10bit|8bit|batch|uncut|extended)\b"""),
+                    " "
+                )
+                .replace(Regex("""\b(19|20)\d{2}\b"""), " ")
+                .replace(Regex("""[\s.,:;_\-!]+$"""), "")
+                .replace(Regex("""\s+"""), " ")
+                .trim()
+
         override suspend fun resolve(
             app: Requests,
             title: String,
@@ -2091,7 +2166,49 @@ override suspend fun resolve(
                     fuzzyFiltered += p.optInt("id", -1) to ptitle
                 }
             }
-            val matchingPostIds = identityFiltered.ifEmpty { fuzzyFiltered }
+            var matchingPostIds = identityFiltered.ifEmpty { fuzzyFiltered }
+
+            // ── (v45) TIER 3: multi-season anime rescue ─────────────────
+            // AniList files every anime season as a SEPARATE entry, so the
+            // resolver receives sequel titles like "Demon Slayer:
+            // Entertainment District Arc" while Circle FTP files the same
+            // show as "Demon Slayer (TV Series 2019-) Anime [Dual Audio]"
+            // (mega post) or "Demon Slayer Season 2" (per-season post) —
+            // both die at the strict AND fuzzy gates above. When the site
+            // IS requested for a series and nothing matched, accept posts
+            // whose DECORATION-STRIPPED bare title contains the query
+            // (forward) or is a clean prefix of it (reverse: the sequel's
+            // subtitle is always a trailing decoration). Episodes are still
+            // only ever taken from content seasons whose markers match the
+            // requested season (the v11 guard below), so a rescued post can
+            // never serve the wrong season — worst case it yields nothing.
+            if (matchingPostIds.isEmpty() && season != null && episode != null) {
+                val qNorm = title.normaliseTitle()
+                if (qNorm.length >= 4) {
+                    val rescue = mutableListOf<Pair<Int, String>>()
+                    for (i in 0 until postsArr.length()) {
+                        val p = postsArr.optJSONObject(i) ?: continue
+                        val ptitle = p.optString("title").ifBlank { p.optString("name") ?: "" }
+                        if (ptitle.isBlank()) continue
+                        val pNorm = bareSeriesTitle(ptitle).normaliseTitle()
+                        if (pNorm.length < 4) continue
+                        val forward = pNorm.contains(qNorm)
+                        val reverse = qNorm.startsWith(pNorm) &&
+                            (qNorm.length == pNorm.length || qNorm[pNorm.length] == ' ')
+                        if (forward || reverse) {
+                            rescue += p.optInt("id", -1) to ptitle
+                        }
+                    }
+                    if (rescue.isNotEmpty()) {
+                        Log.d(
+                            TAG,
+                            "CircleFTP: tier-3 season-aware rescue matched " +
+                                "${rescue.size} post(s) for '$title' s=$season e=$episode"
+                        )
+                        matchingPostIds = rescue
+                    }
+                }
+            }
             if (matchingPostIds.isEmpty()) {
                 Log.d(TAG, "CircleFTP: no match for '$title' (year=$year) — skipping")
                 return false

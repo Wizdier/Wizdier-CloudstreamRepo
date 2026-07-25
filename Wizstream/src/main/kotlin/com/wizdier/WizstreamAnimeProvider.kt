@@ -10,6 +10,8 @@ import com.lagradost.cloudstream3.LoadResponse.Companion.addSimklId
 import com.lagradost.cloudstream3.LoadResponse.Companion.addTrailer
 import com.lagradost.cloudstream3.Score
 import com.lagradost.cloudstream3.syncproviders.SyncIdName
+import com.lagradost.cloudstream3.syncproviders.AccountManager
+import com.lagradost.cloudstream3.syncproviders.SyncRepo
 import com.lagradost.cloudstream3.utils.*
 import kotlinx.coroutines.*
 import kotlinx.coroutines.sync.Semaphore
@@ -248,7 +250,7 @@ class WizstreamAnimeProvider : MainAPI() {
     //  Main pages
     // ═══════════════════════════════════════════════════════════════════════
 
-    override val mainPage = mainPageOf(
+    private val defaultMainPages = mainPageOf(
         "trending" to "Trending Anime",
         "airing" to "Airing Now (Ongoing Series)",
         "popular" to "Popular This Season",
@@ -257,7 +259,33 @@ class WizstreamAnimeProvider : MainAPI() {
         "alltime" to "All-Time Popular",
     )
 
+    // (v45) Personal AniList rows — they appear ONLY while the user is
+    // logged into AniList inside Cloudstream (Settings → Accounts). The
+    // getter is evaluated on every home open, so logging in or out takes
+    // effect without a restart.
+    private val userMainPages = mainPageOf(
+        "my_watching" to "⏯ Watching — My AniList",
+        "my_planning" to "📋 Plan to Watch — My AniList",
+    )
+
+    override val mainPage: List<MainPageData>
+        get() = if (anilistAuthToken() != null) userMainPages + defaultMainPages
+            else defaultMainPages
+
+    /** Access token for the Cloudstream-logged-in AniList account (null
+     *  when logged out). Reads the app's account store via SyncRepo;
+     *  wrapped in runCatching so any auth-layer API change simply behaves
+     *  as "logged out" instead of crashing the homepage. */
+    private fun anilistAuthToken(): String? = runCatching {
+        SyncRepo(AccountManager.aniListApi).authToken()?.accessToken
+            ?.takeIf { it.isNotBlank() }
+    }.getOrNull()
+
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
+        // (v45) Personal AniList rows — served from the logged-in account.
+        if (request.data == "my_watching" || request.data == "my_planning") {
+            return myAnilistPage(page, request)
+        }
         val perPage = 30
         val cfg: PageCfg = when (request.data) {
             "trending" -> PageCfg(sort = listOf("TRENDING_DESC"))
@@ -362,6 +390,7 @@ class WizstreamAnimeProvider : MainAPI() {
                 anilistId = id, imdbId = imdbId, tmdbId = tmdbId, malId = detail.malId,
                 season = null, episode = null, title = title, altTitle = detail.altTitle,
                 isMovie = true, year = detail.year,
+                franchiseTitles = detail.franchiseTitles,
                 dub = DubStatus.Subbed,
             ).toJson()) { name = "Movie" })
             else -> (1..episodes).map { epNum ->
@@ -372,6 +401,7 @@ class WizstreamAnimeProvider : MainAPI() {
                     isMovie = false, year = detail.year,
                     // (v33) the site's season number for source lookups
                     sourceSeason = if (detail.seasonOffset > 0) detail.seasonOffset + 1 else null,
+                    franchiseTitles = detail.franchiseTitles,
                     dub = DubStatus.Subbed,
                 ).toJson()) {
                     name = epMeta?.title ?: "Episode $epNum"
@@ -521,6 +551,10 @@ class WizstreamAnimeProvider : MainAPI() {
                     tmdbId = ctx.tmdbId,
                     imdbId = ctx.imdbId,
                     altTitle = ctx.altTitle,
+                    // (v45) franchise-root titles from the prequel walk —
+                    // the search key that actually exists on BDIX sites
+                    // for sequel-season entries.
+                    extraAltTitles = ctx.franchiseTitles ?: emptyList(),
                 )
             }.getOrDefault(false)
         }
@@ -601,6 +635,11 @@ class WizstreamAnimeProvider : MainAPI() {
         // "separate-entry seasons" (Demon Slayer S2 = its own AniList entry)
         // onto the season numbers the streaming sites actually use.
         val seasonOffset: Int = 0,
+        // (v45) English+romaji titles of every counted prequel ancestor,
+        // walk order (franchise root LAST). BDIX sites file multi-season
+        // anime under the root title — these are the resolver search keys
+        // that fix sequel-entry resolution.
+        val franchiseTitles: List<String> = emptyList(),
     )
 
     private fun parseAnilistUrl(url: String): Int? {
@@ -666,7 +705,6 @@ class WizstreamAnimeProvider : MainAPI() {
                     role
                     node { id name { full } image { large } }
                     voiceActorsJapanese: voiceActors(language: JAPANESE, sort: [RELEVANCE]) { name { full } image { large } }
-                    voiceActorsEnglish: voiceActors(language: ENGLISH, sort: [RELEVANCE]) { name { full } image { large } }
                   }
                 }
                 relations { edges { node { id type title { romaji english } coverImage { large } format } relationType } }
@@ -763,28 +801,21 @@ class WizstreamAnimeProvider : MainAPI() {
         // ── Extract cast from AniList (NOT TMDB) ──────────────────────────
         // AniList's `characters.edges[]` provides:
         //   • node.id / node.name.full / node.image.large — character
-        //   • voiceActors[Japanese|English][0]            — best-match VA
+        //   • voiceActorsJapanese[0]         — best-match Japanese VA
         // Cloudstream ActorData: actor = character (main avatar),
-        // voiceActor = actual voice actor (secondary avatar).
-        // (v31) 25 MAIN+SUPPORTING characters with JA + EN voice actors.
-        // (v43 fix) DUPLICATE CAST ELIMINATED — two duplicate classes:
-        //   1. AniList itself sometimes lists the SAME character in several
-        //      edges (long-running shows) → edges are now merged by node id
-        //      (name as fallback), keeping the first (MAIN) role.
-        //   2. The v31 JA/EN split emitted ONE CARD PER LANGUAGE, so every
-        //      character appeared twice in the picker → now ONE card per
-        //      character with the Japanese VA as dual avatar (the site's
-        //      convention mirrors Circle FTP); when an English VA also
-        //      exists, its name rides along in the role subtitle
-        //      ("Main · EN: Bryce Papenbrook") — zero information lost,
-        //      zero duplicate cards.
+        // voiceActor = Japanese voice actor (secondary avatar).
+        // (v31) 25 MAIN+SUPPORTING characters.
+        // (v45) JAPANESE-CAST-ONLY, per user request: no English VA is
+        //   fetched or displayed. Each character renders EXACTLY ONE card
+        //   (repeated AniList edges merged by node id) with the JA VA as
+        //   dual avatar; characters with no JA VA on AniList still get
+        //   their character card (no VA avatar) — never an EN substitute.
         actors = media.optJSONObject("characters")?.optJSONArray("edges")?.let { edges ->
             class CharAgg(
                 val name: String,
                 val image: String?,
                 var role: String,
                 var jaVa: Actor?,
-                var enVa: Actor?,
             )
             val byChar = LinkedHashMap<String, CharAgg>()
             for (i in 0 until edges.length()) {
@@ -799,7 +830,7 @@ class WizstreamAnimeProvider : MainAPI() {
                         node.optJSONObject("image")?.aOptStr("large"),
                         edge.aOptStr("role")?.lowercase()
                             ?.replaceFirstChar { it.uppercase() } ?: "Main",
-                        null, null,
+                        null,
                     )
                 }
                 if (agg.role != "Main") {
@@ -814,32 +845,16 @@ class WizstreamAnimeProvider : MainAPI() {
                         }
                     }
                 }
-                if (agg.enVa == null) {
-                    edge.optJSONArray("voiceActorsEnglish")?.optJSONObject(0)?.let { va ->
-                        va.optJSONObject("name")?.aOptStr("full")?.let { vaName ->
-                            agg.enVa = Actor(vaName, va.optJSONObject("image")?.aOptStr("large"))
-                        }
-                    }
-                }
             }
             val out = mutableListOf<ActorData>()
             byChar.values.forEach { agg ->
-                val ja = agg.jaVa
-                val en = agg.enVa
-                val primary = ja ?: en
-                if (primary == null) {
-                    out += ActorData(actor = Actor(agg.name, agg.image), roleString = agg.role)
+                out += if (agg.jaVa == null) {
+                    ActorData(actor = Actor(agg.name, agg.image), roleString = agg.role)
                 } else {
-                    val roleStr = when {
-                        ja != null && en != null && !en.name.equals(ja.name, true) ->
-                            agg.role + " · EN: " + en.name
-                        ja == null && en != null -> agg.role + " (EN dub)"
-                        else -> agg.role
-                    }
-                    out += ActorData(
+                    ActorData(
                         actor = Actor(agg.name, agg.image),
-                        roleString = roleStr,
-                        voiceActor = primary,
+                        roleString = agg.role,
+                        voiceActor = agg.jaVa,
                     )
                 }
             }
@@ -889,7 +904,11 @@ class WizstreamAnimeProvider : MainAPI() {
         // Cours splits ("… Part 2") are traversed but NOT counted, so
         // cours-inflated AniList numbering stays aligned with TMDB/site
         // season numbers (AoT "Final Season" → site Season 4).
-        val seasonOffset = franchiseSeasonOffset(
+        // (v45) The walk ALSO harvests every counted ancestor's titles —
+        // BDIX sites file everything under the franchise ROOT ("Attack on
+        // Titan", never "Attack on Titan: The Final Season"), so the
+        // root/ancestor titles are resolvers' best search keys.
+        val (seasonOffset, franchiseTitles) = franchiseInfo(
             id, media.optJSONObject("relations")?.optJSONArray("edges")
         )
 
@@ -917,6 +936,7 @@ class WizstreamAnimeProvider : MainAPI() {
             episodeMeta = episodeMeta,
             recommendations = recs,
             seasonOffset = seasonOffset,
+            franchiseTitles = franchiseTitles,
         )
         META_CACHE[id] = now to detail
         return detail
@@ -927,11 +947,14 @@ class WizstreamAnimeProvider : MainAPI() {
 
     /**
      * Count broadcast-format TV entries preceding [id] in its AniList
-     * PREQUEL chain. Each extra hop costs one tiny AniList query (≤6 hops;
-     * single-season shows stop after the first edge scan with no prequel).
+     * PREQUEL chain, and harvest each counted ancestor's English+romaji
+     * titles (root franchise comes last in the list). Each extra hop costs
+     * one tiny AniList query (≤6 hops; single-season shows stop after the
+     * first edge scan with no prequel).
      */
-    private suspend fun franchiseSeasonOffset(id: Int, initialEdges: JSONArray?): Int {
+    private suspend fun franchiseInfo(id: Int, initialEdges: JSONArray?): Pair<Int, List<String>> {
         var offset = 0
+        val titles = mutableListOf<String>()
         val visited = hashSetOf(id)
         var edges = initialEdges
         var hops = 0
@@ -939,6 +962,7 @@ class WizstreamAnimeProvider : MainAPI() {
             hops++
             var traverseId: Int? = null
             var countId: Int? = null
+            var countTitles: List<String>? = null
             for (i in 0 until edges.length()) {
                 val e = edges.optJSONObject(i) ?: continue
                 if (!e.optString("relationType").equals("PREQUEL", true)) continue
@@ -949,14 +973,26 @@ class WizstreamAnimeProvider : MainAPI() {
                 if (traverseId == null) traverseId = nid
                 val fmt = node.optString("format")
                 val nTitle = node.optJSONObject("title")
-                val tstr = nTitle?.aOptStr("english") ?: nTitle?.aOptStr("romaji") ?: ""
+                val en = nTitle?.aOptStr("english")
+                val ro = nTitle?.aOptStr("romaji")
+                val tstr = en ?: ro ?: ""
                 if (fmt in franchiseBroadcastFormats && !coursSplitRegex.containsMatchIn(tstr)) {
                     countId = nid
+                    countTitles = listOfNotNull(en, ro)
                     break
                 }
             }
             val nextId = countId ?: traverseId ?: break
-            if (countId != null) offset++
+            if (countId != null) {
+                offset++
+                countTitles?.let { t ->
+                    t.forEach { cand ->
+                        if (cand.isNotBlank() && titles.none { it.equals(cand, true) }) {
+                            titles += cand
+                        }
+                    }
+                }
+            }
             visited += nextId
             val gql = """
             query (${'$'}id: Int) {
@@ -968,25 +1004,94 @@ class WizstreamAnimeProvider : MainAPI() {
             val resp = anilistQuery(gql, JSONObject().put("id", nextId)) ?: break
             edges = resp.optJSONObject("Media")?.optJSONObject("relations")?.optJSONArray("edges")
         }
-        return offset
+        return offset to titles
     }
 
-    private suspend fun anilistQuery(query: String, variables: JSONObject): JSONObject? =
+    private suspend fun anilistQuery(
+        query: String,
+        variables: JSONObject,
+        bearerToken: String? = null,
+    ): JSONObject? =
         runCatching {
             val body = JSONObject().apply {
                 put("query", query); put("variables", variables)
             }.toString().toRequestBody("application/json".toMediaTypeOrNull())
+            val headers = mutableMapOf(
+                "User-Agent" to A_UA,
+                "Content-Type" to "application/json",
+                "Accept" to "application/json",
+            )
+            if (!bearerToken.isNullOrBlank()) headers["Authorization"] = "Bearer $bearerToken"
             val res = app.post(ANILIST_ENDPOINT,
-                headers = mapOf(
-                    "User-Agent" to A_UA,
-                    "Content-Type" to "application/json",
-                    "Accept" to "application/json",
-                ),
+                headers = headers,
                 requestBody = body,
                 timeout = 12_000)
             if (res.code !in 200..299) null
             else JSONObject(res.text).optJSONObject("data")
         }.getOrNull()
+
+    // ── (v45) Personal AniList homepage rows ─────────────────────────────
+    // Served ONLY while the user is logged into AniList in Cloudstream.
+    // The whole MediaListCollection arrives in one authed call; we cache it
+    // for 5 minutes and paginate client-side so home-page paging stays free.
+    private val myListCache = ConcurrentHashMap<String, Pair<Long, List<SearchResponse>>>()
+
+    private suspend fun myAnilistPage(page: Int, request: MainPageRequest): HomePageResponse {
+        val perPage = 30
+        val status = if (request.data == "my_watching") "CURRENT" else "PLANNING"
+        val token = anilistAuthToken()
+            ?: return newHomePageResponse(request.name, emptyList(), hasNext = false)
+
+        val cacheKey = "$status:" + token.takeLast(6)
+        val now = System.currentTimeMillis()
+        val cached = myListCache[cacheKey]
+        val all: List<SearchResponse> = if (cached != null && now - cached.first < 5 * 60_000) {
+            cached.second
+        } else {
+            fetchMyList(status, token).also { myListCache[cacheKey] = now to it }
+        }
+        val from = (page - 1) * perPage
+        val items = all.drop(from).take(perPage)
+        return newHomePageResponse(
+            request.name, items, hasNext = from + items.size < all.size
+        )
+    }
+
+    private suspend fun fetchMyList(status: String, token: String): List<SearchResponse> {
+        val gql = """
+            query (${'$'}status: [MediaListStatus]) {
+              Viewer { id }
+              MediaListCollection(type: ANIME, status_in: ${'$'}status, sort: UPDATED_TIME_DESC) {
+                lists {
+                  entries {
+                    progress status updatedAt
+                    media {
+                      id idMal title { romaji english native }
+                      coverImage { extraLarge large }
+                      bannerImage episodes format season seasonYear
+                      averageScore genres startDate { year } status
+                    }
+                  }
+                }
+              }
+            }
+        """.trimIndent()
+        val variables = JSONObject().apply { put("status", JSONArray(listOf(status))) }
+        val data = anilistQuery(gql, variables, token) ?: return emptyList()
+        val out = mutableListOf<SearchResponse>()
+        data.optJSONObject("MediaListCollection")?.optJSONArray("lists")?.let { lists ->
+            for (i in 0 until lists.length()) {
+                lists.optJSONObject(i)?.optJSONArray("entries")?.let { entries ->
+                    for (j in 0 until entries.length()) {
+                        entries.optJSONObject(j)?.optJSONObject("media")?.let { m ->
+                            mediaToSearch(m)?.let(out::add)
+                        }
+                    }
+                }
+            }
+        }
+        return out
+    }
 
     private suspend fun tmdbGet(path: String, q: Map<String, Any?> = emptyMap()): JSONObject? =
         runCatching {
@@ -1034,6 +1139,9 @@ class WizstreamAnimeProvider : MainAPI() {
         // (v33) season number as the SOURCE SITE sees it (franchise offset
         // applied). null → use `season`.
         val sourceSeason: Int? = null,
+        // (v45) counted prequel-ancestor titles (root last) — extra BDIX
+        // search keys for multi-season franchise entries.
+        val franchiseTitles: List<String>? = null,
         val dub: DubStatus = DubStatus.Subbed,
     ) {
         fun toJson(): String = JSONObject().apply {
@@ -1047,6 +1155,8 @@ class WizstreamAnimeProvider : MainAPI() {
             altTitle?.let { put("alt_title", it) }
             year?.let { put("year", it) }
             sourceSeason?.let { put("src_season", it) }
+            franchiseTitles?.takeIf { it.isNotEmpty() }
+                ?.let { put("src_franchise", JSONArray(it)) }
             put("is_movie", isMovie)
             put("dub", dub.ordinal)
         }.toString()
@@ -1066,6 +1176,9 @@ class WizstreamAnimeProvider : MainAPI() {
                     year = o.aOptInt("year"),
                     isMovie = o.optBoolean("is_movie", false),
                     sourceSeason = o.aOptInt("src_season"),
+                    franchiseTitles = o.optJSONArray("src_franchise")?.let { arr ->
+                        (0 until arr.length()).mapNotNull { arr.optString(it).takeIf { s -> s.isNotBlank() } }
+                    },
                     dub = DubStatus.values().getOrElse(o.optInt("dub", 0)) { DubStatus.Subbed },
                 ).also { require(it.anilistId != 0) }
             }
