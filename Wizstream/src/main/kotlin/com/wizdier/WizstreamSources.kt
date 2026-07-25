@@ -2056,6 +2056,40 @@ override suspend fun resolve(
                 .replace(Regex("""\s+"""), " ")
                 .trim()
 
+        // (v48) ── Anime-category BROWSE rescue ──────────────────────────
+        // The user's saved proof ("Haikyuu!! (TV Series 2014-2020) Anime
+        // [Dual Audio] [Eng＋Japanese]") showed Haikyuu/Final/Part-2 kept
+        // failing despite every search widening: the server-side search
+        // simply isn't a plain substring match we can steer from outside
+        // Bangladesh. The standalone's own anime listing, however, is a
+        // plain paged catalogue (categoryExact=21, "Anime Series") — so for
+        // SERIES requests we can walk it ourselves and run the same tier
+        // gates client-side, which is exactly what a human browsing the
+        // site does. Cached 10 minutes; pages stop on an empty/short page.
+        private var animeCategoryCache: Pair<Long, List<org.json.JSONObject>>? = null
+
+        private suspend fun animeCategoryPosts(app: Requests): List<org.json.JSONObject> {
+            val now = System.currentTimeMillis()
+            animeCategoryCache?.let { (ts, posts) ->
+                if (now - ts < 10 * 60_000L) return posts
+            }
+            val out = mutableListOf<org.json.JSONObject>()
+            for (page in 1..12) {
+                val resp = fetchWithFallback(
+                    app,
+                    primary = "$PRIMARY_API/api/posts?categoryExact=21&page=$page&order=desc&limit=60",
+                    fallback = "$FALLBACK_API/api/posts?categoryExact=21&page=$page&order=desc&limit=60",
+                )?.first ?: break
+                val arr = runCatching { JSONObject(resp).optJSONArray("posts") }.getOrNull() ?: break
+                val len = arr.length()
+                if (len == 0) break
+                for (i in 0 until len) arr.optJSONObject(i)?.let { out += it }
+                if (len < 60) break
+            }
+            animeCategoryCache = now to out
+            return out
+        }
+
         /** (v45) Decoration-stripped post title for the tier-3 multi-season
          *  rescue match: drops "(TV Series 2024-)"/"[Dual Audio]" wrappers,
          *  season numbers, part/cour/final markers, quality/audio junk and
@@ -2252,6 +2286,52 @@ override suspend fun resolve(
                     }
                 }
             }
+            // ── (v48) Anime-category browse rescue ───────────────────────
+            // The text search is opaque (not plain substring — final and
+            // cours entries got zero rows despite correct titles). For
+            // SERIES requests, walk the anime catalogue pages ourselves
+            // and run the same strict→fuzzy→tier-3 gates client-side.
+            if (matchingPostIds.isEmpty() && season != null && episode != null) {
+                val catPosts = animeCategoryPosts(app)
+                if (catPosts.isNotEmpty()) {
+                    val qNorm = title.normaliseTitle()
+                    val identity = mutableListOf<Pair<Int, String>>()
+                    val fuzzy = mutableListOf<Pair<Int, String>>()
+                    val rescue = mutableListOf<Pair<Int, String>>()
+                    for (p in catPosts) {
+                        val ptitle = p.optString("title").ifBlank { p.optString("name") ?: "" }
+                        if (ptitle.isBlank()) continue
+                        val postYear = Regex("\\b(19|20)\\d{2}\\b").find(ptitle)?.value?.toIntOrNull()
+                        val effectiveYear = year ?: postYear
+                        if (isSameMediaTitle(ptitle, title, effectiveYear)) {
+                            identity += p.optInt("id", -1) to ptitle
+                            continue
+                        }
+                        if (isFuzzySameMedia(ptitle, title, effectiveYear)) {
+                            fuzzy += p.optInt("id", -1) to ptitle
+                            continue
+                        }
+                        if (qNorm.length >= 4) {
+                            val pNorm = bareSeriesTitle(ptitle).normaliseTitle()
+                            if (pNorm.length < 4) continue
+                            val forward = pNorm.contains(qNorm)
+                            val reverse = qNorm.startsWith(pNorm) &&
+                                (qNorm.length == pNorm.length || qNorm[pNorm.length] == ' ')
+                            if (forward || reverse) {
+                                rescue += p.optInt("id", -1) to ptitle
+                            }
+                        }
+                    }
+                    matchingPostIds = identity.ifEmpty { fuzzy.ifEmpty { rescue } }
+                    if (matchingPostIds.isNotEmpty()) {
+                        Log.d(
+                            TAG,
+                            "CircleFTP: anime-category browse matched " +
+                                "${matchingPostIds.size} post(s) for '$title' s=$season e=$episode"
+                        )
+                    }
+                }
+            }
             if (matchingPostIds.isEmpty()) {
                 Log.d(TAG, "CircleFTP: no match for '$title' (year=$year) — skipping")
                 return false
@@ -2367,10 +2447,15 @@ override suspend fun resolve(
                     //   • The post title explicitly says "Season N" matching
                     //     the requested season (so content[0] IS the
                     //     requested season), OR
-                    //   • The post title has no "Season N" marker (so this
-                    //     is likely a single-season post).
+                    //   • The post title has no "Season N" marker AND the
+                    //     post holds exactly ONE season bucket (a genuine
+                    //     single-season post). (v48: the mark-less mega
+                    //     posts — "Attack on Titan (TV Series 2013-)" —
+                    //     previously served Season 1's episodes for ANY
+                    //     missing season bucket, silently wrong.)
                     if (episodesArray == null || episodesArray.length() == 0) {
-                        val canFallbackToContent0 = titleSeasonNum == null || titleSeasonNum == seasonToUse
+                        val canFallbackToContent0 = titleSeasonNum == seasonToUse ||
+                            (titleSeasonNum == null && contentArray.length() == 1)
                         if (canFallbackToContent0) {
                             seasonObj = contentArray.optJSONObject(0)
                             episodesArray = seasonObj?.optJSONArray("episodes")
