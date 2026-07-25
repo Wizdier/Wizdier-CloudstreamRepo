@@ -923,20 +923,43 @@ class WizstreamAnimeProvider : MainAPI() {
             malId = media.optInt("idMal", 0).takeIf { it != 0 },
             format = format,
         )
-        val (members, franchiseTitles) = if (format == "MOVIE") {
+        // (v49) Standalone OVAs/specials/movies render as single-entry
+        // pages — opening an OVA must not drag the whole TV chain into
+        // its page. (ONA stays chain-capable: AniList files several TV
+        // seasons as ONA, e.g. Rent-a-Girlfriend S4.)
+        val chainAllowed = format != "MOVIE" && format != "OVA" &&
+            format != "SPECIAL" && format != "MUSIC"
+        // (v49) Title-stem gate for franchiseChain: candidates must share
+        // the franchise's title stem; anchor = the OPENED entry's en+ro
+        // (normalised alnum-only; arc suffixes still contain the root, an
+        // unrelated spin-off like One Piece's MONSTERS ONA fails and
+        // terminates that walk direction instead of faking a Season 1).
+        val gateStems = listOfNotNull(title, altTitle)
+            .map { it.lowercase().replace(Regex("""[^a-z0-9]+"""), "") }
+            .filter { it.length >= 4 }.distinct()
+        val (members, franchiseTitles) = if (!chainAllowed) {
             listOf(openedMember) to emptyList()
         } else {
             franchiseChain(
-                id, media.optJSONObject("relations")?.optJSONArray("edges"), openedMember
+                id,
+                media.optJSONObject("relations")?.optJSONArray("edges"),
+                openedMember,
+                gateStems,
             )
         }
-        // Fold into stacked (site-style) seasons. A cours part joins the
-        // season its direct prequel opened and continues its numbering
-        // (AoT S3=12 rows, S3 Part 2 continues at 13 → stacked 22).
+        // Fold into stacked (site-style) seasons. A cours part (Part 2+)
+        // joins the season its direct prequel opened and continues its
+        // numbering (AoT S3=12 rows, S3 Part 2 continues at 13 → stacked
+        // 22). (v49) A "… Part 1" entry STARTS a fresh season (JJK "The
+        // Culling Game Part 1" is Season 3, not a tail of Season 2), and
+        // unaired 0-episode members (announced sequels AniList lists with
+        // no count) are hidden instead of becoming phantom seasons.
         var seasonCounter = 0
         var nextStart = 1
         members.forEach { m ->
-            if (titlePartNumber(m.title) == null || seasonCounter == 0) {
+            if (m.episodes <= 0) return@forEach
+            val partNum = titlePartNumber(m.title)
+            if (partNum == null || partNum == 1 || seasonCounter == 0) {
                 seasonCounter++
                 m.siteSeason = seasonCounter
                 m.seasonStart = 1
@@ -947,7 +970,7 @@ class WizstreamAnimeProvider : MainAPI() {
             nextStart = m.seasonStart + m.episodes
         }
 
-        // (v48) If ani.zip has no TMDB id for this entry, try a bare TMDB
+            // (v48) If ani.zip has no TMDB id for this entry, try a bare TMDB
         // title search (Japanese-original preference) — soft enrichment,
         // only ever touches metadata, never which links play.
         if (tmdbId == null && format != "MOVIE") {
@@ -971,17 +994,75 @@ class WizstreamAnimeProvider : MainAPI() {
                 aPickTrailer(extDetails.optJSONObject("videos")?.optJSONArray("results"))
                 simklId = fetchSimklId(imdbId, kind)
                 if (kind == "tv") {
-                    // ONE TMDB season fetch per stacked season on the page.
+                    // ONE TMDB season fetch per stacked season on the page,
+                    // in parallel (season blurbs are the last page-load cost).
                     val runtimeHint = media.aOptInt("duration")
-                    val neededSeasons = members.map { it.siteSeason }.distinct().filter { it > 0 }
+                    val neededSeasons = members.filter { it.episodes > 0 }
+                        .map { it.siteSeason }.distinct().filter { it > 0 }
+                    val metaBySeason = coroutineScope {
+                        neededSeasons.map { s ->
+                            async(Dispatchers.IO) { s to tmdbSeasonMeta(tmdbId!!, s, runtimeHint) }
+                        }.awaitAll().toMap()
+                    }
+                    // (v49) ARC re-fold: TMDB sometimes packs TWO AniList
+                    // arc-entries into ONE season — Demon Slayer "Mugen
+                    // Train Arc" (7) + "Entertainment District Arc" (11) =
+                    // TMDB s2's 18. When a stacked season is SHORTER than
+                    // TMDB's counterpart and the NEXT member in the chain
+                    // fills the remainder EXACTLY, pull it into the same
+                    // bucket and continue numbering. Conservative: only
+                    // exact fits (7+11 == 18), only when TMDB's length is
+                    // actually known (a successful /season call).
+                    // Recount seasonStart along the chain-ordered members.
+                    // (The members list IS in chain order; the re-fold only
+                    // ever mutates siteSeason, never list order.)
+                    fun recount() {
+                        var prevSeason = -1
+                        var rstart = 1
+                        members.filter { it.episodes > 0 }.forEach { m ->
+                            if (m.siteSeason != prevSeason) {
+                                rstart = 1
+                                prevSeason = m.siteSeason
+                            }
+                            m.seasonStart = rstart
+                            rstart += m.episodes
+                        }
+                    }
+                    var guard = 0
+                    var changed = true
+                    while (changed && guard < 8) {
+                        guard++
+                        changed = false
+                        val alive = members.filter { it.episodes > 0 }
+                        alive.forEachIndexed { idx, m ->
+                            if (changed) return@forEachIndexed
+                            val s = m.siteSeason
+                            val len = (metaBySeason[s] ?: emptyMap()).size
+                            if (len <= 0) return@forEachIndexed
+                            // is m the LAST member of its season?
+                            val isLastOfSeason = alive.getOrNull(idx + 1)?.siteSeason != s
+                            if (!isLastOfSeason) return@forEachIndexed
+                            val sum = alive.filter { it.siteSeason == s }.sumOf { it.episodes }
+                            if (sum >= len) return@forEachIndexed
+                            val nxt = alive.getOrNull(idx + 1) ?: return@forEachIndexed
+                            // only fold a COUNTED arc entry (never a cours part)
+                            if (titlePartNumber(nxt.title) != null) return@forEachIndexed
+                            if (sum + nxt.episodes == len) {
+                                nxt.siteSeason = s
+                                changed = true
+                            }
+                        }
+                        if (changed) recount()
+                    }
                     // Absolute-index seeds per stacked season (for the
-                    // absolute-packed fallback below).
+                    // absolute-packed fallback below) — AFTER the re-fold.
                     val absStartBySeason = HashMap<Int, Int>()
                     var absRun = 1
-                    neededSeasons.sorted().forEach { s ->
-                        absStartBySeason[s] = absRun
-                        absRun += members.filter { it.siteSeason == s }.sumOf { it.episodes }
-                    }
+                    members.filter { it.episodes > 0 }
+                        .map { it.siteSeason }.distinct().sorted().forEach { s ->
+                            absStartBySeason[s] = absRun
+                            absRun += members.filter { it.siteSeason == s }.sumOf { it.episodes }
+                        }
                     // (v48) Absolute-style TMDB shows ("Rent-a-Girlfriend"
                     // files all 60 episodes under season 1 — season 3
                     // simply doesn't exist there, which is why those pages
@@ -998,7 +1079,7 @@ class WizstreamAnimeProvider : MainAPI() {
                         realTmdbSeasons.all { it == 1 } && neededSeasons.any { it > 1 }
                     var absoluteSeason1: Map<Int, EpisodeMeta>? = null
                     neededSeasons.forEach { s ->
-                        var meta = tmdbSeasonMeta(tmdbId!!, s, runtimeHint)
+                        var meta = metaBySeason[s] ?: emptyMap()
                         if (meta.isEmpty() && s > 1 && absolutePacked) {
                             if (absoluteSeason1 == null) {
                                 absoluteSeason1 = tmdbSeasonMeta(tmdbId!!, 1, runtimeHint)
@@ -1155,7 +1236,17 @@ class WizstreamAnimeProvider : MainAPI() {
         id: Int,
         initialEdges: JSONArray?,
         opened: FranchiseMember,
+        gateStems: List<String> = emptyList(),
     ): Pair<List<FranchiseMember>, List<String>> {
+        // (v49) A broadcast candidate failing the stem gate ends its walk
+        // direction (prequel AND sequel sides). Bridges (OVA/movie link
+        // nodes) traverse unchecked — they never join the page.
+        fun stemOk(t: String): Boolean {
+            if (gateStems.isEmpty()) return true
+            val n = t.lowercase().replace(Regex("""[^a-z0-9]+"""), "")
+            if (n.length < 4) return false
+            return gateStems.any { g -> n.contains(g) || g.contains(n) }
+        }
         val visited = hashSetOf(id)
         val pre = mutableListOf<RelCand>()          // nearest-prequel FIRST
         val rootTitles = mutableListOf<String>()    // counted ancestors, walk order
@@ -1172,6 +1263,7 @@ class WizstreamAnimeProvider : MainAPI() {
             val hop = counted ?: anyBroadcast
                 ?: (if (bridges < 3) bridge else null)
                 ?: break
+            if (hop.fmt in franchiseBroadcastFormats && !stemOk(hop.title)) break
             visited += hop.id
             if (hop.fmt in franchiseBroadcastFormats) {
                 pre += hop
@@ -1219,6 +1311,7 @@ class WizstreamAnimeProvider : MainAPI() {
             val hop = best
                 ?: (if (sBridges < 3) sBridge else null)
                 ?: break
+            if (hop.fmt in franchiseBroadcastFormats && !stemOk(hop.title)) break
             visited += hop.id
             if (hop.fmt in franchiseBroadcastFormats) {
                 post += hop
