@@ -9,6 +9,8 @@ import com.lagradost.cloudstream3.Score
 import com.lagradost.cloudstream3.SearchResponse
 import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.TvType
+import com.lagradost.cloudstream3.Actor
+import com.lagradost.cloudstream3.ActorData
 import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.mainPageOf
 import com.lagradost.cloudstream3.newEpisode
@@ -18,17 +20,21 @@ import com.lagradost.cloudstream3.newMovieSearchResponse
 import com.lagradost.cloudstream3.newSubtitleFile
 import com.lagradost.cloudstream3.newTvSeriesLoadResponse
 import com.lagradost.cloudstream3.newTvSeriesSearchResponse
+import com.lagradost.cloudstream3.LoadResponse.Companion.addImdbId
 import com.lagradost.cloudstream3.LoadResponse.Companion.addTrailer
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.getQualityFromName
 import com.lagradost.cloudstream3.utils.newExtractorLink
 import com.lagradost.api.Log
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
 import org.json.JSONArray
 import org.json.JSONObject
 import org.jsoup.Jsoup
 import java.net.URLDecoder
 import java.net.URLEncoder
+import java.util.concurrent.ConcurrentHashMap
 
 /**
  * FM FTP (https://fmftp.net) — React SPA backed by its public "Cinefy" REST
@@ -72,6 +78,34 @@ class FmFtpProvider : MainAPI() {
         private const val TMDB_IMG = "https://image.tmdb.org/t/p"
         private val VIDEO_EXT = listOf(".mp4", ".mkv", ".avi", ".m4v", ".mov", ".webm", ".ts")
         private val SUB_EXT = listOf(".srt", ".vtt", ".ass", ".ssa")
+        // (v2) Display-title cleaner: quality/rip/dub-language tails are
+        // stripped so cards read "Avatar", not "Avatar 2009 1080p BluRay
+        // Hindi Dubbed". Cut only happens when ≥3 chars of head remain, so
+        // legit titles beginning with a language word survive untouched
+        // ("Hindi Medium" is a real film).
+        private val JUNK_TAIL_RE = Regex(
+            """(?i)\b(480p|576p|720p|1080p|2160p|4k|uhd|hdrip|webrip|web\s?-?\s?dl|bluray|""" +
+                """bdrip|brrip|hdtc|hdts|cam|camrip|dvdrip|dvdscr|x264|x265|hevc|h\s?\.?\s?264|""" +
+                """h\s?\.?\s?265|av1|aac|ac3|eac3|dts|mp3|esub|msub|subs?|10bit|8bit|dub(bed)?|""" +
+                """dual\s?-?\s?audio|multi\s?-?\s?audio|hindi|english|bengali|bangla|tamil|""" +
+                """telugu|korean|japanese|uncut|extended|repack|proper|imax)\b[\s\S]*$"""
+        )
+        private val YEAR_RE = Regex("""(?<!\d)(19\d{2}|20\d{2})(?!\d)""")
+        private val SEP_RE = Regex("""[()\[\]{}.,:_\-!'·]""")
+        private val WS_RE = Regex("""\s+""")
+    }
+
+    /** Site title → bare display title (junk tail + year removed, separators
+     *  normalised). Returns null when nothing usable remains. */
+    private fun cleanDisplayTitle(raw: String): String? {
+        var t = raw.trim()
+        if (t.isBlank()) return null
+        JUNK_TAIL_RE.find(t)?.let { m ->
+            if (m.range.first >= 3) t = t.substring(0, m.range.first)
+        }
+        YEAR_RE.find(t)?.let { m -> t = t.replace(m.value, " ") }
+        t = t.replace(SEP_RE, " ").replace(WS_RE, " ").trim()
+        return t.ifBlank { null }
     }
 
     override val mainPage = mainPageOf(
@@ -106,7 +140,9 @@ class FmFtpProvider : MainAPI() {
         val lib = optJSONObject("Library")
         val isShow = (lib?.optString("type") == "TV_SHOW") ||
             (!has("file_path") && has("path"))
-        val title = optString("title").trim().ifBlank { null } ?: return null
+        val rawTitle = optString("title").trim()
+        // (v2) bare display title on cards too — no year/quality/dub junk.
+        val title = cleanDisplayTitle(rawTitle) ?: rawTitle.ifBlank { null } ?: return null
         val yr = optInt("year", 0).takeIf { it > 0 }
         val poster = optString("poster_path").trim()
             .takeIf { it.isNotBlank() }?.let { "$TMDB_IMG/w500$it" }
@@ -130,19 +166,34 @@ class FmFtpProvider : MainAPI() {
 
     private suspend fun loadMovie(url: String): LoadResponse? {
         val d = fetchJson(url) ?: return null
-        val title = d.optString("title").trim().ifBlank { null } ?: return null
-        val poster = tmdbImg(d.optString("poster_path"), "w500")
-        val backdrop = tmdbImg(d.optString("backdrop_path"), "original")
+        val rawTitle = d.optString("title").trim().ifBlank { null } ?: return null
+        val title = cleanDisplayTitle(rawTitle) ?: rawTitle
+        // (v2) TMDB enrichment: FM FTP details already carry the TMDB id +
+        // IMDb id, so enrichment starts from an exact ID lookup — no title
+        // searching, no mismatch risk. Everything TMDB-side is a fallback
+        // for the site's own fields, never a replacement of catalogue facts.
+        val tmdbId = d.optInt("tmdb_id", 0).takeIf { it > 0 }
+        val imdbDirect = d.optString("imdb_id").trim().ifBlank { null }
+        val tmdb = tmdbId?.let { Tmdb.byId(false, it) }
+
         return newMovieLoadResponse(title, url, TvType.Movie, url) {
-            this.posterUrl = poster
-            this.backgroundPosterUrl = backdrop
-            this.plot = d.optString("overview").trim().ifBlank { null }
-            this.year = d.optInt("year", 0).takeIf { it > 0 }
-            this.tags = d.optString("genre").split(",").map { it.trim() }.filter { it.isNotBlank() }
+            this.posterUrl = tmdbImg(d.optString("poster_path"), "w500") ?: tmdb?.poster
+            this.backgroundPosterUrl = tmdbImg(d.optString("backdrop_path"), "original")
+                ?: tmdb?.backdrop
+            this.plot = d.optString("overview").trim().ifBlank { null } ?: tmdb?.plot
+            this.year = d.optInt("year", 0).takeIf { it > 0 } ?: tmdb?.year
+            this.tags = tmdb?.genres?.takeIf { it.isNotEmpty() }
+                ?: d.optString("genre").split(",").map { it.trim() }.filter { it.isNotBlank() }
             val rating = d.optDouble("online_rating", 0.0).takeIf { it > 0.0 }
+                ?: tmdb?.rating
             this.score = rating?.let { Score.from10(it) }
+            this.duration = tmdb?.runtime
+            tmdb?.actors?.takeIf { it.isNotEmpty() }?.let { this.actors = it }
+            try { tmdb?.logo?.let { this.logoUrl = it } } catch (_: Throwable) {}
+            try { (imdbDirect ?: tmdb?.imdbId)?.let { addImdbId(it) } } catch (_: Throwable) {}
             val yt = d.optString("trailer").trim().ifBlank { null }
-            try { yt?.let { addTrailer("https://www.youtube.com/watch?v=$it") } } catch (_: Throwable) {}
+                ?.let { "https://www.youtube.com/watch?v=$it" } ?: tmdb?.trailer
+            try { yt?.let { addTrailer(it) } } catch (_: Throwable) {}
         }
     }
 
@@ -151,11 +202,15 @@ class FmFtpProvider : MainAPI() {
         // enumerate episodes (the /seasons and /episodes REST sub-paths are
         // broken server-side).
         val d = fetchJson("$url?fields=episodes") ?: return null
-        val title = d.optString("title").trim().ifBlank { null } ?: return null
-        val poster = tmdbImg(d.optString("poster_path"), "w500")
-        val backdrop = tmdbImg(d.optString("backdrop_path"), "original")
+        val rawTitle = d.optString("title").trim().ifBlank { null } ?: return null
+        val title = cleanDisplayTitle(rawTitle) ?: rawTitle
+        val tmdbId = d.optInt("tmdb_id", 0).takeIf { it > 0 }
+        val imdbDirect = d.optString("imdb_id").trim().ifBlank { null }
+        val tmdb = tmdbId?.let { Tmdb.byId(true, it) }
 
-        val episodes = mutableListOf<Episode>()
+        // Collect visible episodes first so we know which TMDB seasons to pull.
+        data class RawEp(val s: Int, val e: Int, val siteName: String?, val siteStill: String?)
+        val rawEps = mutableListOf<RawEp>()
         val arr = d.optJSONArray("episodes") ?: JSONArray()
         for (i in 0 until arr.length()) {
             val ep = arr.optJSONObject(i) ?: continue
@@ -163,25 +218,54 @@ class FmFtpProvider : MainAPI() {
             val s = ep.optInt("season_number", -1)
             val e = ep.optInt("episode_number", -1)
             if (s < 0 || e < 0) continue
-            val epUrl = "$url/epdata?s=$s&e=$e"
+            rawEps += RawEp(
+                s, e,
+                ep.optString("name").trim().ifBlank { null },
+                ep.optString("still_path").trim().ifBlank { null }
+            )
+        }
+
+        // (v2) Fetch every referenced TMDB season in parallel (cached), so
+        // each episode gains synopsis + canonical still + TMDB title.
+        val seasonMaps: Map<Int, Map<Int, Tmdb.EpMeta>> = if (tmdb != null) {
+            val wanted = rawEps.map { it.s }.distinct()
+            coroutineScope {
+                wanted.map { s -> async { s to Tmdb.season(tmdb.id, s) } }
+                    .map { it.await() }
+                    .toMap()
+            }
+        } else emptyMap()
+
+        val episodes = mutableListOf<Episode>()
+        rawEps.forEach { raw ->
+            val meta = seasonMaps[raw.s]?.get(raw.e)
+            val epUrl = "$url/epdata?s=${raw.s}&e=${raw.e}"
             episodes += newEpisode(epUrl) {
-                this.name = ep.optString("name").trim().ifBlank { "Episode $e" }
-                this.season = s
-                this.episode = e
-                this.posterUrl = tmdbImg(ep.optString("still_path"), "w500")
+                this.name = meta?.name ?: raw.siteName ?: "Episode ${raw.e}"
+                this.season = raw.s
+                this.episode = raw.e
+                this.description = meta?.overview
+                this.posterUrl = tmdbImg(raw.siteStill, "w500") ?: meta?.still
             }
         }
 
         return newTvSeriesLoadResponse(title, url, TvType.TvSeries, episodes) {
-            this.posterUrl = poster
-            this.backgroundPosterUrl = backdrop
-            this.plot = d.optString("overview").trim().ifBlank { null }
-            this.year = d.optInt("year", 0).takeIf { it > 0 }
-            this.tags = d.optString("genre").split(",").map { it.trim() }.filter { it.isNotBlank() }
+            this.posterUrl = tmdbImg(d.optString("poster_path"), "w500") ?: tmdb?.poster
+            this.backgroundPosterUrl = tmdbImg(d.optString("backdrop_path"), "original")
+                ?: tmdb?.backdrop
+            this.plot = d.optString("overview").trim().ifBlank { null } ?: tmdb?.plot
+            this.year = d.optInt("year", 0).takeIf { it > 0 } ?: tmdb?.year
+            this.tags = tmdb?.genres?.takeIf { it.isNotEmpty() }
+                ?: d.optString("genre").split(",").map { it.trim() }.filter { it.isNotBlank() }
             val rating = d.optDouble("online_rating", 0.0).takeIf { it > 0.0 }
+                ?: tmdb?.rating
             this.score = rating?.let { Score.from10(it) }
+            tmdb?.actors?.takeIf { it.isNotEmpty() }?.let { this.actors = it }
+            try { tmdb?.logo?.let { this.logoUrl = it } } catch (_: Throwable) {}
+            try { (imdbDirect ?: tmdb?.imdbId)?.let { addImdbId(it) } } catch (_: Throwable) {}
             val yt = d.optString("trailer").trim().ifBlank { null }
-            try { yt?.let { addTrailer("https://www.youtube.com/watch?v=$it") } } catch (_: Throwable) {}
+                ?.let { "https://www.youtube.com/watch?v=$it" } ?: tmdb?.trailer
+            try { yt?.let { addTrailer(it) } } catch (_: Throwable) {}
         }
     }
 
@@ -355,5 +439,186 @@ class FmFtpProvider : MainAPI() {
 
     private inline fun runSafe(block: () -> Unit) {
         try { block() } catch (t: Throwable) { Log.d("FmFtp", "emit: ${t.message}") }
+    }
+
+    // ── (v2) TMDB enrichment ──────────────────────────────────────────────
+    /**
+     * Thin TMDB client for full metadata pages (cast with photos, title
+     * logo, runtime, genre names, trailer, IMDb id, per-episode synopses
+     * + stills). Same public API key and field set the Circle FTP
+     * extension uses. Everything is a SOFT fallback: any TMDB failure
+     * silently leaves the site's own metadata in place. Cached per process
+     * so paging through content never re-hits the API.
+     */
+    private object Tmdb {
+        private const val API = "https://api.themoviedb.org/3"
+        private const val KEY = "98ae14df2b8d8f8f8136499daf79f0e0"
+        private const val IMG = "https://image.tmdb.org/t/p"
+        private val metaCache = ConcurrentHashMap<String, Meta>()
+        private val seasonCache = ConcurrentHashMap<Int, Map<Int, EpMeta>>()
+
+        data class EpMeta(
+            val name: String?,
+            val overview: String?,
+            val still: String?,
+            val runtime: Int?
+        )
+
+        data class Meta(
+            val id: Int,
+            val poster: String?,
+            val backdrop: String?,
+            val plot: String?,
+            val year: Int?,
+            val rating: Double?,
+            val runtime: Int?,
+            val genres: List<String>,
+            val trailer: String?,
+            val logo: String?,
+            val imdbId: String?,
+            val actors: List<ActorData>
+        )
+
+        /** Exact lookup — FM FTP details tell us the TMDB id directly. */
+        suspend fun byId(isTv: Boolean, tmdbId: Int): Meta? {
+            val key = (if (isTv) "tv:" else "movie:") + tmdbId
+            metaCache[key]?.let { return it }
+            // Only successful fetches are cached (ConcurrentHashMap rejects
+            // nulls) — a transient TMDB outage therefore never poisons the
+            // session, it just retries on the next load.
+            val meta = fetchMeta(if (isTv) "tv" else "movie", tmdbId)
+            if (meta != null) metaCache[key] = meta
+            return meta
+        }
+
+        /** Season-level episode metadata, cached one map per season. */
+        suspend fun season(tmdbId: Int, seasonNumber: Int): Map<Int, EpMeta> {
+            val key = tmdbId * 1000 + seasonNumber
+            seasonCache[key]?.let { return it }
+            val text = get("$API/tv/$tmdbId/season/$seasonNumber?api_key=$KEY") ?: run {
+                seasonCache[key] = emptyMap()
+                return emptyMap()
+            }
+            val out = mutableMapOf<Int, EpMeta>()
+            runCatching {
+                val root = JSONObject(text)
+                val arr = root.optJSONArray("episodes") ?: JSONArray()
+                for (i in 0 until arr.length()) {
+                    val ep = arr.optJSONObject(i) ?: continue
+                    val num = ep.optInt("episode_number", -1)
+                    if (num < 0) continue
+                    out[num] = EpMeta(
+                        name = str(ep, "name"),
+                        overview = str(ep, "overview"),
+                        still = str(ep, "still_path")?.let { "$IMG/w500$it" },
+                        runtime = ep.optInt("runtime", 0).takeIf { it > 0 }
+                    )
+                }
+            }
+            seasonCache[key] = out
+            return out
+        }
+
+        private suspend fun fetchMeta(type: String, id: Int): Meta? {
+            val text = get(
+                "$API/$type/$id?api_key=$KEY" +
+                    "&append_to_response=credits,external_ids,videos,images"
+            ) ?: return null
+            return runCatching {
+                val root = JSONObject(text)
+
+                // Trailer: official YouTube trailer first, any trailer second.
+                var trailer: String? = null
+                var anyTrailer: String? = null
+                val vids = root.optJSONObject("videos")?.optJSONArray("results")
+                if (vids != null) {
+                    for (i in 0 until vids.length()) {
+                        val v = vids.optJSONObject(i) ?: continue
+                        if (v.optString("type") != "Trailer" ||
+                            v.optString("site") != "YouTube") continue
+                        val u = "https://www.youtube.com/watch?v=" + v.optString("key")
+                        if (anyTrailer == null) anyTrailer = u
+                        if (v.optBoolean("official", false)) { trailer = u; break }
+                    }
+                }
+                if (trailer == null) trailer = anyTrailer
+
+                // Title logo: best English non-SVG → any, w500.
+                var logo: String? = null
+                val logos = root.optJSONObject("images")?.optJSONArray("logos")
+                if (logos != null) {
+                    var enSvg: String? = null
+                    var anyPng: String? = null
+                    var anySvg: String? = null
+                    for (i in 0 until logos.length()) {
+                        val l = logos.optJSONObject(i) ?: continue
+                        val path = str(l, "file_path") ?: continue
+                        val isSvg = path.endsWith(".svg", true)
+                        val lang = l.optString("iso_639_1").trim().lowercase()
+                        if (lang == "en" && !isSvg) { logo = path; break }
+                        if (lang == "en" && isSvg && enSvg == null) enSvg = path
+                        if (!isSvg && anyPng == null) anyPng = path
+                        if (isSvg && anySvg == null) anySvg = path
+                    }
+                    if (logo == null) logo = enSvg ?: anyPng ?: anySvg
+                }
+                val logoUrl = logo?.let { "$IMG/w500$it" }
+
+                val genres = mutableListOf<String>()
+                root.optJSONArray("genres")?.let { ga ->
+                    for (i in 0 until ga.length()) {
+                        str(ga.optJSONObject(i), "name")?.let { genres += it }
+                    }
+                }
+
+                val castOut = mutableListOf<ActorData>()
+                root.optJSONObject("credits")?.optJSONArray("cast")?.let { ca ->
+                    val limit = minOf(ca.length(), 20)
+                    for (i in 0 until limit) {
+                        val c = ca.optJSONObject(i) ?: continue
+                        val nm = str(c, "name") ?: continue
+                        castOut += ActorData(
+                            actor = Actor(nm, str(c, "profile_path")?.let { "$IMG/w185$it" }),
+                            roleString = str(c, "character")
+                        )
+                    }
+                }
+
+                val release = root.optString("release_date",
+                    root.optString("first_air_date", ""))
+                val runtime = root.optInt("runtime", 0).takeIf { it > 0 }
+                    ?: root.optJSONArray("episode_run_time")?.let { ra ->
+                        if (ra.length() > 0) ra.optInt(0, 0).takeIf { it > 0 } else null
+                    }
+
+                val ext = root.optJSONObject("external_ids")
+                Meta(
+                    id = id,
+                    poster = str(root, "poster_path")?.let { "$IMG/w500$it" },
+                    backdrop = str(root, "backdrop_path")?.let { "$IMG/original$it" },
+                    plot = str(root, "overview"),
+                    year = release.split("-").firstOrNull()?.toIntOrNull(),
+                    rating = root.optDouble("vote_average", 0.0).takeIf { it > 0.0 },
+                    runtime = runtime,
+                    genres = genres,
+                    trailer = trailer,
+                    logo = logoUrl,
+                    imdbId = ext?.let { str(it, "imdb_id") } ?: str(root, "imdb_id"),
+                    actors = castOut
+                )
+            }.getOrNull()
+        }
+
+        private fun str(o: JSONObject?, k: String): String? {
+            if (o == null || !o.has(k) || o.isNull(k)) return null
+            return o.optString(k, "").trim().takeIf { it.isNotBlank() && it != "null" }
+        }
+
+        private suspend fun get(url: String): String? {
+            val resp = runCatching { app.get(url, timeout = 8_000) }.getOrNull()
+                ?: return null
+            if (resp.code !in 200..299 || resp.text.isBlank()) return null
+            return resp.text
+        }
     }
 }

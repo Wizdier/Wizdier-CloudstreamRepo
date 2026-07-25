@@ -7,7 +7,7 @@
 
 [![Cloudstream](https://img.shields.io/badge/Cloudstream-extension-blueviolet?logo=android)](https://github.com/recloudstream/cloudstream)
 [![Extensions](https://img.shields.io/badge/extensions-8-success)](#-the-extensions)
-[![Latest build](https://img.shields.io/badge/Wizstream-v43-orange)](#-changelog)
+[![Latest build](https://img.shields.io/badge/Wizstream-v44-orange)](#-changelog)
 
 ---
 
@@ -43,8 +43,8 @@ a new version.
 | 4 | **CTGMovies** | bn | Movies, web-series, anime | `ctgmovies.com` |
 | 5 | **FTPBD** | en | Movies, TV & anime (big Hindi-dubbed section) | `ftpbd.net` |
 | 6 | **FlixHub** | en | Hollywood·Bollywood·South-Indian movies & series | `flixhub.net` (BDIX) |
-| 7 | **FM FTP** | bn | Movies & TV shows via JSON API + direct file index | `fmftp.net` |
-| 8 | **Mediaserver** | bn | Movies & single episodes from a WordPress video library | `103.225.94.27/mediaserver` (BDIX) |
+| 7 | **FM FTP** | bn | Movies & TV shows via JSON API + direct file index (TMDB-enriched) | `fmftp.net` |
+| 8 | **Mediaserver** | bn | Movies & single episodes from a WordPress video library (TMDB-enriched) | `103.225.94.27/mediaserver` (BDIX) |
 
 > **What is “BDIX”?** Some of these servers sit behind Bangladeshi ISP
 > peering. From outside Bangladesh they simply don't answer — that is normal

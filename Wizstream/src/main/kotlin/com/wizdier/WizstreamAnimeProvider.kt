@@ -664,7 +664,7 @@ class WizstreamAnimeProvider : MainAPI() {
                 characters(sort: [ROLE, RELEVANCE], perPage: 25) {
                   edges {
                     role
-                    node { name { full } image { large } }
+                    node { id name { full } image { large } }
                     voiceActorsJapanese: voiceActors(language: JAPANESE, sort: [RELEVANCE]) { name { full } image { large } }
                     voiceActorsEnglish: voiceActors(language: ENGLISH, sort: [RELEVANCE]) { name { full } image { large } }
                   }
@@ -762,38 +762,84 @@ class WizstreamAnimeProvider : MainAPI() {
 
         // ── Extract cast from AniList (NOT TMDB) ──────────────────────────
         // AniList's `characters.edges[]` provides:
-        //   • node.name.full       — character name
-        //   • node.image.large     — character image
-        //   • voiceActors[].name.full  — Japanese voice actor name
-        //   • voiceActors[].image.large — voice actor image
-        // We use Cloudstream's ActorData with `actor` = voice actor,
-        // `roleString` = "Voice Actor", and `voiceActor` field for the
-        // dual-avatar display Cloudstream supports.
-        // (v31) Expanded cast: 25 MAIN+SUPPORTING characters (was 10 MAIN
-        // only), each with BOTH their Japanese and English voice actor when
-        // AniList has one. roleString is the character's actual role
-        // (Main/Supporting) instead of the flat "Voice Actor" label.
+        //   • node.id / node.name.full / node.image.large — character
+        //   • voiceActors[Japanese|English][0]            — best-match VA
+        // Cloudstream ActorData: actor = character (main avatar),
+        // voiceActor = actual voice actor (secondary avatar).
+        // (v31) 25 MAIN+SUPPORTING characters with JA + EN voice actors.
+        // (v43 fix) DUPLICATE CAST ELIMINATED — two duplicate classes:
+        //   1. AniList itself sometimes lists the SAME character in several
+        //      edges (long-running shows) → edges are now merged by node id
+        //      (name as fallback), keeping the first (MAIN) role.
+        //   2. The v31 JA/EN split emitted ONE CARD PER LANGUAGE, so every
+        //      character appeared twice in the picker → now ONE card per
+        //      character with the Japanese VA as dual avatar (the site's
+        //      convention mirrors Circle FTP); when an English VA also
+        //      exists, its name rides along in the role subtitle
+        //      ("Main · EN: Bryce Papenbrook") — zero information lost,
+        //      zero duplicate cards.
         actors = media.optJSONObject("characters")?.optJSONArray("edges")?.let { edges ->
-            val out = mutableListOf<ActorData>()
+            class CharAgg(
+                val name: String,
+                val image: String?,
+                var role: String,
+                var jaVa: Actor?,
+                var enVa: Actor?,
+            )
+            val byChar = LinkedHashMap<String, CharAgg>()
             for (i in 0 until edges.length()) {
                 val edge = edges.optJSONObject(i) ?: continue
                 val node = edge.optJSONObject("node") ?: continue
                 val charName = node.optJSONObject("name")?.aOptStr("full") ?: continue
-                val charImage = node.optJSONObject("image")?.aOptStr("large")
-                val roleText = edge.aOptStr("role")
-                    ?.lowercase()?.replaceFirstChar { it.uppercase() } ?: "Main"
-                for (arrKey in listOf("voiceActorsJapanese", "voiceActorsEnglish")) {
-                    val va = edge.optJSONArray(arrKey)?.optJSONObject(0) ?: continue
-                    val vaName = va.optJSONObject("name")?.aOptStr("full") ?: continue
-                    val vaImage = va.optJSONObject("image")?.aOptStr("large")
-                    // Cloudstream's ActorData:
-                    //   actor      = the character (main avatar)
-                    //   roleString = Main / Supporting
-                    //   voiceActor = the actual voice actor (secondary avatar)
+                val charId = node.optInt("id", 0)
+                val key = if (charId > 0) "id:$charId" else "nm:" + charName.lowercase()
+                val agg = byChar.getOrPut(key) {
+                    CharAgg(
+                        charName,
+                        node.optJSONObject("image")?.aOptStr("large"),
+                        edge.aOptStr("role")?.lowercase()
+                            ?.replaceFirstChar { it.uppercase() } ?: "Main",
+                        null, null,
+                    )
+                }
+                if (agg.role != "Main") {
+                    val r = edge.aOptStr("role")?.lowercase()
+                        ?.replaceFirstChar { it.uppercase() }
+                    if (r == "Main") agg.role = r
+                }
+                if (agg.jaVa == null) {
+                    edge.optJSONArray("voiceActorsJapanese")?.optJSONObject(0)?.let { va ->
+                        va.optJSONObject("name")?.aOptStr("full")?.let { vaName ->
+                            agg.jaVa = Actor(vaName, va.optJSONObject("image")?.aOptStr("large"))
+                        }
+                    }
+                }
+                if (agg.enVa == null) {
+                    edge.optJSONArray("voiceActorsEnglish")?.optJSONObject(0)?.let { va ->
+                        va.optJSONObject("name")?.aOptStr("full")?.let { vaName ->
+                            agg.enVa = Actor(vaName, va.optJSONObject("image")?.aOptStr("large"))
+                        }
+                    }
+                }
+            }
+            val out = mutableListOf<ActorData>()
+            byChar.values.forEach { agg ->
+                val ja = agg.jaVa
+                val en = agg.enVa
+                val primary = ja ?: en
+                if (primary == null) {
+                    out += ActorData(actor = Actor(agg.name, agg.image), roleString = agg.role)
+                } else {
+                    val roleStr = when {
+                        ja != null && en != null && !en.name.equals(ja.name, true) ->
+                            agg.role + " · EN: " + en.name
+                        ja == null && en != null -> agg.role + " (EN dub)"
+                        else -> agg.role
+                    }
                     out += ActorData(
-                        actor = Actor(charName, charImage),
-                        roleString = roleText,
-                        voiceActor = Actor(vaName, vaImage),
+                        actor = Actor(agg.name, agg.image),
+                        roleString = roleStr,
+                        voiceActor = primary,
                     )
                 }
             }
