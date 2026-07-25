@@ -4,37 +4,31 @@ import com.lagradost.cloudstream3.plugins.BasePlugin
 import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
 
 /**
- * WizstreamPlugin — single Cloudstream plugin that registers TWO MainAPI
- * providers from one .cs3 file (the "streamplay" pattern):
+ * WizstreamPlugin — the TMDB half of Wizstream, since v51 its own
+ * single-purpose extension (the AniList catalogue moved out into the
+ * separate WizstreamAnime plugin):
  *
- *   1. WizstreamProvider        — TMDB catalogue (movies & TV series)
- *   2. WizstreamAnimeProvider   — AniList catalogue (anime / OVA / movies)
+ *   • WizstreamProvider — TMDB catalogue (movies, TV series, Asian drama,
+ *     cartoons).
  *
- * Both providers share the same `WizstreamSources` resolver bundle so
- * every loadLinks call attempts the 4 BDIX source sites (Cineplex BD,
- * FTPBD, Circle FTP, CTGMovies) AND the Vid[x] embed family
- * (vidsrc, vidnest, vidplay, vidup/vidlink, vidrock, vidfast, videasy)
- * plus the bundled web sources (Cineby, Bingr, Moonflix), all in
- * parallel. Duplicates are de-duped by URL. Dead embed hosts
- * (SmashyStream, AutoEmbe, AnimeStream, ZoroAnime) were removed in v25
- * after a fresh live health sweep.
+ * Link resolution comes from the bundled `WizstreamSources` resolver
+ * bundle: the BDIX sources (Cineplex BD, FTPBD, Circle FTP, CTGMovies,
+ * FM FTP, Mediaserver), the web sources (Cineby, Bingr, Moonflix) and the
+ * Vid[x] embed family, all in parallel, de-duplicated by URL.
  *
  * Custom extractors (WizstreamExtractors.kt) are registered here so
  * `loadExtractor` can dispatch to them when a vid embed URL is encountered
  * that Cloudstream's built-in extractor registry doesn't cover.
+ *
+ * NOTE: the same WizstreamSources.kt + WizstreamExtractors.kt files are
+ * mirrored into ../WizstreamAnime at build time — edit them HERE (the
+ * Wizstream module is the single source of truth).
  */
 @CloudstreamPlugin
 class WizstreamPlugin : BasePlugin() {
     override fun load() {
-        // Register both catalogue providers.
         registerMainAPI(WizstreamProvider())
-        registerMainAPI(WizstreamAnimeProvider())
 
-        // Register custom vid-embed extractors. These complement
-        // Cloudstream's built-in extractor registry — when loadExtractor
-        // is called with a URL whose host matches one of our extractors'
-        // mainUrl, our extractor's getUrl() is invoked.
-        //
         // VsEmbed handles vidsrc.to / vidsrc.mov / vidsrc-embed.su /
         // vidsrc.me redirects (they all 302 to vsembed.ru).
         registerExtractorAPI(VsEmbedExtractor())

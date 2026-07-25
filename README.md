@@ -1,13 +1,15 @@
 # 🎬 Wizdier Cloudstream Repository
 
-> **8 Cloudstream extensions** — one unified catalogue plugin (movies · TV ·
-> anime) plus seven standalone BDIX source extensions for Bangladeshi networks.
+> **9 Cloudstream extensions** — two catalogue plugins: **Wizstream** (movies &
+> TV, powered by TMDB) and **Wizstream-Anime** (anime & OVA, powered by AniList),
+> both sharing one link-scraping engine, plus seven standalone BDIX source
+> extensions for Bangladeshi networks.
 > Movies, web-series, anime, animation, cartoons & documentaries — Bangla,
 > Hindi, English, Korean, Japanese and more. Health-checked **2026-07-25**.
 
 [![Cloudstream](https://img.shields.io/badge/Cloudstream-extension-blueviolet?logo=android)](https://github.com/recloudstream/cloudstream)
-[![Extensions](https://img.shields.io/badge/extensions-8-success)](#-the-extensions)
-[![Latest build](https://img.shields.io/badge/Wizstream-v50-orange)](#-changelog)
+[![Extensions](https://img.shields.io/badge/extensions-9-success)](#-the-extensions)
+[![Latest build](https://img.shields.io/badge/Wizstream-v51-orange)](#-changelog)
 
 ---
 
@@ -53,18 +55,20 @@ a new version.
 
 ---
 
-## ⭐ Wizstream — what's inside
+## ⭐ Wizstream & Wizstream-Anime — what's inside
 
-One install gives you **two catalogue apps**:
+Two separate installs, one engine — since v51 each catalogue is its own
+simple plugin:
 
-- **Wizstream** — movies & TV series, powered by TMDB (Trending, Popular,
+- **Wizstream** — movies & TV series, powered by **TMDB** (Trending, Popular,
   Top Rated, Upcoming, Now Playing, On The Air).
-- **Wizstream-Anime** — anime, OVA & anime movies, powered by AniList
-  (Trending, Popular This Season, Top Rated, Upcoming, All-Time Popular).
+- **Wizstream-Anime** — anime, OVA & anime movies, powered by **AniList**
+  (Trending, Popular This Season, Top Rated, Upcoming, All-Time Popular),
+  with stacked CircleFTP-style multi-season pages.
 
 Both show posters, backdrops, logos, trailers, ratings, full cast (anime
-pages list up to 25 main+supporting characters with Japanese **and** English
-voice actors) and per-episode stills/synopses. MAL · AniList · Kitsu · Simkl
+pages list up to 25 main+supporting characters with Japanese voice actors)
+and per-episode stills/synopses. MAL · AniList · Kitsu · Simkl
 tracking syncs where applicable.
 
 ### 📺 Where links come from (all fetched in parallel, de-duplicated)
@@ -136,7 +140,8 @@ site's own code on every update.
 Repo layout:
 
 ```
-├── Wizstream/     unified catalogue plugin (this repo's flagship)
+├── Wizstream/     TMDB catalogue plugin (movies & TV — this repo's flagship)
+├── WizstreamAnime/ AniList catalogue plugin (anime & OVA — split out in v51)
 ├── Cineplex BD/   standalone BDIX
 ├── Circle FTP/    standalone BDIX
 ├── CTGMovies/     standalone BDIX
