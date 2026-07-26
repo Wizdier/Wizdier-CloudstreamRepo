@@ -266,6 +266,10 @@ class WizstreamAnimeProvider : MainAPI() {
     private val userMainPages = mainPageOf(
         "my_watching" to "⏯ Watching — My AniList",
         "my_planning" to "📋 Plan to Watch — My AniList",
+        // (v62) Viewer-keyed metadata row: the account's own favourites
+        // grid (Viewer/User favourites.anime — exists only through the
+        // logged-in identity, anonymous AniList queries can't see it).
+        "my_favourites" to "⭐ Your Favourites — My AniList",
     )
 
     override val mainPage: List<MainPageData>
@@ -304,6 +308,9 @@ class WizstreamAnimeProvider : MainAPI() {
         // (v45) Personal AniList rows — served from the logged-in account.
         if (request.data == "my_watching" || request.data == "my_planning") {
             return myAnilistPage(page, request)
+        }
+        if (request.data == "my_favourites") {
+            return myFavouritesPage(page, request)
         }
         val perPage = 30
         val cfg: PageCfg = when (request.data) {
@@ -391,6 +398,19 @@ class WizstreamAnimeProvider : MainAPI() {
 
         val detail = fetchAniDetail(id)
             ?: throw ErrorLoadingException("Could not load AniList media $id")
+
+        // (v62) pinned account line (see fetchPersonalEntryLine); null
+        // while logged out. Kept OUT of the META_CACHE copy on purpose.
+        val personalLine = fetchPersonalEntryLine(id)
+        val displayPlot = listOfNotNull(personalLine, detail.plot)
+            .filter { it.isNotBlank() }.joinToString("\n\n")
+        // (v62) Logcat-visible record of the trackers this page binds.
+        runCatching {
+            android.util.Log.i(
+                "WizstreamAnime",
+                "sync-bind anilist=$id mal=${detail.malId} kitsu=${detail.kitsuId}"
+            )
+        }
 
         // (v58) PURE-AniList module behaves like a normal AniList client:
         // whichever entry was opened is exactly what the page shows — its
@@ -507,7 +527,7 @@ class WizstreamAnimeProvider : MainAPI() {
             newMovieLoadResponse(title, url, TvType.AnimeMovie, epList.first().data) {
                 this.posterUrl = detail.posterUrl
                 this.backgroundPosterUrl = detail.backdropUrl
-                this.plot = detail.plot
+                this.plot = displayPlot
                 this.year = detail.year
                 this.tags = detail.tags
                 this.recommendations = recs
@@ -523,9 +543,14 @@ class WizstreamAnimeProvider : MainAPI() {
             }
         } else {
             newAnimeLoadResponse(title, url, type) {
+                // (v62) Feed the app's title-based tracker resolvers the
+                // entry's real english/romaji variants — used only if an
+                // id is ever missing, then they resolve the RIGHT entry.
+                runCatching { this.engName = detail.title }
+                runCatching { this.japName = detail.altTitle }
                 this.posterUrl = detail.posterUrl
                 this.backgroundPosterUrl = detail.backdropUrl
-                this.plot = detail.plot
+                this.plot = displayPlot
                 this.year = detail.year
                 this.tags = detail.tags
                 this.recommendations = recs
@@ -1544,6 +1569,116 @@ class WizstreamAnimeProvider : MainAPI() {
         }
         return out
     }
+    // (v62) USER-ID-keyed AniList metadata, part 1: the viewer's own
+    // favourites grid as a home row. Token path (Viewer query) sees even
+    // a private account; the username path (public User query) covers
+    // older app builds — same split as the Watching/Plan rows.
+    private suspend fun myFavouritesPage(page: Int, request: MainPageRequest): HomePageResponse {
+        val perPage = 30
+        val token = anilistAuthToken()
+        val loginName = anilistLoginName()
+        if (token == null && loginName == null) {
+            return newHomePageResponse(request.name, emptyList(), hasNext = false)
+        }
+        val cacheKey = "FAV:" + (token?.takeLast(6) ?: ("@" + loginName))
+        val now = System.currentTimeMillis()
+        val cached = myListCache[cacheKey]
+        val all: List<SearchResponse> = if (cached != null && now - cached.first < 5 * 60_000) {
+            cached.second
+        } else {
+            fetchFavourites(token, loginName).also { myListCache[cacheKey] = now to it }
+        }
+        val from = (page - 1) * perPage
+        val items = all.drop(from).take(perPage)
+        return newHomePageResponse(
+            request.name, items, hasNext = from + items.size < all.size
+        )
+    }
+
+    private val favMediaFields = """id idMal title { romaji english native }
+        coverImage { extraLarge large }
+        bannerImage episodes format season seasonYear
+        averageScore genres startDate { year } status"""
+
+    private suspend fun fetchFavourites(
+        token: String?,
+        userName: String?,
+    ): List<SearchResponse> {
+        val fields = favMediaFields
+        val authed = token != null
+        val data = if (authed) {
+            anilistQuery("""
+                query {
+                  Viewer {
+                    favourites { anime(perPage: 100) { nodes { $fields } } }
+                  }
+                }
+            """.trimIndent(), JSONObject(), token)
+        } else if (userName != null) {
+            anilistQuery("""
+                query (${'$'}name: String) {
+                  User(name: ${'$'}name) {
+                    favourites { anime(perPage: 100) { nodes { $fields } } }
+                  }
+                }
+            """.trimIndent(), JSONObject().put("name", userName), null)
+        } else null ?: return emptyList()
+        val root = if (authed) data?.optJSONObject("Viewer") else data?.optJSONObject("User")
+        val nodes = root?.optJSONObject("favourites")
+            ?.optJSONObject("anime")?.optJSONArray("nodes")
+            ?: return emptyList()
+        val out = mutableListOf<SearchResponse>()
+        for (i in 0 until nodes.length()) {
+            nodes.optJSONObject(i)?.let { m -> mediaToSearch(m)?.let(out::add) }
+        }
+        return out
+    }
+
+    // (v62) USER-ID-keyed AniList metadata, part 2: on entry pages, ask
+    // AniList what the LOGGED-IN user's own list entry for THIS media
+    // says (status/progress/personal score/rewatches/notes) and pin it
+    // to the top of the description. Anonymous queries can never see
+    // this — it exists only through the account token. It also makes a
+    // polluted entry self-evident: if the old sync bug wrote Season-1
+    // progress onto this entry, the line literally shows it.
+    private suspend fun fetchPersonalEntryLine(mediaId: Int): String? {
+        val token = anilistAuthToken() ?: return null
+        val data = anilistQuery("""
+            query (${'$'}id: Int) {
+              Media(id: ${'$'}id, type: ANIME) {
+                episodes
+                mediaListEntry {
+                  status progress score(format: POINT_10) repeat private notes
+                }
+              }
+            }
+        """.trimIndent(), JSONObject().put("id", mediaId), token) ?: return null
+        val media = data.optJSONObject("Media") ?: return null
+        val entry = media.optJSONObject("mediaListEntry") ?: return null
+        val eps = media.optInt("episodes", 0)
+        val statusLabel = when (entry.aOptStr("status")) {
+            "CURRENT" -> "Watching"
+            "REPEATING" -> "Rewatching"
+            "COMPLETED" -> "Completed"
+            "PAUSED" -> "On hold"
+            "DROPPED" -> "Dropped"
+            "PLANNING" -> "Plan to watch"
+            else -> null
+        }
+        val progress = entry.optInt("progress", 0)
+        val score = entry.optDouble("score", 0.0).takeIf { it > 0.0 }
+        val repeat = entry.optInt("repeat", 0).takeIf { it > 0 }
+        val notes = (entry.aOptStr("notes") ?: "").trim().replace('\n', ' ').take(80)
+        val parts = mutableListOf<String>()
+        statusLabel?.let(parts::add)
+        parts += if (eps > 0) "ep $progress/$eps" else "ep $progress"
+        score?.let { parts += "★$it" }
+        repeat?.let { parts += "rewatched ×$it" }
+        if (entry.optBoolean("private")) parts += "private"
+        if (notes.isNotBlank()) parts += "“$notes”"
+        return "👤 Your AniList: " + parts.joinToString(" · ")
+    }
+
     private suspend fun fetchSimklId(imdbId: String?, kind: String): Int? {
         if (imdbId.isNullOrBlank()) return null
         val type = if (kind == "movie") "movies" else "tv"
