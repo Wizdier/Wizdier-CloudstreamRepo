@@ -2500,7 +2500,73 @@ override suspend fun resolve(
                         .ifBlank { detail.optString("name", "") }
                     val titleSeasonNum = extractSeasonFromTitle(postTitleStr)
 
-                    // Try content[season-1] first (standard multi-season layout).
+                    // (v63) LABEL-FIRST season selection — positional
+                    // content[season-1] breaks the moment a site splits one
+                    // season into cours blocks: with [S1][S2][S3-P1][S3-P2]
+                    // [S4], "Season 4" rows sit at array index 3 where
+                    // content[season-1] points — the request then silently
+                    // pulls S3-Part-2's rows (wrong episodes), and stacked
+                    // Part-2 numbers (13-22) fell off the 12-row Part-1
+                    // block entirely ("S3 Part 2 fetches NOTHING"). Every
+                    // content block on this API carries a season label
+                    // (proven by the saved post-102185 detail JSON), so the
+                    // labels decide: blocks of the requested season pool IN
+                    // ORDER, and — the same recursive cours doctrine the
+                    // episode-table mapper uses — a "Part N"-styled block
+                    // with no season number of its own CONTINUES the season
+                    // of the block before it.
+                    val partLabelRx = Regex(
+                        "(?i)\\b(?:part|cour)\\s*\\.?\\s*\\d{1,2}\\b|\\bpt\\s*\\.?\\s*\\d{1,2}\\b|\\bp\\d{1,2}\\b"
+                    )
+                    val labelBlocks = ArrayList<Pair<org.json.JSONObject, Int?>>()
+                    var lastLabelSeason: Int? = null
+                    for (ci in 0 until contentArray.length()) {
+                        val b = contentArray.optJSONObject(ci) ?: continue
+                        val lbl = b.optStringOrNullCp("seasonName")
+                            ?: b.optStringOrNullCp("season_name")
+                            ?: b.optStringOrNullCp("title")
+                        var bs = lbl?.let { extractSeasonFromTitle(it) }
+                        if (bs == null && lbl != null && partLabelRx.containsMatchIn(lbl)) {
+                            bs = lastLabelSeason
+                        }
+                        if (bs != null) lastLabelSeason = bs
+                        labelBlocks += b to bs
+                    }
+                    fun rowsOf(b: org.json.JSONObject): List<org.json.JSONObject> {
+                        val a = b.optJSONArray("episodes") ?: return emptyList()
+                        return (0 until a.length()).mapNotNull { a.optJSONObject(it) }
+                    }
+                    val seasonBlocks =
+                        labelBlocks.filter { it.second == seasonToUse }.map { it.first }
+                    if (seasonBlocks.isNotEmpty()) {
+                        // Entry-local aim: when the queried TITLE itself
+                        // names a part ("Attack on Titan Season 3 Part 2" →
+                        // part 2), numbers 1..N belong to THAT cours block —
+                        // the entry-local pass lands there exactly. Stacked
+                        // numbers (13-22 on a 10-row part) overshoot and
+                        // fall through to the pooled index below.
+                        val partAsk = Regex("(?i)\\bpart\\s*(\\d{1,2})\\b")
+                            .find(title)?.groupValues?.getOrNull(1)?.toIntOrNull()
+                        if (partAsk != null && partAsk in 1..seasonBlocks.size) {
+                            val pb = rowsOf(seasonBlocks[partAsk - 1])
+                            if (episodeToUse in 1..pb.size) {
+                                val link = rowLink(pb[episodeToUse - 1])
+                                if (!link.isNullOrEmpty()) {
+                                    mediaUrls += link
+                                    return@forEach
+                                }
+                            }
+                        }
+                        val pool = seasonBlocks.flatMap { rowsOf(it) }
+                        if (episodeToUse in 1..pool.size) {
+                            val link = rowLink(pool[episodeToUse - 1])
+                            if (!link.isNullOrEmpty()) mediaUrls += link
+                        }
+                        return@forEach
+                    }
+
+                    // Positional fallback (labels absent on this post) —
+                    // original v11 layout, unchanged.
                     var seasonObj = contentArray.optJSONObject(seasonToUse - 1)
                     var episodesArray = seasonObj?.optJSONArray("episodes")
 
@@ -2558,7 +2624,7 @@ override suspend fun resolve(
                         if (poolSawLabel && episodeToUse in 1..pool.size &&
                             pool.size > (episodesArray?.length() ?: 0)
                         ) {
-                            val link = pool[episodeToUse - 1].optStringOrNullCp("link")
+                            val link = rowLink(pool[episodeToUse - 1])
                             if (!link.isNullOrEmpty()) mediaUrls += link
                             return@forEach
                         }
@@ -2566,7 +2632,7 @@ override suspend fun resolve(
 
                     if (episodesArray != null && episodeToUse in 1..episodesArray.length()) {
                         val epObj = episodesArray.optJSONObject(episodeToUse - 1)
-                        val link = epObj?.optStringOrNullCp("link")
+                        val link = epObj?.let { rowLink(it) }
                         if (link != null && link.isNotEmpty()) {
                             mediaUrls += link
                         }
@@ -2653,6 +2719,12 @@ override suspend fun resolve(
             }
             return null
         }
+
+        /** Episode-row link extractor — the API keys it as "link" (post
+         *  102185's saved detail JSON), but tolerate url/file/src too. */
+        private fun rowLink(o: org.json.JSONObject): String? =
+            o.optStringOrNullCp("link") ?: o.optStringOrNullCp("url")
+                ?: o.optStringOrNullCp("file") ?: o.optStringOrNullCp("src")
 
         private suspend fun emitCircleFtpEncoded(
             data: String,

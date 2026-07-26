@@ -399,9 +399,19 @@ class WizstreamAnimeProvider : MainAPI() {
         val detail = fetchAniDetail(id)
             ?: throw ErrorLoadingException("Could not load AniList media $id")
 
-        // (v62) pinned account line (see fetchPersonalEntryLine); null
-        // while logged out. Kept OUT of the META_CACHE copy on purpose.
-        val personalLine = fetchPersonalEntryLine(id)
+        // (v62/v63) pinned account line; null while logged out. Kept OUT
+        // of the META_CACHE copy on purpose. v63: EVERY tracker the user
+        // logged into is read — the sync sheet silently shows only the
+        // FIRST-answering one, so a polluted MAL/Kitsu entry (written by
+        // the v58-60 root-misbind bug, now dead) looked identical to a
+        // binding bug; the line makes each tracker's own numbers visible.
+        val personalLine = listOfNotNull(
+            fetchPersonalEntryLine(id),
+            detail.malId?.let { fetchMalEntryLine(it) },
+            detail.kitsuId?.let { fetchKitsuEntryLine(it) },
+        ).takeIf { it.isNotEmpty() }
+            ?.joinToString("  |  ")
+            ?.let { "👤 $it" }
         val displayPlot = listOfNotNull(personalLine, detail.plot)
             .filter { it.isNotBlank() }.joinToString("\n\n")
         // (v62) Logcat-visible record of the trackers this page binds.
@@ -487,16 +497,48 @@ class WizstreamAnimeProvider : MainAPI() {
                     // titles ("Primal Desires" on S3 Part 2). Those get
                     // rejected now and the shared episode table's title
                     // (correct per stacked slot) shows instead.
-                    val sEpList = m.streamEps.let { list ->
+                    // (v63) ORDER-NORMALISED feed. Some AniList streaming
+                    // feeds arrive NEWEST-FIRST (verified on Takopi's
+                    // Original Sin: index 0 = "Episode 6 - To All of You in
+                    // 2016" — every row got the episode SIX positions newer,
+                    // so row 1 wore ep 6's title while TMDB meta stayed
+                    // right). Detect direction from the numbers inside the
+                    // titles and flip descending feeds before window math.
+                    val sEpList = run {
                         val seasonTotal = seasonTotals[m.siteSeason] ?: m.episodes
+                        val raw = m.streamEps
+                        if (raw.isEmpty()) return@run emptyList<StreamEp>()
+                        val nums = raw.map { streamEpNumber(it.title) }
+                        val firstNum = nums.firstOrNull { it != null }
+                        val lastNum = nums.lastOrNull { it != null }
+                        val ordered =
+                            if (firstNum != null && lastNum != null && firstNum > lastNum)
+                                raw.reversed() else raw
                         when {
-                            list.size <= m.episodes + 3 -> list
-                            list.size == seasonTotal ->
-                                list.subList(m.seasonStart - 1, m.seasonStart - 1 + m.episodes)
+                            ordered.size <= m.episodes + 3 -> ordered
+                            ordered.size == seasonTotal ->
+                                ordered.subList(m.seasonStart - 1, m.seasonStart - 1 + m.episodes)
                             else -> emptyList()
                         }
                     }
-                    val sEp = sEpList.getOrNull(localEp - 1)
+                    // (v63) NUMBER-ANCHORED pick: feeds carrying leading
+                    // junk (PV/trailer entries) used to shift EVERY row by
+                    // one. When the titles parse, match by the number
+                    // inside the title — the smallest number counts as
+                    // row 1, so cours-offset feeds (…13-22) still align.
+                    val sEp = run {
+                        val pairs = sEpList.mapNotNull { ep ->
+                            streamEpNumber(ep.title)?.let { it to ep }
+                        }
+                        if (pairs.isNotEmpty() && pairs.size * 2 >= sEpList.size &&
+                            pairs.map { it.first }.toSet().size == pairs.size
+                        ) {
+                            val off = (pairs.minOf { it.first } - 1).coerceAtLeast(0)
+                            val byRow = HashMap<Int, StreamEp>()
+                            pairs.forEach { (n, ep) -> byRow.putIfAbsent(n - off, ep) }
+                            byRow[localEp] ?: sEpList.getOrNull(localEp - 1)
+                        } else sEpList.getOrNull(localEp - 1)
+                    }
                     newEpisode(LinkContext(
                         anilistId = m.id, imdbId = imdbId, tmdbId = tmdbId, malId = m.malId,
                         season = m.siteSeason, episode = stackedEp, entryEpisode = localEp,
@@ -1216,6 +1258,13 @@ class WizstreamAnimeProvider : MainAPI() {
      *  AniList has. Used first on episode rows; TMDB fills gaps. */
     private data class StreamEp(val title: String?, val thumb: String?)
 
+    /** (v63) Episode number inside a licensed-stream title
+     *  ("Episode 6 - To All of You in 2016" → 6). Leading digits only. */
+    private fun streamEpNumber(title: String?): Int? = title?.let {
+        Regex("""^\s*(?:episode|ep)?\.?\s*(\d{1,4})\b""", RegexOption.IGNORE_CASE)
+            .find(it)?.groupValues?.getOrNull(1)?.toIntOrNull()
+    }
+
     private fun JSONObject.toStreamEps(): List<StreamEp> =
         optJSONArray("streamingEpisodes")?.let { arr ->
             (0 until arr.length()).map { i ->
@@ -1676,7 +1725,120 @@ class WizstreamAnimeProvider : MainAPI() {
         repeat?.let { parts += "rewatched ×$it" }
         if (entry.optBoolean("private")) parts += "private"
         if (notes.isNotBlank()) parts += "“$notes”"
-        return "👤 Your AniList: " + parts.joinToString(" · ")
+        if (eps > 0 && progress > eps) parts += "⚠"
+        return "AniList: " + parts.joinToString(" · ")
+    }
+
+    // (v63) Personal line for MAL — same viewer-keyed idea as AniList's:
+    // the app's stored MAL OAuth token reads the user's own list entry
+    // for exactly this MAL id. ⚠ marks progress ABOVE the entry's own
+    // episode count — the signature of the old root-misbind copying
+    // Season-1 progress onto this entry (the fix is editing that entry
+    // once on myanimelist.net; bindings have been entry-correct since
+    // v61, so it stays fixed).
+    private suspend fun fetchMalEntryLine(malId: Int): String? {
+        val token = runCatching {
+            SyncRepo(AccountManager.malApi).authToken()?.accessToken
+                ?.takeIf { it.isNotBlank() }
+        }.getOrNull() ?: return null
+        val text = runCatching {
+            app.get(
+                "https://api.myanimelist.net/v2/anime/$malId?fields=my_list_status,num_episodes",
+                headers = mapOf(
+                    "Authorization" to "Bearer $token",
+                    "User-Agent" to A_UA,
+                ),
+                timeout = 6000,
+            ).text
+        }.getOrNull() ?: return null
+        val o = runCatching { JSONObject(text) }.getOrNull() ?: return null
+        val st = o.optJSONObject("my_list_status") ?: return null
+        val eps = o.optInt("num_episodes", 0)
+        val statusLabel = when (st.aOptStr("status")) {
+            "watching" -> "Watching"
+            "completed" -> "Completed"
+            "on_hold" -> "On hold"
+            "dropped" -> "Dropped"
+            "plan_to_watch" -> "Plan to watch"
+            else -> null
+        }
+        val progress = st.optInt("num_episodes_watched", 0)
+        val score = st.optInt("score", 0).takeIf { it > 0 }
+        val parts = mutableListOf<String>()
+        statusLabel?.let(parts::add)
+        parts += if (eps > 0) "ep $progress/$eps" else "ep $progress"
+        score?.let { parts += "★$it" }
+        if (eps > 0 && progress > eps) parts += "⚠"
+        return "MAL: " + parts.joinToString(" · ")
+    }
+
+    // (v63) Personal line for Kitsu — two authed calls (viewer id is not
+    // derivable from the token alone): users?filter[self]=true, then the
+    // library entry filtered to this exact anime (the v61 mal-mapped
+    // per-entry id). Viewer id cached per token.
+    private var kitsuViewerCache: Pair<String, String>? = null
+
+    private suspend fun fetchKitsuEntryLine(kitsuId: String): String? {
+        val token = runCatching {
+            SyncRepo(AccountManager.kitsuApi).authToken()?.accessToken
+                ?.takeIf { it.isNotBlank() }
+        }.getOrNull() ?: return null
+        val headers = mapOf(
+            "Authorization" to "Bearer $token",
+            "Accept" to "application/vnd.api+json",
+            "User-Agent" to A_UA,
+        )
+        val tail = token.takeLast(6)
+        val viewerId = kitsuViewerCache?.takeIf { it.first == tail }?.second ?: run {
+            val t = runCatching {
+                app.get(
+                    "https://kitsu.io/api/edge/users?filter%5Bself%5D=true",
+                    headers = headers, timeout = 6000,
+                ).text
+            }.getOrNull() ?: return null
+            val uid = runCatching {
+                JSONObject(t).optJSONArray("data")?.optJSONObject(0)?.optString("id")
+            }.getOrNull()?.takeIf { it.isNotBlank() } ?: return null
+            kitsuViewerCache = tail to uid
+            uid
+        }
+        val t = runCatching {
+            app.get(
+                "https://kitsu.io/api/edge/library-entries" +
+                    "?filter%5BuserId%5D=$viewerId&filter%5BanimeId%5D=$kitsuId&include=anime",
+                headers = headers, timeout = 6000,
+            ).text
+        }.getOrNull() ?: return null
+        val root = runCatching { JSONObject(t) }.getOrNull() ?: return null
+        val entry = root.optJSONArray("data")?.optJSONObject(0) ?: return null
+        val attrs = entry.optJSONObject("attributes") ?: return null
+        var eps = 0
+        root.optJSONArray("included")?.let { inc ->
+            for (i in 0 until inc.length()) {
+                val a = inc.optJSONObject(i)
+                    ?.takeIf { it.optString("type") == "anime" }
+                    ?.optJSONObject("attributes") ?: continue
+                eps = a.optInt("episodeCount", 0)
+                if (eps > 0) break
+            }
+        }
+        val statusLabel = when (attrs.aOptStr("status")) {
+            "current" -> "Watching"
+            "completed" -> "Completed"
+            "on_hold" -> "On hold"
+            "dropped" -> "Dropped"
+            "planned" -> "Plan to watch"
+            else -> null
+        }
+        val progress = attrs.optInt("progress", 0)
+        val score = attrs.optInt("ratingTwenty", 0).takeIf { it > 0 }
+            ?.let { it / 2.0 }
+        val parts = mutableListOf<String>()
+        statusLabel?.let(parts::add)
+        parts += if (eps > 0) "ep $progress/$eps" else "ep $progress"
+        score?.let { parts += "★$it" }
+        if (eps > 0 && progress > eps) parts += "⚠"
+        return "Kitsu: " + parts.joinToString(" · ")
     }
 
     private suspend fun fetchSimklId(imdbId: String?, kind: String): Int? {
