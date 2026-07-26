@@ -1,17 +1,16 @@
 # 🎬 Wizdier Cloudstream Repository
 
-> **9 Cloudstream extensions** — the unified catalogue plugin **Wizstream**
-> (TMDB catalogue with StreamPlay-style AniList enrichment for anime, plus
-> the full AniList catalogue inside), plus **WizstreamAniList** — a PURE
-> AniList-metadata anime catalogue (zero TMDB) — sharing one link-scraping
-> engine, plus seven standalone BDIX source extensions for Bangladeshi
-> networks.
+> **9 Cloudstream extensions** — the main catalogue plugin **Wizstream**
+> (TMDB with StreamPlay-style AniList enrichment for anime), plus
+> **WizstreamAnime** ("Wizstream-Anime" in-app) — the PURE AniList-metadata
+> anime catalogue (zero TMDB) — sharing one link-scraping engine, plus
+> seven standalone BDIX source extensions for Bangladeshi networks.
 > Movies, web-series, anime, animation, cartoons & documentaries — Bangla,
 > Hindi, English, Korean, Japanese and more. Health-checked **2026-07-25**.
 
 [![Cloudstream](https://img.shields.io/badge/Cloudstream-extension-blueviolet?logo=android)](https://github.com/recloudstream/cloudstream)
 [![Extensions](https://img.shields.io/badge/extensions-9-success)](#-the-extensions)
-[![Latest build](https://img.shields.io/badge/Wizstream-v55-orange)](#-changelog)
+[![Latest build](https://img.shields.io/badge/Wizstream-v56-orange)](#-changelog)
 
 ---
 
@@ -68,10 +67,11 @@ a new version.
   MAL·AniList·Kitsu tracking ids, AniList banner art and the Japanese
   voice-actor cast — episode tables stay TMDB (its packed-cours numbering
   is exactly what the BDIX sites use).
-- **The full AniList catalogue is also inside the same package** — anime,
-  OVA & anime movies (Trending, Popular This Season, Top Rated, Upcoming,
-  All-Time Popular), with stacked CircleFTP-style multi-season pages and
-  per-entry AniList episode titles where the streaming feed has them.
+- **The anime catalogue is the separate WizstreamAnime module** —
+  "Wizstream-Anime" in-app: anime, OVA & anime movies (Trending, Popular
+  This Season, Top Rated, Upcoming, All-Time Popular), PURE AniList
+  metadata, stacked CircleFTP-style multi-season pages, per-entry AniList
+  episode titles where the streaming feed has them.
 
 Both show posters, backdrops, logos, trailers, ratings, full cast (anime
 pages list up to 25 main+supporting characters with Japanese voice actors)
@@ -147,10 +147,10 @@ site's own code on every update.
 Repo layout:
 
 ```
-├── Wizstream/     Unified catalogue plugin — TMDB + AniList catalogues,
-│                  StreamPlay-style anime enrichment (this repo's flagship)
-├── WizstreamAnime/ WizstreamAniList — PURE AniList-metadata anime catalogue
-│                  (zero TMDB anywhere; bare "Episode N" rows where AniList
+├── Wizstream/     Main catalogue plugin — TMDB + AniList enrichment,
+│                  StreamPlay-style anime pages (this repo's flagship)
+├── WizstreamAnime/ "Wizstream-Anime" in-app — PURE AniList-metadata anime
+│                  catalogue (zero TMDB; bare "Episode N" rows where AniList
 │                  has no streaming feed — that's the price of purity)
 ├── Cineplex BD/   standalone BDIX
 ├── Circle FTP/    standalone BDIX

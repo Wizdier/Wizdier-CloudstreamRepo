@@ -1,19 +1,20 @@
-version = 55
+version = 56
 
 cloudstream {
-    description = "WizstreamAniList — the PURE AniList catalogue plugin: " +
-        "every piece of metadata (titles, posters, banners, summaries, " +
-        "genres, scores, trailers, full Japanese voice-actor cast, " +
-        "MAL/AniList tracking) comes from AniList alone — zero TMDB calls, " +
-        "zero TMDB fields. Episode titles/thumbnails use AniList's own " +
-        "licensed-streaming feed per entry; where that feed is missing " +
-        "rows honestly show \"Episode N\" with the show poster. Stacked " +
-        "CircleFTP-style multi-season mega pages intact (cours merged: " +
-        "Attack on Titan Season 3 = all 22 episodes). Links resolve " +
-        "through the same engine as Wizstream: BDIX sources (Cineplex BD, " +
-        "FTPBD, Circle FTP, CTGMovies, FM FTP, Mediaserver) + web sources " +
-        "(Cineby, Bingr, Moonflix) + the Vid[x] embed family + anime " +
-        "streaming sources (AniZone, Mkissa-AllAnime, Miruro, AniChi)."
+    description = "WizstreamAnime — THE anime catalogue (in-app source " +
+        "name: \"Wizstream-Anime\"), PURE AniList metadata: every piece " +
+        "(titles, posters, banners, summaries, genres, scores, trailers, " +
+        "full Japanese voice-actor cast, MAL/AniList tracking) comes from " +
+        "AniList alone — zero TMDB calls, zero TMDB fields. Episode " +
+        "titles/thumbnails use AniList's own licensed-streaming feed per " +
+        "entry; where that feed is missing rows honestly show " +
+        "\"Episode N\" with the show poster. Stacked CircleFTP-style " +
+        "multi-season mega pages (cours merged: Attack on Titan Season 3 " +
+        "= all 22 episodes). Links resolve through the same engine as " +
+        "Wizstream: BDIX sources (Cineplex BD, FTPBD, Circle FTP, " +
+        "CTGMovies, FM FTP, Mediaserver) + web sources (Cineby, Bingr, " +
+        "Moonflix) + the Vid[x] embed family + anime streaming sources " +
+        "(AniZone, Mkissa-AllAnime, Miruro, AniChi)."
     authors = listOf("Wizdier")
     status = 1
     tvTypes = listOf(

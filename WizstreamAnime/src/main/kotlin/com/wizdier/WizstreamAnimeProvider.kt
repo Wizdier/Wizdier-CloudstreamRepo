@@ -159,9 +159,9 @@ private fun nextSeasonFilter(): Pair<String, Int> {
 class WizstreamAnimeProvider : MainAPI() {
 
     override var mainUrl = "https://anilist.co"
-    // Distinct name so this pure module can never collide with the
-    // "Wizstream-Anime" provider inside the unified Wizstream package.
-    override var name = "Wizstream-AniList"
+    // (v56) THE canonical anime source name — the unified Wizstream no
+    // longer bundles an AniList catalogue, so this pure module owns it.
+    override var name = "Wizstream-Anime"
     override var lang = "bn"
     override val hasMainPage = true
     override val hasQuickSearch = true
