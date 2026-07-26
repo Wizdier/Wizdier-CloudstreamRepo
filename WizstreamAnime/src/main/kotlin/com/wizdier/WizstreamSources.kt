@@ -4958,3 +4958,199 @@ override suspend fun resolve(
 internal fun JSONObject.optStringOrNullCp(k: String): String? =
     if (!has(k) || isNull(k)) null
     else optString(k, "").trim().takeIf { it.isNotBlank() && it != "null" }
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  (v59) WizEpisodeTable — recursive multi-season anime episode-table mapper
+// ═════════════════════════════════════════════════════════════════════════════
+//
+// CircleFTP (and BDIX season packs generally) file a multi-season anime as
+// ONE catalogue: per-season tabs whose rows count SEQUENTIALLY through
+// cours splits AND long story-specials — Attack on Titan's "Season 4" tab
+// holds 30 rows: the 28 TV episodes PLUS "The Final Chapters" parts 1 & 2
+// (two ~1-hour specials).
+//
+// TMDB stores the exact same canon differently: the 28 under Season 4 and
+// the specials under "Season 0" (S0E36 "The Final Chapters Special (1)",
+// S0E37 "(2)" — each with full titles, descriptions, stills and runtimes).
+//
+// This mapper recurses TMDB's canon season by season: for every TV season
+// it walks the show's specials and repeatedly TAIL-ATTACHES the ones that
+//   • aired AFTER that season's finale, and
+//   • aired BEFORE the next season's premiere (for the FINAL season the
+//     window is open-ended — TMDB's last_air_date ignores specials, so
+//     the Final Chapters land chronologically "after the show ended"), and
+//   • run ≥ 55 minutes — the "1-hour-long episode" rule: kills chibi
+//     shorts, 24-minute OVAs and 50-minute recap omnibuses, and
+//   • aren't named like a ceremony ("Reading & Live Event" must never
+//     masquerade as a season episode),
+// continuing the season's numbering SEQUENTIALLY (S4E29, S4E30) exactly
+// like the site's rows. At most 3 specials absorb into one season. A row
+// also remembers where TMDB canonically stores it (S0E36), so embed hosts
+// can be pointed at the real location instead of the stacked number.
+internal object WizEpisodeTable {
+
+    private const val TABLE_KEY = "98ae14df2b8d8f8f8136499daf79f0e0"
+    private const val TABLE_API = "https://api.themoviedb.org/3"
+    private const val TABLE_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+    private const val STORY_SPECIAL_MIN_RUNTIME_MIN = 55
+    private const val MAX_ABSORBED_PER_SEASON = 3
+    // Named like a ceremony, not like story content (TMDB's specials
+    // season also hosts live events/stage readings — those must never
+    // become numbered season rows).
+    private val NON_STORY_SPECIAL = Regex(
+        """(?i)\b(live\s*&?\s*event|stage\s*event|stage\s*play|stage\s*greeting|reading|concert|panel|fan\s*meeting|screening\s*event|talk\s*show)\b"""
+    )
+    private const val CACHE_MS = 45 * 60 * 1000L
+    private const val NEG_CACHE_MS = 5 * 60 * 1000L
+
+    class EpRow(
+        val name: String?,
+        val overview: String?,
+        val stillUrl: String?,
+        val airDate: Long?,   // unix ms, UTC day — what Episode.date wants
+        val runtime: Int?,
+        val score: Double?,
+        // Where TMDB canonically stores an absorbed special (0/36 etc.).
+        // null = regular row, stacked number == TMDB's own numbering.
+        val tmdbSeason: Int?,
+        val tmdbEpisode: Int?,
+    )
+
+    private val cache =
+        java.util.concurrent.ConcurrentHashMap<Int, Pair<Long, Map<Int, Map<Int, EpRow>>?>>()
+
+    private fun parseYmd(s: String?): Long? {
+        if (s == null) return null
+        val parts = s.split("-")
+        if (parts.size != 3) return null
+        val y = parts[0].toIntOrNull() ?: return null
+        val m = parts[1].toIntOrNull() ?: return null
+        val d = parts[2].toIntOrNull() ?: return null
+        return runCatching {
+            val c = java.util.Calendar.getInstance(java.util.TimeZone.getTimeZone("UTC"))
+            c.clear(); c.set(y, m - 1, d)
+            c.timeInMillis
+        }.getOrNull()
+    }
+
+    private suspend fun getJson(app: Requests, path: String): JSONObject? = runCatching {
+        val url = "$TABLE_API$path?api_key=$TABLE_KEY&language=en-US"
+        val res = app.get(url, headers = mapOf(
+            "User-Agent" to TABLE_UA,
+            "Accept" to "application/json",
+        ), timeout = 10_000)
+        if (res.code !in 200..299) null else JSONObject(res.text)
+    }.getOrNull()
+
+    /** Site-stacked episode table: siteSeason → stackedEpisode → row. */
+    suspend fun table(app: Requests, tmdbId: Int): Map<Int, Map<Int, EpRow>>? {
+        val now = System.currentTimeMillis()
+        cache[tmdbId]?.let { (ts, v) ->
+            if (now - ts < (if (v == null) NEG_CACHE_MS else CACHE_MS)) return v
+        }
+        val built = runCatching { buildTable(app, tmdbId) }.getOrNull()
+        cache[tmdbId] = now to built
+        return built
+    }
+
+    private suspend fun buildTable(app: Requests, tmdbId: Int): Map<Int, Map<Int, EpRow>>? {
+        val detail = getJson(app, "/tv/$tmdbId") ?: return null
+        val seasonsArr = detail.optJSONArray("seasons") ?: return null
+        val seasons = (0 until seasonsArr.length()).mapNotNull { i ->
+            seasonsArr.optJSONObject(i)?.optInt("season_number")?.takeIf { it > 0 }
+        }.sorted().distinct()
+        if (seasons.isEmpty()) return null
+
+        // Pull every TV season + the specials season, bounded-parallel.
+        val sem = Semaphore(4)
+        val seasonJson = coroutineScope {
+            (listOf(0) + seasons).map { s ->
+                async(Dispatchers.IO) {
+                    sem.withPermit { s to getJson(app, "/tv/$tmdbId/season/$s") }
+                }
+            }.awaitAll().toMap()
+        }
+
+        fun rowOf(e: JSONObject): EpRow = EpRow(
+            name = e.optStringOrNullCp("name"),
+            overview = e.optStringOrNullCp("overview"),
+            stillUrl = e.optStringOrNullCp("still_path")
+                ?.let { "https://image.tmdb.org/t/p/w780$it" },
+            airDate = parseYmd(e.optStringOrNullCp("air_date")),
+            runtime = e.optInt("runtime").takeIf { it > 0 },
+            score = e.optDouble("vote_average").takeIf { !it.isNaN() && it > 0.0 },
+            tmdbSeason = null, tmdbEpisode = null,
+        )
+
+        val out = LinkedHashMap<Int, MutableList<EpRow>>()
+        val lastAirBySeason = HashMap<Int, Long>()
+        val firstAirBySeason = HashMap<Int, Long>()
+        for (s in seasons) {
+            val arr = seasonJson[s]?.optJSONArray("episodes")
+            val raw = if (arr == null) emptyList()
+            else (0 until arr.length()).mapNotNull { arr.optJSONObject(it) }
+                .filter { it.optInt("episode_number", 0) > 0 }
+                .sortedBy { it.optInt("episode_number") }
+            out[s] = raw.map(::rowOf).toMutableList()
+            raw.mapNotNull { parseYmd(it.optStringOrNullCp("air_date")) }.let { days ->
+                days.minOrNull()?.let { firstAirBySeason[s] = it }
+                days.maxOrNull()?.let { lastAirBySeason[s] = it }
+            }
+        }
+
+        // ── Recursive specials tail-attach ────────────────────────────────
+        val s0 = seasonJson[0]?.optJSONArray("episodes")
+        if (s0 != null && s0.length() > 0) {
+            class Cand(val airMs: Long, val s0Ep: Int, val row: EpRow)
+            val cands = mutableListOf<Cand>()
+            for (i in 0 until s0.length()) {
+                val e = s0.optJSONObject(i) ?: continue
+                val s0Ep = e.optInt("episode_number", 0).takeIf { it > 0 } ?: continue
+                val run = e.optInt("runtime", 0)
+                if (run < STORY_SPECIAL_MIN_RUNTIME_MIN) continue   // "1-hour" rule
+                val specialName = e.optStringOrNullCp("name")
+                if (specialName != null && NON_STORY_SPECIAL.containsMatchIn(specialName)) continue
+                val air = parseYmd(e.optStringOrNullCp("air_date")) ?: continue
+                cands += Cand(air, s0Ep, EpRow(
+                    name = e.optStringOrNullCp("name"),
+                    overview = e.optStringOrNullCp("overview"),
+                    stillUrl = e.optStringOrNullCp("still_path")
+                        ?.let { "https://image.tmdb.org/t/p/w780$it" },
+                    airDate = air,
+                    runtime = run,
+                    score = e.optDouble("vote_average").takeIf { !it.isNaN() && it > 0.0 },
+                    tmdbSeason = 0, tmdbEpisode = s0Ep,
+                ))
+            }
+            cands.sortWith(compareBy({ it.airMs }, { it.s0Ep }))
+            val absorbed = HashMap<Int, Int>()
+            for (c in cands) {
+                // Whose tail does this special continue? The LAST season
+                // whose finale aired before it …
+                val after = seasons.lastOrNull { s ->
+                    lastAirBySeason[s]?.let { c.airMs > it } == true
+                } ?: continue
+                // … provided it aired BEFORE the next season's premiere.
+                // For the FINAL season the window is OPEN-ENDED: TMDB's
+                // last_air_date only counts regular episodes, so story
+                // specials (the Final Chapters) land chronologically
+                // "after the show ended" and would otherwise never absorb.
+                val nextSeason = seasons.firstOrNull { it > after }
+                val withinWindow = if (nextSeason == null) true
+                else firstAirBySeason[nextSeason]?.let { c.airMs < it } == true
+                if (!withinWindow) continue
+                if ((absorbed[after] ?: 0) >= MAX_ABSORBED_PER_SEASON) continue
+                // Skip pure re-packagings of the finale itself.
+                if (out[after]?.lastOrNull()?.name?.equals(c.row.name, true) == true) continue
+                absorbed[after] = (absorbed[after] ?: 0) + 1
+                out[after]?.add(c.row)
+            }
+        }
+
+        // Renumber sequentially after every attach: stacked EpRow index.
+        return out.mapValues { (_, rows) ->
+            rows.mapIndexed { idx, r -> (idx + 1) to r }.toMap()
+        }
+    }
+}

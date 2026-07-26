@@ -1,14 +1,19 @@
-version = 58
+version = 59
 
 cloudstream {
     description = "WizstreamAnime — THE anime catalogue (in-app source " +
         "name: \"Wizstream-Anime\"), PURE AniList metadata: every piece " +
         "(titles, posters, banners, summaries, genres, scores, trailers, " +
         "full Japanese voice-actor cast, MAL/AniList tracking) comes from " +
-        "AniList alone — zero TMDB calls, zero TMDB fields. Episode " +
-        "titles/thumbnails use AniList's own licensed-streaming feed per " +
-        "entry; where that feed is missing rows honestly show " +
-        "\"Episode N\" with the show poster. Stacked CircleFTP-style " +
+        "AniList alone. Pages behave like a normal AniList client " +
+        "(per-entry pages since v58). Episode fields: AniList's licensed " +
+        "streaming feed supplies titles/thumbnails first (whole-season " +
+        "feeds on cours parts are sliced to the entry's own window); the " +
+        "only thing AniList fundamentally lacks — descriptions, plus " +
+        "titles for unstreamed shows — fills from the recursive shared " +
+        "episode-table mapper (v59, same catalogue CircleFTP mirrors), " +
+        "which also attaches long story-specials to their parent season's " +
+        "tail sequentially (Final Chapters 1/2 = S4E29/E30). Stacked CircleFTP-style " +
         "multi-season mega pages (cours merged: Attack on Titan Season 3 " +
         "= all 22 episodes). Links resolve through the same engine as " +
         "Wizstream: BDIX sources (Cineplex BD, FTPBD, Circle FTP, " +

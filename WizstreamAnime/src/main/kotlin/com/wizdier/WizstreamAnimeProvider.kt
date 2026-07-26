@@ -403,7 +403,13 @@ class WizstreamAnimeProvider : MainAPI() {
         val title = detail.title
         val episodes = detail.episodes
         val type = when (detail.format) {
-            "MOVIE", "SPECIAL" -> if (episodes <= 1) TvType.AnimeMovie else TvType.Anime
+            "MOVIE" -> if (episodes <= 1) TvType.AnimeMovie else TvType.Anime
+            // (v59) Story-special entries (AoT's "Kanketsu-hen Zenpen" =
+            // The Final Chapters 1) must keep a PER-ENTRY episode page so
+            // their rows ride the recursively-attached stacked numbers
+            // (S4E29) down to the CircleFTP season tab — as a "Movie" row
+            // there'd be no season/episode to map.
+            "SPECIAL" -> TvType.Anime
             "OVA", "ONA" -> TvType.OVA
             "MUSIC" -> TvType.AnimeMovie
             else -> TvType.Anime
@@ -436,14 +442,27 @@ class WizstreamAnimeProvider : MainAPI() {
                 // entry-local episode for the anime-web sources.
                 (1..m.episodes).map { localEp ->
                     val stackedEp = m.seasonStart + localEp - 1
-                    val epMeta = detail.seasonMeta[m.siteSeason]?.get(stackedEp)
-                    // (v53) AniList metadata first: this entry's own
-                    // streaming-episode title/thumb. Guard: AniList sometimes
-                    // attaches the WHOLE season's list to a split-cour entry —
-                    // an overlong list would shift titles, so refuse it.
-                    val sEp = m.streamEps
-                        .takeIf { it.size <= m.episodes + 3 }
-                        ?.getOrNull(localEp - 1)
+                    // (v59) Episode meta fills (with the user's blessing)
+                    // from the catalogue CircleFTP mirrors — the recursive
+                    // WizEpisodeTable resolves this stacked slot to TMDB's
+                    // canon row, cours folds and tail-absorbed specials
+                    // alike. Catalogue/pages stay 100% AniList.
+                    val epMeta = detail.epTable[m.siteSeason]?.get(stackedEp)
+                    // (v53, healed v59) AniList titles first: this entry's
+                    // streaming-feed title/thumb. Two accepted shapes:
+                    // entry-scoped (normal), or a WHOLE-SEASON list glued
+                    // to a cours part — slice the window this entry owns
+                    // (AoT S3 Part 2: 22-row season list, entry starts at
+                    // 13 → rows 12..21) instead of dropping every title.
+                    val sEpList = m.streamEps.let { list ->
+                        when {
+                            list.size <= m.episodes + 3 -> list
+                            list.size >= m.seasonStart + m.episodes - 1 ->
+                                list.subList(m.seasonStart - 1, m.seasonStart - 1 + m.episodes)
+                            else -> emptyList()
+                        }
+                    }
+                    val sEp = sEpList.getOrNull(localEp - 1)
                     newEpisode(LinkContext(
                         anilistId = m.id, imdbId = imdbId, tmdbId = tmdbId, malId = m.malId,
                         season = m.siteSeason, episode = stackedEp, entryEpisode = localEp,
@@ -451,14 +470,16 @@ class WizstreamAnimeProvider : MainAPI() {
                         isMovie = false, year = detail.year,
                         sourceSeason = m.siteSeason,
                         franchiseTitles = detail.franchiseTitles,
+                        tmdbSeason = epMeta?.tmdbSeason,
+                        tmdbEpisode = epMeta?.tmdbEpisode,
                         dub = DubStatus.Subbed,
                     ).toJson()) {
-                        name = sEp?.title ?: "Episode $localEp"
+                        name = sEp?.title ?: epMeta?.name ?: "Episode $localEp"
                         season = 1
                         episode = localEp
                         posterUrl = sEp?.thumb ?: epMeta?.stillUrl ?: detail.posterUrl
                         description = epMeta?.overview
-                        runCatching { epMeta?.rating?.let { score = Score.from10(it) } }
+                        runCatching { epMeta?.score?.let { score = Score.from10(it) } }
                         runTime = epMeta?.runtime
                         this.date = epMeta?.airDate
                     }
@@ -537,11 +558,17 @@ class WizstreamAnimeProvider : MainAPI() {
                 async(Dispatchers.IO) {
                     gate.withPermit {
                         // (v48) ctx already carries STACKED numbering.
-                        val seasonForSources = ctx.sourceSeason ?: ctx.season
-                        val embedUrl = if (ctx.isMovie || seasonForSources == null || ctx.episode == null) {
+                        // (v59) …but a tail-absorbed story-special ALSO
+                        // carries its canonical TMDB location (stacked
+                        // S4E29 = TMDB S0E36): TMDB-indexed embed hosts
+                        // must be pointed there, BDIX/anime-web resolvers
+                        // keep reading the stacked rows.
+                        val seasonForSources = ctx.tmdbSeason ?: ctx.sourceSeason ?: ctx.season
+                        val episodeForHost = ctx.tmdbEpisode ?: ctx.episode
+                        val embedUrl = if (ctx.isMovie || seasonForSources == null || episodeForHost == null) {
                             host.movie(id)
                         } else {
-                            host.tv(id, seasonForSources, ctx.episode)
+                            host.tv(id, seasonForSources, episodeForHost)
                         }
                         try {
                             val before = anyFound
@@ -658,15 +685,6 @@ class WizstreamAnimeProvider : MainAPI() {
     //  AniList + mapping helpers
     // ═══════════════════════════════════════════════════════════════════════
 
-    private data class EpisodeMeta(
-        val title: String?,
-        val overview: String?,
-        val stillUrl: String?,
-        val rating: Double?,
-        val airDate: Long?,
-        val runtime: Int?,
-    )
-
     private data class AniDetail(
         val title: String,
         val altTitle: String? = null,
@@ -690,8 +708,10 @@ class WizstreamAnimeProvider : MainAPI() {
         // its siteSeason/seasonStart resolved (single-entry shows carry
         // just the opened member — the page renders exactly as before).
         val members: List<FranchiseMember> = emptyList(),
-        // (v48) TMDB episode metadata per STACKED season → stacked ep.
-        val seasonMeta: Map<Int, Map<Int, EpisodeMeta>> = emptyMap(),
+        // (v59) Recursive episode-table rows per STACKED season →
+        // stacked ep (replaces v48's season-meta map; same catalogue
+        // CircleFTP mirrors, site-tail specials included).
+        val epTable: Map<Int, Map<Int, WizEpisodeTable.EpRow>> = emptyMap(),
         val recommendations: List<JSONObject>,
         // (v45) English+romaji titles of every counted prequel ancestor,
         // walk order (franchise root LAST). BDIX sites file multi-season
@@ -743,6 +763,24 @@ class WizstreamAnimeProvider : MainAPI() {
                 this.posterUrl = cover; this.year = year
             }
         }
+    }
+
+    // (v59) Cached ani.zip id-map lookup (TMDB show id) for FRANCHISE
+    // entries other than the opened one — the opened entry's own lookup
+    // is inline in fetchAniDetail; this exists so a cours part / special
+    // without a mapping of its own can still reach the show's TMDB id
+    // via the franchise root (roots are the reliably-mapped entries).
+    private val aniZipTmdbCache = HashMap<Int, Int?>()
+    private suspend fun fetchAniZipTmdbId(anilistId: Int): Int? {
+        if (aniZipTmdbCache.containsKey(anilistId)) return aniZipTmdbCache[anilistId]
+        val found = runCatching {
+            val text = app.get("https://api.ani.zip/mappings?anilist_id=$anilistId",
+                headers = mapOf("User-Agent" to A_UA), timeout = 8000).text
+            JSONObject(text).optJSONObject("mappings")
+                ?.aOptStr("themoviedb_id")?.toIntOrNull()
+        }.getOrNull()
+        aniZipTmdbCache[anilistId] = found
+        return found
     }
 
     private suspend fun fetchAniDetail(id: Int): AniDetail? {
@@ -964,27 +1002,58 @@ class WizstreamAnimeProvider : MainAPI() {
         // Fold into stacked (site-style) seasons. A cours part joins the
         // season its direct prequel opened and continues its numbering
         // (AoT S3=12 rows, S3 Part 2 continues at 13 → stacked 22).
+        // (v59) Recursive tail-attach for story-special members (and for
+        // the opened entry itself when it's a special): they fold INTO
+        // the season they follow, continuing its numbering sequentially —
+        // "Kanketsu-hen Zenpen" → S4E29, "Kouhen" → S4E30, exactly the
+        // rows CircleFTP's Season-4 tab ends with and TMDB's canonical
+        // map (S0E36/E37) holds the metadata for. Generalizes to every
+        // anime whose chain ends in long-form specials.
         var seasonCounter = 0
         var nextStart = 1
         members.forEach { m ->
-            if (titlePartNumber(m.title) == null || seasonCounter == 0) {
-                seasonCounter++
-                m.siteSeason = seasonCounter
-                m.seasonStart = 1
-            } else {
-                m.siteSeason = seasonCounter
-                m.seasonStart = nextStart
+            when {
+                m.format !in franchiseBroadcastFormats -> {
+                    if (seasonCounter == 0) {
+                        seasonCounter = 1
+                        m.siteSeason = 1
+                        m.seasonStart = 1
+                    } else {
+                        m.siteSeason = seasonCounter
+                        m.seasonStart = nextStart
+                    }
+                }
+                titlePartNumber(m.title) == null || seasonCounter == 0 -> {
+                    seasonCounter++
+                    m.siteSeason = seasonCounter
+                    m.seasonStart = 1
+                }
+                else -> {
+                    m.siteSeason = seasonCounter
+                    m.seasonStart = nextStart
+                }
             }
             nextStart = m.seasonStart + m.episodes
         }
 
-        // (v55, PURE ANILIST module) No TMDB calls anywhere in this
-        // module: no title search, no details fetch, no per-season episode
-        // table. AniList's own streaming-feed rows already supply episode
-        // titles/thumbs in load(); everything else stays bare-but-honest
-        // ("Episode N" + the show poster). Logo stays empty (AniList has
-        // no logo data); backdrop stays the AniList banner (or nothing).
-        val seasonMeta = HashMap<Int, Map<Int, EpisodeMeta>>()
+        // (v59, per user decision) EPISODE meta fills from the catalogue
+        // CircleFTP mirrors: the recursive WizEpisodeTable maps every
+        // stacked (siteSeason, stackedEp) — cours folds AND tail-absorbed
+        // story-specials alike — onto TMDB's canon row, carrying real
+        // titles, descriptions, stills, runtimes, air dates. Everything
+        // else here stays 100% AniList (this table touches ONLY the
+        // per-episode fields AniList fundamentally can't answer — AniList
+        // exposes no per-episode description). The show's TMDB id comes
+        // from the ani.zip id-map of the opened entry, falling back to
+        // the franchise-root entry's map (roots are the reliably-mapped
+        // entries; cour parts/specials often have none).
+        val showTmdbId = tmdbId?.takeIf { it > 0 }
+            ?: members.firstOrNull()?.let { root -> fetchAniZipTmdbId(root.id) }
+        val epTable: Map<Int, Map<Int, WizEpisodeTable.EpRow>> =
+            if (format == "MOVIE") emptyMap()
+            else showTmdbId?.let { id ->
+                runCatching { WizEpisodeTable.table(app, id) }.getOrNull()
+            } ?: emptyMap()
 
         val malId = media.optInt("idMal", 0).takeIf { it != 0 }
 
@@ -1008,7 +1077,7 @@ class WizstreamAnimeProvider : MainAPI() {
             actors = actors,
             trailerUrl = trailerUrl,
             members = members,
-            seasonMeta = seasonMeta,
+            epTable = epTable,
             recommendations = recs,
             franchiseTitles = franchiseTitles,
         )
@@ -1171,6 +1240,14 @@ class WizstreamAnimeProvider : MainAPI() {
         // candidate wins when branches appear; same bridge rule for
         // OVA/movie link nodes (Haikyuu S3 → OVA → TO THE TOP).
         val post = mutableListOf<RelCand>()
+        // (v59) Recursive story-special absorption (user design): a
+        // SEQUEL-chained long-form special — AniList format SPECIAL, like
+        // Attack on Titan's "Kanketsu-hen Zenpen/Kouhen" (The Final
+        // Chapters 1 & 2, one ~1-hour episode each) — isn't a side-story
+        // bridge; it CONTINUES the final TV season and joins the stacked
+        // fold right after it (S4E29, then S4E30). OVA/movie link nodes
+        // still stay invisible bridges. At most 3 absorb per chain.
+        val tailSpecials = mutableListOf<RelCand>()
         var sEdges = initialEdges
         var sHops = 0
         var sBridges = 0
@@ -1204,6 +1281,11 @@ class WizstreamAnimeProvider : MainAPI() {
                 post += hop
             } else {
                 sBridges++
+                // (v59) Sequel-chain story-specials are absorbed as chain
+                // members so the fold can tail-attach them sequentially.
+                if (hop.fmt == "SPECIAL" && hop.eps in 1..6 && tailSpecials.size < 3) {
+                    tailSpecials += hop
+                }
             }
             sEdges = relationsEdges(hop.id) ?: break
         }
@@ -1221,6 +1303,17 @@ class WizstreamAnimeProvider : MainAPI() {
             members += FranchiseMember(
                 id = c.id, title = c.title, altTitle = c.alt,
                 episodes = if (c.eps > 0) c.eps else 12,
+                malId = c.malId, format = c.fmt,
+                streamEps = c.streamEps,
+            )
+        }
+        // (v59) Absorbed specials always tail the chain (the fold gives
+        // them the continuing stacked numbers — Final Chapters 1 → S4E29,
+        // 2 → S4E30 — no matter which entry was opened).
+        tailSpecials.forEach { c ->
+            members += FranchiseMember(
+                id = c.id, title = c.title, altTitle = c.alt,
+                episodes = if (c.eps > 0) c.eps else 1,
                 malId = c.malId, format = c.fmt,
                 streamEps = c.streamEps,
             )
@@ -1408,6 +1501,12 @@ class WizstreamAnimeProvider : MainAPI() {
         // (v45) counted prequel-ancestor titles (root last) — extra BDIX
         // search keys for multi-season franchise entries.
         val franchiseTitles: List<String>? = null,
+        // (v59) Canonical TMDB location of a tail-absorbed story-special
+        // (recursive map: AniList "Kanketsu-hen Zenpen" = stacked S4E29 =
+        // TMDB S0E36). BDIX/anime-web resolvers keep the stacked numbers;
+        // only TMDB-indexed embed hosts get pointed at these.
+        val tmdbSeason: Int? = null,
+        val tmdbEpisode: Int? = null,
         val dub: DubStatus = DubStatus.Subbed,
     ) {
         fun toJson(): String = JSONObject().apply {
@@ -1422,6 +1521,8 @@ class WizstreamAnimeProvider : MainAPI() {
             year?.let { put("year", it) }
             sourceSeason?.let { put("src_season", it) }
             entryEpisode?.let { put("entry_ep", it) }
+            tmdbSeason?.let { put("t_season", it) }
+            tmdbEpisode?.let { put("t_ep", it) }
             franchiseTitles?.takeIf { it.isNotEmpty() }
                 ?.let { put("src_franchise", JSONArray(it)) }
             put("is_movie", isMovie)
@@ -1444,6 +1545,8 @@ class WizstreamAnimeProvider : MainAPI() {
                     isMovie = o.optBoolean("is_movie", false),
                     sourceSeason = o.aOptInt("src_season"),
                     entryEpisode = o.aOptInt("entry_ep"),
+                    tmdbSeason = o.aOptInt("t_season"),
+                    tmdbEpisode = o.aOptInt("t_ep"),
                     franchiseTitles = o.optJSONArray("src_franchise")?.let { arr ->
                         (0 until arr.length()).mapNotNull { arr.optString(it).takeIf { s -> s.isNotBlank() } }
                     },

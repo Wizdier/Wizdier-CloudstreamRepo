@@ -440,11 +440,22 @@ class WizstreamProvider : MainAPI() {
                 runCatching { enrich?.anilistId?.let { addAniListId(it) } }
             }
         } else {
-            val seasons = detail.seasons.ifEmpty { listOf(1) }
-            val episodesAll = boundedParallelMapWz(seasons, 6) { s ->
-                fetchSeasonEpisodes(tmdbId, s, title, detail)
-            }.flatten().distinctBy { (it.season ?: 1) to (it.episode ?: 0) }
-                .sortedWith(compareBy({ it.season ?: 1 }, { it.episode ?: 0 }))
+            // (v59) Anime episode tables come from the recursive
+            // WizEpisodeTable mapper: same catalogue shape as CircleFTP —
+            // per-season rows extended SEQUENTIALLY with tail-absorbed
+            // story-specials (Attack on Titan S4 = 28 TV eps + The Final
+            // Chapters 1&2 as E29/E30), titles and descriptions included —
+            // then renumbered like the site's tabs. Non-anime shows keep
+            // the plain per-season fetch. Null table (network/empty show)
+            // falls back to the plain fetch too.
+            val animeTable = if (isAnime) buildAnimeEpisodeTable(tmdbId, title, detail) else null
+            val episodesAll = animeTable ?: run {
+                val seasons = detail.seasons.ifEmpty { listOf(1) }
+                boundedParallelMapWz(seasons, 6) { s ->
+                    fetchSeasonEpisodes(tmdbId, s, title, detail)
+                }.flatten().distinctBy { (it.season ?: 1) to (it.episode ?: 0) }
+                    .sortedWith(compareBy({ it.season ?: 1 }, { it.episode ?: 0 }))
+            }
 
             if (isAnime) {
                 // Anime: TMDB hosts the episode table (its packed-cours
@@ -503,6 +514,11 @@ class WizstreamProvider : MainAPI() {
         val id = ctx.imdbId ?: ctx.tmdbId?.toString() ?: return@coroutineScope false
         val s = ctx.season
         val e = ctx.episode
+        // (v59) Tail-absorbed story-specials (WizEpisodeTable) carry their
+        // canonical TMDB location: TMDB-indexed embed hosts must ask for
+        // S0E36, not the stacked S4E29 (which TMDB has no row for).
+        val embedS = ctx.tmdbSeason ?: s
+        val embedE = ctx.tmdbEpisode ?: e
 
         val seenUrls = Collections.newSetFromMap<String>(ConcurrentHashMap())
         val seenSubs = Collections.newSetFromMap<String>(ConcurrentHashMap())
@@ -512,10 +528,10 @@ class WizstreamProvider : MainAPI() {
         val jobs = VID_HOSTS.map { host ->
             async(Dispatchers.IO) {
                 gate.withPermit {
-                    val embedUrl = if (ctx.isMovie || s == null || e == null) {
+                    val embedUrl = if (ctx.isMovie || embedS == null || embedE == null) {
                         host.movie(id)
                     } else {
-                        host.tv(id, s, e)
+                        host.tv(id, embedS, embedE)
                     }
                     try {
                         val before = anyFound
@@ -856,6 +872,44 @@ class WizstreamProvider : MainAPI() {
         }.getOrNull()
     }
 
+    // (v59) Recursive BDIX-shaped episode table for JP-animation pages:
+    // WizEpisodeTable folds tail attached story-specials into their parent
+    // season sequentially (AoT Final Chapters 1/2 → S4E29/E30) while
+    // remembering each row's canonical TMDB location so the embed hosts
+    // can be pointed at it (see LinkContext.tmdbSeason/tmdbEpisode).
+    private suspend fun buildAnimeEpisodeTable(
+        tmdbId: Int,
+        showTitle: String,
+        detail: TmdbDetail,
+    ): List<Episode>? {
+        val tbl = runCatching { WizEpisodeTable.table(app, tmdbId) }.getOrNull()
+            ?: return null
+        return tbl.toSortedMap().flatMap { (season, eps) ->
+            eps.toSortedMap().map { (epNum, row) ->
+                newEpisode(LinkContext(
+                    imdbId = detail.imdbId,
+                    tmdbId = tmdbId,
+                    season = season,
+                    episode = epNum,
+                    title = showTitle,
+                    isMovie = false,
+                    year = detail.year,
+                    tmdbSeason = row.tmdbSeason,
+                    tmdbEpisode = row.tmdbEpisode,
+                ).toJson()) {
+                    this.name = row.name ?: "Episode $epNum"
+                    this.season = season
+                    this.episode = epNum
+                    this.posterUrl = row.stillUrl
+                    this.description = row.overview
+                    runCatching { row.score?.let { score = Score.from10(it) } }
+                    runTime = row.runtime
+                    this.date = row.airDate
+                }
+            }
+        }
+    }
+
     private suspend fun fetchSeasonEpisodes(
         tmdbId: Int,
         season: Int,
@@ -947,6 +1001,13 @@ class WizstreamProvider : MainAPI() {
         val title: String? = null,
         val isMovie: Boolean = false,
         val year: Int? = null,   // (v18) TMDB year — needed for identity matching in BDIX resolvers
+        // (v59) Canonical TMDB location of a tail-absorbed story-special
+        // (e.g. AoT "The Final Chapters Special (1)" = S0E36 while its
+        // stacked site row is S4E29 — see WizEpisodeTable). BDIX resolvers
+        // keep reading the stacked season/episode; only the TMDB-indexed
+        // embed hosts get pointed at these. null = regular row.
+        val tmdbSeason: Int? = null,
+        val tmdbEpisode: Int? = null,
     ) {
         fun toJson(): String = JSONObject().apply {
             imdbId?.let { put("imdb_id", it) }
@@ -955,6 +1016,8 @@ class WizstreamProvider : MainAPI() {
             episode?.let { put("episode", it) }
             title?.let { put("title", it) }
             year?.let { put("year", it) }
+            tmdbSeason?.let { put("t_season", it) }
+            tmdbEpisode?.let { put("t_ep", it) }
             put("is_movie", isMovie)
         }.toString()
 
@@ -969,6 +1032,8 @@ class WizstreamProvider : MainAPI() {
                     title = o.optStringOrNullWz("title"),
                     year = o.optIntOrNullWz("year"),
                     isMovie = o.optBoolean("is_movie", false),
+                    tmdbSeason = o.optIntOrNullWz("t_season"),
+                    tmdbEpisode = o.optIntOrNullWz("t_ep"),
                 )
             }
         }
