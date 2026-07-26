@@ -691,7 +691,13 @@ class WizstreamAnimeProvider : MainAPI() {
     )
 
     private fun parseAnilistUrl(url: String): Int? {
+        // Accept every form this extension has ever emitted or stored:
+        //   wiz://anilist/<id>                               (≤v51)
+        //   https://anilist.co/anime/<id>                    (v52+)
+        //   https://anilist.co/wiz://anilist/<id>            (app-side
+        //     fixUrl artifact seen on v51 error screens)
         val m = Regex("wiz://anilist/(\\d+)").find(url)
+            ?: Regex("/anime/(\\d+)").find(url)
             ?: Regex("anilist/(\\d+)").find(url)
             ?: return null
         return m.groupValues[1].toIntOrNull()
