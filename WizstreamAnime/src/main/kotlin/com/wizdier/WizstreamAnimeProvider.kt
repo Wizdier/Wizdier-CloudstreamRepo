@@ -801,6 +801,42 @@ class WizstreamAnimeProvider : MainAPI() {
         return found
     }
 
+    // (v61) Per-entry-correct Kitsu id — resolved through Kitsu's OWN
+    // external-id mapping, keyed by the entry's authoritative MAL id (the
+    // AniList idMal field). One request, cached by malId; the Kitsu
+    // include=item inlines the anime resource, so no follow-up hop.
+    // Returns null when Kitsu simply has no mapping for the entry.
+    private val kitsuByMalCache = HashMap<Int, String?>()
+    private suspend fun fetchKitsuIdByMal(malId: Int): String? {
+        if (malId <= 0) return null
+        if (kitsuByMalCache.containsKey(malId)) return kitsuByMalCache[malId]
+        val found = runCatching {
+            val url = "https://kitsu.io/api/edge/mappings" +
+                "?filter%5BexternalSite%5D=myanimelist%2Fanime" +
+                "&filter%5BexternalId%5D=$malId&include=item"
+            val text = app.get(url, headers = mapOf(
+                "User-Agent" to A_UA,
+                "Accept" to "application/vnd.api+json",
+            ), timeout = 8000).text
+            val included = JSONObject(text).optJSONArray("included")
+            included?.let { arr ->
+                (0 until arr.length())
+                    .mapNotNull { arr.optJSONObject(it) }
+                    .firstOrNull { it.optString("type") == "anime" }
+                    ?.optString("id")?.takeIf { s -> s.isNotBlank() }
+            }
+        }.getOrNull()
+        kitsuByMalCache[malId] = found
+        return found
+    }
+
+    // (v61) Viewer id for logged-in list fetching (MediaListCollection
+    // rejects userName:null, so the token path needs userId).
+    private suspend fun fetchViewerId(token: String): Int? = runCatching {
+        anilistQuery("query { Viewer { id } }", JSONObject(), token)
+            ?.optJSONObject("Viewer")?.optInt("id", 0)?.takeIf { it != 0 }
+    }.getOrNull()
+
     private suspend fun fetchAniDetail(id: Int): AniDetail? {
         val now = System.currentTimeMillis()
         META_CACHE[id]?.let { (ts, cached) ->
@@ -1067,13 +1103,26 @@ class WizstreamAnimeProvider : MainAPI() {
         // entries; cour parts/specials often have none).
         val showTmdbId = tmdbId?.takeIf { it > 0 }
             ?: members.firstOrNull()?.let { root -> fetchAniZipTmdbId(root.id) }
+        val showTable = if (format == "MOVIE") null
+        else showTmdbId?.let { id ->
+            runCatching { WizEpisodeTable.table(app, id) }.getOrNull()
+        }
         val epTable: Map<Int, Map<Int, WizEpisodeTable.EpRow>> =
-            if (format == "MOVIE") emptyMap()
-            else showTmdbId?.let { id ->
-                runCatching { WizEpisodeTable.table(app, id) }.getOrNull()
-            } ?: emptyMap()
+            showTable?.seasons ?: emptyMap()
+        // (v61) High-quality LANDSCAPE art: AniList's banner stays first
+        // (it's the AniList asset), but most entries simply don't have
+        // one — the header then renders empty. The shared mapper already
+        // fetched the TMDB show page; its w1280 backdrop fills the gap.
+        if (backdropUrl == null) backdropUrl = showTable?.backdropUrl
+        // (v61) Official TITLE LOGO from TMDB's images (fetched inside
+        // the same mapper call) beats the MetaHub guess; MetaHub stays as
+        // last resort for titles TMDB can't logo.
+        showTable?.logoUrl?.let { logoUrl = it }
 
         val malId = media.optInt("idMal", 0).takeIf { it != 0 }
+
+        val resolvedKitsuId = malId?.let { fetchKitsuIdByMal(it) }
+            ?: kitsuId.takeIf { members.size <= 1 }
 
         val detail = AniDetail(
             title = title,
@@ -1089,14 +1138,16 @@ class WizstreamAnimeProvider : MainAPI() {
             tmdbId = tmdbId,
             malId = malId,
             simklId = simklId,
-            // (v60) Kitsu stays bound ONLY when the page is one clean
-            // single-entry show. ani.zip's kitsu_id for a cours/special
-            // entry fuzzily points at the franchise ROOT on Kitsu, so the
-            // sync sheet showed the root's progress against this entry's
-            // total (root "25 completed" on a 10-episode page — the
-            // "totally wrong tracking" report). AniList (opened id) and
-            // MAL (media.idMal — authoritative per entry) always bind.
-            kitsuId = kitsuId.takeIf { members.size <= 1 },
+            // (v61) Per-entry-correct Kitsu id, DETERMINISTIC: resolved
+            // through Kitsu's own myanimelist/anime mapping from the
+            // entry's authoritative AniList idMal (MAL 38524 → Kitsu
+            // 41982 = "Season 3 Part 2", exactly). ani.zip's kitsu_id
+            // fuzzily pointed at the franchise ROOT (25-ep Season 1) —
+            // the "season 1 tracking data" the app sheet displayed. The
+            // app's own getTracker fallback aborts once all three ids
+            // exist, so this also stops the app from re-fuzzing it.
+            // Root-ani.zip remains only for clean single-entry shows.
+            kitsuId = resolvedKitsuId,
             episodes = episodes,
             format = format,
             actors = actors,
@@ -1416,7 +1467,9 @@ class WizstreamAnimeProvider : MainAPI() {
         // Token (private-list-proof, app ≥4.8) preferred; username (public
         // profile query, every app generation) as fallback. Neither → hide.
         val token = anilistAuthToken()
-        val loginName = if (token == null) anilistLoginName() else null
+        // (v61) always resolved — if the token is expired and the viewer
+        // call fails, the public username path still fills the rows.
+        val loginName = anilistLoginName()
         if (token == null && loginName == null) {
             return newHomePageResponse(request.name, emptyList(), hasNext = false)
         }
@@ -1441,11 +1494,17 @@ class WizstreamAnimeProvider : MainAPI() {
         token: String?,
         userName: String?,
     ): List<SearchResponse> {
+        // (v61) THE userlist bug: the authenticated path used to send
+        // userName:null — MediaListCollection has no implicit viewer, so
+        // AniList rejected the whole call and BOTH personal rows silently
+        // stayed empty. The token path now resolves the viewer's numeric
+        // id first and queries by userId; the public fallback still goes
+        // by userName.
         val gql = """
-            query (${'$'}status: [MediaListStatus], ${'$'}userName: String) {
-              Viewer { id }
+            query (${'$'}status: [MediaListStatus], ${'$'}userName: String, ${'$'}userId: Int) {
               MediaListCollection(
                 userName: ${'$'}userName,
+                userId: ${'$'}userId,
                 type: ANIME,
                 status_in: ${'$'}status,
                 sort: UPDATED_TIME_DESC
@@ -1464,11 +1523,11 @@ class WizstreamAnimeProvider : MainAPI() {
               }
             }
         """.trimIndent()
+        val viewerId = token?.let { fetchViewerId(it) }
         val variables = JSONObject().apply {
             put("status", JSONArray(listOf(status)))
-            // Authenticated viewer flow ignores userName (AniList resolves
-            // the viewer automatically); the public fallback supplies it.
-            userName?.let { put("userName", it) } ?: put("userName", JSONObject.NULL)
+            put("userName", userName ?: JSONObject.NULL)
+            put("userId", viewerId ?: JSONObject.NULL)
         }
         val data = anilistQuery(gql, variables, token) ?: return emptyList()
         val out = mutableListOf<SearchResponse>()

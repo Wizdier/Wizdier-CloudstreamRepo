@@ -60,13 +60,21 @@ object WizstreamSources {
             return@coroutineScope false
         }
 
-        val sources = listOf(
+        // (v61) BDIX vs web bookkeeping kept separate: rescue passes below
+        // exist to fix BDIX catalog mismatch (cours splits, franchise
+        // titles), and must NOT be suppressed just because a web-API
+        // source emitted something — that made the v60 entry-local pass
+        // and the v45 franchise passes dead code whenever Bingr/Moonflix
+        // answered, which is precisely what kept cours-part pages dry.
+        val bdixSources = listOf(
             CineplexBdResolver,
             FtpBdResolver,
             CircleFtpResolver,
             CtgMoviesResolver,
             FmFtpResolver,
             MediaserverResolver,
+        )
+        val sources = bdixSources + listOf(
             CinebyResolver,
             BingrResolver,
             MoonflixResolver,
@@ -76,7 +84,7 @@ object WizstreamSources {
         val jobs = sources.map { src ->
             async(Dispatchers.IO) {
                 gate.withPermit {
-                    runCatching {
+                    src to runCatching {
                         src.resolve(
                             app = app,
                             title = title,
@@ -100,7 +108,9 @@ object WizstreamSources {
                 }
             }
         }
-        var found = jobs.awaitAll().any { it }
+        val primary = jobs.awaitAll()
+        var found = primary.any { it.second }
+        var bdixFound = primary.any { (s, ok) -> ok && s in bdixSources }
 
         // ── (v31) Alternate-title pass for the BDIX resolvers ─────────────
         // AniList feeds romaji/English titles that BDIX catalogues may index
@@ -134,7 +144,7 @@ object WizstreamSources {
                     }
                 }
             }
-            if (altJobs.awaitAll().any { it }) found = true
+            if (altJobs.awaitAll().any { it }) { found = true; bdixFound = true }
         }
 
         // ── (v45) Franchise-root passes for multi-season anime ──────────
@@ -152,7 +162,10 @@ object WizstreamSources {
             .take(3)
             .toList()
             .forEach { alt ->
-                if (found) return@forEach
+                // (v61) gated on BDIX success only — a web-API answer must
+                // not cancel the franchise rescue (root posting is the
+                // whole point of these passes).
+                if (bdixFound) return@forEach
                 val bdix = listOf(
                     CineplexBdResolver, FtpBdResolver, CircleFtpResolver, CtgMoviesResolver,
                     FmFtpResolver, MediaserverResolver,
@@ -180,7 +193,7 @@ object WizstreamSources {
                         }
                     }
                 }
-                if (altJobs.awaitAll().any { it }) found = true
+                if (altJobs.awaitAll().any { it }) { found = true; bdixFound = true }
             }
 
         // ── (v60) Entry-local episode pass for cours-split posts ──────
@@ -191,7 +204,10 @@ object WizstreamSources {
         // can never land; the entry-local number (1-10) is what that post
         // knows. Runs ONLY while nothing matched yet — merged layouts pay
         // nothing. Same BDIX set: web sources key on ids, not numbers.
-        if (!found && entryEpisode != null && !isMovie && season != null &&
+        // (v61) re-gated on bdixFound: in v60 this checked the GLOBAL
+        // found flag, which web sources (Bingr/Moonflix) had already set —
+        // the pass never actually fired, exactly why S3 Part 2 stayed dry.
+        if (!bdixFound && entryEpisode != null && !isMovie && season != null &&
             episode != null && entryEpisode > 0 && entryEpisode != episode
         ) {
             val bdix = listOf(
@@ -221,7 +237,7 @@ object WizstreamSources {
                     }
                 }
             }
-            if (altJobs.awaitAll().any { it }) found = true
+            if (altJobs.awaitAll().any { it }) { found = true; bdixFound = true }
         }
         found
     }
@@ -5103,8 +5119,18 @@ internal object WizEpisodeTable {
         val tmdbEpisode: Int?,
     )
 
+    // (v61) The table + the show-level artwork the same calls already pay
+    // for: a high-res LANDSCAPE backdrop (w1280) and the official TITLE
+    // LOGO (TMDB images, English first then language-neutral). The pure
+    // module uses these to fill what AniList cannot supply.
+    class Table(
+        val seasons: Map<Int, Map<Int, EpRow>>,
+        val backdropUrl: String?,
+        val logoUrl: String?,
+    )
+
     private val cache =
-        java.util.concurrent.ConcurrentHashMap<Int, Pair<Long, Map<Int, Map<Int, EpRow>>?>>()
+        java.util.concurrent.ConcurrentHashMap<Int, Pair<Long, Table?>>()
 
     private fun parseYmd(s: String?): Long? {
         if (s == null) return null
@@ -5121,7 +5147,8 @@ internal object WizEpisodeTable {
     }
 
     private suspend fun getJson(app: Requests, path: String): JSONObject? = runCatching {
-        val url = "$TABLE_API$path?api_key=$TABLE_KEY&language=en-US"
+        val joiner = if ('?' in path) "&" else "?"
+        val url = "$TABLE_API$path$joiner" + "api_key=$TABLE_KEY&language=en-US"
         val res = app.get(url, headers = mapOf(
             "User-Agent" to TABLE_UA,
             "Accept" to "application/json",
@@ -5129,8 +5156,8 @@ internal object WizEpisodeTable {
         if (res.code !in 200..299) null else JSONObject(res.text)
     }.getOrNull()
 
-    /** Site-stacked episode table: siteSeason → stackedEpisode → row. */
-    suspend fun table(app: Requests, tmdbId: Int): Map<Int, Map<Int, EpRow>>? {
+    /** Site-stacked episode table + show art. */
+    suspend fun table(app: Requests, tmdbId: Int): Table? {
         val now = System.currentTimeMillis()
         cache[tmdbId]?.let { (ts, v) ->
             if (now - ts < (if (v == null) NEG_CACHE_MS else CACHE_MS)) return v
@@ -5140,7 +5167,7 @@ internal object WizEpisodeTable {
         return built
     }
 
-    private suspend fun buildTable(app: Requests, tmdbId: Int): Map<Int, Map<Int, EpRow>>? {
+    private suspend fun buildTable(app: Requests, tmdbId: Int): Table? {
         val detail = getJson(app, "/tv/$tmdbId") ?: return null
         val seasonsArr = detail.optJSONArray("seasons") ?: return null
         val seasons = (0 until seasonsArr.length()).mapNotNull { i ->
@@ -5148,15 +5175,30 @@ internal object WizEpisodeTable {
         }.sorted().distinct()
         if (seasons.isEmpty()) return null
 
-        // Pull every TV season + the specials season, bounded-parallel.
+        // Pull every TV season + the specials season + the image list,
+        // bounded-parallel.
         val sem = Semaphore(4)
-        val seasonJson = coroutineScope {
-            (listOf(0) + seasons).map { s ->
+        val (seasonPairs, imagesJson) = coroutineScope {
+            val seasonJobs = (listOf(0) + seasons).map { s ->
                 async(Dispatchers.IO) {
                     sem.withPermit { s to getJson(app, "/tv/$tmdbId/season/$s") }
                 }
-            }.awaitAll().toMap()
+            }
+            val imgJob = async(Dispatchers.IO) {
+                sem.withPermit { getJson(app, "/tv/$tmdbId/images?include_image_language=en,null") }
+            }
+            seasonJobs.awaitAll().toMap() to imgJob.await()
         }
+        val seasonJson = seasonPairs
+        val logos = imagesJson?.optJSONArray("logos")
+        val logoPath = if (logos == null || logos.length() == 0) null
+        else (0 until logos.length()).mapNotNull { logos.optJSONObject(it) }
+            .filter { it.optStringOrNullCp("file_path") != null }
+            .maxByOrNull { it.optDouble("vote_average") }
+            ?.optStringOrNullCp("file_path")
+        val artBackdrop = detail.optStringOrNullCp("backdrop_path")
+            ?.let { "https://image.tmdb.org/t/p/w1280$it" }
+        val artLogo = logoPath?.let { "https://image.tmdb.org/t/p/w500$it" }
 
         fun rowOf(e: JSONObject): EpRow = EpRow(
             name = e.optStringOrNullCp("name"),
@@ -5235,8 +5277,9 @@ internal object WizEpisodeTable {
         }
 
         // Renumber sequentially after every attach: stacked EpRow index.
-        return out.mapValues { (_, rows) ->
+        val tableSeasons = out.mapValues { (_, rows) ->
             rows.mapIndexed { idx, r -> (idx + 1) to r }.toMap()
         }
+        return Table(tableSeasons, artBackdrop, artLogo)
     }
 }

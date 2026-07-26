@@ -883,7 +883,7 @@ class WizstreamProvider : MainAPI() {
         detail: TmdbDetail,
     ): List<Episode>? {
         val tbl = runCatching { WizEpisodeTable.table(app, tmdbId) }.getOrNull()
-            ?: return null
+            ?.seasons ?: return null
         return tbl.toSortedMap().flatMap { (season, eps) ->
             eps.toSortedMap().map { (epNum, row) ->
                 newEpisode(LinkContext(
