@@ -418,6 +418,12 @@ class WizstreamAnimeProvider : MainAPI() {
         val imdbId = detail.imdbId
         val tmdbId = detail.tmdbId
 
+        // (v60) Stacked-season episode totals per this chain — needed to
+        // prove an AniList streaming feed is season-aligned before slicing
+        // it (see the ep-row notes below).
+        val seasonTotals = detail.members.groupBy { it.siteSeason }
+            .mapValues { (_, ms) -> ms.sumOf { m -> m.episodes } }
+
         val epList = when (type) {
             TvType.AnimeMovie -> listOf(newEpisode(LinkContext(
                 anilistId = id, imdbId = imdbId, tmdbId = tmdbId, malId = detail.malId,
@@ -448,16 +454,24 @@ class WizstreamAnimeProvider : MainAPI() {
                     // canon row, cours folds and tail-absorbed specials
                     // alike. Catalogue/pages stay 100% AniList.
                     val epMeta = detail.epTable[m.siteSeason]?.get(stackedEp)
-                    // (v53, healed v59) AniList titles first: this entry's
-                    // streaming-feed title/thumb. Two accepted shapes:
-                    // entry-scoped (normal), or a WHOLE-SEASON list glued
-                    // to a cours part — slice the window this entry owns
-                    // (AoT S3 Part 2: 22-row season list, entry starts at
-                    // 13 → rows 12..21) instead of dropping every title.
+                    // (v53, healed v59, HARDENED v60) AniList titles
+                    // first — but only feeds whose shape PROVES alignment
+                    // with this entry's rows:
+                    //   • entry-scoped (±3): use as-is;
+                    //   • exactly the stacked-season total (v59's cours
+                    //     case: a genuine 22-title Season-3 feed on the
+                    //     Part-2 entry): slice the entry's window.
+                    // The v59 window accepted ANY long list — but AoT's
+                    // entries carry Crunchyroll's SERIES-wide feed (S1E1
+                    // at index 0), so Season-3 pages printed Season-1
+                    // titles ("Primal Desires" on S3 Part 2). Those get
+                    // rejected now and the shared episode table's title
+                    // (correct per stacked slot) shows instead.
                     val sEpList = m.streamEps.let { list ->
+                        val seasonTotal = seasonTotals[m.siteSeason] ?: m.episodes
                         when {
                             list.size <= m.episodes + 3 -> list
-                            list.size >= m.seasonStart + m.episodes - 1 ->
+                            list.size == seasonTotal ->
                                 list.subList(m.seasonStart - 1, m.seasonStart - 1 + m.episodes)
                             else -> emptyList()
                         }
@@ -633,6 +647,10 @@ class WizstreamAnimeProvider : MainAPI() {
                     // the search key that actually exists on BDIX sites
                     // for sequel-season entries.
                     extraAltTitles = ctx.franchiseTitles ?: emptyList(),
+                    // (v60) Gated fallback for sites that post cours splits
+                    // as separate one-bucket posts: stacked 13-22 can't
+                    // land there; the entry's own 1-10 can.
+                    entryEpisode = ctx.entryEpisode,
                 )
             }.getOrDefault(false)
         }
@@ -1071,7 +1089,14 @@ class WizstreamAnimeProvider : MainAPI() {
             tmdbId = tmdbId,
             malId = malId,
             simklId = simklId,
-            kitsuId = kitsuId,
+            // (v60) Kitsu stays bound ONLY when the page is one clean
+            // single-entry show. ani.zip's kitsu_id for a cours/special
+            // entry fuzzily points at the franchise ROOT on Kitsu, so the
+            // sync sheet showed the root's progress against this entry's
+            // total (root "25 completed" on a 10-episode page — the
+            // "totally wrong tracking" report). AniList (opened id) and
+            // MAL (media.idMal — authoritative per entry) always bind.
+            kitsuId = kitsuId.takeIf { members.size <= 1 },
             episodes = episodes,
             format = format,
             actors = actors,

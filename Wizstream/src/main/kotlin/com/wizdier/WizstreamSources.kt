@@ -50,6 +50,11 @@ object WizstreamSources {
         // extra BDIX passes, each gated on "nothing found yet" so happy
         // titles never pay extra network cost.
         extraAltTitles: List<String> = emptyList(),
+        // (v60) entry-local episode number (cours-part's own row: Part 2
+        // ep 1 = 1, while the stacked number is 13). Some sites post
+        // cours splits as SEPARATE one-bucket posts, which can never
+        // answer stacked 13-22 — see the gated pass below.
+        entryEpisode: Int? = null,
     ): Boolean = coroutineScope {
         if (title.isBlank() && tmdbId == null && imdbId == null) {
             return@coroutineScope false
@@ -177,6 +182,47 @@ object WizstreamSources {
                 }
                 if (altJobs.awaitAll().any { it }) found = true
             }
+
+        // ── (v60) Entry-local episode pass for cours-split posts ──────
+        // The stacked (site/TMDB) episode number assumes the site merged
+        // a cours split into one season bucket ("Season 3" = 22 rows).
+        // When the site instead posts the parts separately ("Attack on
+        // Titan Season 3 Part 2", one bucket of 10 rows), stacked ep 13-22
+        // can never land; the entry-local number (1-10) is what that post
+        // knows. Runs ONLY while nothing matched yet — merged layouts pay
+        // nothing. Same BDIX set: web sources key on ids, not numbers.
+        if (!found && entryEpisode != null && !isMovie && season != null &&
+            episode != null && entryEpisode > 0 && entryEpisode != episode
+        ) {
+            val bdix = listOf(
+                CineplexBdResolver, FtpBdResolver, CircleFtpResolver, CtgMoviesResolver,
+                FmFtpResolver, MediaserverResolver,
+            )
+            val altJobs = bdix.map { src ->
+                async(Dispatchers.IO) {
+                    gate.withPermit {
+                        runCatching {
+                            src.resolve(
+                                app = app,
+                                title = title,
+                                year = year,
+                                isMovie = isMovie,
+                                season = season,
+                                episode = entryEpisode,
+                                labelPrefix = labelPrefix,
+                                subtitleCallback = subtitleCallback,
+                                callback = callback,
+                                tmdbId = tmdbId,
+                                imdbId = imdbId,
+                            )
+                        }.onFailure { t ->
+                            Log.w(TAG, "entry-local resolver crashed: ${t.message}")
+                        }.getOrDefault(false)
+                    }
+                }
+            }
+            if (altJobs.awaitAll().any { it }) found = true
+        }
         found
     }
 
@@ -2459,6 +2505,46 @@ override suspend fun resolve(
                         if (canFallbackToContent0) {
                             seasonObj = contentArray.optJSONObject(0)
                             episodesArray = seasonObj?.optJSONArray("episodes")
+                        }
+                    }
+
+                    // (v60) Labeled cours-pool rescue: some posts split
+                    // ONE site season over several content blocks (e.g.
+                    // "Season 3" (12) + "Season 3 Part 2" (10)) while the
+                    // stacked request counts them as one season of 22 —
+                    // ep 13 falls off the first block. When direct
+                    // indexing misses, pool IN ORDER the episode rows of
+                    // every block whose season label equals the requested
+                    // season (strict equality — wrong-season protection
+                    // unchanged) and index into the pool.
+                    if (episodesArray == null || episodeToUse > episodesArray.length()) {
+                        val pool = mutableListOf<org.json.JSONObject>()
+                        var poolSawLabel = false
+                        for (ci in 0 until contentArray.length()) {
+                            val block = contentArray.optJSONObject(ci) ?: continue
+                            val blockEps = block.optJSONArray("episodes") ?: continue
+                            val label = block.optStringOrNullCp("seasonName")
+                                ?: block.optStringOrNullCp("season_name")
+                                ?: block.optStringOrNullCp("title")
+                            val labelSeason = label?.let { extractSeasonFromTitle(it) }
+                            val belongs = when {
+                                labelSeason != null -> {
+                                    poolSawLabel = true
+                                    labelSeason == seasonToUse
+                                }
+                                ci == seasonToUse - 1 -> true   // unlabeled standard slot
+                                else -> false
+                            }
+                            if (belongs) for (ei in 0 until blockEps.length()) {
+                                blockEps.optJSONObject(ei)?.let { pool += it }
+                            }
+                        }
+                        if (poolSawLabel && episodeToUse in 1..pool.size &&
+                            pool.size > (episodesArray?.length() ?: 0)
+                        ) {
+                            val link = pool[episodeToUse - 1].optStringOrNullCp("link")
+                            if (!link.isNullOrEmpty()) mediaUrls += link
+                            return@forEach
                         }
                     }
 
