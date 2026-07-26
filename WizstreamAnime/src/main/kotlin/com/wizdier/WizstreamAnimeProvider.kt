@@ -392,12 +392,15 @@ class WizstreamAnimeProvider : MainAPI() {
         val detail = fetchAniDetail(id)
             ?: throw ErrorLoadingException("Could not load AniList media $id")
 
-        // (v50, re-applied in v52) Merged franchise pages wear the ROOT
-        // title, and MAL/AniList sync binds to the root entry — progress
-        // lands on the same tracker entry whichever part was opened.
-        val rootMember =
-            if (detail.members.size > 1) detail.members.firstOrNull { it.episodes > 0 } else null
-        val title = rootMember?.title ?: detail.title
+        // (v58) PURE-AniList module behaves like a normal AniList client:
+        // whichever entry was opened is exactly what the page shows — its
+        // own title, its own episodes (entry-local numbering), its own
+        // tracking ids. The franchise walk below still runs, but only to
+        // compute the invisible site-season offset every episode row
+        // carries in its LinkContext (so CircleFTP-style merged season
+        // packs — e.g. the site's "AoT Season 3 = 22" — resolve correctly
+        // even from a Part-2 entry page).
+        val title = detail.title
         val episodes = detail.episodes
         val type = when (detail.format) {
             "MOVIE", "SPECIAL" -> if (episodes <= 1) TvType.AnimeMovie else TvType.Anime
@@ -417,13 +420,20 @@ class WizstreamAnimeProvider : MainAPI() {
                 franchiseTitles = detail.franchiseTitles,
                 dub = DubStatus.Subbed,
             ).toJson()) { name = "Movie" })
-            else -> detail.members.flatMap { m ->
-                // (v48) Stacked rows — one row per (member × entry episode)
-                // with STACKED season+episode numbers (CircleFTP mega-post
-                // layout: cours parts continue their parent season's
-                // numbering). The row's LinkContext ALSO remembers the
-                // owning AniList entry + its entry-local episode for the
-                // anime-web sources, which mirror AniList's per-entry split.
+            else -> detail.members
+                // (v58) Per-entry pages: only the opened entry's own
+                // episodes are displayed (entry-local numbering, like any
+                // AniList client). The STACKED season/episode still ride
+                // in the LinkContext — BDIX season packs need them.
+                .filter { it.id == id }
+                .flatMap { m ->
+                // (v58) Display = entry-local; data = stacked. The visible
+                // row numbers/titles follow the opened AniList entry, while
+                // every row's LinkContext ALSO carries the STACKED
+                // season+episode (cours parts continue their parent
+                // season's numbering — Part 2 ep 1 = packed Season-3 ep 13)
+                // for the BDIX season packs, PLUS the owning entry's id +
+                // entry-local episode for the anime-web sources.
                 (1..m.episodes).map { localEp ->
                     val stackedEp = m.seasonStart + localEp - 1
                     val epMeta = detail.seasonMeta[m.siteSeason]?.get(stackedEp)
@@ -443,9 +453,9 @@ class WizstreamAnimeProvider : MainAPI() {
                         franchiseTitles = detail.franchiseTitles,
                         dub = DubStatus.Subbed,
                     ).toJson()) {
-                        name = sEp?.title ?: epMeta?.title ?: "Episode $stackedEp"
-                        season = m.siteSeason
-                        episode = stackedEp
+                        name = sEp?.title ?: "Episode $localEp"
+                        season = 1
+                        episode = localEp
                         posterUrl = sEp?.thumb ?: epMeta?.stillUrl ?: detail.posterUrl
                         description = epMeta?.overview
                         runCatching { epMeta?.rating?.let { score = Score.from10(it) } }
@@ -489,9 +499,9 @@ class WizstreamAnimeProvider : MainAPI() {
                 runCatching { detail.trailerUrl?.let { addTrailer(it) } }
                 runCatching { detail.logoUrl?.let { this.logoUrl = it } }
                 runCatching { imdbId?.let { addImdbId(it) } }
-                runCatching { (rootMember?.malId ?: detail.malId)?.let { addMalId(it) } }
+                runCatching { detail.malId?.let { addMalId(it) } }
                 runCatching { detail.kitsuId?.let { addKitsuId(it) } }
-                addAniListId(rootMember?.id ?: id)
+                addAniListId(id)
                 runCatching { detail.simklId?.let { addSimklId(it) } }
                 addEpisodes(DubStatus.Subbed, epList)
             }
@@ -843,7 +853,11 @@ class WizstreamAnimeProvider : MainAPI() {
         // imdb-id-via-TMDB fallback fetch is intentionally gone.
 
         var backdropUrl: String? = banner
-        var logoUrl: String? = null
+        // (v58) Title logo without TMDB: MetaHub's logo CDN, keyed by the
+        // IMDb id from the ani.zip id-map. Not every title has one — when
+        // MetaHub has none, the app simply shows no logo.
+        var logoUrl: String? =
+            imdbId?.let { "https://live.metahub.space/logo/medium/$it/img" }
         // Cast data — extract from AniList (characters + voice actors).
         // TMDB credits are NOT used for anime cast because the user wants
         // anime cast (voice actors + characters) which TMDB doesn't have.
