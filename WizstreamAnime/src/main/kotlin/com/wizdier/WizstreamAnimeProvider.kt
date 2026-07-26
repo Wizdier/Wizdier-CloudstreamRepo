@@ -469,6 +469,9 @@ class WizstreamAnimeProvider : MainAPI() {
                 // in the LinkContext — BDIX season packs need them.
                 .filter { it.id == id }
                 .flatMap { m ->
+                // (v64) Kitsu real episode titles, fetched on first
+                // bare-row encounter inside this member (suspend site).
+                var kitsuTitles: Map<Int, String>? = null
                 // (v58) Display = entry-local; data = stacked. The visible
                 // row numbers/titles follow the opened AniList entry, while
                 // every row's LinkContext ALSO carries the STACKED
@@ -539,6 +542,24 @@ class WizstreamAnimeProvider : MainAPI() {
                             byRow[localEp] ?: sEpList.getOrNull(localEp - 1)
                         } else sEpList.getOrNull(localEp - 1)
                     }
+                    // (v64) Row-name chain: real stream title → real
+                    // TMDB name → Kitsu's episode title. Bare "Episode N"
+                    // labels are NOT titles — Crunchyroll sends
+                    // number-only feeds for some shows (verified live for
+                    // 2.5 Dimensional Seduction) and TMDB auto-names
+                    // untitled episodes the same way ("Episode 1" is what
+                    // its API returns for nameless rows).
+                    val streamTitle = sEp?.title?.takeUnless { isBareEpisodeLabel(it) }
+                    val tmdbTitle = epMeta?.name?.takeUnless { isBareEpisodeLabel(it) }
+                    val kitsuTitle = if (streamTitle == null && tmdbTitle == null) {
+                        detail.kitsuId?.let { kid ->
+                            (kitsuTitles
+                                ?: fetchKitsuEpisodeTitles(kid).also { kitsuTitles = it })
+                                .get(localEp)
+                        }?.takeUnless { isBareEpisodeLabel(it) }
+                    } else null
+                    val rowName = streamTitle ?: tmdbTitle ?: kitsuTitle
+                        ?: sEp?.title ?: epMeta?.name ?: "Episode $localEp"
                     newEpisode(LinkContext(
                         anilistId = m.id, imdbId = imdbId, tmdbId = tmdbId, malId = m.malId,
                         season = m.siteSeason, episode = stackedEp, entryEpisode = localEp,
@@ -550,7 +571,7 @@ class WizstreamAnimeProvider : MainAPI() {
                         tmdbEpisode = epMeta?.tmdbEpisode,
                         dub = DubStatus.Subbed,
                     ).toJson()) {
-                        name = sEp?.title ?: epMeta?.name ?: "Episode $localEp"
+                        name = rowName
                         season = 1
                         episode = localEp
                         posterUrl = sEp?.thumb ?: epMeta?.stillUrl ?: detail.posterUrl
@@ -1263,6 +1284,62 @@ class WizstreamAnimeProvider : MainAPI() {
     private fun streamEpNumber(title: String?): Int? = title?.let {
         Regex("""^\s*(?:episode|ep)?\.?\s*(\d{1,4})\b""", RegexOption.IGNORE_CASE)
             .find(it)?.groupValues?.getOrNull(1)?.toIntOrNull()
+    }
+
+    /** (v64) TRUE for titles that carry NO real name: a bare number
+     *  label ("Episode 13", "EP 7", "12"). Crunchyroll feeds some shows
+     *  (2.5 Dimensional Seduction) with number-only titles, and TMDB
+     *  auto-names every untitled episode "Episode N" the same way — both
+     *  then masquerade as titles while being none. */
+    private fun isBareEpisodeLabel(title: String?): Boolean {
+        val t = title?.trim() ?: return true
+        return Regex("""^(?:episode|ep)?\.?\s*\d{1,4}\s*$""", RegexOption.IGNORE_CASE)
+            .containsMatchIn(t)
+    }
+
+    // (v64) Kitsu keeps REAL episode titles (verified live: 2.5
+    // Dimensional Seduction rows are named there, e.g. ep 1 = "New
+    // Student from Another Dimension") even when the AniList stream feed
+    // and TMDB only know "Episode N". Public endpoint, no auth; fetched
+    // lazily ONLY when a row would otherwise print a bare label, cached
+    // 30 min by (per-entry-correct) kitsu id.
+    private val kitsuEpTitleCache =
+        ConcurrentHashMap<String, Pair<Long, Map<Int, String>>>()
+
+    private suspend fun fetchKitsuEpisodeTitles(kitsuId: String): Map<Int, String> {
+        kitsuEpTitleCache[kitsuId]?.let { (ts, map) ->
+            if (System.currentTimeMillis() - ts < 30 * 60_000L) return map
+        }
+        val out = HashMap<Int, String>()
+        var offset = 0
+        var page = 0
+        while (page < 6) { // 20/page hard cap on Kitsu's side; 120 eps max
+            page++
+            val t = runCatching {
+                app.get(
+                    "https://kitsu.io/api/edge/anime/$kitsuId/episodes" +
+                        "?sort=number&page%5Blimit%5D=20&page%5Boffset%5D=$offset",
+                    headers = mapOf("User-Agent" to A_UA),
+                    timeout = 7000,
+                ).text
+            }.getOrNull() ?: break
+            val root = runCatching { JSONObject(t) }.getOrNull() ?: break
+            val arr = root.optJSONArray("data") ?: break
+            if (arr.length() == 0) break
+            for (i in 0 until arr.length()) {
+                val a = arr.optJSONObject(i)?.optJSONObject("attributes") ?: continue
+                val num = a.optInt("number", 0).takeIf { it > 0 } ?: continue
+                val titles = a.optJSONObject("titles")
+                val name = titles?.aOptStr("en")?.takeIf { !isBareEpisodeLabel(it) }
+                    ?: titles?.aOptStr("en_jp")?.takeIf { !isBareEpisodeLabel(it) }
+                    ?: titles?.aOptStr("canonical")?.takeIf { !isBareEpisodeLabel(it) }
+                if (name != null) out.putIfAbsent(num, name)
+            }
+            if (arr.length() < 20) break
+            offset += 20
+        }
+        kitsuEpTitleCache[kitsuId] = System.currentTimeMillis() to out
+        return out
     }
 
     private fun JSONObject.toStreamEps(): List<StreamEp> =

@@ -2209,27 +2209,53 @@ override suspend fun resolve(
             // term came back empty for every Haikyuu season. Reducing the
             // query to its bare franchise words ("HAIKYU", "Shingeki no
             // Kyojin") is what the tier-3 rescue then matches against.
-            var searchResp: Pair<String, Boolean>? = null
+            // (v64) Search robustness: (a) query variants gain the
+            // PART-STRIPPED form ("…Season 3 Part 2" → "…Season 3") so a
+            // full-phrase server search can't starve on the part suffix;
+            // (b) results are PAGED (limit=60, up to 4 pages, deduped by
+            // post id) — franchise mega posts are old uploads that sink
+            // below page 1 on busy root-title searches, and single-page
+            // reads silently missed them.
+            val partStripped = title
+                .replace(Regex("(?i)\\bpart\\s*\\d{1,2}\\b"), " ")
+                .replace(Regex("\\s+"), " ").trim()
             val queryVariants = listOf(
                 title,
                 cleanedSearchTerm(title),
+                partStripped,
+                cleanedSearchTerm(partStripped),
                 cleanedSearchTerm(bareSeriesTitle(title)),
             ).filter { it.isNotBlank() }.distinct()
+            val merged = LinkedHashMap<Int, org.json.JSONObject>()
+            var ipRewriteLinks = false
+            var searchHit = false
             for (q in queryVariants) {
-                val resp = fetchWithFallback(
-                    app,
-                    primary = "$PRIMARY_API/api/posts?searchTerm=${encodeUrl(q)}&order=desc",
-                    fallback = "$FALLBACK_API/api/posts?searchTerm=${encodeUrl(q)}&order=desc",
-                ) ?: continue
-                val arr = runCatching { JSONObject(resp.first).optJSONArray("posts") }
-                    .getOrNull()
-                if (arr != null && arr.length() > 0) {
-                    searchResp = resp
-                    break
+                var page = 0
+                var sawAny = false
+                while (page < 4) {
+                    page++
+                    val resp = fetchWithFallback(
+                        app,
+                        primary = "$PRIMARY_API/api/posts?searchTerm=${encodeUrl(q)}&order=desc&limit=60&page=$page",
+                        fallback = "$FALLBACK_API/api/posts?searchTerm=${encodeUrl(q)}&order=desc&limit=60&page=$page",
+                    ) ?: break
+                    val arr = runCatching { JSONObject(resp.first).optJSONArray("posts") }
+                        .getOrNull() ?: break
+                    if (arr.length() == 0) break
+                    sawAny = true
+                    ipRewriteLinks = ipRewriteLinks || resp.second
+                    for (i in 0 until arr.length()) {
+                        arr.optJSONObject(i)?.let { row ->
+                            merged[row.optInt("id", -(merged.size + 1))] = row
+                        }
+                    }
+                    if (arr.length() < 60) break
                 }
+                if (sawAny) { searchHit = true; break }
             }
-            if (searchResp == null) return false
-            val searchText = searchResp.first
+            if (!searchHit || merged.isEmpty()) return false
+            val searchText = JSONObject()
+                .put("posts", JSONArray(merged.values.toList())).toString()
 
             // (v34) Hostname-vs-IP parity with CircleFtpProvider. The
             // standalone only swaps *.circleftp.net hosts for their raw BDIX
@@ -2249,7 +2275,6 @@ override suspend fun resolve(
             // Now: rewrite ONLY when the raw-IP API mirror actually answered
             // — the situation where the user's DNS can't resolve
             // circleftp.net and the IP is the working route.
-            val ipRewriteLinks = searchResp.second
 
             val postsArr = runCatching { JSONObject(searchText).optJSONArray("posts") }
                 .getOrNull() ?: return false
