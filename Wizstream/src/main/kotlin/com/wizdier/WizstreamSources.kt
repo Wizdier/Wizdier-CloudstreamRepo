@@ -66,19 +66,11 @@ object WizstreamSources {
         // source emitted something — that made the v60 entry-local pass
         // and the v45 franchise passes dead code whenever Bingr/Moonflix
         // answered, which is precisely what kept cours-part pages dry.
-        val bdixSources = listOf(
-            CineplexBdResolver,
-            FtpBdResolver,
-            CircleFtpResolver,
-            CtgMoviesResolver,
-            FmFtpResolver,
-            MediaserverResolver,
-        )
-        val sources = bdixSources + listOf(
-            CinebyResolver,
-            BingrResolver,
-            MoonflixResolver,
-        )
+        val bdixSources = TOGGLE_BDIX_RESOLVERS
+        // (v68) per-source toggles (extension "Open Settings" menu) —
+        // disabled sources are skipped here and in every rescue pass.
+        val sources = (bdixSources + TOGGLE_WEB_RESOLVERS)
+            .filter { WizSourcePrefs.isEnabled(it.toggleId) }
 
         val gate = Semaphore(4)
         val jobs = sources.map { src ->
@@ -119,10 +111,8 @@ object WizstreamSources {
         // so only they are re-run with the alias; the API-backed sources
         // (Cineby/Bingr/Moonflix) key on TMDB IDs and would just duplicate.
         if (!altTitle.isNullOrBlank() && !altTitle.equals(title, ignoreCase = true)) {
-            val bdix = listOf(
-                CineplexBdResolver, FtpBdResolver, CircleFtpResolver, CtgMoviesResolver,
-                FmFtpResolver, MediaserverResolver,
-            )
+            val bdix = TOGGLE_BDIX_RESOLVERS
+                .filter { WizSourcePrefs.isEnabled(it.toggleId) }   // (v68) user toggles
             val altJobs = bdix.map { src ->
                 async(Dispatchers.IO) {
                     gate.withPermit {
@@ -166,10 +156,8 @@ object WizstreamSources {
                 // not cancel the franchise rescue (root posting is the
                 // whole point of these passes).
                 if (bdixFound) return@forEach
-                val bdix = listOf(
-                    CineplexBdResolver, FtpBdResolver, CircleFtpResolver, CtgMoviesResolver,
-                    FmFtpResolver, MediaserverResolver,
-                )
+                val bdix = TOGGLE_BDIX_RESOLVERS
+                    .filter { WizSourcePrefs.isEnabled(it.toggleId) }   // (v68) user toggles
                 val altJobs = bdix.map { src ->
                     async(Dispatchers.IO) {
                         gate.withPermit {
@@ -210,10 +198,8 @@ object WizstreamSources {
         if (!bdixFound && entryEpisode != null && !isMovie && season != null &&
             episode != null && entryEpisode > 0 && entryEpisode != episode
         ) {
-            val bdix = listOf(
-                CineplexBdResolver, FtpBdResolver, CircleFtpResolver, CtgMoviesResolver,
-                FmFtpResolver, MediaserverResolver,
-            )
+            val bdix = TOGGLE_BDIX_RESOLVERS
+                .filter { WizSourcePrefs.isEnabled(it.toggleId) }   // (v68) user toggles
             val altJobs = bdix.map { src ->
                 async(Dispatchers.IO) {
                     gate.withPermit {
@@ -845,7 +831,89 @@ object WizstreamSources {
         }
     }
 
+    // ════════════════════════════════════════════════════════════════════════
+    //  (v68) Per-source toggles + "Open Settings" dialog
+    //  The app renders an "Open Settings" button for any plugin whose
+    //  plugin-class (com.lagradost.cloudstream3.plugins.Plugin) sets
+    //  `openSettings`; both Wizstream plugins wire it to WizSourcePrefs's
+    //  dialog. Toggles persist in the app-wide DataStore (AcraApplication
+    //  keys, "wiz_src_<id>") and are read LIVE at every resolve — changes
+    //  apply instantly, no restart or reload needed. All sources default ON.
+    // ════════════════════════════════════════════════════════════════════════
+
+    internal fun wizToggleId(o: Any): String =
+        o::class.simpleName.orEmpty().removeSuffix("Resolver").lowercase()
+
+    internal val TOGGLE_BDIX_RESOLVERS: List<SourceResolver> = listOf(
+        CineplexBdResolver, FtpBdResolver, CircleFtpResolver, CtgMoviesResolver,
+        FmFtpResolver, MediaserverResolver,
+    )
+    internal val TOGGLE_WEB_RESOLVERS: List<SourceResolver> = listOf(
+        CinebyResolver, BingrResolver, MoonflixResolver,
+    )
+
+    private val TOGGLE_LABELS: Map<String, String> = mapOf(
+        "cineplexbd" to "Cineplex BD",
+        "ftpbd" to "FTPBD",
+        "circleftp" to "Circle FTP",
+        "ctgmovies" to "CTGMovies",
+        "fmftp" to "FM FTP",
+        "mediaserver" to "Mediaserver",
+        "cineby" to "Cineby",
+        "bingr" to "Bingr",
+        "moonflix" to "Moonflix",
+    )
+
+    object WizSourcePrefs {
+        private const val PFX = "wiz_src_"
+
+        class Src(val id: String, val label: String, val bdix: Boolean)
+
+        /** Build a dialog entry from a resolver object (label from the map). */
+        fun src(o: Any, bdix: Boolean): Src {
+            val id = wizToggleId(o)
+            return Src(id, TOGGLE_LABELS[id] ?: id, bdix)
+        }
+
+        fun isEnabled(id: String): Boolean = runCatching {
+            CloudStreamApp.getKey(PFX + id, true) ?: true
+        }.getOrDefault(true)
+
+        fun setEnabled(id: String, on: Boolean) {
+            runCatching { CloudStreamApp.setKey(PFX + id, on) }
+        }
+
+        /**
+         * Multi-choice "choose your sources" dialog; each tap writes
+         * immediately. Caller passes the module's own list (Wizstream:
+         * BDIX + web; WizstreamAnime: BDIX + web + anime-web resolvers).
+         */
+        fun openDialog(context: android.content.Context, sources: List<Src>) {
+            val items = sources
+                .map { it.label + if (it.bdix) "   · BDIX" else "" }
+                .toTypedArray()
+            val checks = sources.map { isEnabled(it.id) }.toBooleanArray()
+            android.app.AlertDialog.Builder(context)
+                .setTitle("Sources — tap to toggle (applies instantly)")
+                .setMultiChoiceItems(items, checks) { _, which, checked ->
+                    setEnabled(sources[which].id, checked)
+                }
+                .setPositiveButton("Done", null)
+                .setNeutralButton("All on") { dlg, _ ->
+                    sources.forEach { setEnabled(it.id, true) }
+                    dlg.dismiss()
+                    openDialog(context, sources)
+                }
+                .show()
+        }
+    }
+
     internal interface SourceResolver {
+        /** (v68) toggle identity — class-name derived and stable
+         *  (extension dex is not obfuscated: CircleFtpResolver → "circleftp"). */
+        val toggleId: String
+            get() = wizToggleId(this)
+
         suspend fun resolve(
             app: Requests,
             title: String,

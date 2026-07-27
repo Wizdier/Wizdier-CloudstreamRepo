@@ -68,6 +68,8 @@ object WizstreamAnimeSources {
             return@coroutineScope false
         }
 
+        // (v68) per-source toggles apply here too (shared WizSourcePrefs
+        // prefs object; keys "wiz_src_<id>").
         val sources = listOf(
             AniZoneResolver,
             AllmangaResolver,
@@ -76,7 +78,7 @@ object WizstreamAnimeSources {
             AniNekoResolver,
             ReAnimeResolver,
             TokyoInsiderResolver,
-        )
+        ).filter { WizstreamSources.WizSourcePrefs.isEnabled(it.toggleId) }
 
         val gate = Semaphore(4)
         val jobs = sources.map { src ->
@@ -106,6 +108,11 @@ object WizstreamAnimeSources {
     }
 
     internal interface AnimeSourceResolver {
+        /** (v68) toggle identity — same class-name derivation as the shared
+         *  engine (AniZoneResolver → "anizone"), shared pref namespace. */
+        val toggleId: String
+            get() = WizstreamSources.wizToggleId(this)
+
         suspend fun resolve(
             app: Requests,
             title: String,

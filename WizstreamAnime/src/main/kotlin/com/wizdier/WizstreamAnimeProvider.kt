@@ -627,35 +627,42 @@ class WizstreamAnimeProvider : MainAPI() {
             }
         }
 
-        // (v66) SIMKL-POISON STRIP — root-caused from the user's logcat
-        //   (logcat_2026_07_27_08_52.txt). The Cloudstream LIBRARY invisibly
-        //   folds every tracker id a page binds into syncData["simkl"] as a
-        //   JSON blob: MainAPI's companion has addMalId/addAniListId/
-        //   addImdbId each append into it — that's why the app's SYNCVM log
-        //   showed `addSync simkl = {"Imdb":…,"Mal":"38524","AniList":"104578"}`
-        //   even though this module never sets a Simkl id itself. Simkl's
-        //   catalogue is FRANCHISE-level for split-cour anime (one "Attack on
-        //   Titan" entry spanning S1 + every S3 part), and the app reads its
-        //   sync map in HashMap bucket order — "simkl" FIRST, ahead of
-        //   mal/anilist/kitsu — so the tracking sheet's first-answer rule
-        //   always took Simkl's franchise progress (25) as watched while the
-        //   total still came from AniList (10). Hence the device-proven
-        //   "25/10" on S3P1/S3P2 and the phantom "watched" on never-listed
-        //   entries like Rent-a-Girlfriend S4 (Simkl's show entry carried
-        //   S1–S3 progress). Strip the auto-injected key so the sheet falls
-        //   through to mal/anilist/kitsu — all entry-accurate and already
-        //   proven clean on the user's lists (10/10 everywhere). Logged so a
-        //   quick logcat grep can verify the strip on-device.
+        // (v67) CONDITIONAL Simkl — Simkl sync returns, but only where it
+        //   is CORRECT. Background (root-caused from the user's logcat
+        //   logcat_2026_07_27_08_52.txt, fixed bluntly in v66): the
+        //   Cloudstream LIBRARY invisibly folds every tracker id a page
+        //   binds into syncData["simkl"] — addMalId/addAniListId/addImdbId
+        //   each append to it, no extension opt-out — and the app reads its
+        //   sync map in HashMap bucket order with "simkl" FIRST, so the
+        //   tracking sheet's first-answer rule always took Simkl's number.
+        //   That's fine ONLY when this AniList entry maps 1:1 to a Simkl
+        //   record. Simkl MERGES cours-split entries into ONE franchise
+        //   record — AoT S3P1/S3P2 (anilist 99147/104578) both resolve to
+        //   Simkl's single "Attack on Titan" — so cours-linked pages showed
+        //   franchise progress (25/10 on BOTH parts) and untouched entries
+        //   (Rent-a-Girlfriend S4) looked "watched" from the franchise
+        //   record's S1–S3 progress. Rule: strip the key for cours-linked
+        //   entries (SEQUEL/PREQUEL anime relations), keep it for
+        //   franchise-isolated ones — there Simkl tracking is real and 1:1
+        //   correct. Both paths logged for on-device verification.
         runCatching {
             val prefix = com.lagradost.cloudstream3.LoadResponse.simklIdPrefix
                 .takeIf { it.isNotBlank() } ?: "simkl"
-            val removed = loadResponse.syncData.remove(prefix)
-                ?: loadResponse.syncData.remove("simkl")
-            if (removed != null) {
+            if (detail.coursLinked) {
+                val removed = loadResponse.syncData.remove(prefix)
+                    ?: loadResponse.syncData.remove("simkl")
+                if (removed != null) {
+                    android.util.Log.i(
+                        "WizstreamAnime",
+                        "sync-strip '$prefix' removed " +
+                            "(cours-linked entry — Simkl's merged franchise record would poison the sheet, v67)"
+                    )
+                }
+            } else if (loadResponse.syncData.containsKey(prefix)) {
                 android.util.Log.i(
                     "WizstreamAnime",
-                    "sync-strip '$prefix' removed " +
-                        "(Simkl franchise-level progress must not answer per-entry pages, v66)"
+                    "sync-keep '$prefix' " +
+                        "(franchise-isolated entry — maps 1:1 to a Simkl record, v67)"
                 )
             }
         }
@@ -866,6 +873,12 @@ class WizstreamAnimeProvider : MainAPI() {
         // anime under the root title — these are the resolver search keys
         // that fix sequel-entry resolution.
         val franchiseTitles: List<String> = emptyList(),
+        // (v67) True when any SEQUEL/PREQUEL anime relation exists — Simkl
+        // merges such cours-linked entries into ONE franchise record, so the
+        // library's auto-injected simkl key is stripped for these pages
+        // (v66 sheet poison); franchise-isolated entries keep real 1:1
+        // Simkl tracking.
+        val coursLinked: Boolean = false,
     )
 
     private fun parseAnilistUrl(url: String): Int? {
@@ -1286,6 +1299,18 @@ class WizstreamAnimeProvider : MainAPI() {
             epTable = epTable,
             recommendations = recs,
             franchiseTitles = franchiseTitles,
+            // (v67) cours-linked ⇒ Simkl merges this entry into one franchise
+            // record ⇒ its auto-added simkl key must be stripped downstream.
+            coursLinked = media.optJSONObject("relations")
+                ?.optJSONArray("edges")?.let { edges ->
+                    (0 until edges.length()).any { i ->
+                        val e = edges.optJSONObject(i) ?: return@any false
+                        val rel = e.optString("relationType")
+                        (rel.equals("SEQUEL", true) || rel.equals("PREQUEL", true)) &&
+                            (e.optJSONObject("node")?.optString("type")
+                                ?: "ANIME").equals("ANIME", true)
+                    }
+                } ?: false,
         )
         META_CACHE[id] = now to detail
         return detail
