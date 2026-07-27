@@ -48,15 +48,15 @@ class WizstreamPlugin : Plugin() {   // (v68) app-side Plugin ⇒ openSettings b
         // toggles persist in DataStore keys and apply on the NEXT resolve
         // (instant — no restart). True = BDIX source (tagged in the list).
         val toggleSources = listOf(
-            WizSourcePrefs.src(CineplexBdResolver, true),
-            WizSourcePrefs.src(FtpBdResolver, true),
-            WizSourcePrefs.src(CircleFtpResolver, true),
-            WizSourcePrefs.src(CtgMoviesResolver, true),
-            WizSourcePrefs.src(FmFtpResolver, true),
-            WizSourcePrefs.src(MediaserverResolver, true),
-            WizSourcePrefs.src(CinebyResolver, false),
-            WizSourcePrefs.src(BingrResolver, false),
-            WizSourcePrefs.src(MoonflixResolver, false),
+            WizSourcePrefs.src(CineplexBdResolver, "BDIX SOURCES", "cineplexbd.net"),
+            WizSourcePrefs.src(FtpBdResolver, "BDIX SOURCES", "ftpbd.net"),
+            WizSourcePrefs.src(CircleFtpResolver, "BDIX SOURCES", "new.circleftp.net"),
+            WizSourcePrefs.src(CtgMoviesResolver, "BDIX SOURCES", "ctgmovies.com"),
+            WizSourcePrefs.src(FmFtpResolver, "BDIX SOURCES", "FM FTP · BDIX"),
+            WizSourcePrefs.src(MediaserverResolver, "BDIX SOURCES", "Mediaserver · BDIX"),
+            WizSourcePrefs.src(CinebyResolver, "WEB SOURCES", "www.cineby.at"),
+            WizSourcePrefs.src(BingrResolver, "WEB SOURCES", "bingr.one"),
+            WizSourcePrefs.src(MoonflixResolver, "WEB SOURCES", "Moonflix · web"),
         )
         openSettings = {
                 ctx -> WizstreamSources.WizSourcePrefs.openDialog(ctx, toggleSources)

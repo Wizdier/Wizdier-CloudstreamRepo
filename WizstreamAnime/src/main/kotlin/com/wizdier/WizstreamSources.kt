@@ -867,12 +867,17 @@ object WizstreamSources {
     object WizSourcePrefs {
         private const val PFX = "wiz_src_"
 
-        class Src(val id: String, val label: String, val bdix: Boolean)
+        class Src(
+            val id: String,
+            val label: String,
+            val section: String,   // "BDIX SOURCES", "WEB SOURCES", "ANIME-WEB SOURCES"
+            val host: String,      // cosmetic subtitle, e.g. "new.circleftp.net"
+        )
 
         /** Build a dialog entry from a resolver object (label from the map). */
-        fun src(o: Any, bdix: Boolean): Src {
+        fun src(o: Any, section: String, host: String): Src {
             val id = wizToggleId(o)
-            return Src(id, TOGGLE_LABELS[id] ?: id, bdix)
+            return Src(id, TOGGLE_LABELS[id] ?: id, section, host)
         }
 
         fun isEnabled(id: String): Boolean = runCatching {
@@ -884,20 +889,98 @@ object WizstreamSources {
         }
 
         /**
-         * Multi-choice "choose your sources" dialog; each tap writes
-         * immediately. Caller passes the module's own list (Wizstream:
-         * BDIX + web; WizstreamAnime: BDIX + web + anime-web resolvers).
+         * (v69) Immersive source-settings SHEET — real switches, grouped
+         * sections, host subtitles, live apply. Built programmatically (the
+         * extension ships no Android resources), wired to the app's native
+         * `openSettings` plugin hook. Every toggle writes its DataStore key
+         * immediately; the resolve engine reads keys on the NEXT resolution,
+         * so no restart/reload is ever needed.
          */
+        @Suppress("SetTextI18n")
         fun openDialog(context: android.content.Context, sources: List<Src>) {
-            val items = sources
-                .map { it.label + if (it.bdix) "   · BDIX" else "" }
-                .toTypedArray()
-            val checks = sources.map { isEnabled(it.id) }.toBooleanArray()
-            android.app.AlertDialog.Builder(context)
-                .setTitle("Sources — tap to toggle (applies instantly)")
-                .setMultiChoiceItems(items, checks) { _, which, checked ->
-                    setEnabled(sources[which].id, checked)
+            val dm = context.resources.displayMetrics.density
+            fun dp(v: Int) = (v * dm).toInt()
+            val accent = 0xFF9C6BFF.toInt()      // Cloudstream-ish violet
+            val textPrimary = 0xFFF1F1F1.toInt()
+            val textMuted = 0xFF9AA0A6.toInt()
+
+            val root = android.widget.LinearLayout(context).apply {
+                orientation = android.widget.LinearLayout.VERTICAL
+                setPadding(dp(20), dp(12), dp(16), dp(4))
+            }
+
+            // ── Header ────────────────────────────────────────────────
+            root.addView(android.widget.TextView(context).apply {
+                text = "⚙  Sources"
+                setTextColor(textPrimary)
+                textSize = 20f
+                setTypeface(typeface, android.graphics.Typeface.BOLD)
+            })
+            root.addView(android.widget.TextView(context).apply {
+                text = "Flip a switch — it applies on the very next episode you tap. No restart needed."
+                setTextColor(textMuted)
+                textSize = 12.5f
+                setPadding(0, dp(2), 0, dp(8))
+            })
+
+            // ── Sections + switch rows ────────────────────────────────
+            val switches = mutableListOf<android.widget.Switch>()
+            val bySection = sources.groupBy { it.section }
+            bySection.forEach { (section, group) ->
+                root.addView(android.widget.TextView(context).apply {
+                    text = section + if (section.contains("BDIX"))
+                        "   ·  needs a BDIX ISP connection" else ""
+                    setTextColor(accent)
+                    textSize = 12f
+                    letterSpacing = 0.12f
+                    setTypeface(typeface, android.graphics.Typeface.BOLD)
+                    setPadding(0, dp(10), 0, dp(2))
+                })
+
+                group.forEach { src ->
+                    val row = android.widget.LinearLayout(context).apply {
+                        orientation = android.widget.LinearLayout.HORIZONTAL
+                        gravity = android.view.Gravity.CENTER_VERTICAL
+                        setPadding(0, dp(4), 0, dp(4))
+                    }
+                    val labels = android.widget.LinearLayout(context).apply {
+                        orientation = android.widget.LinearLayout.VERTICAL
+                        layoutParams = android.widget.LinearLayout.LayoutParams(
+                            0, android.widget.LinearLayout.LayoutParams.WRAP_CONTENT, 1f
+                        )
+                    }
+                    val on = isEnabled(src.id)
+                    val name = android.widget.TextView(context).apply {
+                        text = src.label
+                        setTextColor(if (on) textPrimary else textMuted)
+                        textSize = 15f
+                    }
+                    val host = android.widget.TextView(context).apply {
+                        text = src.host
+                        setTextColor(textMuted)
+                        textSize = 11.5f
+                    }
+                    labels.addView(name)
+                    labels.addView(host)
+                    val sw = android.widget.Switch(context).apply {
+                        isChecked = on
+                        setOnCheckedChangeListener { _, checked ->
+                            setEnabled(src.id, checked)
+                            name.setTextColor(if (checked) textPrimary else textMuted)
+                        }
+                    }
+                    switches += sw
+                    row.addView(labels)
+                    row.addView(sw)
+                    // whole row also toggles the switch (bigger touch target)
+                    row.setOnClickListener { sw.toggle() }
+                    root.addView(row)
                 }
+            }
+
+            val scroll = android.widget.ScrollView(context).apply { addView(root) }
+            android.app.AlertDialog.Builder(context)
+                .setView(scroll)
                 .setPositiveButton("Done", null)
                 .setNeutralButton("All on") { dlg, _ ->
                     sources.forEach { setEnabled(it.id, true) }

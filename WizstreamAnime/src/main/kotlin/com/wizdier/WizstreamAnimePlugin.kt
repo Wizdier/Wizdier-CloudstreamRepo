@@ -43,23 +43,30 @@ class WizstreamAnimePlugin : Plugin() {   // (v68) app-side Plugin ⇒ openSetti
         // resolver's class-name-derived toggleId — AniZoneResolver →
         // "anizone", UniqueStreamResolver → "uniquestream", etc).
         val toggleSources = listOf(
-            WizSourcePrefs.src(CineplexBdResolver, true),
-            WizSourcePrefs.src(FtpBdResolver, true),
-            WizSourcePrefs.src(CircleFtpResolver, true),
-            WizSourcePrefs.src(CtgMoviesResolver, true),
-            WizSourcePrefs.src(FmFtpResolver, true),
-            WizSourcePrefs.src(MediaserverResolver, true),
-            WizSourcePrefs.src(CinebyResolver, false),
-            WizSourcePrefs.src(BingrResolver, false),
-            WizSourcePrefs.src(MoonflixResolver, false),
+            WizSourcePrefs.src(CineplexBdResolver, "BDIX SOURCES", "cineplexbd.net"),
+            WizSourcePrefs.src(FtpBdResolver, "BDIX SOURCES", "ftpbd.net"),
+            WizSourcePrefs.src(CircleFtpResolver, "BDIX SOURCES", "new.circleftp.net"),
+            WizSourcePrefs.src(CtgMoviesResolver, "BDIX SOURCES", "ctgmovies.com"),
+            WizSourcePrefs.src(FmFtpResolver, "BDIX SOURCES", "FM FTP · BDIX"),
+            WizSourcePrefs.src(MediaserverResolver, "BDIX SOURCES", "Mediaserver · BDIX"),
+            WizSourcePrefs.src(CinebyResolver, "WEB SOURCES", "www.cineby.at"),
+            WizSourcePrefs.src(BingrResolver, "WEB SOURCES", "bingr.one"),
+            WizSourcePrefs.src(MoonflixResolver, "WEB SOURCES", "Moonflix · web"),
         ) + listOf(
-            WizstreamSources.WizSourcePrefs.Src("anizone", "AniZone", false),
-            WizstreamSources.WizSourcePrefs.Src("allmanga", "AllAnime (Mkissa)", false),
-            WizstreamSources.WizSourcePrefs.Src("anichi", "AniChi", false),
-            WizstreamSources.WizSourcePrefs.Src("uniquestream", "UniqueStream", false),
-            WizstreamSources.WizSourcePrefs.Src("anineko", "AniNeko", false),
-            WizstreamSources.WizSourcePrefs.Src("reanime", "ReAnime", false),
-            WizstreamSources.WizSourcePrefs.Src("tokyoinsider", "TokyoInsider", false),
+            WizstreamSources.WizSourcePrefs.Src(
+                "anizone", "AniZone", "ANIME-WEB SOURCES", "anizone.to"),
+            WizstreamSources.WizSourcePrefs.Src(
+                "allmanga", "AllAnime (Mkissa)", "ANIME-WEB SOURCES", "allmanga.to"),
+            WizstreamSources.WizSourcePrefs.Src(
+                "anichi", "AniChi", "ANIME-WEB SOURCES", "anichi.to"),
+            WizstreamSources.WizSourcePrefs.Src(
+                "uniquestream", "UniqueStream", "ANIME-WEB SOURCES", "anime.uniquestream.net"),
+            WizstreamSources.WizSourcePrefs.Src(
+                "anineko", "AniNeko", "ANIME-WEB SOURCES", "anineko.to"),
+            WizstreamSources.WizSourcePrefs.Src(
+                "reanime", "ReAnime", "ANIME-WEB SOURCES", "reanime.to"),
+            WizstreamSources.WizSourcePrefs.Src(
+                "tokyoinsider", "TokyoInsider", "ANIME-WEB SOURCES", "tokyoinsider.com"),
         )
         openSettings = {
                 ctx -> WizstreamSources.WizSourcePrefs.openDialog(ctx, toggleSources)
