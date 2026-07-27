@@ -1915,6 +1915,10 @@ override suspend fun resolve(
                 }
             }
 
+            Log.d(
+                TAG, "FtpBD: emit ${mediaUrls.size} url(s) for " +
+                    "'$title' s=$season e=$episode"
+            )
             var any = false
             mediaUrls.forEach { u ->
                 if (emitDirect(app, u, srcLabel, "$SITE/", HEADERS, subtitleCallback, callback)) any = true
@@ -2331,6 +2335,11 @@ override suspend fun resolve(
                 }
             }
             var matchingPostIds = identityFiltered.ifEmpty { fuzzyFiltered }
+            Log.d(
+                TAG, "CircleFTP: '$title' s=$season e=$episode hit=$searchHit " +
+                    "posts=${merged.size} identity=${identityFiltered.size} " +
+                    "fuzzy=${fuzzyFiltered.size}"
+            )
 
             // ── (v45) TIER 3: multi-season anime rescue ─────────────────
             // AniList files every anime season as a SEPARATE entry, so the
@@ -2446,7 +2455,14 @@ override suspend fun resolve(
                     }
                 }.awaitAll().filterNotNull()
             }
-            if (postDetails.isEmpty()) return false
+            Log.d(
+                TAG, "CircleFTP: details=${postDetails.size} " +
+                    "candidates=${matchingPostIds.map { it.first }}"
+            )
+            if (postDetails.isEmpty()) {
+                Log.d(TAG, "CircleFTP: no details — bailing for '$title'")
+                return false
+            }
 
             // 4. Filter posts by type ONLY for movies. For TV/anime, keep ALL
             //    posts (the pre-v11 behaviour that was working). This is
@@ -2583,6 +2599,11 @@ override suspend fun resolve(
                             }
                         }
                         val pool = seasonBlocks.flatMap { rowsOf(it) }
+                        Log.d(
+                            TAG, "CircleFTP: post ${detail.optInt("id", -1)} " +
+                                "labels=${labelBlocks.map { it.second }} pool=${pool.size} " +
+                                "ep=$episodeToUse partAsk=$partAsk"
+                        )
                         if (episodeToUse in 1..pool.size) {
                             val link = rowLink(pool[episodeToUse - 1])
                             if (!link.isNullOrEmpty()) mediaUrls += link
@@ -2590,6 +2611,11 @@ override suspend fun resolve(
                         return@forEach
                     }
 
+                    Log.d(
+                        TAG, "CircleFTP: post ${detail.optInt("id", -1)} has no " +
+                            "season-$seasonToUse labels — positional path " +
+                            "(blocks=${contentArray.length()}, ep=$episodeToUse)"
+                    )
                     // Positional fallback (labels absent on this post) —
                     // original v11 layout, unchanged.
                     var seasonObj = contentArray.optJSONObject(seasonToUse - 1)
@@ -2693,6 +2719,10 @@ override suspend fun resolve(
             //    played fine) and (b) fetched m3u8 playlists up-front via
             //    generateM3u8, so a slow/dead CDN box surfaced as a load-time
             //    timeout instead of a player decision.
+            Log.d(
+                TAG, "CircleFTP: emit ${mediaUrls.size} url(s) for " +
+                    "'$title' s=$season e=$episode"
+            )
             var any = false
             mediaUrls.forEach { u ->
                 if (u.contains("movie?data=") || u.contains("episode?data=") ||

@@ -644,6 +644,17 @@ class WizstreamAnimeProvider : MainAPI() {
         val ctx = try { LinkContext.fromJson(data) } catch (_: Exception) { null }
             ?: return@coroutineScope false
 
+        // (v65) logcat record of the exact coordinates each row links out
+        // with — grep "WizstreamAnime: loadLinks" to see what a tapped row
+        // asks the resolvers for (stacked vs entry-local vs TMDB).
+        runCatching {
+            android.util.Log.i(
+                "WizstreamAnime",
+                "loadLinks '${ctx.title}' s=${ctx.sourceSeason ?: ctx.season} " +
+                    "e=${ctx.episode} local=${ctx.entryEpisode} tse=${ctx.tmdbSeason}/${ctx.tmdbEpisode}"
+            )
+        }
+
         val idList = buildList {
             ctx.imdbId?.let { add(it) }
             ctx.tmdbId?.let { add(it.toString()) }
