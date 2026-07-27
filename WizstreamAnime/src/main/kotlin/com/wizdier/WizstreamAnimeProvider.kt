@@ -6,7 +6,6 @@ import com.lagradost.cloudstream3.LoadResponse.Companion.addAniListId
 import com.lagradost.cloudstream3.LoadResponse.Companion.addImdbId
 import com.lagradost.cloudstream3.LoadResponse.Companion.addKitsuId
 import com.lagradost.cloudstream3.LoadResponse.Companion.addMalId
-import com.lagradost.cloudstream3.LoadResponse.Companion.addSimklId
 import com.lagradost.cloudstream3.LoadResponse.Companion.addTrailer
 import com.lagradost.cloudstream3.Score
 import com.lagradost.cloudstream3.syncproviders.SyncIdName
@@ -586,7 +585,7 @@ class WizstreamAnimeProvider : MainAPI() {
 
         val recs = detail.recommendations.mapNotNull { m -> mediaToSearch(m) }
 
-        return if (type == TvType.AnimeMovie) {
+        val loadResponse = if (type == TvType.AnimeMovie) {
             newMovieLoadResponse(title, url, TvType.AnimeMovie, epList.first().data) {
                 this.posterUrl = detail.posterUrl
                 this.backgroundPosterUrl = detail.backdropUrl
@@ -602,7 +601,6 @@ class WizstreamAnimeProvider : MainAPI() {
                 runCatching { detail.malId?.let { addMalId(it) } }
                 runCatching { detail.kitsuId?.let { addKitsuId(it) } }
                 runCatching { addAniListId(id) }
-                runCatching { detail.simklId?.let { addSimklId(it) } }
             }
         } else {
             newAnimeLoadResponse(title, url, type) {
@@ -625,10 +623,43 @@ class WizstreamAnimeProvider : MainAPI() {
                 runCatching { detail.malId?.let { addMalId(it) } }
                 runCatching { detail.kitsuId?.let { addKitsuId(it) } }
                 addAniListId(id)
-                runCatching { detail.simklId?.let { addSimklId(it) } }
                 addEpisodes(DubStatus.Subbed, epList)
             }
         }
+
+        // (v66) SIMKL-POISON STRIP — root-caused from the user's logcat
+        //   (logcat_2026_07_27_08_52.txt). The Cloudstream LIBRARY invisibly
+        //   folds every tracker id a page binds into syncData["simkl"] as a
+        //   JSON blob: MainAPI's companion has addMalId/addAniListId/
+        //   addImdbId each append into it — that's why the app's SYNCVM log
+        //   showed `addSync simkl = {"Imdb":…,"Mal":"38524","AniList":"104578"}`
+        //   even though this module never sets a Simkl id itself. Simkl's
+        //   catalogue is FRANCHISE-level for split-cour anime (one "Attack on
+        //   Titan" entry spanning S1 + every S3 part), and the app reads its
+        //   sync map in HashMap bucket order — "simkl" FIRST, ahead of
+        //   mal/anilist/kitsu — so the tracking sheet's first-answer rule
+        //   always took Simkl's franchise progress (25) as watched while the
+        //   total still came from AniList (10). Hence the device-proven
+        //   "25/10" on S3P1/S3P2 and the phantom "watched" on never-listed
+        //   entries like Rent-a-Girlfriend S4 (Simkl's show entry carried
+        //   S1–S3 progress). Strip the auto-injected key so the sheet falls
+        //   through to mal/anilist/kitsu — all entry-accurate and already
+        //   proven clean on the user's lists (10/10 everywhere). Logged so a
+        //   quick logcat grep can verify the strip on-device.
+        runCatching {
+            val prefix = com.lagradost.cloudstream3.LoadResponse.simklIdPrefix
+                .takeIf { it.isNotBlank() } ?: "simkl"
+            val removed = loadResponse.syncData.remove(prefix)
+                ?: loadResponse.syncData.remove("simkl")
+            if (removed != null) {
+                android.util.Log.i(
+                    "WizstreamAnime",
+                    "sync-strip '$prefix' removed " +
+                        "(Simkl franchise-level progress must not answer per-entry pages, v66)"
+                )
+            }
+        }
+        return loadResponse
     }
 
     // ═══════════════════════════════════════════════════════════════════════
