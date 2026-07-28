@@ -2358,6 +2358,311 @@ override suspend fun resolve(
                 .replace(Regex("""\s+"""), " ")
                 .trim()
 
+        // ── (v71) MAIN-SITE rescue (main.circleftp.net) ─────────────────────
+        // The "new" site (new.circleftp.net:5000) is a RE-CATALOGUE, not a
+        // migration: posts the operator never re-upped exist ONLY on the old
+        // WordPress site ("Circle Network"). Device-verified by the user:
+        // "Haikyuu is not available on new.circleftp.net but available on
+        // it's main site main.circleftp.net" — no amount of search/paging on
+        // the new API can find it (structurally absent), so a resolve that
+        // ends dry on the new API now falls through to here.
+        //
+        // The main site is plain WordPress:
+        //   • wp-json search: /wp-json/wp/v2/search?search=<q>&per_page=50
+        //     &subtype=any (API presence confirmed via the oembed/wp-json
+        //     discovery links in the user's saved SingleFile captures) —
+        //     the classic ?s= search page is the fallback when the JSON
+        //     route is disabled/blocked. Post permalinks live under
+        //     /cn/<slug>/ (proven by the same captures: the Haikyuu and
+        //     Attack-on-Titan posts).
+        //   • Post pages are server-rendered: per-season su_tabs + <table>
+        //     rows of
+        //       <td>Haikyuu!!.S1.Episode:1</td>
+        //       <td><a href=http://ftp15.circleftp.net/FILE/.../Season%201/
+        //       %5BJudas%5D%20Haikyuu%21%21%20S1%20-%2001.mkv>Download</a></td>
+        //     (structure proven by the saved Haikyuu capture: 85 distinct
+        //     mkv URLs = TMDB's exact 25/25/10/25 season counts).
+        // So: search → gate candidates through the SAME identity/fuzzy/
+        // tier-3 chain as the new-API pipeline → parse each post's media
+        // anchors into (season, episode, url) rows → pick the requested
+        // episode NUMBER-TRUE (same doctrine as the v70 new-API pool
+        // picker: when ≥50% of a post's in-season rows declare a number,
+        // only exact number matches are served; else positional indexing).
+        private const val MAIN_SITE = "http://main.circleftp.net"
+        private val MAIN_HEADERS = mapOf(
+            "User-Agent" to UA,
+            "Referer" to "$MAIN_SITE/",
+        )
+
+        private data class MainSiteRow(val season: Int?, val epNum: Int?, val url: String)
+
+        /** Parsed media rows per post URL, 10-minute cache — one post
+         *  serves every episode of a binge session. */
+        private val mainSiteRowsCache =
+            java.util.concurrent.ConcurrentHashMap<String, Pair<Long, List<MainSiteRow>>>()
+
+        /** wp-json / ?s= results must be POST permalinks (proven to live
+         *  under /cn/<slug>/ etc.), not nav, category or software pages. */
+        private val mainPostUrlRx = Regex(
+            """^https?://main\.circleftp\.net/(cn|anime|tv|series|movies?)/[^/?#]+/?$""",
+            RegexOption.IGNORE_CASE,
+        )
+        private val mainMediaFileRx = Regex("""(?i)\.(mkv|mp4|avi|m4v|ts|webm)$""")
+        private val mainJunkFileRx = Regex(
+            """(?i)\.(srt|vtt|ass|ssa|sub|zip|rar|7z|txt|nfo|jpg|jpeg|png|webp|exe|apk|iso)$"""
+        )
+
+        /**
+         * Parse one main-site post page into (season, episode, url) media
+         * rows from its HTML anchors (the episode tables link STRAIGHT to
+         * files on ftp*.circleftp.net — proven by the saved captures).
+         */
+        private suspend fun mainSiteRowsForPost(
+            app: Requests,
+            postUrl: String,
+        ): List<MainSiteRow> {
+            val now = System.currentTimeMillis()
+            mainSiteRowsCache[postUrl]?.let { (ts, rows) ->
+                if (now - ts < 10 * 60_000L) return rows
+            }
+            val resp = runCatching {
+                app.get(postUrl, headers = MAIN_HEADERS, verify = false, cacheTime = 60, timeout = 12_000)
+            }.getOrNull()
+            if (resp == null || resp.code !in 200..299 || resp.text.isBlank()) return emptyList()
+            val doc = runCatching { Jsoup.parse(resp.text, postUrl) }.getOrNull()
+                ?: return emptyList()
+            val rows = ArrayList<MainSiteRow>()
+            for (a in doc.select("a[href]")) {
+                val href = a.attr("abs:href").ifBlank { a.attr("href") }.trim()
+                if (!href.startsWith("http")) continue
+                val decoded = runCatching {
+                    java.net.URLDecoder.decode(href, "UTF-8")
+                }.getOrElse { href }
+                val fileName = decoded.substringBefore('?').substringBefore('#')
+                    .substringAfterLast('/')
+                val looksMedia = mainMediaFileRx.containsMatchIn(fileName) ||
+                    (href.contains("/FILE/", ignoreCase = true) &&
+                        !mainJunkFileRx.containsMatchIn(fileName))
+                if (!looksMedia) continue
+                // Row label: the episode tables carry the file's display
+                // name in the row's FIRST <td> ("Haikyuu!!.S1.Episode:1")
+                // while the anchor text itself is just "Download"/"Watch
+                // Online" — prefer the table-cell text, fall back to the
+                // anchor text, then to the decoded filename alone.
+                val cell = a.closest("tr")?.selectFirst("td")?.text().orEmpty()
+                val anchor = a.text().trim()
+                val label = when {
+                    cell.isNotBlank() && !cell.equals("download", true) &&
+                        !cell.equals("watch online", true) -> "$cell $fileName"
+                    anchor.isNotBlank() && !anchor.equals("download", true) &&
+                        !anchor.equals("watch online", true) -> "$anchor $fileName"
+                    else -> fileName
+                }
+                val basis = "$label $decoded"
+                // Season: explicit ".S1" / "S:1" / "S1E" / "S1 - " forms
+                // first, then the shared title parser (its "Season 1"
+                // pattern catches the decoded URL path /FILE/.../Season 1/).
+                val seasonNum =
+                    Regex("""(?i)\.S\s*:?\s*(\d{1,2})(?=\.|\s|$)""").find(basis)
+                        ?.groupValues?.getOrNull(1)?.toIntOrNull()
+                        ?: Regex("""(?i)\bS\s*:\s*(\d{1,2})\s*E""").find(basis)
+                            ?.groupValues?.getOrNull(1)?.toIntOrNull()
+                        ?: Regex("""(?i)\bS(\d{1,2})\s*E\d{1,4}\b""").find(basis)
+                            ?.groupValues?.getOrNull(1)?.toIntOrNull()
+                        ?: Regex("""(?i)\bS(\d{1,2})\s*-\s*\d{1,3}\b""").find(basis)
+                            ?.groupValues?.getOrNull(1)?.toIntOrNull()
+                        ?: extractSeasonFromTitle(basis)
+                // Episode number — number-true doctrine; the captures prove
+                // the forms: "Episode:1", "S:4E:29", "S2 E0",
+                // Judas "S1 - 01", KaiDubs "S4 - 01 (60)".
+                val epNum =
+                    Regex("""(?i)\bepisode\s*:?\s*(\d{1,4})""").find(basis)
+                        ?.groupValues?.getOrNull(1)?.toIntOrNull()
+                        ?: Regex("""(?i)\bS\s*:?\s*\d{1,2}\s*\.?\s*E\s*:?\s*(\d{1,4})""").find(basis)
+                            ?.groupValues?.getOrNull(1)?.toIntOrNull()
+                        ?: Regex("""(?i)\bS\d{1,2}\s*-\s*(\d{1,3})\s*(?:\(|$|\.)""").find(basis)
+                            ?.groupValues?.getOrNull(1)?.toIntOrNull()
+                        ?: Regex("""(?i)\s-\s(\d{1,2})\s\(""").find(basis)
+                            ?.groupValues?.getOrNull(1)?.toIntOrNull()
+                rows += MainSiteRow(seasonNum, epNum, href)
+            }
+            val out = rows.distinctBy { it.url }
+            mainSiteRowsCache[postUrl] = now to out
+            return out
+        }
+
+        /**
+         * Search the main site for post candidates and gate them through
+         * the SAME identity → fuzzy → tier-3 chain the new-API pipeline
+         * uses (franchise siblings rejected identically).
+         * Returns (postUrl, postTitle) pairs.
+         */
+        private suspend fun mainSiteSearchPosts(
+            app: Requests,
+            title: String,
+            year: Int?,
+            isMovie: Boolean,
+            season: Int?,
+        ): List<Pair<String, String>> {
+            val partStripped = title
+                .replace(Regex("(?i)\\bpart\\s*\\d{1,2}\\b"), " ")
+                .replace(Regex("\\s+"), " ").trim()
+            val queryVariants = listOf(
+                title,
+                cleanedSearchTerm(title),
+                partStripped,
+                cleanedSearchTerm(partStripped),
+                cleanedSearchTerm(bareSeriesTitle(title)),
+            ).filter { it.isNotBlank() }.distinct()
+            val merged = LinkedHashMap<String, String>()  // postUrl → title
+            for (q in queryVariants) {
+                // 1) WordPress REST search.
+                val jsonResp = runCatching {
+                    app.get(
+                        "$MAIN_SITE/wp-json/wp/v2/search?search=${encodeUrl(q)}" +
+                            "&per_page=50&subtype=any",
+                        headers = MAIN_HEADERS, verify = false, cacheTime = 60, timeout = 10_000,
+                    )
+                }.getOrNull()
+                if (jsonResp != null && jsonResp.code in 200..299) {
+                    val arr = runCatching { JSONArray(jsonResp.text) }.getOrNull()
+                    if (arr != null) {
+                        for (i in 0 until arr.length()) {
+                            val o = arr.optJSONObject(i) ?: continue
+                            val u = o.optStringOrNullCp("url")?.trim() ?: continue
+                            val tRaw = o.optStringOrNullCp("title") ?: continue
+                            if (!mainPostUrlRx.matches(u)) continue
+                            if ("popular-useful-software" in u.lowercase()) continue
+                            // wp-json titles are HTML-escaped ("&#8211;") —
+                            // decode or entity fragments pollute the token
+                            // gates ("8211" junk tokens).
+                            val t = runCatching { Jsoup.parse(tRaw).text() }
+                                .getOrDefault(tRaw).trim()
+                            if (t.isNotBlank()) merged[u] = t
+                        }
+                    }
+                }
+                // 2) Classic WordPress ?s= HTML search (fallback for when
+                //    the REST route is disabled or filtered).
+                if (merged.isEmpty()) {
+                    val htmlResp = runCatching {
+                        app.get(
+                            "$MAIN_SITE/?s=${encodeUrl(q)}",
+                            headers = MAIN_HEADERS, verify = false, cacheTime = 60, timeout = 10_000,
+                        )
+                    }.getOrNull()
+                    if (htmlResp != null && htmlResp.code in 200..299) {
+                        val doc = runCatching { Jsoup.parse(htmlResp.text, MAIN_SITE) }
+                            .getOrNull()
+                        doc?.select("a[href]")?.forEach { a ->
+                            val u = a.attr("abs:href").ifBlank { a.attr("href") }.trim()
+                            if (!mainPostUrlRx.matches(u)) return@forEach
+                            if ("popular-useful-software" in u.lowercase()) return@forEach
+                            val t = a.text().trim()
+                                .ifBlank { a.attr("title").trim() }
+                                .ifBlank { a.selectFirst("img")?.attr("alt")?.trim().orEmpty() }
+                            if (t.isNotBlank()) merged[u] = t
+                        }
+                    }
+                }
+                if (merged.isNotEmpty()) {
+                    Log.d(
+                        TAG, "CircleFTP: main-site search '$q' rows=${merged.size} " +
+                            "(query variant hit)"
+                    )
+                    break
+                } else {
+                    Log.d(TAG, "CircleFTP: main-site search '$q' rows=0 — next variant")
+                }
+            }
+            if (merged.isEmpty()) return emptyList()
+            // Gates — 1:1 with the browse tier of the new-API pipeline.
+            val qNorm = title.normaliseTitle()
+            val identity = mutableListOf<Pair<String, String>>()
+            val fuzzy = mutableListOf<Pair<String, String>>()
+            val rescue = mutableListOf<Pair<String, String>>()
+            for ((u, t) in merged) {
+                val postYear = Regex("\\b(19|20)\\d{2}\\b").find(t)?.value?.toIntOrNull()
+                val effectiveYear = year ?: postYear
+                if (isSameMediaTitle(t, title, effectiveYear)) {
+                    identity += u to t
+                    continue
+                }
+                if (isFuzzySameMedia(t, title, effectiveYear)) {
+                    fuzzy += u to t
+                    continue
+                }
+                if (!isMovie && season != null && qNorm.length >= 4) {
+                    val pNorm = bareSeriesTitle(t).normaliseTitle()
+                    if (pNorm.length < 4) continue
+                    val forward = pNorm.contains(qNorm)
+                    val reverse = qNorm.startsWith(pNorm) &&
+                        (qNorm.length == pNorm.length || qNorm[pNorm.length] == ' ')
+                    if (forward || reverse) rescue += u to t
+                }
+            }
+            return identity.ifEmpty { fuzzy.ifEmpty { rescue } }
+        }
+
+        /**
+         * (v71) Full main-site resolve: search → gate → parse ≤3 posts →
+         * number-true episode pick. Returns media URLs fed into the SHARED
+         * emit section (links go out in hostname form with no referer —
+         * 1:1 with the site's own web player; the user's BDIX connection
+         * is the same one that browses the main site, so DNS is fine).
+         */
+        private suspend fun mainSiteMediaUrls(
+            app: Requests,
+            title: String,
+            year: Int?,
+            isMovie: Boolean,
+            season: Int?,
+            episode: Int?,
+        ): Set<String> {
+            val candidates = mainSiteSearchPosts(app, title, year, isMovie, season)
+            if (candidates.isEmpty()) {
+                Log.d(TAG, "CircleFTP: main-site '$title' candidates=0")
+                return emptySet()
+            }
+            Log.i(TAG, "CircleFTP: main-site '$title' candidates=${candidates.size}")
+            val out = linkedSetOf<String>()
+            val seasonToUse = season ?: 1
+            val episodeToUse = episode ?: 1
+            for ((postUrl, _) in candidates.distinctBy { it.first }.take(3)) {
+                val rows = mainSiteRowsForPost(app, postUrl)
+                if (rows.isEmpty()) continue
+                if (isMovie) {
+                    // Movie post: the page already passed the identity/
+                    // fuzzy gate, so every media row on it is the film
+                    // (parts / encode variants all wanted).
+                    out += rows.map { it.url }
+                    continue
+                }
+                // Season filter: rows that DECLARE a season must match the
+                // requested one; undeclared rows keep their positional
+                // chance (v11 doctrine — unlabeled mega content).
+                val seasonRows = rows.filter { it.season == null || it.season == seasonToUse }
+                if (seasonRows.isEmpty()) continue
+                val parsed = seasonRows.count { it.epNum != null }
+                val numberTrue = parsed * 2 >= seasonRows.size
+                val picked: List<MainSiteRow> = if (numberTrue) {
+                    seasonRows.filter { it.epNum == episodeToUse }
+                } else {
+                    seasonRows.getOrNull(episodeToUse - 1)?.let { listOf(it) } ?: emptyList()
+                }
+                val slug = postUrl.trimEnd('/').substringAfterLast('/')
+                Log.d(
+                    TAG, "CircleFTP: main-site post $slug " +
+                        "seasonRows=${seasonRows.size} " +
+                        "seasons=${seasonRows.mapNotNull { it.season }.distinct()} " +
+                        "ep=$episodeToUse pick=${if (numberTrue) "num" else "pos"} " +
+                        "hit=${picked.size}"
+                )
+                out += picked.map { it.url }
+            }
+            return out
+        }
+
         override suspend fun resolve(
             app: Requests,
             title: String,
@@ -2628,13 +2933,37 @@ override suspend fun resolve(
                     }
                 }
             }
-            if (matchingPostIds.isEmpty()) {
-                Log.d(TAG, "CircleFTP: no match for '$title' (year=$year) — skipping")
-                return false
-            }
-
             val srcLabel = "$labelPrefix • $LABEL"
             val mediaUrls = linkedSetOf<String>()
+
+            // (v71) MAIN-SITE FIRST CHANCE (the Haikyuu case): every
+            // new-API tier missed. The old WordPress site is tried BEFORE
+            // declaring failure — its catalogue was never migrated into the
+            // new API, so legacy mega posts (Haikyuu 2014-2020) exist only
+            // there.
+            var mainSiteTried = false
+            if (matchingPostIds.isEmpty()) {
+                mainSiteTried = true
+                Log.i(
+                    TAG, "CircleFTP: no new-site match for '$title' " +
+                        "(year=$year) — trying main-site"
+                )
+                mediaUrls += mainSiteMediaUrls(app, title, year, isMovie, season, episode)
+                if (mediaUrls.isEmpty()) {
+                    Log.d(TAG, "CircleFTP: no match for '$title' (year=$year) — skipping")
+                    return false
+                }
+            }
+
+            // (v71) The whole new-API post pipeline (sections 3-6) is wrapped
+            // so any dead end inside falls THROUGH to the main-site second
+            // chance below instead of returning false outright (previously
+            // matched-but-empty posts killed the resolve). It is skipped
+            // entirely when no posts matched — the main-site rescue above
+            // already ran in that case. (Inner body kept at its original
+            // indentation on purpose, to keep this diff reviewable.)
+            run {
+                if (matchingPostIds.isEmpty()) return@run
 
             // 3. Fetch ALL matching post details concurrently. Each post's
             //    detail JSON contains:
@@ -2661,7 +2990,7 @@ override suspend fun resolve(
             )
             if (postDetails.isEmpty()) {
                 Log.d(TAG, "CircleFTP: no details — bailing for '$title'")
-                return false
+                return@run
             }
 
             // 4. Filter posts by type ONLY for movies. For TV/anime, keep ALL
@@ -2679,13 +3008,13 @@ override suspend fun resolve(
             } else {
                 postDetails
             }
-            if (typeFiltered.isEmpty()) return false
+            if (typeFiltered.isEmpty()) return@run
 
             // (v18) identity matching happened before the detail fetches —
             // every post here is the requested title, so no relevance
             // re-check (and no "keep everything" fallback) is needed.
             val filteredDetails = typeFiltered
-            if (filteredDetails.isEmpty()) return false
+            if (filteredDetails.isEmpty()) return@run
 
             // 5. Route to movie or TV/anime path based on the user's request.
             if (isMovie) {
@@ -2943,6 +3272,21 @@ override suspend fun resolve(
                         if (u != null && u.isNotBlank()) mediaUrls += u
                     }
                 }
+            }
+
+            }  // end new-API pipeline (v71 fall-through wrapper)
+
+            // (v71) MAIN-SITE SECOND CHANCE: the new API DID have matching
+            // posts, but none yielded this exact (season, episode) — e.g.
+            // a half-migrated re-upload whose missing seasons are still
+            // only on the old site. Same rescue, one attempt.
+            if (mediaUrls.isEmpty() && !mainSiteTried) {
+                mainSiteTried = true
+                Log.i(
+                    TAG, "CircleFTP: new-site pipeline empty for '$title' " +
+                        "s=$season e=$episode — trying main-site"
+                )
+                mediaUrls += mainSiteMediaUrls(app, title, year, isMovie, season, episode)
             }
 
             // 7. Emit — v33: 1:1 with CircleFtpProvider.loadLinks.

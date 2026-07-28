@@ -480,12 +480,21 @@ class WizstreamAnimeProvider : MainAPI() {
                 // entry-local episode for the anime-web sources.
                 (1..m.episodes).map { localEp ->
                     val stackedEp = m.seasonStart + localEp - 1
+                    // (v71) ABSOLUTE chain index — the addressing every
+                    // absolute-packed TMDB show (JJK's 59-episode "Season
+                    // 1", Oshi no Ko's 35) answers meta by.
+                    val absIndex = m.absStart + localEp - 1
                     // (v59) Episode meta fills (with the user's blessing)
                     // from the catalogue CircleFTP mirrors — the recursive
                     // WizEpisodeTable resolves this stacked slot to TMDB's
                     // canon row, cours folds and tail-absorbed specials
                     // alike. Catalogue/pages stay 100% AniList.
-                    val epMeta = detail.epTable[m.siteSeason]?.get(stackedEp)
+                    // (v71) absolute-packed shows address meta by absIndex.
+                    val epMeta = if (detail.absolutePacked) {
+                        detail.epTable[1]?.get(absIndex)
+                    } else {
+                        detail.epTable[m.siteSeason]?.get(stackedEp)
+                    }
                     // (v53, healed v59, HARDENED v60) AniList titles
                     // first — but only feeds whose shape PROVES alignment
                     // with this entry's rows:
@@ -566,14 +575,27 @@ class WizstreamAnimeProvider : MainAPI() {
                         isMovie = false, year = detail.year,
                         sourceSeason = m.siteSeason,
                         franchiseTitles = detail.franchiseTitles,
-                        tmdbSeason = epMeta?.tmdbSeason,
-                        tmdbEpisode = epMeta?.tmdbEpisode,
+                        // (v71) embed-host canon coordinates: on absolute-
+                        // packed shows every regular row's canon address
+                        // IS (1, absIndex) — vidsrc-family hosts index
+                        // TMDB, where JJK S3E3 does not exist but S1E50
+                        // does. Specials keep their real canon (S0E36).
+                        tmdbSeason = if (detail.absolutePacked && epMeta != null) 1
+                            else epMeta?.tmdbSeason,
+                        tmdbEpisode = if (detail.absolutePacked && epMeta != null) absIndex
+                            else epMeta?.tmdbEpisode,
                         dub = DubStatus.Subbed,
                     ).toJson()) {
                         name = rowName
                         season = 1
                         episode = localEp
-                        posterUrl = sEp?.thumb ?: epMeta?.stillUrl ?: detail.posterUrl
+                        // (v71) TMDB stills BEFORE feed thumbnails: the
+                        // licensed-stream feed ships the generic SHOW key
+                        // visual for many rows, so every episode wore the
+                        // same picture while real per-episode stills sat
+                        // unused (the side-by-side "same thumbnail
+                        // everywhere" from the user's screenshot).
+                        posterUrl = epMeta?.stillUrl ?: sEp?.thumb ?: detail.posterUrl
                         description = epMeta?.overview
                         runCatching { epMeta?.score?.let { score = Score.from10(it) } }
                         runTime = epMeta?.runtime
@@ -878,6 +900,10 @@ class WizstreamAnimeProvider : MainAPI() {
         // stacked ep (replaces v48's season-meta map; same catalogue
         // CircleFTP mirrors, site-tail specials included).
         val epTable: Map<Int, Map<Int, WizEpisodeTable.EpRow>> = emptyMap(),
+        // (v71) TMDB files the whole franchise under one giant season —
+        // per-episode meta then answers by ABSOLUTE chain index
+        // (m.absStart + localEp − 1), not (siteSeason, stacked).
+        val absolutePacked: Boolean = false,
         val recommendations: List<JSONObject>,
         // (v45) English+romaji titles of every counted prequel ancestor,
         // walk order (franchise root LAST). BDIX sites file multi-season
@@ -1210,6 +1236,14 @@ class WizstreamAnimeProvider : MainAPI() {
         // Fold into stacked (site-style) seasons. A cours part joins the
         // season its direct prequel opened and continues its numbering
         // (AoT S3=12 rows, S3 Part 2 continues at 13 → stacked 22).
+        // (v71) HARD RULE — "Part 1" is a NEW season, never a tail
+        // (device-verified regression: JUJUTSU KAISEN Season 3: The
+        // Culling Game Part 1 — AniList 172463, english title literally
+        // carries "Part 1" — folded INTO Season 2 at stacked 24 (logcat
+        // 's=2 e=24'), so every BDIX lookup and every episode-meta row
+        // pointed two positions past Season 2's end: wrong files, no
+        // stills. Part-1 now opens its own stacked season; Part 2+ can
+        // only ever CONTINUE (classic cours doctrine).
         // (v59) Recursive tail-attach for story-special members (and for
         // the opened entry itself when it's a special): they fold INTO
         // the season they follow, continuing its numbering sequentially —
@@ -1219,7 +1253,9 @@ class WizstreamAnimeProvider : MainAPI() {
         // anime whose chain ends in long-form specials.
         var seasonCounter = 0
         var nextStart = 1
+        var absCounter = 1
         members.forEach { m ->
+            val part = titlePartNumber(m.title)
             when {
                 m.format !in franchiseBroadcastFormats -> {
                     if (seasonCounter == 0) {
@@ -1231,7 +1267,8 @@ class WizstreamAnimeProvider : MainAPI() {
                         m.seasonStart = nextStart
                     }
                 }
-                titlePartNumber(m.title) == null || seasonCounter == 0 -> {
+                // (v71) part==1 must OPEN a season (see hard rule above)
+                part == null || part <= 1 || seasonCounter == 0 -> {
                     seasonCounter++
                     m.siteSeason = seasonCounter
                     m.seasonStart = 1
@@ -1242,6 +1279,10 @@ class WizstreamAnimeProvider : MainAPI() {
                 }
             }
             nextStart = m.seasonStart + m.episodes
+            // (v71) absolute chain position recorded for the
+            // absolute-packed-TMDB meta addressing below.
+            m.absStart = absCounter
+            absCounter += m.episodes
         }
 
         // (v59, per user decision) EPISODE meta fills from the catalogue
@@ -1285,6 +1326,30 @@ class WizstreamAnimeProvider : MainAPI() {
         }
         val epTable: Map<Int, Map<Int, WizEpisodeTable.EpRow>> =
             showTable?.seasons ?: emptyMap()
+        // (v71) ABSOLUTE-PACKED TMDB detection (device-verified: Jujutsu
+        //   Kaisen files all 59 franchise episodes under ONE TMDB
+        //   "Season 1"; Oshi no Ko packs 35 = S1+S2+S3 the same way).
+        //   Site/BDIX coordinates stay production-stacked (CircleFTP
+        //   post 71681 labels [1,2,3] — seasons!), but TMDB META
+        //   (titles, stills, ratings, air dates, embed-host canon
+        //   coordinates) must be addressed by the ABSOLUTE chain index
+        //   (m.absStart + localEp − 1). Before this, absolute-packed
+        //   shows had season-keyed meta misses on every non-first entry:
+        //   rows fell back to feed titles with generic key-visual
+        //   thumbnails and no ratings/dates (user's side-by-side with
+        //   StreamPlay, which does this addressing right).
+        val absTotal = members.sumOf { it.episodes }
+        val absolutePacked = epTable.size == 1 && epTable.containsKey(1) &&
+            (epTable[1]?.size ?: 0) >= absTotal
+        // (v71) Visible-in-logcat mode line: which addressing scheme the
+        // rows below use. "absolute" = TMDB packs the whole franchise
+        // under ONE season (JJK 95479 = 59 eps in S1); "stacked" = real
+        // production seasons.
+        android.util.Log.i(
+            "WizstreamAnime",
+            "meta-mode ${if (absolutePacked) "absolute" else "stacked"} " +
+                "'$title' members=${members.size} absTotal=$absTotal"
+        )
         // (v61) High-quality LANDSCAPE art: AniList's banner stays first
         // (it's the AniList asset), but most entries simply don't have
         // one — the header then renders empty. The shared mapper already
@@ -1330,6 +1395,7 @@ class WizstreamAnimeProvider : MainAPI() {
             trailerUrl = trailerUrl,
             members = members,
             epTable = epTable,
+            absolutePacked = absolutePacked,
             recommendations = recs,
             franchiseTitles = franchiseTitles,
             // (v67) cours-linked ⇒ Simkl merges this entry into one franchise
@@ -1372,6 +1438,11 @@ class WizstreamAnimeProvider : MainAPI() {
         // (cours parts continue where the previous segment stopped:
         // AoT S3 Part 2 → season 3, seasonStart 13).
         var seasonStart: Int = 1,
+        // (v71) 1-based position of this member's first episode across the
+        // WHOLE franchise chain (JJK: S1→1, S2→25, Culling Part 1→48) —
+        // the addressing scheme of absolute-packed TMDB shows (their one
+        // giant "Season 1" counts every episode of the franchise).
+        var absStart: Int = 1,
     )
 
     /** (v53) One row of AniList's streamingEpisodes (licensed-stream feed
@@ -1535,6 +1606,18 @@ class WizstreamAnimeProvider : MainAPI() {
         val visited = hashSetOf(id)
         val pre = mutableListOf<RelCand>()          // nearest-prequel FIRST
         val rootTitles = mutableListOf<String>()    // counted ancestors, walk order
+        // (v71) Long-form SPECIAL nodes traversed as prequel bridges, each
+        //   remembered with the pre-walk depth at traversal.
+        //   Device-verified: AniList 162314 (AoT "THE FINAL CHAPTERS
+        //   Special 2") has exactly ONE anime relation — PREQUEL = 146984
+        //   (Special 1, format SPECIAL). Bridging it invisibly skipped it
+        //   from the chain, so Special 2's fold fell onto stack slot 29 =
+        //   Special 1's slot: the page's row showed Special 1's title and
+        //   fetched Special 1's link, exactly the user's "both of the
+        //   last parts episodes showing same title and fetching the same
+        //   link". These bridge specials are REAL franchise members; only
+        //   OVA/movie link nodes stay invisible (Haikyuu S4 ← OVA ← S3).
+        val preSpecials = mutableListOf<Pair<RelCand, Int>>()
         var edges = initialEdges
         var hops = 0
         var bridges = 0
@@ -1545,6 +1628,7 @@ class WizstreamAnimeProvider : MainAPI() {
             // link nodes are traversed as bridges (never added) so the
             // walk can re-attach past them (Haikyuu S4 ← OVA ← S3), but
             // never pollute the season list (AoT S1 ← No Regrets OVA).
+            // (v71) …except long SPECIAL bridges — members (see above).
             val hop = counted ?: anyBroadcast
                 ?: (if (bridges < 3) bridge else null)
                 ?: break
@@ -1560,6 +1644,9 @@ class WizstreamAnimeProvider : MainAPI() {
                 }
             } else {
                 bridges++
+                if (hop.fmt == "SPECIAL" && hop.eps in 1..6) {
+                    preSpecials += hop to pre.size
+                }
             }
             edges = relationsEdges(hop.id) ?: break
         }
@@ -1623,6 +1710,24 @@ class WizstreamAnimeProvider : MainAPI() {
                 episodes = if (c.eps > 0) c.eps else 12,
                 malId = c.malId, format = c.fmt,
                 streamEps = c.streamEps,
+            )
+        }
+        // (v71) Insert prequel-bridge specials at their traversal point:
+        // a special bridged when `pre` held k entries sits between the
+        // k nearest prequels and everything older (position pre.size−k
+        // in the oldest→newest order). AoT: Special 1 bridged at k=0 →
+        // lands right before the opened Special 2 (slot 29), pushing
+        // Special 2 to its true slot 30.
+        preSpecials.sortedByDescending { it.second }.forEach { (c, atK) ->
+            val pos = (pre.size - atK).coerceIn(0, members.size)
+            members.add(
+                pos,
+                FranchiseMember(
+                    id = c.id, title = c.title, altTitle = c.alt,
+                    episodes = if (c.eps > 0) c.eps else 1,
+                    malId = c.malId, format = c.fmt,
+                    streamEps = c.streamEps,
+                )
             )
         }
         members += opened

@@ -1020,6 +1020,9 @@ class WizstreamProvider : MainAPI() {
     ) {
         var siteSeason: Int = 0
         var seasonStart: Int = 1
+        // (v71) absolute chain position — the addressing absolute-packed
+        // TMDB shows (JJK's one 59-episode "Season 1") answer meta by.
+        var absStart: Int = 1
     }
 
     private fun romanToIntWz(s: String): Int? {
@@ -1108,6 +1111,12 @@ class WizstreamProvider : MainAPI() {
         val visited = hashSetOf(startId)
         val pre = mutableListOf<FEntry>()
         val rootTitles = mutableListOf<String>()
+        // (v71) Long SPECIAL nodes bridged in the prequel walk are real
+        // franchise members (AoT Special 2's ONLY anime relation is
+        // PREQUEL = Special 1, format SPECIAL — device-verified). Each is
+        // remembered with the walk depth, then inserted at its traversal
+        // point; OVA/movie bridges stay invisible (Haikyuu S4 ← OVA).
+        val preSpecials = mutableListOf<Pair<FEntry, Int>>()
         var edges = startEdges
         var hops = 0
         var bridges = 0
@@ -1129,6 +1138,9 @@ class WizstreamProvider : MainAPI() {
                 }
             } else {
                 bridges++
+                if (hop.format == "SPECIAL" && hop.episodes in 1..6) {
+                    preSpecials += hop to pre.size
+                }
             }
             edges = franchiseNodeWz(hop.id).second ?: break
         }
@@ -1172,6 +1184,11 @@ class WizstreamProvider : MainAPI() {
         }
         val members = ArrayList<FEntry>()
         pre.asReversed().forEach { members += it }
+        // (v71) Insert bridged specials at their traversal point (k=0 →
+        // right before the opened entry, like AoT Special 1).
+        preSpecials.sortedByDescending { it.second }.forEach { (c, atK) ->
+            members.add((pre.size - atK).coerceIn(0, members.size), c)
+        }
         members += opened
         post.forEach { members += it }
         tailSpecials.forEach { members += it }
@@ -1181,11 +1198,17 @@ class WizstreamProvider : MainAPI() {
 
     /** Fold members into stacked site seasons: a cours part joins the
      *  season its prequel opened and continues its numbering; long
-     *  story-specials tail-attach the season they follow. */
+     *  story-specials tail-attach the season they follow.
+     *  (v71) HARD RULE: "Part 1" opens a NEW season, never a tail —
+     *  JUJUTSU KAISEN S3 "The Culling Game Part 1" folded into Season 2
+     *  at stacked 24 on v70 (device-verified logcat 's=2 e=24'),
+     *  which poisoned every BDIX/meta lookup for that page. */
     private fun foldFranchiseWz(members: List<FEntry>) {
         var seasonCounter = 0
         var nextStart = 1
+        var absCounter = 1
         members.forEach { m ->
+            val part = titlePartNumberWz(m.title)
             when {
                 m.format !in franchiseBroadcastFormatsWz -> {
                     if (seasonCounter == 0) {
@@ -1197,7 +1220,7 @@ class WizstreamProvider : MainAPI() {
                         m.seasonStart = nextStart
                     }
                 }
-                titlePartNumberWz(m.title) == null || seasonCounter == 0 -> {
+                part == null || part <= 1 || seasonCounter == 0 -> {
                     seasonCounter++
                     m.siteSeason = seasonCounter
                     m.seasonStart = 1
@@ -1208,6 +1231,8 @@ class WizstreamProvider : MainAPI() {
                 }
             }
             nextStart = m.seasonStart + m.episodes.coerceAtLeast(1)
+            m.absStart = absCounter
+            absCounter += m.episodes.coerceAtLeast(1)
         }
     }
 
@@ -1226,6 +1251,16 @@ class WizstreamProvider : MainAPI() {
     ): List<Episode> {
         foldFranchiseWz(members)
         val tbl = runCatching { WizEpisodeTable.table(app, tmdbId) }.getOrNull()
+        // (v71) ABSOLUTE-PACKED TMDB addressing (JJK: all 59 episodes
+        // under TMDB "Season 1"; Oshi no Ko: 35 the same way): meta is
+        // looked up by absolute chain index and every regular row's
+        // embed-host canon address is (1, absIndex). Site coordinates
+        // stay production-stacked — CircleFTP's JJK post 71681 labels
+        // [1,2,3], i.e. real seasons (user's saved JSON).
+        val tblSeasons = tbl?.seasons
+        val absTotal = members.sumOf { it.episodes.coerceAtLeast(1) }
+        val absolutePacked = tblSeasons != null && tblSeasons.size == 1 &&
+            tblSeasons.containsKey(1) && (tblSeasons[1]?.size ?: 0) >= absTotal
         val franchiseKeys = (
             rootTitles + showTitle + members.map { it.title } + members.mapNotNull { it.altTitle }
             ).filter { it.isNotBlank() }.distinctBy { it.lowercase() }
@@ -1245,7 +1280,12 @@ class WizstreamProvider : MainAPI() {
                 (1..gm.episodes.coerceAtLeast(1)).forEach { localEp ->
                     displayCounter++
                     val stacked = gm.seasonStart + localEp - 1
-                    val meta = tbl?.seasons?.get(gm.siteSeason)?.get(stacked)
+                    val absIndex = gm.absStart + localEp - 1
+                    val meta = if (absolutePacked) {
+                        tblSeasons?.get(1)?.get(absIndex)
+                    } else {
+                        tblSeasons?.get(gm.siteSeason)?.get(stacked)
+                    }
                     out += newEpisode(
                         LinkContext(
                             imdbId = detail.imdbId,
@@ -1255,8 +1295,10 @@ class WizstreamProvider : MainAPI() {
                             title = gm.title,
                             isMovie = false,
                             year = detail.year,
-                            tmdbSeason = meta?.tmdbSeason,
-                            tmdbEpisode = meta?.tmdbEpisode,
+                            tmdbSeason = if (absolutePacked && meta != null) 1
+                                else meta?.tmdbSeason,
+                            tmdbEpisode = if (absolutePacked && meta != null) absIndex
+                                else meta?.tmdbEpisode,
                             anilistId = gm.id,
                             malId = gm.malId ?: enrich?.malId,
                             entryEpisode = localEp,
@@ -1281,7 +1323,9 @@ class WizstreamProvider : MainAPI() {
         }
         Log.d(
             TAG, "Wizstream: franchise de-stack for '$showTitle' — " +
-                "${members.size} entries, $groupIdx groups, ${out.size} rows"
+                "${members.size} entries, $groupIdx groups, ${out.size} rows " +
+                "meta-mode ${if (absolutePacked) "absolute" else "stacked"} " +
+                "abs=$absolutePacked"
         )
         return out
     }
