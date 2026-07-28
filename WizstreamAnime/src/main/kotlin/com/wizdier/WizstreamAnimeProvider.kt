@@ -627,42 +627,53 @@ class WizstreamAnimeProvider : MainAPI() {
             }
         }
 
-        // (v67) CONDITIONAL Simkl — Simkl sync returns, but only where it
-        //   is CORRECT. Background (root-caused from the user's logcat
-        //   logcat_2026_07_27_08_52.txt, fixed bluntly in v66): the
+        // (v70) SIMKL LAST, NEVER REMOVED (user report v67-69: "Simkl
+        //   still not working for Wizstream Anime"). History: the
         //   Cloudstream LIBRARY invisibly folds every tracker id a page
-        //   binds into syncData["simkl"] — addMalId/addAniListId/addImdbId
-        //   each append to it, no extension opt-out — and the app reads its
-        //   sync map in HashMap bucket order with "simkl" FIRST, so the
-        //   tracking sheet's first-answer rule always took Simkl's number.
-        //   That's fine ONLY when this AniList entry maps 1:1 to a Simkl
-        //   record. Simkl MERGES cours-split entries into ONE franchise
-        //   record — AoT S3P1/S3P2 (anilist 99147/104578) both resolve to
-        //   Simkl's single "Attack on Titan" — so cours-linked pages showed
-        //   franchise progress (25/10 on BOTH parts) and untouched entries
-        //   (Rent-a-Girlfriend S4) looked "watched" from the franchise
-        //   record's S1–S3 progress. Rule: strip the key for cours-linked
-        //   entries (SEQUEL/PREQUEL anime relations), keep it for
-        //   franchise-isolated ones — there Simkl tracking is real and 1:1
-        //   correct. Both paths logged for on-device verification.
+        //   binds into syncData["simkl"] (addMalId/addAniListId/addImdbId
+        //   each append — no extension opt-out), and because that fold
+        //   runs inside the FIRST addMalId call, the "simkl" key is born
+        //   FIRST in the LinkedHashMap — so the tracking sheet's
+        //   first-not-null rule (app SyncViewModel.updateUserData walks
+        //   the map in insertion order) always took Simkl's FRANCHISE-
+        //   MERGED number (25/10 on AoT S3P2, "watched" ghosts on
+        //   untouched cours). v66 stripped the key everywhere; v67 kept
+        //   it for isolated entries — but the user actually USES Simkl
+        //   sync, and stripping means marking episodes never reaches it.
+        //
+        //   The correct shape: keep the key (Simkl sync WORKS — the app's
+        //   modifyData writes progress to every tracker in the map,
+        //   Simkl included) but move simkl to the END of the map, so the
+        //   sheet's first-not-null read is answered by the ENTRY-EXACT
+        //   trackers (mal/anilist/kitsu) and Simkl's merged franchise
+        //   record only ever answers when nothing else can (e.g. user
+        //   tracks this show on Simkl only). `LoadResponse.syncData` is a
+        //   `var MutableMap` in the library, so a fresh ordered
+        //   LinkedHashMap is a legal, total replacement.
         runCatching {
-            val prefix = com.lagradost.cloudstream3.LoadResponse.simklIdPrefix
-                .takeIf { it.isNotBlank() } ?: "simkl"
-            if (detail.coursLinked) {
-                val removed = loadResponse.syncData.remove(prefix)
-                    ?: loadResponse.syncData.remove("simkl")
-                if (removed != null) {
-                    android.util.Log.i(
-                        "WizstreamAnime",
-                        "sync-strip '$prefix' removed " +
-                            "(cours-linked entry — Simkl's merged franchise record would poison the sheet, v67)"
-                    )
-                }
-            } else if (loadResponse.syncData.containsKey(prefix)) {
+            val sv = loadResponse.syncData
+            val simklKey = sv.keys.firstOrNull {
+                it.equals(
+                    com.lagradost.cloudstream3.LoadResponse.simklIdPrefix
+                        .takeIf { p -> p.isNotBlank() } ?: "simkl",
+                    ignoreCase = true
+                ) || it.equals("simkl", ignoreCase = true)
+            }
+            if (simklKey != null && sv.keys.last() != simklKey) {
+                val reordered = LinkedHashMap<String, String>(sv.size + 1)
+                for ((k, v) in sv) if (k != simklKey) reordered[k] = v
+                reordered[simklKey] = sv.getValue(simklKey)
+                loadResponse.syncData = reordered
                 android.util.Log.i(
                     "WizstreamAnime",
-                    "sync-keep '$prefix' " +
-                        "(franchise-isolated entry — maps 1:1 to a Simkl record, v67)"
+                    "sync-order: '$simklKey' moved LAST (kept — Simkl sync " +
+                        "writes through, but entry-exact trackers answer " +
+                        "the sheet first, v70)"
+                )
+            } else if (simklKey != null) {
+                android.util.Log.i(
+                    "WizstreamAnime",
+                    "sync-order: '$simklKey' already last — kept (v70)"
                 )
             }
         }
@@ -1246,9 +1257,31 @@ class WizstreamAnimeProvider : MainAPI() {
         // entries; cour parts/specials often have none).
         val showTmdbId = tmdbId?.takeIf { it > 0 }
             ?: members.firstOrNull()?.let { root -> fetchAniZipTmdbId(root.id) }
+            // (v70) TMDB search fallback (user report: titles/stills/
+            // landscape art "suck sometimes" — the broken cases are
+            // entries ani.zip never mapped). TMDB's own search recovers
+            // the show id from the AniList title + start year, with a
+            // title-identity + ±1-year gate inside findShow.
+            ?: title.let { t ->
+                runCatching { WizEpisodeTable.findShow(app, t, year) }.getOrNull()
+            }
         val showTable = if (format == "MOVIE") null
         else showTmdbId?.let { id ->
             runCatching { WizEpisodeTable.table(app, id) }.getOrNull()
+        }
+        if (format != "MOVIE" && showTable == null) {
+            android.util.Log.i(
+                "WizstreamAnime",
+                "meta-gap: no TMDB table for '$title' (tmdb=$showTmdbId) — " +
+                    "episode titles/stills will fall back to AniList feed + Kitsu only"
+            )
+        }
+        // (v70) Movies too: bannerless anime films get TMDB's landscape
+        // backdrop instead of an empty header.
+        if (format == "MOVIE" && backdropUrl == null && showTmdbId != null) {
+            backdropUrl = runCatching {
+                WizEpisodeTable.movieBackdrop(app, showTmdbId)
+            }.getOrNull() ?: backdropUrl
         }
         val epTable: Map<Int, Map<Int, WizEpisodeTable.EpRow>> =
             showTable?.seasons ?: emptyMap()

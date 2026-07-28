@@ -862,6 +862,15 @@ object WizstreamSources {
         "cineby" to "Cineby",
         "bingr" to "Bingr",
         "moonflix" to "Moonflix",
+        // (v70) anime-web resolvers (WizstreamAnimeSources) — now toggled
+        // from BOTH extensions' settings menus.
+        "anizone" to "AniZone",
+        "allmanga" to "AllAnime (Mkissa)",
+        "anichi" to "AniChi",
+        "uniquestream" to "UniqueStream",
+        "anineko" to "AniNeko",
+        "reanime" to "ReAnime",
+        "tokyoinsider" to "TokyoInsider",
     )
 
     object WizSourcePrefs {
@@ -2283,28 +2292,43 @@ override suspend fun resolve(
         // SERIES requests we can walk it ourselves and run the same tier
         // gates client-side, which is exactly what a human browsing the
         // site does. Cached 10 minutes; pages stop on an empty/short page.
-        private var animeCategoryCache: Pair<Long, List<org.json.JSONObject>>? = null
+        private var animeCategoryCache:
+            Pair<Long, Pair<List<org.json.JSONObject>, Boolean>>? = null
 
-        private suspend fun animeCategoryPosts(app: Requests): List<org.json.JSONObject> {
+        private suspend fun animeCategoryPosts(
+            app: Requests,
+        ): Pair<List<org.json.JSONObject>, Boolean> {
             val now = System.currentTimeMillis()
-            animeCategoryCache?.let { (ts, posts) ->
-                if (now - ts < 10 * 60_000L) return posts
+            animeCategoryCache?.let { (ts, v) ->
+                if (now - ts < 10 * 60_000L) return v
             }
             val out = mutableListOf<org.json.JSONObject>()
-            for (page in 1..12) {
+            var usedIp = false
+            // (v70) 12 → 40 pages: the catalogue is upload-date-ordered, so
+            // legacy mega posts (Haikyuu 2014-2020, Attack on Titan 2013-)
+            // sink far below the first 720 rows. 2400 rows covers the
+            // backlog a human reaches by paging the site's Anime category.
+            for (page in 1..40) {
                 val resp = fetchWithFallback(
                     app,
                     primary = "$PRIMARY_API/api/posts?categoryExact=21&page=$page&order=desc&limit=60",
                     fallback = "$FALLBACK_API/api/posts?categoryExact=21&page=$page&order=desc&limit=60",
-                )?.first ?: break
-                val arr = runCatching { JSONObject(resp).optJSONArray("posts") }.getOrNull() ?: break
+                ) ?: break
+                usedIp = usedIp || resp.second
+                val arr = runCatching { JSONObject(resp.first).optJSONArray("posts") }
+                    .getOrNull() ?: break
                 val len = arr.length()
                 if (len == 0) break
                 for (i in 0 until len) arr.optJSONObject(i)?.let { out += it }
                 if (len < 60) break
+                // Yield between pages: 40 sequential API hits is a long
+                // crawl — keep the resolver cancellable/cooperative.
+                kotlinx.coroutines.yield()
             }
-            animeCategoryCache = now to out
-            return out
+            Log.d(TAG, "CircleFTP: anime browse catalogued ${out.size} posts")
+            val value = out to usedIp
+            animeCategoryCache = now to value
+            return value
         }
 
         /** (v45) Decoration-stripped post title for the tier-3 multi-season
@@ -2406,9 +2430,30 @@ override suspend fun resolve(
                     }
                     if (arr.length() < 60) break
                 }
-                if (sawAny) { searchHit = true; break }
+                if (sawAny) {
+                    searchHit = true
+                    Log.d(
+                        TAG, "CircleFTP: search '$q' rows=${merged.size} " +
+                            "(query variant hit)"
+                    )
+                    break
+                } else {
+                    Log.d(TAG, "CircleFTP: search '$q' rows=0 — next variant")
+                }
             }
-            if (!searchHit || merged.isEmpty()) return false
+            // (v70) THE DEAD-RESCUE BUG (user report: "Haikyuu still not
+            // getting fetched" while AoT/JJK worked): when EVERY text-search
+            // variant starved server-side, this `return false` fired BEFORE
+            // the v48 anime-category browse/rescue tiers below — the exact
+            // case those tiers exist for. The browse now ALWAYS gets its
+            // chance on a dry search; only a dry search AND a dry browse
+            // still ends the resolve.
+            if (!searchHit || merged.isEmpty()) {
+                Log.d(
+                    TAG, "CircleFTP: all search variants dry for '$title' " +
+                        "— continuing into category browse/rescue tiers"
+                )
+            }
             val searchText = JSONObject()
                 .put("posts", JSONArray(merged.values.toList())).toString()
 
@@ -2432,8 +2477,11 @@ override suspend fun resolve(
             // circleftp.net and the IP is the working route.
 
             val postsArr = runCatching { JSONObject(searchText).optJSONArray("posts") }
-                .getOrNull() ?: return false
-            if (postsArr.length() == 0) return false
+                .getOrNull() ?: JSONArray()
+            // (v70) empty search results NO LONGER bail here (see the
+            // dead-rescue fix above) — identity/fuzzy/tier-3 simply find
+            // nothing in an empty array and the category-browse tier below
+            // still runs.
 
             // 2. Collect all posts, then keep only the ones that ARE the
             //    requested TMDB item.
@@ -2539,7 +2587,8 @@ override suspend fun resolve(
             // SERIES requests, walk the anime catalogue pages ourselves
             // and run the same strict→fuzzy→tier-3 gates client-side.
             if (matchingPostIds.isEmpty() && season != null && episode != null) {
-                val catPosts = animeCategoryPosts(app)
+                val (catPosts, catUsedIp) = animeCategoryPosts(app)
+                ipRewriteLinks = ipRewriteLinks || catUsedIp
                 if (catPosts.isNotEmpty()) {
                     val qNorm = title.normaliseTitle()
                     val identity = mutableListOf<Pair<Int, String>>()
@@ -2682,9 +2731,47 @@ override suspend fun resolve(
                 val seasonToUse = season ?: 1
                 val episodeToUse = episode ?: 1
 
-                filteredDetails.forEach { detail ->
+                // (v70) CROSS-POST SEASON COVERAGE (user report: "JJK got
+                // two different entries in CircleFTP ... not mapping
+                // correctly with the episodes"). JJK lives as TWO posts —
+                // one carries ONLY "Season 1" (24 rows), the other ONLY
+                // "Season 2" (E0-E23) — and both identity-match the show,
+                // so both used to contribute to EVERY request: for a
+                // Season-1 ask, the Season-2 post's positional fallback
+                // served S2E(N-1) next to the correct S1 link; for a
+                // Season-2 ask, the S1 post mirrored its Season-1 rows as
+                // "season 2". Rule now: when the requested season is
+                // covered by SOME post's labeled blocks, posts whose
+                // blocks are labeled but DON'T cover it are skipped —
+                // their positional path could only ever serve the wrong
+                // season. Posts with NO labels at all keep their legacy
+                // positional chance (unlabeled mega posts, v11 doctrine).
+                val perPostBlocks = filteredDetails.map { blocksWithSeasons(it) }
+                val perPostSeasons = perPostBlocks.map { blocks ->
+                    blocks.mapNotNull { it.second }.toSet()
+                }
+                val seasonCoveredElsewhere = perPostSeasons.any { seasonToUse in it }
+                Log.d(
+                    TAG, "CircleFTP: season-map per post = " +
+                        "${perPostSeasons.map { it.toList() }} need=$seasonToUse " +
+                        "covered=$seasonCoveredElsewhere"
+                )
+
+                filteredDetails.forEachIndexed { postIdx, detail ->
+                    val labelBlocks = perPostBlocks[postIdx]
+                    val labeledSeasons = perPostSeasons[postIdx]
+                    if (seasonCoveredElsewhere && labeledSeasons.isNotEmpty() &&
+                        seasonToUse !in labeledSeasons
+                    ) {
+                        Log.d(
+                            TAG, "CircleFTP: post ${detail.optInt("id", -1)} has " +
+                                "seasons $labeledSeasons — no season $seasonToUse " +
+                                "(covered cross-post, v70) — skipped"
+                        )
+                        return@forEachIndexed
+                    }
                     val contentArray = detail.optJSONArray("content")
-                    if (contentArray == null || contentArray.length() == 0) return@forEach
+                    if (contentArray == null || contentArray.length() == 0) return@forEachIndexed
 
                     // Determine the post's season number from its title.
                     // "One Piece Season 2" → 2; "One Piece S3" → 3; "One Piece" → null.
@@ -2692,7 +2779,9 @@ override suspend fun resolve(
                         .ifBlank { detail.optString("name", "") }
                     val titleSeasonNum = extractSeasonFromTitle(postTitleStr)
 
-                    // (v63) LABEL-FIRST season selection — positional
+                    // (v63) LABEL-FIRST season selection (v70: the label
+                    // walk itself is hoisted into blocksWithSeasons and
+                    // shared with the coverage guard above) — positional
                     // content[season-1] breaks the moment a site splits one
                     // season into cours blocks: with [S1][S2][S3-P1][S3-P2]
                     // [S4], "Season 4" rows sit at array index 3 where
@@ -2707,27 +2796,6 @@ override suspend fun resolve(
                     // episode-table mapper uses — a "Part N"-styled block
                     // with no season number of its own CONTINUES the season
                     // of the block before it.
-                    val partLabelRx = Regex(
-                        "(?i)\\b(?:part|cour)\\s*\\.?\\s*\\d{1,2}\\b|\\bpt\\s*\\.?\\s*\\d{1,2}\\b|\\bp\\d{1,2}\\b"
-                    )
-                    val labelBlocks = ArrayList<Pair<org.json.JSONObject, Int?>>()
-                    var lastLabelSeason: Int? = null
-                    for (ci in 0 until contentArray.length()) {
-                        val b = contentArray.optJSONObject(ci) ?: continue
-                        val lbl = b.optStringOrNullCp("seasonName")
-                            ?: b.optStringOrNullCp("season_name")
-                            ?: b.optStringOrNullCp("title")
-                        var bs = lbl?.let { extractSeasonFromTitle(it) }
-                        if (bs == null && lbl != null && partLabelRx.containsMatchIn(lbl)) {
-                            bs = lastLabelSeason
-                        }
-                        if (bs != null) lastLabelSeason = bs
-                        labelBlocks += b to bs
-                    }
-                    fun rowsOf(b: org.json.JSONObject): List<org.json.JSONObject> {
-                        val a = b.optJSONArray("episodes") ?: return emptyList()
-                        return (0 until a.length()).mapNotNull { a.optJSONObject(it) }
-                    }
                     val seasonBlocks =
                         labelBlocks.filter { it.second == seasonToUse }.map { it.first }
                     if (seasonBlocks.isNotEmpty()) {
@@ -2740,26 +2808,31 @@ override suspend fun resolve(
                         val partAsk = Regex("(?i)\\bpart\\s*(\\d{1,2})\\b")
                             .find(title)?.groupValues?.getOrNull(1)?.toIntOrNull()
                         if (partAsk != null && partAsk in 1..seasonBlocks.size) {
-                            val pb = rowsOf(seasonBlocks[partAsk - 1])
-                            if (episodeToUse in 1..pb.size) {
-                                val link = rowLink(pb[episodeToUse - 1])
-                                if (!link.isNullOrEmpty()) {
-                                    mediaUrls += link
-                                    return@forEach
-                                }
+                            val pb = rowsOfBlock(seasonBlocks[partAsk - 1])
+                            // (v70) number-true pick inside the cours block
+                            // too — stray E0-style rows shift position.
+                            val (prow, pmode) = pickPoolRow(pb, episodeToUse)
+                            val link = prow?.let { rowLink(it) }
+                            if (!link.isNullOrEmpty()) {
+                                Log.d(
+                                    TAG, "CircleFTP: post ${detail.optInt("id", -1)} " +
+                                        "part-aim hit (part $partAsk, pick=$pmode) " +
+                                        "ep=$episodeToUse"
+                                )
+                                mediaUrls += link
+                                return@forEachIndexed
                             }
                         }
-                        val pool = seasonBlocks.flatMap { rowsOf(it) }
+                        val pool = seasonBlocks.flatMap { rowsOfBlock(it) }
+                        val (row, pickMode) = pickPoolRow(pool, episodeToUse)
                         Log.d(
                             TAG, "CircleFTP: post ${detail.optInt("id", -1)} " +
                                 "labels=${labelBlocks.map { it.second }} pool=${pool.size} " +
-                                "ep=$episodeToUse partAsk=$partAsk"
+                                "ep=$episodeToUse partAsk=$partAsk pick=$pickMode"
                         )
-                        if (episodeToUse in 1..pool.size) {
-                            val link = rowLink(pool[episodeToUse - 1])
-                            if (!link.isNullOrEmpty()) mediaUrls += link
-                        }
-                        return@forEach
+                        val link = row?.let { rowLink(it) }
+                        if (!link.isNullOrEmpty()) mediaUrls += link
+                        return@forEachIndexed
                     }
 
                     Log.d(
@@ -2823,18 +2896,29 @@ override suspend fun resolve(
                                 blockEps.optJSONObject(ei)?.let { pool += it }
                             }
                         }
-                        if (poolSawLabel && episodeToUse in 1..pool.size &&
-                            pool.size > (episodesArray?.length() ?: 0)
-                        ) {
-                            val link = rowLink(pool[episodeToUse - 1])
-                            if (!link.isNullOrEmpty()) mediaUrls += link
-                            return@forEach
+                        if (poolSawLabel && pool.size > (episodesArray?.length() ?: 0)) {
+                            // (v70) number-true pick here too.
+                            val (vrow, vmode) = pickPoolRow(pool, episodeToUse)
+                            val link = vrow?.let { rowLink(it) }
+                            if (!link.isNullOrEmpty()) {
+                                Log.d(
+                                    TAG, "CircleFTP: post ${detail.optInt("id", -1)} " +
+                                        "cours-pool rescue hit (pick=$vmode) ep=$episodeToUse"
+                                )
+                                mediaUrls += link
+                                return@forEachIndexed
+                            }
                         }
                     }
 
                     if (episodesArray != null && episodeToUse in 1..episodesArray.length()) {
-                        val epObj = episodesArray.optJSONObject(episodeToUse - 1)
-                        val link = epObj?.let { rowLink(it) }
+                        val rows = (0 until episodesArray.length())
+                            .mapNotNull { episodesArray.optJSONObject(it) }
+                        // (v70) number-true pick on the plain positional
+                        // path as well — unlabeled posts whose rows still
+                        // carry SxEy names get exact-number service.
+                        val (erow, _) = pickPoolRow(rows, episodeToUse)
+                        val link = erow?.let { rowLink(it) }
                         if (link != null && link.isNotEmpty()) {
                             mediaUrls += link
                         }
@@ -2931,6 +3015,92 @@ override suspend fun resolve(
         private fun rowLink(o: org.json.JSONObject): String? =
             o.optStringOrNullCp("link") ?: o.optStringOrNullCp("url")
                 ?: o.optStringOrNullCp("file") ?: o.optStringOrNullCp("src")
+
+        /** (v70) Label each content block of a post detail with the season
+         *  number its own label declares. A "Part N"-styled block with no
+         *  season number of its own CONTINUES the season of the block
+         *  before it (the recursive cours doctrine — proven needed by
+         *  post 102185's saved JSON where blocks arrive as
+         *  "Season 3"(12) + "Season 3 Part 2"(10)). */
+        internal fun blocksWithSeasons(
+            detail: org.json.JSONObject,
+        ): List<Pair<org.json.JSONObject, Int?>> {
+            val contentArray = detail.optJSONArray("content") ?: return emptyList()
+            val partLabelRx = Regex(
+                "(?i)\\b(?:part|cour)\\s*\\.?\\s*\\d{1,2}\\b|\\bpt\\s*\\.?\\s*\\d{1,2}\\b|\\bp\\d{1,2}\\b"
+            )
+            val out = ArrayList<Pair<org.json.JSONObject, Int?>>()
+            var lastLabelSeason: Int? = null
+            for (ci in 0 until contentArray.length()) {
+                val b = contentArray.optJSONObject(ci) ?: continue
+                val lbl = b.optStringOrNullCp("seasonName")
+                    ?: b.optStringOrNullCp("season_name")
+                    ?: b.optStringOrNullCp("title")
+                var bs = lbl?.let { extractSeasonFromTitle(it) }
+                if (bs == null && lbl != null && partLabelRx.containsMatchIn(lbl)) {
+                    bs = lastLabelSeason
+                }
+                if (bs != null) lastLabelSeason = bs
+                out += b to bs
+            }
+            return out
+        }
+
+        internal fun rowsOfBlock(b: org.json.JSONObject): List<org.json.JSONObject> {
+            val a = b.optJSONArray("episodes") ?: return emptyList()
+            return (0 until a.length()).mapNotNull { a.optJSONObject(it) }
+        }
+
+        /** (v70) The episode number a row DECLARES for itself — the site
+         *  tags rows "Attack On Titan.S:4E:27", "Jujutsu Kaisen.S:2E:0",
+         *  "[SubsPlease] Jujutsu Kaisen S2 E0 (1080p)" — read from the
+         *  row's name/label fields first, then the decoded link filename.
+         *  Returns null when the row carries no explicit number (KaiDubs
+         *  "S4 - 01 (60)" batches) — callers stay positional there. */
+        private fun rowEpisodeNumber(o: org.json.JSONObject): Int? {
+            val texts = ArrayList<String>()
+            o.optStringOrNullCp("name")?.let { texts += it }
+            o.optStringOrNullCp("title")?.let { texts += it }
+            o.optStringOrNullCp("label")?.let { texts += it }
+            o.optStringOrNullCp("episode")?.let { texts += it }
+            rowLink(o)?.let { u ->
+                runCatching { java.net.URLDecoder.decode(u, "UTF-8") }
+                    .getOrNull()?.let { texts += it }
+            }
+            val seRx = Regex("(?i)\\bS\\d{1,2}\\s*[-_. ]?E\\s*:?\\s*(\\d{1,4})\\b")
+            val sColonERx = Regex("(?i)\\bS\\s*:\\s*\\d{1,2}\\s*E\\s*:\\s*(\\d{1,4})\\b")
+            val epWordRx = Regex("(?i)\\bEpisode\\s*:?\\s*(\\d{1,4})\\b")
+            for (t in texts) {
+                seRx.find(t)?.groupValues?.getOrNull(1)?.toIntOrNull()?.let { return it }
+                sColonERx.find(t)?.groupValues?.getOrNull(1)?.toIntOrNull()?.let { return it }
+            }
+            for (t in texts) {
+                epWordRx.find(t)?.groupValues?.getOrNull(1)?.toIntOrNull()?.let { return it }
+            }
+            return null
+        }
+
+        /** (v70) NUMBER-TRUE row pick. When ≥ half of the pooled rows
+         *  declare parseable episode numbers, the requested episode is
+         *  served by NUMBER — never by position. The JJK Season-2 bucket
+         *  starts at row "E:0" (a stray special), so positional E1 → the
+         *  special's video and EVERY episode shifted by one; number-true
+         *  E1 → the row labeled E:1. Rows that don't parse keep the old
+         *  positional read (unchanged v11-69 behaviour for KaiDubs-style
+         *  batches). */
+        internal fun pickPoolRow(
+            pool: List<org.json.JSONObject>,
+            episodeToUse: Int,
+        ): Pair<org.json.JSONObject?, String> {
+            if (pool.isEmpty()) return null to "empty"
+            val nums = pool.map { rowEpisodeNumber(it) }
+            val parsed = nums.count { it != null }
+            if (parsed * 2 >= pool.size) {
+                pool.indices.firstOrNull { nums[it] == episodeToUse }
+                    ?.let { return pool[it] to "num" }
+            }
+            return pool.getOrNull(episodeToUse - 1) to "pos"
+        }
 
         private suspend fun emitCircleFtpEncoded(
             data: String,
@@ -5444,6 +5614,76 @@ internal object WizEpisodeTable {
         cache[tmdbId] = now to built
         return built
     }
+
+    // ── (v70) TMDB search fallback + movie art ──────────────────────────
+    // User report: episode titles/thumbnails/landscape art "suck
+    // sometimes" — the gaps are entries ani.zip NEVER mapped, so no TMDB
+    // id existed to build a table from and every TMDB-fed field stayed
+    // empty. TMDB's own /search/tv recovers most of those shows from the
+    // AniList title + start year; correctness gate = title identity plus
+    // a ±1 year window when both sides know the year.
+    private val findCache =
+        java.util.concurrent.ConcurrentHashMap<String, Pair<Long, Int?>>()
+
+    private fun normCmp(t: String): String =
+        t.lowercase()
+            .replace(Regex("""\[[^]]*]"""), " ")
+            .replace(Regex("""\([^)]*\)"""), " ")
+            .replace(Regex("""[^a-z0-9]+"""), " ")
+            .trim()
+            .replace(Regex("""\s+"""), " ")
+
+    /** TMDB tv-show id for an unmapped AniList entry, or null. */
+    suspend fun findShow(app: Requests, title: String, year: Int?): Int? {
+        if (title.isBlank()) return null
+        val key = "${normCmp(title)}|$year"
+        val now = System.currentTimeMillis()
+        findCache[key]?.let { (ts, v) -> if (now - ts < CACHE_MS) return v }
+        val found = runCatching {
+            val q = java.net.URLEncoder.encode(title, "UTF-8")
+            val yearQ = year?.let { "&first_air_date_year=$it" } ?: ""
+            val j = getJson(app, "/search/tv?query=$q$yearQ")
+                ?: year?.let { getJson(app, "/search/tv?query=$q") }
+            val arr = j?.optJSONArray("results") ?: return@runCatching null
+            val qn = normCmp(title)
+            var bestId: Int? = null
+            var bestScore = -1
+            for (i in 0 until arr.length().coerceAtMost(8)) {
+                val r = arr.optJSONObject(i) ?: continue
+                val names = listOfNotNull(
+                    r.optStringOrNullCp("name"),
+                    r.optStringOrNullCp("original_name"),
+                ).map { normCmp(it) }
+                if (names.isEmpty()) continue
+                val exact = names.any { it == qn }
+                val either = names.any { it.contains(qn) || qn.contains(it) }
+                if (!exact && !either) continue
+                val ry = r.optStringOrNullCp("first_air_date")
+                    ?.take(4)?.toIntOrNull()
+                val yearOk = year == null || ry == null ||
+                    kotlin.math.abs(ry - year) <= 1
+                if (!yearOk) continue
+                var score = 0
+                if (exact) score += 4
+                if (either) score += 1
+                if (ry != null && year != null && ry == year) score += 2
+                if (score > bestScore) {
+                    bestScore = score
+                    bestId = r.optInt("id", 0).takeIf { it != 0 }
+                }
+            }
+            bestId
+        }.getOrNull()
+        findCache[key] = now to found
+        return found
+    }
+
+    /** LANDSCAPE backdrop + title LOGO for an anime MOVIE (the table
+     *  builder above is tv-shaped; movies only need art, no episodes). */
+    suspend fun movieBackdrop(app: Requests, tmdbId: Int): String? =
+        getJson(app, "/movie/$tmdbId")
+            ?.optStringOrNullCp("backdrop_path")
+            ?.let { "https://image.tmdb.org/t/p/w1280$it" }
 
     private suspend fun buildTable(app: Requests, tmdbId: Int): Table? {
         val detail = getJson(app, "/tv/$tmdbId") ?: return null

@@ -1,4 +1,4 @@
-version = 69
+version = 70
 
 cloudstream {
     description = "Wizstream — the main catalogue, StreamPlay style. " +
@@ -28,3 +28,25 @@ cloudstream {
 android {
     namespace = "com.wizdier.wizstream"
 }
+
+// ── Anime-web resolver mirror (v70) ───────────────────────────────────────
+// WizstreamAnimeSources.kt (the 7 anime streaming resolvers: AniZone,
+// Allmanga, AniChi, UniqueStream, AniNeko, ReANIME, TokyoInsider) is owned
+// by the WizstreamAnime module — single source of truth, exactly like
+// WizstreamSources.kt is owned HERE and mirrored the other way. Since v70
+// Wizstream's anime pages are per-entry de-stacked (CircleFTP structure:
+// every AniList entry its own group of entry-local episodes), so their
+// rows resolve through the anime-web sites too — this task mirrors the
+// file in before every build so both plugins ship identical resolvers.
+val syncAnimeSources = tasks.register("syncAnimeSources") {
+    doLast {
+        val src = rootProject.file(
+            "WizstreamAnime/src/main/kotlin/com/wizdier/WizstreamAnimeSources.kt"
+        )
+        val dst = file("src/main/kotlin/com/wizdier/WizstreamAnimeSources.kt")
+        if (!dst.exists() || src.readText() != dst.readText()) {
+            src.copyTo(dst, overwrite = true)
+        }
+    }
+}
+tasks.named("preBuild") { dependsOn(syncAnimeSources) }

@@ -57,6 +57,17 @@ class WizstreamPlugin : Plugin() {   // (v68) app-side Plugin ⇒ openSettings b
             WizSourcePrefs.src(CinebyResolver, "WEB SOURCES", "www.cineby.at"),
             WizSourcePrefs.src(BingrResolver, "WEB SOURCES", "bingr.one"),
             WizSourcePrefs.src(MoonflixResolver, "WEB SOURCES", "Moonflix · web"),
+            // (v70) anime streaming sources — the de-stacked anime pages
+            // ("CircleFTP structure") resolve through these too. Mirrored
+            // from the WizstreamAnime module; same shared pref keys, so a
+            // toggle here also applies in Wizstream-Anime and vice versa.
+            WizSourcePrefs.src(WizstreamAnimeSources.AniZoneResolver, "ANIME-WEB SOURCES", "anizone.to"),
+            WizSourcePrefs.src(WizstreamAnimeSources.AllmangaResolver, "ANIME-WEB SOURCES", "allmanga.to"),
+            WizSourcePrefs.src(WizstreamAnimeSources.AniChiResolver, "ANIME-WEB SOURCES", "anichi.to"),
+            WizSourcePrefs.src(WizstreamAnimeSources.UniqueStreamResolver, "ANIME-WEB SOURCES", "anime.uniquestream.net"),
+            WizSourcePrefs.src(WizstreamAnimeSources.AniNekoResolver, "ANIME-WEB SOURCES", "anineko.to"),
+            WizSourcePrefs.src(WizstreamAnimeSources.ReAnimeResolver, "ANIME-WEB SOURCES", "reanime.to"),
+            WizSourcePrefs.src(WizstreamAnimeSources.TokyoInsiderResolver, "ANIME-WEB SOURCES", "tokyoinsider.com"),
         )
         openSettings = {
                 ctx -> WizstreamSources.WizSourcePrefs.openDialog(ctx, toggleSources)

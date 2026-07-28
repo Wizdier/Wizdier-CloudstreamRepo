@@ -418,6 +418,10 @@ class WizstreamProvider : MainAPI() {
                 title = title,
                 isMovie = true,
                 year = year,
+                // (v70) anime movies carry the AniList entry ids too, so the
+                // anime-web resolvers (AniZone/Allmanga/…) resolve them.
+                anilistId = enrich?.anilistId,
+                malId = enrich?.malId,
             ).toJson()
             newMovieLoadResponse(
                 title, url, if (isAnime) TvType.AnimeMovie else TvType.Movie, data
@@ -449,7 +453,37 @@ class WizstreamProvider : MainAPI() {
             // the plain per-season fetch. Null table (network/empty show)
             // falls back to the plain fetch too.
             val animeTable = if (isAnime) buildAnimeEpisodeTable(tmdbId, title, detail) else null
-            val episodesAll = animeTable ?: run {
+            // (v70) PER-ENTRY DE-STACKED anime pages ("CircleFTP
+            // structure"): group rows by AniList franchise entry instead
+            // of TMDB's merged cours stack. Rows keep BOTH coordinate
+            // sets, so BDIX/TMDB/embed lookups are bit-identical to the
+            // stacked table while the anime-web resolvers gain their
+            // expected per-entry ids + entry-local numbers. Safety rails:
+            //   • walk failure → today's stacked table (v59 buildAnime
+            //     EpisodeTable), which itself falls back to plain TMDB;
+            //   • ONE-entry shows whose TMDB page legitimately carries
+            //     many seasons (absolute-numbered long runners, One
+            //     Piece-style) keep the stacked table — season
+            //     navigation beats a 1000-row single season there.
+            var entryRows: List<Episode>? = null
+            if (isAnime && enrich?.anilistId != null) {
+                val fr = fetchAnimeFranchise(enrich.anilistId)
+                if (fr != null) {
+                    val (members, rootTitles) = fr
+                    val broadcastCount =
+                        members.count { it.format in franchiseBroadcastFormatsWz }
+                    if (members.isNotEmpty() &&
+                        (broadcastCount >= 2 || detail.seasons.size <= 3)
+                    ) {
+                        entryRows = runCatching {
+                            buildFranchiseEpisodes(
+                                members, rootTitles, tmdbId, title, detail, enrich
+                            )
+                        }.getOrNull()?.takeIf { it.isNotEmpty() }
+                    }
+                }
+            }
+            val episodesAll = entryRows ?: animeTable ?: run {
                 val seasons = detail.seasons.ifEmpty { listOf(1) }
                 boundedParallelMapWz(seasons, 6) { s ->
                     fetchSeasonEpisodes(tmdbId, s, title, detail)
@@ -566,6 +600,10 @@ class WizstreamProvider : MainAPI() {
             runCatching {
                 WizstreamSources.resolveAll(
                     app = app,
+                    // (v70) entry title first (cours "Part N" ask), franchise
+                    // root titles as the BDIX search keys, entry-local
+                    // episode for split-cours posts — same invocation
+                    // contract WizstreamAnimeProvider uses.
                     title = ctx.title ?: "",
                     year = ctx.year,
                     isMovie = ctx.isMovie,
@@ -584,12 +622,49 @@ class WizstreamProvider : MainAPI() {
                     },
                     tmdbId = ctx.tmdbId,
                     imdbId = ctx.imdbId,
+                    altTitle = ctx.altTitle,
+                    extraAltTitles = ctx.franchiseTitles ?: emptyList(),
+                    entryEpisode = ctx.entryEpisode,
+                )
+            }.getOrDefault(false)
+        }
+
+        // ── (v70) Anime-web source resolvers ─────────────────────────────
+        // De-stacked anime rows carry their owning AniList entry's ids and
+        // entry-local episode, so the 7 anime streaming resolvers
+        // (AniZone, Allmanga, AniChi, UniqueStream, AniNeko, ReANIME,
+        // TokyoInsider — mirrored from the WizstreamAnime module) resolve
+        // them exactly like they do in Wizstream-Anime: an entry is a
+        // whole show there, episodes 1..N.
+        val animeJob = if (ctx.anilistId == null) null else async(Dispatchers.IO) {
+            runCatching {
+                WizstreamAnimeSources.resolveAnime(
+                    app = app,
+                    title = ctx.title ?: "",
+                    altTitle = ctx.altTitle,
+                    anilistId = ctx.anilistId,
+                    malId = ctx.malId,
+                    isMovie = ctx.isMovie,
+                    season = 1,
+                    episode = if (ctx.isMovie) null else (ctx.entryEpisode ?: ctx.episode),
+                    labelPrefix = "Wizstream",
+                    subtitleCallback = { sub ->
+                        if (seenSubs.add(sub.url)) subtitleCallback(sub)
+                    },
+                    callback = { link ->
+                        val normalized = link.url.trim()
+                        if (normalized.isNotBlank() && seenUrls.add(normalized)) {
+                            callback(link)
+                            anyFound = true
+                        }
+                    },
                 )
             }.getOrDefault(false)
         }
 
         jobs.awaitAll()
         sourceJob.await()
+        animeJob?.await()
         anyFound
     }
 
@@ -910,6 +985,307 @@ class WizstreamProvider : MainAPI() {
         }
     }
 
+    // ═══════════════════════════════════════════════════════════════════
+    //  (v70) Anime franchise de-stacking — "CircleFTP structure"
+    // ═══════════════════════════════════════════════════════════════════
+    //  User request: "separate multi stacked season animes in Wizstream
+    //  like CircleFTP". TMDB files a cours-split anime as one merged
+    //  season stack (AoT S3 = 22 rows spanning AniList's S3 + S3-Part-2
+    //  entries); AniList — and every anime-web streaming site — files
+    //  each entry separately with its OWN episode numbering. So the
+    //  anime page now groups rows BY ANILIST ENTRY (each entry = one
+    //  season group of entry-local rows, tail-absorbed story-specials
+    //  continuing the last group exactly like the site's tabs), while
+    //  every row carries BOTH coordinate sets: the stacked (site/TMDB)
+    //  season+episode for BDIX/TMDB-indexed resolvers AND the owning
+    //  entry's ids + entry-local episode for the anime-web resolvers.
+    //  This is the same machine WizstreamAnimeProvider runs (v48 fold),
+    //  ported lean: no streaming-feed fetch — row meta comes from the
+    //  shared WizEpisodeTable (TMDB canon, specials already attached).
+
+    private val franchiseBroadcastFormatsWz = setOf("TV", "TV_SHORT", "ONA")
+    private val coursSplitRegexWz =
+        Regex("""(?i)\b(part|cour)\s*\d+|\bpart\s+[ivxlcdm]+\b""")
+    private val partNumberRegexWz = Regex(
+        """(?i)\b(?:part|cour)\s*(\d{1,2})\b|\bpart\s+([ivxlcdm]{1,5})\b"""
+    )
+
+    private data class FEntry(
+        val id: Int,
+        val title: String,
+        val altTitle: String?,
+        val episodes: Int,
+        val malId: Int?,
+        val format: String?,
+    ) {
+        var siteSeason: Int = 0
+        var seasonStart: Int = 1
+    }
+
+    private fun romanToIntWz(s: String): Int? {
+        val vals = mapOf('i' to 1, 'v' to 5, 'x' to 10, 'l' to 50, 'c' to 100)
+        var total = 0
+        var prev = 0
+        for (ch in s.lowercase().reversed()) {
+            val v = vals[ch] ?: return null
+            total += if (v < prev) -v else v
+            prev = v
+        }
+        return total.takeIf { it > 0 }
+    }
+
+    private fun titlePartNumberWz(title: String): Int? {
+        if (!coursSplitRegexWz.containsMatchIn(title)) return null
+        val m = partNumberRegexWz.find(title) ?: return 2
+        return m.groupValues.getOrNull(1)?.takeIf { it.isNotBlank() }?.toIntOrNull()
+            ?: m.groupValues.getOrNull(2)?.takeIf { it.isNotBlank() }?.let(::romanToIntWz)
+            ?: 2
+    }
+
+    private fun JSONObject.toFEntry(): FEntry? {
+        val nt = optJSONObject("title")
+        val en = nt?.optStringOrNullWz("english")
+        val ro = nt?.optStringOrNullWz("romaji")
+        val t = en ?: ro ?: nt?.optStringOrNullWz("native") ?: return null
+        val alt = listOfNotNull(en, ro).firstOrNull { !it.equals(t, ignoreCase = true) }
+        val idV = optInt("id", 0).takeIf { it != 0 } ?: return null
+        return FEntry(
+            id = idV,
+            title = t,
+            altTitle = alt,
+            episodes = optInt("episodes", 0),
+            malId = optInt("idMal", 0).takeIf { it != 0 },
+            format = optStringOrNullWz("format"),
+        )
+    }
+
+    /** One AniList query: the entry's own core fields + its relation edges. */
+    private suspend fun franchiseNodeWz(id: Int): Pair<FEntry?, JSONArray?> {
+        val gql = """
+            query (${'$'}id: Int) {
+              Media(id: ${'$'}id, type: ANIME) {
+                id idMal format episodes title { english romaji native }
+                relations { edges { node { id type format episodes idMal title { english romaji native } } relationType } }
+              }
+            }
+        """.trimIndent()
+        val media = anilistGraph(gql, JSONObject().put("id", id))
+            ?.optJSONObject("Media") ?: return null to null
+        val self = media.toFEntry()
+        val edges = media.optJSONObject("relations")?.optJSONArray("edges")
+        return self to edges
+    }
+
+    private fun JSONArray.pickPrequelWz(visited: Set<Int>): Triple<FEntry?, FEntry?, FEntry?> {
+        var counted: FEntry? = null
+        var anyBroadcast: FEntry? = null
+        var bridge: FEntry? = null
+        for (i in 0 until length()) {
+            val e = optJSONObject(i) ?: continue
+            if (!e.optString("relationType").equals("PREQUEL", true)) continue
+            val node = e.optJSONObject("node") ?: continue
+            if (!node.optString("type").equals("ANIME", true)) continue
+            val cand = node.toFEntry() ?: continue
+            if (cand.id in visited) continue
+            if (bridge == null) bridge = cand
+            if (cand.format !in franchiseBroadcastFormatsWz) continue
+            if (anyBroadcast == null) anyBroadcast = cand
+            if (!coursSplitRegexWz.containsMatchIn(cand.title)) {
+                counted = cand
+                break
+            }
+        }
+        return Triple(counted, anyBroadcast, bridge)
+    }
+
+    /** Walk prequels to the root, then sequels forward. OVA/movie nodes
+     *  are invisible bridges; long SEQUEL specials absorb at the tail. */
+    private suspend fun fetchAnimeFranchise(
+        startId: Int,
+    ): Pair<List<FEntry>, List<String>>? = runCatching {
+        val (self, startEdges) = franchiseNodeWz(startId)
+        val opened = self ?: return@runCatching null
+        val visited = hashSetOf(startId)
+        val pre = mutableListOf<FEntry>()
+        val rootTitles = mutableListOf<String>()
+        var edges = startEdges
+        var hops = 0
+        var bridges = 0
+        while (hops < 8) {
+            hops++
+            val (counted, anyBroadcast, bridge) = (edges ?: break).pickPrequelWz(visited)
+            val hop = counted ?: anyBroadcast
+                ?: (if (bridges < 3) bridge else null)
+                ?: break
+            visited += hop.id
+            if (hop.format in franchiseBroadcastFormatsWz) {
+                pre += hop
+                if (counted != null && counted.id == hop.id) {
+                    listOfNotNull(
+                        hop.title.takeIf { it.isNotBlank() }, hop.altTitle
+                    ).forEach { cand ->
+                        if (rootTitles.none { it.equals(cand, true) }) rootTitles += cand
+                    }
+                }
+            } else {
+                bridges++
+            }
+            edges = franchiseNodeWz(hop.id).second ?: break
+        }
+        val post = mutableListOf<FEntry>()
+        val tailSpecials = mutableListOf<FEntry>()
+        var sEdges = startEdges
+        var sHops = 0
+        var sBridges = 0
+        while (sHops < 6) {
+            sHops++
+            val arr = sEdges ?: break
+            var best: FEntry? = null
+            var bestEps = 0
+            var sBridge: FEntry? = null
+            for (i in 0 until arr.length()) {
+                val e = arr.optJSONObject(i) ?: continue
+                if (!e.optString("relationType").equals("SEQUEL", true)) continue
+                val node = e.optJSONObject("node") ?: continue
+                if (!node.optString("type").equals("ANIME", true)) continue
+                val cand = node.toFEntry() ?: continue
+                if (cand.id in visited) continue
+                if (sBridge == null) sBridge = cand
+                if (cand.format !in franchiseBroadcastFormatsWz) continue
+                if (cand.episodes <= 0) continue
+                if (best == null || cand.episodes > bestEps) {
+                    best = cand
+                    bestEps = cand.episodes
+                }
+            }
+            val hop = best ?: (if (sBridges < 3) sBridge else null) ?: break
+            visited += hop.id
+            if (hop.format in franchiseBroadcastFormatsWz) {
+                post += hop
+            } else {
+                sBridges++
+                if (hop.format == "SPECIAL" && hop.episodes in 1..6 && tailSpecials.size < 3) {
+                    tailSpecials += hop
+                }
+            }
+            sEdges = franchiseNodeWz(hop.id).second ?: break
+        }
+        val members = ArrayList<FEntry>()
+        pre.asReversed().forEach { members += it }
+        members += opened
+        post.forEach { members += it }
+        tailSpecials.forEach { members += it }
+        val seenIds = HashSet<Int>()
+        members.filter { seenIds.add(it.id) } to rootTitles
+    }.getOrNull()
+
+    /** Fold members into stacked site seasons: a cours part joins the
+     *  season its prequel opened and continues its numbering; long
+     *  story-specials tail-attach the season they follow. */
+    private fun foldFranchiseWz(members: List<FEntry>) {
+        var seasonCounter = 0
+        var nextStart = 1
+        members.forEach { m ->
+            when {
+                m.format !in franchiseBroadcastFormatsWz -> {
+                    if (seasonCounter == 0) {
+                        seasonCounter = 1
+                        m.siteSeason = 1
+                        m.seasonStart = 1
+                    } else {
+                        m.siteSeason = seasonCounter
+                        m.seasonStart = nextStart
+                    }
+                }
+                titlePartNumberWz(m.title) == null || seasonCounter == 0 -> {
+                    seasonCounter++
+                    m.siteSeason = seasonCounter
+                    m.seasonStart = 1
+                }
+                else -> {
+                    m.siteSeason = seasonCounter
+                    m.seasonStart = nextStart
+                }
+            }
+            nextStart = m.seasonStart + m.episodes.coerceAtLeast(1)
+        }
+    }
+
+    /** Entry-grouped anime rows: each franchise entry = one season group
+     *  of entry-local rows; non-broadcast members (absorbed story
+     *  specials) continue the previous group's numbering, exactly like
+     *  CircleFTP's per-season tabs. Row meta = shared WizEpisodeTable
+     *  (TMDB canon, already specials-aware). */
+    private suspend fun buildFranchiseEpisodes(
+        members: List<FEntry>,
+        rootTitles: List<String>,
+        tmdbId: Int,
+        showTitle: String,
+        detail: TmdbDetail,
+        enrich: AnimeEnrich?,
+    ): List<Episode> {
+        foldFranchiseWz(members)
+        val tbl = runCatching { WizEpisodeTable.table(app, tmdbId) }.getOrNull()
+        val franchiseKeys = (
+            rootTitles + showTitle + members.map { it.title } + members.mapNotNull { it.altTitle }
+            ).filter { it.isNotBlank() }.distinctBy { it.lowercase() }
+        val out = ArrayList<Episode>()
+        var groupIdx = 0
+        var i = 0
+        while (i < members.size) {
+            val head = members[i]
+            groupIdx++
+            val group = mutableListOf(head)
+            while (i + 1 < members.size && members[i + 1].format !in franchiseBroadcastFormatsWz) {
+                group += members[i + 1]
+                i++
+            }
+            var displayCounter = 0
+            group.forEach { gm ->
+                (1..gm.episodes.coerceAtLeast(1)).forEach { localEp ->
+                    displayCounter++
+                    val stacked = gm.seasonStart + localEp - 1
+                    val meta = tbl?.seasons?.get(gm.siteSeason)?.get(stacked)
+                    out += newEpisode(
+                        LinkContext(
+                            imdbId = detail.imdbId,
+                            tmdbId = tmdbId,
+                            season = gm.siteSeason,
+                            episode = stacked,
+                            title = gm.title,
+                            isMovie = false,
+                            year = detail.year,
+                            tmdbSeason = meta?.tmdbSeason,
+                            tmdbEpisode = meta?.tmdbEpisode,
+                            anilistId = gm.id,
+                            malId = gm.malId ?: enrich?.malId,
+                            entryEpisode = localEp,
+                            altTitle = gm.altTitle,
+                            franchiseTitles = franchiseKeys,
+                        ).toJson()
+                    ) {
+                        name = meta?.name
+                            ?.takeUnless { it.equals("Episode $stacked", true) }
+                            ?: "Episode $displayCounter"
+                        season = groupIdx
+                        episode = displayCounter
+                        posterUrl = meta?.stillUrl
+                        description = meta?.overview
+                        runCatching { meta?.score?.let { score = Score.from10(it) } }
+                        runTime = meta?.runtime
+                        this.date = meta?.airDate
+                    }
+                }
+            }
+            i++
+        }
+        Log.d(
+            TAG, "Wizstream: franchise de-stack for '$showTitle' — " +
+                "${members.size} entries, $groupIdx groups, ${out.size} rows"
+        )
+        return out
+    }
+
     private suspend fun fetchSeasonEpisodes(
         tmdbId: Int,
         season: Int,
@@ -1008,6 +1384,18 @@ class WizstreamProvider : MainAPI() {
         // embed hosts get pointed at these. null = regular row.
         val tmdbSeason: Int? = null,
         val tmdbEpisode: Int? = null,
+        // (v70) Per-entry de-stacked anime rows ("CircleFTP structure",
+        // user request): the OWNING AniList entry's ids + its ENTRY-LOCAL
+        // episode + the franchise's BDIX search keys ride every row. The
+        // 7 anime-web resolvers mirror AniList's per-entry split (an
+        // entry is a whole show there, episodes 1..N), so this is the
+        // coordinate set resolveAnime needs; BDIX/TMDB/embed hosts keep
+        // reading the stacked season/episode above (unchanged).
+        val anilistId: Int? = null,
+        val malId: Int? = null,
+        val entryEpisode: Int? = null,
+        val altTitle: String? = null,
+        val franchiseTitles: List<String>? = null,
     ) {
         fun toJson(): String = JSONObject().apply {
             imdbId?.let { put("imdb_id", it) }
@@ -1018,12 +1406,19 @@ class WizstreamProvider : MainAPI() {
             year?.let { put("year", it) }
             tmdbSeason?.let { put("t_season", it) }
             tmdbEpisode?.let { put("t_ep", it) }
+            anilistId?.let { put("anilist_id", it) }
+            malId?.let { put("mal_id", it) }
+            entryEpisode?.let { put("entry_ep", it) }
+            altTitle?.let { put("alt_title", it) }
+            franchiseTitles?.takeIf { tl -> tl.isNotEmpty() }
+                ?.let { tl -> put("f_titles", JSONArray(tl)) }
             put("is_movie", isMovie)
         }.toString()
 
         companion object {
             fun fromJson(s: String): LinkContext {
                 val o = JSONObject(s)
+                val fArr = o.optJSONArray("f_titles")
                 return LinkContext(
                     imdbId = o.optStringOrNullWz("imdb_id"),
                     tmdbId = o.optIntOrNullWz("tmdb_id"),
@@ -1034,6 +1429,13 @@ class WizstreamProvider : MainAPI() {
                     isMovie = o.optBoolean("is_movie", false),
                     tmdbSeason = o.optIntOrNullWz("t_season"),
                     tmdbEpisode = o.optIntOrNullWz("t_ep"),
+                    anilistId = o.optIntOrNullWz("anilist_id"),
+                    malId = o.optIntOrNullWz("mal_id"),
+                    entryEpisode = o.optIntOrNullWz("entry_ep"),
+                    altTitle = o.optStringOrNullWz("alt_title"),
+                    franchiseTitles = fArr?.let { arr ->
+                        (0 until arr.length()).mapNotNull { arr.optString(it, null) }
+                    },
                 )
             }
         }
