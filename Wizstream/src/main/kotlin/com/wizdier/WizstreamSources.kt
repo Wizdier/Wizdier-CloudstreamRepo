@@ -2616,8 +2616,12 @@ override suspend fun resolve(
                     }
                     .toList()
                 val walk = if (subs.isEmpty()) listOf(indexUrl) else subs.take(MAIN_SITEMAP_MAX_SUBS)
+                val walkStart = System.currentTimeMillis()
                 var scanned = 0
                 for (sub in walk) {
+                    // (v75) bound the whole walk to ~20s: a dead/slow
+                    // sub-sitemap must not hold an episode tap hostage.
+                    if (System.currentTimeMillis() - walkStart > 20_000L) break
                     val resp = runCatching {
                         app.get(sub, headers = MAIN_HEADERS, verify = false, cacheTime = 60, timeout = 12_000)
                     }.getOrNull()
@@ -2671,7 +2675,9 @@ override suspend fun resolve(
             // somewhere below — distinguishes "site up, genuinely nothing"
             // (a cacheable 90-second negative) from "blocked/unreachable"
             // (never cached, so the very next tap retries fresh).
-            var sawHttpOk = false
+            // (v75) AtomicBoolean: the v75 discovery routes write it from
+            // concurrent coroutines.
+            val sawHttpOk = java.util.concurrent.atomic.AtomicBoolean(false)
             val partStripped = title
                 .replace(Regex("(?i)\\bpart\\s*\\d{1,2}\\b"), " ")
                 .replace(Regex("\\s+"), " ").trim()
@@ -2683,26 +2689,25 @@ override suspend fun resolve(
                 cleanedSearchTerm(bareSeriesTitle(title)),
             ).filter { it.isNotBlank() }.distinct()
             val merged = LinkedHashMap<String, String>()  // postUrl → title
-            for (q in queryVariants) {
-                // (v72) Collect ALL title variants before title-gating them.
-                // v71 stopped at the first *raw* WordPress hit. Haikyuu's
-                // long AniList title can return a sibling/season result that
-                // the identity gate correctly rejects, which prevented the
-                // final bare-root query (HAIKYU) from ever discovering the
-                // old site's actual Haikyuu mega post.
-                val before = merged.size
-                // 1) WordPress REST search.
-                // (v74) Two hardenings: (a) some WP builds reject
-                // subtype=any with a 400 — retry once with the default
-                // subtype; (b) a WAF/security plugin answers API-shaped
-                // requests with an HTML challenge page (HTTP 200, body
-                // starts with '<') — detect it loudly and do NOT treat it
-                // as "site answered fine" for negative caching.
+            // (v75) PARALLEL DISCOVERY (device report at 23:09 — "still
+            // taking a lot of time to fetch the link"): the v74 flow was
+            // strictly SERIAL — 5 query variants x wp-json(10s) + ?s=(10s)
+            // each, then the sitemap walk — ~4 minutes worst case inside ONE
+            // episode tap, and his ring-log had rolled past the resolver
+            // lines before he could capture. Every route now races
+            // CONCURRENTLY: discovery worst case ≈ the slowest single
+            // request (8s caps), not the sum of all of them. Cache-warm
+            // taps are still instant (positive cache checked above).
+            suspend fun searchOneVariant(q: String) {
+                val local = LinkedHashMap<String, String>()
+                // 1) WordPress REST search (v74 doctrine unchanged:
+                //    subtype=any, retry default subtype on 400, WAF
+                //    HTML-challenge detection).
                 var jsonResp = runCatching {
                     app.get(
                         "$MAIN_SITE/wp-json/wp/v2/search?search=${encodeUrl(q)}" +
                             "&per_page=50&subtype=any",
-                        headers = MAIN_HEADERS, verify = false, cacheTime = 60, timeout = 10_000,
+                        headers = MAIN_HEADERS, verify = false, cacheTime = 60, timeout = 8_000,
                     )
                 }.getOrNull()
                 if (jsonResp != null && jsonResp.code == 400) {
@@ -2710,7 +2715,7 @@ override suspend fun resolve(
                         app.get(
                             "$MAIN_SITE/wp-json/wp/v2/search?search=${encodeUrl(q)}" +
                                 "&per_page=50",
-                            headers = MAIN_HEADERS, verify = false, cacheTime = 60, timeout = 10_000,
+                            headers = MAIN_HEADERS, verify = false, cacheTime = 60, timeout = 8_000,
                         )
                     }.getOrNull()
                 }
@@ -2723,7 +2728,7 @@ override suspend fun resolve(
                                 "not JSON (challenge?) len=${jsonResp.text.length}"
                         )
                     } else {
-                        sawHttpOk = true
+                        sawHttpOk.set(true)
                         val arr = runCatching { JSONArray(jsonResp.text) }.getOrNull()
                         if (arr != null) {
                             for (i in 0 until arr.length()) {
@@ -2736,23 +2741,22 @@ override suspend fun resolve(
                                 // gates ("8211" junk tokens).
                                 val t = runCatching { Jsoup.parse(tRaw).text() }
                                     .getOrDefault(tRaw).trim()
-                                if (t.isNotBlank()) merged[u] = t
+                                if (t.isNotBlank()) local[u] = t
                             }
                         }
                     }
                 }
-                // 2) Classic WordPress ?s= HTML search (fallback for when
-                //    the REST route is disabled, filtered, or produced no
-                //    NEW candidate for this particular query variant).
-                if (merged.size == before) {
+                // 2) Classic ?s= fallback — only when THIS variant produced
+                //    nothing from the REST route (per-variant, as v74).
+                if (local.isEmpty()) {
                     val htmlResp = runCatching {
                         app.get(
                             "$MAIN_SITE/?s=${encodeUrl(q)}",
-                            headers = MAIN_HEADERS, verify = false, cacheTime = 60, timeout = 10_000,
+                            headers = MAIN_HEADERS, verify = false, cacheTime = 60, timeout = 8_000,
                         )
                     }.getOrNull()
                     if (htmlResp != null && htmlResp.code in 200..299) {
-                        sawHttpOk = true
+                        sawHttpOk.set(true)
                         // (v74) prefer content-area anchors: v72's relaxed
                         // permalink acceptance would otherwise also admit
                         // sidebar/footer "recent posts" links page-wide.
@@ -2771,15 +2775,33 @@ override suspend fun resolve(
                             val t = a.text().trim()
                                 .ifBlank { a.attr("title").trim() }
                                 .ifBlank { a.selectFirst("img")?.attr("alt")?.trim().orEmpty() }
-                            if (t.isNotBlank()) merged[u] = t
+                            if (t.isNotBlank()) local[u] = t
                         }
                     }
                 }
-                val added = merged.size - before
+                val agg = synchronized(merged) {
+                    for ((u, t) in local) merged[u] = t
+                    merged.size
+                }
                 Log.d(
-                    TAG, "CircleFTP: main-site search '$q' +$added rows " +
-                        "(aggregate=${merged.size})"
+                    TAG, "CircleFTP: main-site search '$q' +${local.size} rows " +
+                        "(aggregate=$agg)"
                 )
+            }
+            // The sitemap catalogue starts downloading NOW, in parallel
+            // with the search variants — launched OUTSIDE the search scope
+            // so a slow walk never delays the search-success path (when the
+            // tier below needs it, it's already mostly done; when it
+            // doesn't, the walk still finishes quietly and keeps the
+            // 30-minute catalogue cache warm for later taps).
+            val catalogueDeferred = kotlinx.coroutines
+                .CoroutineScope(kotlin.coroutines.coroutineContext).async(Dispatchers.IO) {
+                    runCatching { mainSitemapCatalogue(app) }.getOrElse { emptyList() }
+                }
+            coroutineScope {
+                queryVariants.map { q ->
+                    async(Dispatchers.IO) { runCatching { searchOneVariant(q) }.getOrNull() }
+                }.awaitAll()
             }
             // Gates — 1:1 with the browse tier of the new-API pipeline.
             val identity = mutableListOf<Pair<String, String>>()
@@ -2813,7 +2835,12 @@ override suspend fun resolve(
             // caught by the alias fold even though "engjapanese" noise
             // defeats strict slug equality).
             if (result.isEmpty()) {
-                val catalogue = mainSitemapCatalogue(app)
+                // (v75) the catalogue has been downloading in the background
+                // since the search variants started — only a genuinely slow
+                // walk is awaited here, hard-capped at 20s so a flaky
+                // sub-sitemap can't hold the tap hostage.
+                val catalogue = withTimeoutOrNull(20_000L) { catalogueDeferred.await() }
+                    ?: emptyList()
                 if (catalogue.isNotEmpty()) {
                     val qRoot = seriesRootAliasKey(title)
                     val smIdentity = mutableListOf<Pair<String, String>>()
@@ -2866,7 +2893,7 @@ override suspend fun resolve(
             if (result.isNotEmpty()) {
                 mainSiteSearchCache[cacheKey] = now to result
                 mainSiteNegCache.remove(cacheKey)
-            } else if (sawHttpOk) {
+            } else if (sawHttpOk.get()) {
                 mainSiteNegCache[cacheKey] = now
             }
             return result
@@ -2896,19 +2923,26 @@ override suspend fun resolve(
             val out = linkedSetOf<String>()
             val seasonToUse = season ?: 1
             val episodeToUse = episode ?: 1
-            // (v74) Inspect up to 5 candidates (sitemap tier can rank
-            // sibling season/movie posts above the mega post) but stop
-            // early once enough posts actually SERVED: 2 for series (mega
-            // post + a variant) — a hard 3-post cap was the structural
-            // reason a right-but-deep candidate could be missed.
-            var inspected = 0
+            // (v75) The up-to-5 candidate pages are fetched CONCURRENTLY
+            // (independent page loads — serial fetching was the other half
+            // of the minutes-long tap; 10-minute per-post row cache below
+            // still makes binge taps instant). Picking then evaluates in
+            // candidate order and stops after enough posts actually SERVED:
+            // 2 for series (mega post + a variant), 3 for movies.
+            val fetchStart = System.currentTimeMillis()
+            val fetched = coroutineScope {
+                candidates.distinctBy { it.first }.take(5).map { (postUrl, _) ->
+                    async(Dispatchers.IO) {
+                        postUrl to runCatching { mainSiteRowsForPost(app, postUrl) }
+                            .getOrElse { emptyList<MainSiteRow>() }
+                    }
+                }.awaitAll()
+            }
             var successes = 0
             val maxSuccesses = if (isMovie) 3 else 2
-            for ((postUrl, _) in candidates.distinctBy { it.first }) {
-                if (inspected >= 5 || successes >= maxSuccesses) break
-                val rows = mainSiteRowsForPost(app, postUrl)
+            for ((postUrl, rows) in fetched) {
+                if (successes >= maxSuccesses) break
                 if (rows.isEmpty()) continue
-                inspected++
                 if (isMovie) {
                     // Movie post: the page already passed the identity/
                     // fuzzy gate, so every media row on it is the film
@@ -2942,6 +2976,12 @@ override suspend fun resolve(
                     successes++
                 }
             }
+            // (v75) end-to-end timing for the device reports.
+            Log.d(
+                TAG, "CircleFTP: main-site done '$title' urls=${out.size} " +
+                    "inspected=${fetched.count { it.second.isNotEmpty() }} " +
+                    "took=${System.currentTimeMillis() - fetchStart}ms"
+            )
             return out
         }
 
