@@ -1,4 +1,4 @@
-version = 73
+version = 74
 
 cloudstream {
     description = "WizstreamAnime — THE anime catalogue (in-app source " +

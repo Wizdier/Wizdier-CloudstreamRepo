@@ -2422,6 +2422,13 @@ override suspend fun resolve(
         private val MAIN_HEADERS = mapOf(
             "User-Agent" to UA,
             "Referer" to "$MAIN_SITE/",
+            // (v74) Look like a browser page load, not an API client: the
+            // saved captures came from the user's browser (cookies + any
+            // anti-bot clearance). A bare-OkHttp call is exactly the shape
+            // WAF/security plugins challenge — which would silently empty
+            // every search route below on-device.
+            "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language" to "en-US,en;q=0.9",
         )
 
         private data class MainSiteRow(val season: Int?, val epNum: Int?, val url: String)
@@ -2439,6 +2446,14 @@ override suspend fun resolve(
         private val mainSiteSearchCache =
             java.util.concurrent.ConcurrentHashMap<String, Pair<Long, List<Pair<String, String>>>>()
         private const val MAIN_SITE_SEARCH_CACHE_MS = 5 * 60_000L
+        // (v74) Negatives are cached SEPARATELY and briefly (90 s), and only
+        // when the site demonstrably answered (a true "nothing there"). The
+        // v73 design cached empty results in the positive map with the same
+        // 5-minute TTL — if the first tap hit a transient block/timeout,
+        // EVERY later tap failed instantly for five minutes (prime suspect
+        // for the device report "still no link after v72").
+        private val mainSiteNegCache = java.util.concurrent.ConcurrentHashMap<String, Long>()
+        private const val MAIN_SITE_NEG_CACHE_MS = 90_000L
         private fun mainSiteSearchCacheKey(
             title: String, year: Int?, isMovie: Boolean, season: Int?,
         ): String = "${title.normaliseTitle()}|${year ?: 0}|$isMovie|${season ?: 0}"
@@ -2552,6 +2567,79 @@ override suspend fun resolve(
             return out
         }
 
+        // ── (v74) SITEMAP catalogue tier ────────────────────────────────────
+        // WordPress's OWN sitemap is the deterministic catalogue: unlike
+        // the search routes (per-term AND semantics on decorated multi-word
+        // queries, possible WAF challenges on API-shaped requests), the
+        // sitemap either exists or it doesn't and lists EVERY public post
+        // permalink. Slugs are title-derived, so the same identity/fuzzy/
+        // tier-3 gates can match them client-side — the exact doctrine the
+        // v48 anime-category browse already uses on the new API. This is
+        // v74's primary reliability fix for the Haikyuu case: even if BOTH
+        // search routes empty out on-device, the mega post's URL
+        // (/cn/haikyuu-tv-series-2014-2020-anime-dual-audio-engjapanese/ —
+        // proven by the oembed link in the owner's saved capture) is
+        // enumerated here and matched by the romaji alias fold.
+        private data class MainSitemapEntry(val url: String, val slugTitle: String)
+
+        private var mainSitemapCache: Pair<Long, List<MainSitemapEntry>>? = null
+        private const val MAIN_SITEMAP_CACHE_MS = 30 * 60_000L
+        private const val MAIN_SITEMAP_MAX_SUBS = 8
+        private const val MAIN_SITEMAP_MAX_URLS = 16000
+        private val locRx = Regex("""<loc>\s*([^<]+?)\s*</loc>""")
+
+        private suspend fun mainSitemapCatalogue(app: Requests): List<MainSitemapEntry> {
+            val now = System.currentTimeMillis()
+            mainSitemapCache?.let { (ts, v) ->
+                if (now - ts < MAIN_SITEMAP_CACHE_MS) return v
+            }
+            val indexUrls = listOf(
+                "$MAIN_SITE/wp-sitemap.xml",      // WP core (5.5+)
+                "$MAIN_SITE/sitemap_index.xml",   // Yoast-style SEO plugins
+                "$MAIN_SITE/sitemap.xml",          // RankMath-style / generic
+            )
+            val out = LinkedHashMap<String, MainSitemapEntry>()
+            outer@ for (indexUrl in indexUrls) {
+                val idx = runCatching {
+                    app.get(indexUrl, headers = MAIN_HEADERS, verify = false, cacheTime = 60, timeout = 12_000)
+                }.getOrNull()
+                if (idx == null || idx.code !in 200..299) continue
+                if (!idx.text.contains("<loc>")) continue
+                // An index lists sub-sitemaps; a flat urlset lists posts
+                // directly. Walk sub-sitemaps that look like CONTENT maps
+                // (post types / pages), never taxonomy/author maps.
+                val subs = locRx.findAll(idx.text).map { it.groupValues[1].trim() }
+                    .filter {
+                        it.contains("-posts-", ignoreCase = true) ||
+                            it.contains("post", ignoreCase = true) ||
+                            it.contains("cn-", ignoreCase = true)
+                    }
+                    .toList()
+                val walk = if (subs.isEmpty()) listOf(indexUrl) else subs.take(MAIN_SITEMAP_MAX_SUBS)
+                var scanned = 0
+                for (sub in walk) {
+                    val resp = runCatching {
+                        app.get(sub, headers = MAIN_HEADERS, verify = false, cacheTime = 60, timeout = 12_000)
+                    }.getOrNull()
+                    if (resp == null || resp.code !in 200..299) continue
+                    for (m in locRx.findAll(resp.text)) {
+                        val loc = m.groupValues[1].trim()
+                        if (!isMainPostUrl(loc)) continue
+                        val slug = loc.trimEnd('/').substringAfterLast('/')
+                        if (slug.isBlank()) continue
+                        out[loc] = MainSitemapEntry(loc, slug.replace('-', ' '))
+                        if (++scanned >= MAIN_SITEMAP_MAX_URLS) break@outer
+                    }
+                    kotlinx.coroutines.yield()
+                }
+                if (out.isNotEmpty()) break
+            }
+            val value = out.values.toList()
+            mainSitemapCache = now to value
+            Log.d(TAG, "CircleFTP: main-site sitemap catalogued ${value.size} post urls")
+            return value
+        }
+
         /**
          * Search the main site for post candidates and gate them through
          * the SAME identity → fuzzy → tier-3 chain the new-API pipeline
@@ -2573,6 +2661,17 @@ override suspend fun resolve(
                     return candidates
                 }
             }
+            mainSiteNegCache[cacheKey]?.let { savedAt ->
+                if (now - savedAt < MAIN_SITE_NEG_CACHE_MS) {
+                    Log.d(TAG, "CircleFTP: main-site cache '$title' candidates=0 (neg)")
+                    return emptyList()
+                }
+            }
+            // (v74) becomes true only when WordPress demonstrably ANSWERED
+            // somewhere below — distinguishes "site up, genuinely nothing"
+            // (a cacheable 90-second negative) from "blocked/unreachable"
+            // (never cached, so the very next tap retries fresh).
+            var sawHttpOk = false
             val partStripped = title
                 .replace(Regex("(?i)\\bpart\\s*\\d{1,2}\\b"), " ")
                 .replace(Regex("\\s+"), " ").trim()
@@ -2593,27 +2692,52 @@ override suspend fun resolve(
                 // old site's actual Haikyuu mega post.
                 val before = merged.size
                 // 1) WordPress REST search.
-                val jsonResp = runCatching {
+                // (v74) Two hardenings: (a) some WP builds reject
+                // subtype=any with a 400 — retry once with the default
+                // subtype; (b) a WAF/security plugin answers API-shaped
+                // requests with an HTML challenge page (HTTP 200, body
+                // starts with '<') — detect it loudly and do NOT treat it
+                // as "site answered fine" for negative caching.
+                var jsonResp = runCatching {
                     app.get(
                         "$MAIN_SITE/wp-json/wp/v2/search?search=${encodeUrl(q)}" +
                             "&per_page=50&subtype=any",
                         headers = MAIN_HEADERS, verify = false, cacheTime = 60, timeout = 10_000,
                     )
                 }.getOrNull()
-                if (jsonResp != null && jsonResp.code in 200..299) {
-                    val arr = runCatching { JSONArray(jsonResp.text) }.getOrNull()
-                    if (arr != null) {
-                        for (i in 0 until arr.length()) {
-                            val o = arr.optJSONObject(i) ?: continue
-                            val u = o.optStringOrNullCp("url")?.trim() ?: continue
-                            val tRaw = o.optStringOrNullCp("title") ?: continue
-                            if (!isMainPostUrl(u)) continue
-                            // wp-json titles are HTML-escaped ("&#8211;") —
-                            // decode or entity fragments pollute the token
-                            // gates ("8211" junk tokens).
-                            val t = runCatching { Jsoup.parse(tRaw).text() }
-                                .getOrDefault(tRaw).trim()
-                            if (t.isNotBlank()) merged[u] = t
+                if (jsonResp != null && jsonResp.code == 400) {
+                    jsonResp = runCatching {
+                        app.get(
+                            "$MAIN_SITE/wp-json/wp/v2/search?search=${encodeUrl(q)}" +
+                                "&per_page=50",
+                            headers = MAIN_HEADERS, verify = false, cacheTime = 60, timeout = 10_000,
+                        )
+                    }.getOrNull()
+                }
+                if (jsonResp != null) {
+                    if (jsonResp.code !in 200..299) {
+                        Log.d(TAG, "CircleFTP: main-site wp-json http=${jsonResp.code}")
+                    } else if (jsonResp.text.trimStart().startsWith("<")) {
+                        Log.w(
+                            TAG, "CircleFTP: main-site wp-json answered HTML " +
+                                "not JSON (challenge?) len=${jsonResp.text.length}"
+                        )
+                    } else {
+                        sawHttpOk = true
+                        val arr = runCatching { JSONArray(jsonResp.text) }.getOrNull()
+                        if (arr != null) {
+                            for (i in 0 until arr.length()) {
+                                val o = arr.optJSONObject(i) ?: continue
+                                val u = o.optStringOrNullCp("url")?.trim() ?: continue
+                                val tRaw = o.optStringOrNullCp("title") ?: continue
+                                if (!isMainPostUrl(u)) continue
+                                // wp-json titles are HTML-escaped ("&#8211;") —
+                                // decode or entity fragments pollute the token
+                                // gates ("8211" junk tokens).
+                                val t = runCatching { Jsoup.parse(tRaw).text() }
+                                    .getOrDefault(tRaw).trim()
+                                if (t.isNotBlank()) merged[u] = t
+                            }
                         }
                     }
                 }
@@ -2628,9 +2752,20 @@ override suspend fun resolve(
                         )
                     }.getOrNull()
                     if (htmlResp != null && htmlResp.code in 200..299) {
+                        sawHttpOk = true
+                        // (v74) prefer content-area anchors: v72's relaxed
+                        // permalink acceptance would otherwise also admit
+                        // sidebar/footer "recent posts" links page-wide.
                         val doc = runCatching { Jsoup.parse(htmlResp.text, MAIN_SITE) }
                             .getOrNull()
-                        doc?.select("a[href]")?.forEach { a ->
+                        val scoped = doc?.select(
+                            "article a[href], .entry-content a[href], " +
+                                ".post-list a[href], main a[href]"
+                        )
+                        val anchorScope =
+                            if (scoped != null && scoped.isNotEmpty()) scoped
+                            else doc?.select("a[href]")
+                        anchorScope?.forEach { a ->
                             val u = a.attr("abs:href").ifBlank { a.attr("href") }.trim()
                             if (!isMainPostUrl(u)) return@forEach
                             val t = a.text().trim()
@@ -2645,11 +2780,6 @@ override suspend fun resolve(
                     TAG, "CircleFTP: main-site search '$q' +$added rows " +
                         "(aggregate=${merged.size})"
                 )
-            }
-            if (merged.isEmpty()) {
-                val noCandidates = emptyList<Pair<String, String>>()
-                mainSiteSearchCache[cacheKey] = now to noCandidates
-                return noCandidates
             }
             // Gates — 1:1 with the browse tier of the new-API pipeline.
             val identity = mutableListOf<Pair<String, String>>()
@@ -2670,8 +2800,75 @@ override suspend fun resolve(
                     rescue += u to t
                 }
             }
-            val result = identity.ifEmpty { fuzzy.ifEmpty { rescue } }
-            mainSiteSearchCache[cacheKey] = now to result
+            var result: List<Pair<String, String>> =
+                identity.ifEmpty { fuzzy.ifEmpty { rescue } }
+
+            // ── (v74) SITEMAP discovery tier ────────────────────────────
+            // Fires when BOTH search routes produced nothing gate-worthy:
+            // zero raw URLs (multi-term AND search starving on decorated
+            // AniList titles, or an API-shaped-request WAF block) or raw
+            // URLs that were all siblings. The sitemap IS the site — its
+            // post slugs are title-derived, so the same gates match them
+            // client-side (Haikyuu's mega post slug contains "haikyuu",
+            // caught by the alias fold even though "engjapanese" noise
+            // defeats strict slug equality).
+            if (result.isEmpty()) {
+                val catalogue = mainSitemapCatalogue(app)
+                if (catalogue.isNotEmpty()) {
+                    val qRoot = seriesRootAliasKey(title)
+                    val smIdentity = mutableListOf<Pair<String, String>>()
+                    val smFuzzy = mutableListOf<Pair<String, String>>()
+                    val smRescue = mutableListOf<Pair<String, String>>()
+                    for (entry in catalogue) {
+                        val t = entry.slugTitle
+                        if (isSameMediaTitle(t, title, year)) {
+                            smIdentity += entry.url to t
+                            continue
+                        }
+                        if (isFuzzySameMedia(t, title, year)) {
+                            smFuzzy += entry.url to t
+                            continue
+                        }
+                        val aliasForward = qRoot.length >= 4 &&
+                            seriesRootAliasKey(t).contains(qRoot)
+                        if (!isMovie && season != null &&
+                            (isSeriesRescueMatch(t, title) || aliasForward)
+                        ) {
+                            smRescue += entry.url to t
+                        }
+                    }
+                    Log.d(
+                        TAG, "CircleFTP: main-site sitemap '$title' " +
+                            "catalogue=${catalogue.size} identity=${smIdentity.size} " +
+                            "fuzzy=${smFuzzy.size} rescue=${smRescue.size}"
+                    )
+                    // (shortest, least-decorated slug first in the rescue
+                    // pool: the franchise mega post outranks themed
+                    // spin-offs and movies when several slugs clear the
+                    // gate)
+                    val smRescueSorted: List<Pair<String, String>> =
+                        smRescue.sortedBy { it.first.length }
+                    result = when {
+                        smIdentity.isNotEmpty() -> smIdentity.toList()
+                        smFuzzy.isNotEmpty() -> smFuzzy.toList()
+                        else -> smRescueSorted
+                    }
+                } else {
+                    Log.d(TAG, "CircleFTP: main-site sitemap empty/unavailable for '$title'")
+                }
+            }
+
+            // (v74) Cache discipline: a POSITIVE list is cached 5 minutes;
+            // an EMPTY list is only a cacheable negative when the site
+            // provably answered (sawHttpOk) — and then only for 90 seconds.
+            // A blocked/unreachable phone tap therefore never poisons the
+            // next one; every tap retries live.
+            if (result.isNotEmpty()) {
+                mainSiteSearchCache[cacheKey] = now to result
+                mainSiteNegCache.remove(cacheKey)
+            } else if (sawHttpOk) {
+                mainSiteNegCache[cacheKey] = now
+            }
             return result
         }
 
@@ -2699,14 +2896,25 @@ override suspend fun resolve(
             val out = linkedSetOf<String>()
             val seasonToUse = season ?: 1
             val episodeToUse = episode ?: 1
-            for ((postUrl, _) in candidates.distinctBy { it.first }.take(3)) {
+            // (v74) Inspect up to 5 candidates (sitemap tier can rank
+            // sibling season/movie posts above the mega post) but stop
+            // early once enough posts actually SERVED: 2 for series (mega
+            // post + a variant) — a hard 3-post cap was the structural
+            // reason a right-but-deep candidate could be missed.
+            var inspected = 0
+            var successes = 0
+            val maxSuccesses = if (isMovie) 3 else 2
+            for ((postUrl, _) in candidates.distinctBy { it.first }) {
+                if (inspected >= 5 || successes >= maxSuccesses) break
                 val rows = mainSiteRowsForPost(app, postUrl)
                 if (rows.isEmpty()) continue
+                inspected++
                 if (isMovie) {
                     // Movie post: the page already passed the identity/
                     // fuzzy gate, so every media row on it is the film
                     // (parts / encode variants all wanted).
                     out += rows.map { it.url }
+                    successes++
                     continue
                 }
                 // Season filter: rows that DECLARE a season must match the
@@ -2729,7 +2937,10 @@ override suspend fun resolve(
                         "ep=$episodeToUse pick=${if (numberTrue) "num" else "pos"} " +
                         "hit=${picked.size}"
                 )
-                out += picked.map { it.url }
+                if (picked.isNotEmpty()) {
+                    out += picked.map { it.url }
+                    successes++
+                }
             }
             return out
         }
@@ -3342,6 +3553,17 @@ override suspend fun resolve(
                         "s=$season e=$episode — trying main-site"
                 )
                 mediaUrls += mainSiteMediaUrls(app, title, year, isMovie, season, episode)
+            }
+
+            // (v74) ONE compact WARN verdict per fully-exhausted resolve —
+            // survives a quick filtered logcat skim and immediately tells
+            // WHICH show/episode exhausted both site tiers (the D-lines
+            // above carry the per-stage detail when they can be captured).
+            if (mediaUrls.isEmpty()) {
+                Log.w(
+                    TAG, "CircleFTP: DRY '$title' s=$season e=$episode — " +
+                        "new-site tiers + main-site exhausted"
+                )
             }
 
             // 7. Emit — v33: 1:1 with CircleFtpProvider.loadLinks.
