@@ -22,6 +22,7 @@ import org.json.JSONObject
 import java.net.URLEncoder
 import java.util.Collections
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * WizstreamAnimeProvider — AniList catalog + multi-source resolver.
@@ -732,10 +733,12 @@ class WizstreamAnimeProvider : MainAPI() {
             add(ctx.anilistId.toString())
         }.distinct()
 
+        // (v73) VID embeds, BDIX resolvers and anime-web resolvers emit
+        // concurrently; keep their shared final state race-free.
         val seenUrls = Collections.newSetFromMap<String>(ConcurrentHashMap())
         val seenSubs = Collections.newSetFromMap<String>(ConcurrentHashMap())
         val gate = Semaphore(8)
-        var anyFound = false
+        val anyFound = AtomicBoolean(false)
 
         val jobs = VID_HOSTS.flatMap { host ->
             idList.map { id ->
@@ -755,7 +758,6 @@ class WizstreamAnimeProvider : MainAPI() {
                             host.tv(id, seasonForSources, episodeForHost)
                         }
                         try {
-                            val before = anyFound
                             val embedReferer = runCatching {
                                 "https://" + java.net.URL(embedUrl).host + "/"
                             }.getOrDefault("https://")
@@ -766,12 +768,12 @@ class WizstreamAnimeProvider : MainAPI() {
                                     if (seenSubs.add(sub.url)) subtitleCallback(sub)
                                 }
                             ) { link ->
-                                val urlStr = link.url.trim()
+                                val urlStr = link.url.trim().substringBefore('#')
                                 if (urlStr.isBlank() || !seenUrls.add(urlStr)) return@loadExtractor
                                 val newSource = "Wizstream-A • ${host.label}"
                                 val newName = "${host.label} — ${link.name}".trimEnd('—', ' ')
                                 callback(link.aRelabel(newSource, newName))
-                                anyFound = true
+                                anyFound.set(true)
                             }
                         } catch (_: Throwable) {
                             // Host is probably down or blocked — skip silently.
@@ -804,10 +806,10 @@ class WizstreamAnimeProvider : MainAPI() {
                         if (seenSubs.add(sub.url)) subtitleCallback(sub)
                     },
                     callback = { link ->
-                        val normalized = link.url.trim()
+                        val normalized = link.url.trim().substringBefore('#')
                         if (normalized.isNotBlank() && seenUrls.add(normalized)) {
                             callback(link)
-                            anyFound = true
+                            anyFound.set(true)
                         }
                     },
                     tmdbId = ctx.tmdbId,
@@ -853,10 +855,10 @@ class WizstreamAnimeProvider : MainAPI() {
                         if (seenSubs.add(sub.url)) subtitleCallback(sub)
                     },
                     callback = { link ->
-                        val normalized = link.url.trim()
+                        val normalized = link.url.trim().substringBefore('#')
                         if (normalized.isNotBlank() && seenUrls.add(normalized)) {
                             callback(link)
-                            anyFound = true
+                            anyFound.set(true)
                         }
                     },
                 )
@@ -866,7 +868,7 @@ class WizstreamAnimeProvider : MainAPI() {
         jobs.awaitAll()
         sourceJob.await()
         animeSourceJob.await()
-        anyFound
+        anyFound.get()
     }
 
     // ═══════════════════════════════════════════════════════════════════════

@@ -21,6 +21,7 @@ import org.json.JSONObject
 import java.net.URLEncoder
 import java.util.Collections
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * WizstreamProvider — TMDB catalog + multi-source resolver.
@@ -554,10 +555,14 @@ class WizstreamProvider : MainAPI() {
         val embedS = ctx.tmdbSeason ?: s
         val embedE = ctx.tmdbEpisode ?: e
 
+        // (v73) One row resolves through many concurrent jobs. Keep the
+        // completion bit atomic so a successfully emitted link can never be
+        // lost to a racing final return value.
+        Log.i(TAG, "loadLinks '${ctx.title}' site=$s/$e embed=$embedS/$embedE local=${ctx.entryEpisode}")
         val seenUrls = Collections.newSetFromMap<String>(ConcurrentHashMap())
         val seenSubs = Collections.newSetFromMap<String>(ConcurrentHashMap())
         val gate = Semaphore(8)
-        var anyFound = false
+        val anyFound = AtomicBoolean(false)
 
         val jobs = VID_HOSTS.map { host ->
             async(Dispatchers.IO) {
@@ -568,7 +573,6 @@ class WizstreamProvider : MainAPI() {
                         host.tv(id, embedS, embedE)
                     }
                     try {
-                        val before = anyFound
                         loadExtractor(
                             embedUrl,
                             host.referer.ifBlank { embedUrl.substringBeforeLast("/") },
@@ -576,12 +580,12 @@ class WizstreamProvider : MainAPI() {
                                 if (seenSubs.add(sub.url)) subtitleCallback(sub)
                             }
                         ) { link ->
-                            val normalized = link.url.trim()
+                            val normalized = link.url.trim().substringBefore('#')
                             if (normalized.isBlank() || !seenUrls.add(normalized)) return@loadExtractor
                             val newSource = "Wizstream • ${host.label}"
                             val newName = "${host.label} — ${link.name}".trimEnd('—', ' ')
                             callback(link.relabel(newSource, newName))
-                            anyFound = true
+                            anyFound.set(true)
                         }
                     } catch (t: Throwable) {
                         Log.d(TAG, "Host ${host.label} failed: ${t.message}")
@@ -614,10 +618,10 @@ class WizstreamProvider : MainAPI() {
                         if (seenSubs.add(sub.url)) subtitleCallback(sub)
                     },
                     callback = { link ->
-                        val normalized = link.url.trim()
+                        val normalized = link.url.trim().substringBefore('#')
                         if (normalized.isNotBlank() && seenUrls.add(normalized)) {
                             callback(link)
-                            anyFound = true
+                            anyFound.set(true)
                         }
                     },
                     tmdbId = ctx.tmdbId,
@@ -652,10 +656,10 @@ class WizstreamProvider : MainAPI() {
                         if (seenSubs.add(sub.url)) subtitleCallback(sub)
                     },
                     callback = { link ->
-                        val normalized = link.url.trim()
+                        val normalized = link.url.trim().substringBefore('#')
                         if (normalized.isNotBlank() && seenUrls.add(normalized)) {
                             callback(link)
-                            anyFound = true
+                            anyFound.set(true)
                         }
                     },
                 )
@@ -665,7 +669,7 @@ class WizstreamProvider : MainAPI() {
         jobs.awaitAll()
         sourceJob.await()
         animeJob?.await()
-        anyFound
+        anyFound.get()
     }
 
     // ═══════════════════════════════════════════════════════════════════════

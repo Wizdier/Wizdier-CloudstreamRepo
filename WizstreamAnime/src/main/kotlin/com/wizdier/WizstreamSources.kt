@@ -2358,6 +2358,36 @@ override suspend fun resolve(
                 .replace(Regex("""\s+"""), " ")
                 .trim()
 
+        /**
+         * (v72) Conservative series-root alias key for the tier-3 rescue.
+         * AniList spells the volleyball franchise HAIKYU!! (one final U),
+         * while Circle Network's legacy mega post spells it Haikyuu!! (two).
+         * Strict/fuzzy identity must keep treating such strings as distinct
+         * for films; only the already-season-gated series rescue is allowed
+         * this vowel-run fold. It also harmlessly covers common romaji
+         * lengthening variants such as Hoozuki/Hozuki.
+         */
+        private fun seriesRootAliasKey(t: String): String =
+            bareSeriesTitle(t).normaliseTitle()
+                .replace(Regex("([aeiou])\\1+"), "$1")
+
+        /** Shared tier-3 test for the new API, category browse and old
+         * WordPress searches. The normal containment test protects franchise
+         * siblings; an exact alias-key match is the narrow HAIKYU/HAIKYUU
+         * escape hatch described above. */
+        private fun isSeriesRescueMatch(postTitle: String, queryTitle: String): Boolean {
+            val qNorm = queryTitle.normaliseTitle()
+            val pNorm = bareSeriesTitle(postTitle).normaliseTitle()
+            if (qNorm.length < 4 || pNorm.length < 4) return false
+            val containment = pNorm.contains(qNorm) ||
+                (qNorm.startsWith(pNorm) &&
+                    (qNorm.length == pNorm.length || qNorm[pNorm.length] == ' '))
+            if (containment) return true
+            val qRoot = seriesRootAliasKey(queryTitle)
+            val pRoot = seriesRootAliasKey(postTitle)
+            return qRoot.length >= 5 && pRoot.length >= 5 && qRoot == pRoot
+        }
+
         // ── (v71) MAIN-SITE rescue (main.circleftp.net) ─────────────────────
         // The "new" site (new.circleftp.net:5000) is a RE-CATALOGUE, not a
         // migration: posts the operator never re-upped exist ONLY on the old
@@ -2401,12 +2431,43 @@ override suspend fun resolve(
         private val mainSiteRowsCache =
             java.util.concurrent.ConcurrentHashMap<String, Pair<Long, List<MainSiteRow>>>()
 
-        /** wp-json / ?s= results must be POST permalinks (proven to live
-         *  under /cn/<slug>/ etc.), not nav, category or software pages. */
+        // (v73) Candidate search cache. A legacy mega-post needs the same
+        // WordPress search and title gates for every tapped episode, while
+        // the selected post's rows are already cached below. Cache both a
+        // hit and a short-lived miss so a binge session does not serially
+        // repeat up to five WordPress queries per episode on BDIX.
+        private val mainSiteSearchCache =
+            java.util.concurrent.ConcurrentHashMap<String, Pair<Long, List<Pair<String, String>>>>()
+        private const val MAIN_SITE_SEARCH_CACHE_MS = 5 * 60_000L
+        private fun mainSiteSearchCacheKey(
+            title: String, year: Int?, isMovie: Boolean, season: Int?,
+        ): String = "${title.normaliseTitle()}|${year ?: 0}|$isMovie|${season ?: 0}"
+
+        /**
+         * WordPress's REST and classic-search routes do not promise one
+         * permalink shape. v71 accepted only /cn|anime|tv|series|movie/slug,
+         * which silently discarded a valid legacy post if this installation
+         * returned a dated/custom permalink. Accept a same-host content path,
+         * while explicitly excluding WordPress infrastructure and archive
+         * paths; the title gates below still decide media identity.
+         */
         private val mainPostUrlRx = Regex(
-            """^https?://main\.circleftp\.net/(cn|anime|tv|series|movies?)/[^/?#]+/?$""",
+            """^https?://(?:www\.)?main\.circleftp\.net/[^?#]+/?$""",
             RegexOption.IGNORE_CASE,
         )
+        private val mainNonPostFirstPaths = setOf(
+            "wp-json", "wp-admin", "wp-content", "wp-includes", "category",
+            "tag", "author", "feed", "page", "search"
+        )
+        private fun isMainPostUrl(rawUrl: String): Boolean {
+            val u = rawUrl.trim()
+            if (!mainPostUrlRx.matches(u)) return false
+            val path = runCatching { java.net.URI(u).path.orEmpty().trim('/') }
+                .getOrNull().orEmpty()
+            if (path.isBlank()) return false
+            if (path.substringBefore('/').lowercase() in mainNonPostFirstPaths) return false
+            return !path.contains("popular-useful-software", ignoreCase = true)
+        }
         private val mainMediaFileRx = Regex("""(?i)\.(mkv|mp4|avi|m4v|ts|webm)$""")
         private val mainJunkFileRx = Regex(
             """(?i)\.(srt|vtt|ass|ssa|sub|zip|rar|7z|txt|nfo|jpg|jpeg|png|webp|exe|apk|iso)$"""
@@ -2504,6 +2565,14 @@ override suspend fun resolve(
             isMovie: Boolean,
             season: Int?,
         ): List<Pair<String, String>> {
+            val now = System.currentTimeMillis()
+            val cacheKey = mainSiteSearchCacheKey(title, year, isMovie, season)
+            mainSiteSearchCache[cacheKey]?.let { (savedAt, candidates) ->
+                if (now - savedAt < MAIN_SITE_SEARCH_CACHE_MS) {
+                    Log.d(TAG, "CircleFTP: main-site cache '$title' candidates=${candidates.size}")
+                    return candidates
+                }
+            }
             val partStripped = title
                 .replace(Regex("(?i)\\bpart\\s*\\d{1,2}\\b"), " ")
                 .replace(Regex("\\s+"), " ").trim()
@@ -2516,6 +2585,13 @@ override suspend fun resolve(
             ).filter { it.isNotBlank() }.distinct()
             val merged = LinkedHashMap<String, String>()  // postUrl → title
             for (q in queryVariants) {
+                // (v72) Collect ALL title variants before title-gating them.
+                // v71 stopped at the first *raw* WordPress hit. Haikyuu's
+                // long AniList title can return a sibling/season result that
+                // the identity gate correctly rejects, which prevented the
+                // final bare-root query (HAIKYU) from ever discovering the
+                // old site's actual Haikyuu mega post.
+                val before = merged.size
                 // 1) WordPress REST search.
                 val jsonResp = runCatching {
                     app.get(
@@ -2531,8 +2607,7 @@ override suspend fun resolve(
                             val o = arr.optJSONObject(i) ?: continue
                             val u = o.optStringOrNullCp("url")?.trim() ?: continue
                             val tRaw = o.optStringOrNullCp("title") ?: continue
-                            if (!mainPostUrlRx.matches(u)) continue
-                            if ("popular-useful-software" in u.lowercase()) continue
+                            if (!isMainPostUrl(u)) continue
                             // wp-json titles are HTML-escaped ("&#8211;") —
                             // decode or entity fragments pollute the token
                             // gates ("8211" junk tokens).
@@ -2543,8 +2618,9 @@ override suspend fun resolve(
                     }
                 }
                 // 2) Classic WordPress ?s= HTML search (fallback for when
-                //    the REST route is disabled or filtered).
-                if (merged.isEmpty()) {
+                //    the REST route is disabled, filtered, or produced no
+                //    NEW candidate for this particular query variant).
+                if (merged.size == before) {
                     val htmlResp = runCatching {
                         app.get(
                             "$MAIN_SITE/?s=${encodeUrl(q)}",
@@ -2556,8 +2632,7 @@ override suspend fun resolve(
                             .getOrNull()
                         doc?.select("a[href]")?.forEach { a ->
                             val u = a.attr("abs:href").ifBlank { a.attr("href") }.trim()
-                            if (!mainPostUrlRx.matches(u)) return@forEach
-                            if ("popular-useful-software" in u.lowercase()) return@forEach
+                            if (!isMainPostUrl(u)) return@forEach
                             val t = a.text().trim()
                                 .ifBlank { a.attr("title").trim() }
                                 .ifBlank { a.selectFirst("img")?.attr("alt")?.trim().orEmpty() }
@@ -2565,19 +2640,18 @@ override suspend fun resolve(
                         }
                     }
                 }
-                if (merged.isNotEmpty()) {
-                    Log.d(
-                        TAG, "CircleFTP: main-site search '$q' rows=${merged.size} " +
-                            "(query variant hit)"
-                    )
-                    break
-                } else {
-                    Log.d(TAG, "CircleFTP: main-site search '$q' rows=0 — next variant")
-                }
+                val added = merged.size - before
+                Log.d(
+                    TAG, "CircleFTP: main-site search '$q' +$added rows " +
+                        "(aggregate=${merged.size})"
+                )
             }
-            if (merged.isEmpty()) return emptyList()
+            if (merged.isEmpty()) {
+                val noCandidates = emptyList<Pair<String, String>>()
+                mainSiteSearchCache[cacheKey] = now to noCandidates
+                return noCandidates
+            }
             // Gates — 1:1 with the browse tier of the new-API pipeline.
-            val qNorm = title.normaliseTitle()
             val identity = mutableListOf<Pair<String, String>>()
             val fuzzy = mutableListOf<Pair<String, String>>()
             val rescue = mutableListOf<Pair<String, String>>()
@@ -2592,16 +2666,13 @@ override suspend fun resolve(
                     fuzzy += u to t
                     continue
                 }
-                if (!isMovie && season != null && qNorm.length >= 4) {
-                    val pNorm = bareSeriesTitle(t).normaliseTitle()
-                    if (pNorm.length < 4) continue
-                    val forward = pNorm.contains(qNorm)
-                    val reverse = qNorm.startsWith(pNorm) &&
-                        (qNorm.length == pNorm.length || qNorm[pNorm.length] == ' ')
-                    if (forward || reverse) rescue += u to t
+                if (!isMovie && season != null && isSeriesRescueMatch(t, title)) {
+                    rescue += u to t
                 }
             }
-            return identity.ifEmpty { fuzzy.ifEmpty { rescue } }
+            val result = identity.ifEmpty { fuzzy.ifEmpty { rescue } }
+            mainSiteSearchCache[cacheKey] = now to result
+            return result
         }
 
         /**
@@ -2860,30 +2931,22 @@ override suspend fun resolve(
             // requested season (the v11 guard below), so a rescued post can
             // never serve the wrong season — worst case it yields nothing.
             if (matchingPostIds.isEmpty() && season != null && episode != null) {
-                val qNorm = title.normaliseTitle()
-                if (qNorm.length >= 4) {
-                    val rescue = mutableListOf<Pair<Int, String>>()
-                    for (i in 0 until postsArr.length()) {
-                        val p = postsArr.optJSONObject(i) ?: continue
-                        val ptitle = p.optString("title").ifBlank { p.optString("name") ?: "" }
-                        if (ptitle.isBlank()) continue
-                        val pNorm = bareSeriesTitle(ptitle).normaliseTitle()
-                        if (pNorm.length < 4) continue
-                        val forward = pNorm.contains(qNorm)
-                        val reverse = qNorm.startsWith(pNorm) &&
-                            (qNorm.length == pNorm.length || qNorm[pNorm.length] == ' ')
-                        if (forward || reverse) {
-                            rescue += p.optInt("id", -1) to ptitle
-                        }
+                val rescue = mutableListOf<Pair<Int, String>>()
+                for (i in 0 until postsArr.length()) {
+                    val p = postsArr.optJSONObject(i) ?: continue
+                    val ptitle = p.optString("title").ifBlank { p.optString("name") ?: "" }
+                    if (ptitle.isBlank()) continue
+                    if (isSeriesRescueMatch(ptitle, title)) {
+                        rescue += p.optInt("id", -1) to ptitle
                     }
-                    if (rescue.isNotEmpty()) {
-                        Log.d(
-                            TAG,
-                            "CircleFTP: tier-3 season-aware rescue matched " +
-                                "${rescue.size} post(s) for '$title' s=$season e=$episode"
-                        )
-                        matchingPostIds = rescue
-                    }
+                }
+                if (rescue.isNotEmpty()) {
+                    Log.d(
+                        TAG,
+                        "CircleFTP: tier-3 season-aware rescue matched " +
+                            "${rescue.size} post(s) for '$title' s=$season e=$episode"
+                    )
+                    matchingPostIds = rescue
                 }
             }
             // ── (v48) Anime-category browse rescue ───────────────────────
@@ -2895,7 +2958,6 @@ override suspend fun resolve(
                 val (catPosts, catUsedIp) = animeCategoryPosts(app)
                 ipRewriteLinks = ipRewriteLinks || catUsedIp
                 if (catPosts.isNotEmpty()) {
-                    val qNorm = title.normaliseTitle()
                     val identity = mutableListOf<Pair<Int, String>>()
                     val fuzzy = mutableListOf<Pair<Int, String>>()
                     val rescue = mutableListOf<Pair<Int, String>>()
@@ -2912,15 +2974,8 @@ override suspend fun resolve(
                             fuzzy += p.optInt("id", -1) to ptitle
                             continue
                         }
-                        if (qNorm.length >= 4) {
-                            val pNorm = bareSeriesTitle(ptitle).normaliseTitle()
-                            if (pNorm.length < 4) continue
-                            val forward = pNorm.contains(qNorm)
-                            val reverse = qNorm.startsWith(pNorm) &&
-                                (qNorm.length == pNorm.length || qNorm[pNorm.length] == ' ')
-                            if (forward || reverse) {
-                                rescue += p.optInt("id", -1) to ptitle
-                            }
+                        if (isSeriesRescueMatch(ptitle, title)) {
+                            rescue += p.optInt("id", -1) to ptitle
                         }
                     }
                     matchingPostIds = identity.ifEmpty { fuzzy.ifEmpty { rescue } }
