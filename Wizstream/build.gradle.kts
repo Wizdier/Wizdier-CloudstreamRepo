@@ -1,4 +1,4 @@
-version = 76
+version = 80
 
 cloudstream {
     description = "Wizstream — the main catalogue, StreamPlay style. " +

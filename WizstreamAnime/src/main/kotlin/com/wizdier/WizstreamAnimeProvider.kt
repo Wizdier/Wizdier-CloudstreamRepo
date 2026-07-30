@@ -412,8 +412,19 @@ class WizstreamAnimeProvider : MainAPI() {
         ).takeIf { it.isNotEmpty() }
             ?.joinToString("  |  ")
             ?.let { "👤 $it" }
-        val displayPlot = listOfNotNull(personalLine, detail.plot)
-            .filter { it.isNotBlank() }.joinToString("\n\n")
+        // (v78) MDBList aggregated ratings line (opt-in, user API key in
+        // Settings → Integrations; null when no key, so the page is
+        // untouched). This module stays PURE AniList for identity — the
+        // line is additive text only, and the score ring keeps AniList's
+        // own rating so nothing about tracking/binding changes.
+        val mdbLine = runCatching {
+            WizMdbList.ratings(
+                app, detail.imdbId, detail.tmdbId, detail.format == "MOVIE"
+            )?.line
+        }.getOrNull()
+        val displayPlot = listOfNotNull(
+            personalLine, mdbLine?.let { "⭐ $it" }, detail.plot
+        ).filter { it.isNotBlank() }.joinToString("\n\n")
         // (v62) Logcat-visible record of the trackers this page binds.
         runCatching {
             android.util.Log.i(
@@ -526,10 +537,46 @@ class WizstreamAnimeProvider : MainAPI() {
                         val ordered =
                             if (firstNum != null && lastNum != null && firstNum > lastNum)
                                 raw.reversed() else raw
+                        // (v77) The season-window slice is now CONTENT-VERIFIED
+                        // and BOUNDS-SAFE. v76 accepted any feed whose LENGTH
+                        // coincidentally equalled the stacked season total and
+                        // then sliced it blind. Two provable hazards (AoT
+                        // Special 2, AniList 162314, verified live this cycle:
+                        // a 1-episode entry carrying a 29-row SERIES-WIDE
+                        // Crunchyroll feed that runs "…Episode 87" + "Special
+                        // 1", while its stacked season total is 30):
+                        //   • one absorbed special appearing/disappearing on
+                        //     either side makes 29 == 29 and the slice returns
+                        //     'Episode 60 - The Other Side of the Sea' as
+                        //     Special 2's title — the exact "wrong title on the
+                        //     last parts" class of bug;
+                        //   • subList() with an end index past the feed throws
+                        //     IndexOutOfBounds inside load() = a blank page.
+                        // Now: the window must fit, AND the sliced rows must
+                        // actually declare the episode numbers that window
+                        // covers (majority of parsable rows) before we trust it.
+                        val lo = m.seasonStart - 1
+                        val hi = lo + m.episodes
                         when {
                             ordered.size <= m.episodes + 3 -> ordered
-                            ordered.size == seasonTotal ->
-                                ordered.subList(m.seasonStart - 1, m.seasonStart - 1 + m.episodes)
+                            ordered.size == seasonTotal && lo >= 0 && hi <= ordered.size -> {
+                                val win = ordered.subList(lo, hi)
+                                val parsed = win.mapNotNull { streamEpNumber(it.title) }
+                                val aligned = parsed.isEmpty() || parsed.count { n ->
+                                    n in m.seasonStart until (m.seasonStart + m.episodes) ||
+                                        n in 1..m.episodes
+                                } * 2 >= parsed.size
+                                if (aligned) win else {
+                                    android.util.Log.i(
+                                        "WizstreamAnime",
+                                        "feed-gate: '${m.title}' window " +
+                                            "[$lo,$hi) of ${ordered.size} rejected — " +
+                                            "numbers ${parsed.take(4)} don't match stacked " +
+                                            "${m.seasonStart}..${m.seasonStart + m.episodes - 1}"
+                                    )
+                                    emptyList()
+                                }
+                            }
                             else -> emptyList()
                         }
                     }
@@ -1352,10 +1399,46 @@ class WizstreamAnimeProvider : MainAPI() {
             "meta-mode ${if (absolutePacked) "absolute" else "stacked"} " +
                 "'$title' members=${members.size} absTotal=$absTotal"
         )
-        // (v61) High-quality LANDSCAPE art: AniList's banner stays first
-        // (it's the AniList asset), but most entries simply don't have
-        // one — the header then renders empty. The shared mapper already
-        // fetched the TMDB show page; its w1280 backdrop fills the gap.
+        // (v80) PER-ENTRY LANDSCAPE — the de-stacked-header fix.
+        // (Supersedes the v61 rule where AniList's banner came first.)
+        //
+        // AniList has no stacked items: every season, cour part and long
+        // special is a SEPARATE entry. TMDB has exactly ONE show-level
+        // backdrop, so previously every one of those entries rendered the
+        // IDENTICAL header ("if the landscape poster gets fetched in every
+        // item it won't look that good"). TMDB has no per-season backdrops
+        // either (season image endpoints return posters only — verified).
+        //
+        // Fix: deal this franchise's ranked TMDB backdrop POOL one image per
+        // entry, falling back to the best-voted episode still from THIS
+        // entry's own stacked window, then the shared show backdrop.
+        // Deterministic (same entry ⇒ same image every launch) and free —
+        // the pool comes from the /images call the mapper already made.
+        //
+        // (v80, user preference) TMDB art is now preferred OVER AniList's
+        // bannerImage — "I want to literally avoid AniList, their poster
+        // quality is not that good". AniList's banner is kept only as the
+        // final fallback for shows TMDB has no art for at all.
+        val openedIdx = members.indexOfFirst { it.id == id }.coerceAtLeast(0)
+        val openedM = members.getOrNull(openedIdx)
+        val tmdbEntryArt = runCatching {
+            WizEpisodeTable.entryBackdrop(
+                showTable,
+                openedIdx,
+                openedM?.siteSeason,
+                openedM?.seasonStart,
+                openedM?.let { it.seasonStart + it.episodes - 1 },
+            )
+        }.getOrNull()
+        if (tmdbEntryArt != null) {
+            backdropUrl = tmdbEntryArt
+            android.util.Log.i(
+                "WizstreamAnime",
+                "entry-art '$title' idx=$openedIdx s=${openedM?.siteSeason} " +
+                    "eps=${openedM?.seasonStart}..${openedM?.let { it.seasonStart + it.episodes - 1 }} " +
+                    "→ ${tmdbEntryArt.substringAfterLast('/')}"
+            )
+        }
         if (backdropUrl == null) backdropUrl = showTable?.backdropUrl
         // (v61) Official TITLE LOGO from TMDB's images (fetched inside
         // the same mapper call) beats the MetaHub guess; MetaHub stays as

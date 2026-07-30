@@ -72,6 +72,17 @@ object WizstreamSources {
         val sources = (bdixSources + TOGGLE_WEB_RESOLVERS)
             .filter { WizSourcePrefs.isEnabled(it.toggleId) }
 
+        // ── (v78) Wyzie Subs — runs ALONGSIDE every source ──────────────
+        // Subtitles are keyed by IMDB/TMDB id, not by which server the video
+        // came from, so this fires once per resolve in PARALLEL with the
+        // resolvers (it never delays a link: its result goes to the
+        // subtitle callback, and the whole thing no-ops without a user key).
+        val wyzieJob = if (WizWyzieSubs.enabled()) async(Dispatchers.IO) {
+            runCatching {
+                WizWyzieSubs.emit(app, imdbId, tmdbId, season, episode, subtitleCallback)
+            }.onFailure { t -> Log.w(TAG, "Wyzie failed: ${t.message}") }
+        } else null
+
         val gate = Semaphore(4)
         val jobs = sources.map { src ->
             async(Dispatchers.IO) {
@@ -225,6 +236,10 @@ object WizstreamSources {
             }
             if (altJobs.awaitAll().any { it }) { found = true; bdixFound = true }
         }
+        // (v78) Let the subtitle fetch finish before the resolve returns, so
+        // its files are attached to THIS playback session. It is bounded by
+        // its own 8s timeout and can only ever add subtitles, never links.
+        runCatching { wyzieJob?.await() }
         found
     }
 
@@ -871,6 +886,9 @@ object WizstreamSources {
         "anineko" to "AniNeko",
         "reanime" to "ReAnime",
         "tokyoinsider" to "TokyoInsider",
+        // (v78) integrations — not video sources; both need a user API key.
+        "wyziesubs" to "Wyzie Subs",
+        "mdblist" to "MDBList ratings",
     )
 
     object WizSourcePrefs {
@@ -895,6 +913,29 @@ object WizstreamSources {
 
         fun setEnabled(id: String, on: Boolean) {
             runCatching { CloudStreamApp.setKey(PFX + id, on) }
+        }
+
+        // ── (v78) INTEGRATION KEYS — Wyzie Subs + MDBList ──────────────
+        // Both services now require a PER-USER API key. Wyzie's own docs
+        // forbid shipping a key inside a mobile binary ("If the key
+        // reaches an end user's machine, treat it as public") and quota
+        // burned that way is non-refundable, so NOTHING is hardcoded:
+        // the user pastes their own key here and it lives only in this
+        // device's DataStore. Blank key = feature silently OFF (no calls,
+        // no log spam, zero added latency). Shared keys across BOTH
+        // extensions, exactly like the source toggles above.
+        private const val KEY_PFX = "wiz_key_"
+        const val KEY_WYZIE = "wyzie"
+        const val KEY_MDBLIST = "mdblist"
+
+        fun apiKey(id: String): String? = runCatching {
+            CloudStreamApp.getKey<String>(KEY_PFX + id)?.trim()?.takeIf { it.isNotEmpty() }
+        }.getOrNull()
+
+        fun setApiKey(id: String, value: String) {
+            runCatching {
+                CloudStreamApp.setKey(KEY_PFX + id, value.trim())
+            }
         }
 
         /**
@@ -934,6 +975,8 @@ object WizstreamSources {
 
             // ── Sections + switch rows ────────────────────────────────
             val switches = mutableListOf<android.widget.Switch>()
+            // (v78) key-id → text box, saved together when Done is pressed.
+            val keyEditors = mutableListOf<Pair<String, android.widget.EditText>>()
             val bySection = sources.groupBy { it.section }
             bySection.forEach { (section, group) ->
                 root.addView(android.widget.TextView(context).apply {
@@ -987,11 +1030,116 @@ object WizstreamSources {
                 }
             }
 
+            // ── (v78) INTEGRATIONS: services that need a user API key ────
+            // Rendered as: switch row (same look as a source) + a text box
+            // for the key. Both services REQUIRE a per-user key and Wyzie's
+            // terms forbid shipping one inside an app, so the box is the
+            // only way they can ever be on. Empty box = feature off, no
+            // requests made at all.
+            root.addView(android.widget.TextView(context).apply {
+                text = "INTEGRATIONS   ·  your own API key, stored on this device only"
+                setTextColor(accent)
+                textSize = 12f
+                letterSpacing = 0.12f
+                setTypeface(typeface, android.graphics.Typeface.BOLD)
+                setPadding(0, dp(14), 0, dp(2))
+            })
+
+            fun integrationRow(
+                toggleId: String,
+                keyId: String,
+                title: String,
+                blurb: String,
+                where: String,
+            ) {
+                val on = isEnabled(toggleId)
+                val head = android.widget.LinearLayout(context).apply {
+                    orientation = android.widget.LinearLayout.HORIZONTAL
+                    gravity = android.view.Gravity.CENTER_VERTICAL
+                    setPadding(0, dp(6), 0, 0)
+                }
+                val labels = android.widget.LinearLayout(context).apply {
+                    orientation = android.widget.LinearLayout.VERTICAL
+                    layoutParams = android.widget.LinearLayout.LayoutParams(
+                        0, android.widget.LinearLayout.LayoutParams.WRAP_CONTENT, 1f
+                    )
+                }
+                val name = android.widget.TextView(context).apply {
+                    text = title
+                    setTextColor(if (on) textPrimary else textMuted)
+                    textSize = 15f
+                }
+                labels.addView(name)
+                labels.addView(android.widget.TextView(context).apply {
+                    text = blurb
+                    setTextColor(textMuted)
+                    textSize = 11.5f
+                })
+                val sw = android.widget.Switch(context).apply {
+                    isChecked = on
+                    setOnCheckedChangeListener { _, checked ->
+                        setEnabled(toggleId, checked)
+                        name.setTextColor(if (checked) textPrimary else textMuted)
+                    }
+                }
+                head.addView(labels)
+                head.addView(sw)
+                head.setOnClickListener { sw.toggle() }
+                root.addView(head)
+
+                val edit = android.widget.EditText(context).apply {
+                    setText(apiKey(keyId) ?: "")
+                    hint = "Paste your API key"
+                    setHintTextColor(textMuted)
+                    setTextColor(textPrimary)
+                    textSize = 13f
+                    setSingleLine(true)
+                    setPadding(dp(8), dp(6), dp(8), dp(6))
+                }
+                root.addView(edit)
+                root.addView(android.widget.TextView(context).apply {
+                    text = where
+                    setTextColor(textMuted)
+                    textSize = 11f
+                    setPadding(0, dp(1), 0, dp(4))
+                })
+                keyEditors += keyId to edit
+            }
+
+            integrationRow(
+                "wyziesubs", KEY_WYZIE,
+                "Wyzie Subs",
+                "Subtitles for every source — including BDIX .mkv files",
+                "Free key (1 000/day): store.wyzie.io/redeem",
+            )
+            integrationRow(
+                "mdblist", KEY_MDBLIST,
+                "MDBList ratings",
+                "IMDb · RT · Metacritic · MAL scores on show pages",
+                "Free key (1 000/day): mdblist.com → Preferences",
+            )
+            root.addView(android.widget.TextView(context).apply {
+                text = "Keys are saved when you press Done. They never leave this " +
+                    "device except in requests to that service."
+                setTextColor(textMuted)
+                textSize = 11f
+                setPadding(0, dp(4), 0, dp(2))
+            })
+
             val scroll = android.widget.ScrollView(context).apply { addView(root) }
             android.app.AlertDialog.Builder(context)
                 .setView(scroll)
-                .setPositiveButton("Done", null)
+                // (v78) Done also COMMITS the integration keys.
+                .setPositiveButton("Done") { _, _ ->
+                    keyEditors.forEach { (id, box) ->
+                        setApiKey(id, box.text?.toString().orEmpty())
+                    }
+                }
                 .setNeutralButton("All on") { dlg, _ ->
+                    // (v78) keep typed-but-unsaved keys across the rebuild
+                    keyEditors.forEach { (id, box) ->
+                        setApiKey(id, box.text?.toString().orEmpty())
+                    }
                     sources.forEach { setEnabled(it.id, true) }
                     dlg.dismiss()
                     openDialog(context, sources)
@@ -6433,6 +6581,17 @@ internal object WizEpisodeTable {
         val seasons: Map<Int, Map<Int, EpRow>>,
         val backdropUrl: String?,
         val logoUrl: String?,
+        // (v80) PER-ENTRY LANDSCAPE POOL. AniList files every cour/season/
+        // special as its OWN entry, but TMDB has exactly ONE show-level
+        // backdrop — so every de-stacked entry of a franchise used to show
+        // the IDENTICAL header image (user report: "if the landscape poster
+        // gets fetched in every item it won't look that good").
+        // `/tv/{id}/images` is ALREADY fetched here for the logo and
+        // typically carries dozens of HD backdrops (Attack on Titan: 100 at
+        // ≥1920w, Jujutsu Kaisen 97, Oshi no Ko 20). Ranked best-first, they
+        // are dealt ONE PER ENTRY so each season/part/special gets its own
+        // real key art at zero extra network cost.
+        val backdropPool: List<String> = emptyList(),
     )
 
     private val cache =
@@ -6576,6 +6735,24 @@ internal object WizEpisodeTable {
             ?.let { "https://image.tmdb.org/t/p/w1280$it" }
         val artLogo = logoPath?.let { "https://image.tmdb.org/t/p/w500$it" }
 
+        // (v80) Rank the whole backdrop pool ONCE, best art first:
+        // highest community vote, then widest, then file path for a stable
+        // deterministic order (the same entry must always get the same
+        // image across app restarts — no shuffling headers).
+        val backdropsArr = imagesJson?.optJSONArray("backdrops")
+        val pool = if (backdropsArr == null) emptyList()
+        else (0 until backdropsArr.length())
+            .mapNotNull { backdropsArr.optJSONObject(it) }
+            .filter { (it.optInt("width").takeIf { w -> w > 0 } ?: 0) >= 1280 }
+            .filter { it.optStringOrNullCp("file_path") != null }
+            .sortedWith(
+                compareByDescending<JSONObject> { it.optDouble("vote_average").takeIf { d -> !d.isNaN() } ?: 0.0 }
+                    .thenByDescending { it.optInt("width") }
+                    .thenBy { it.optStringOrNullCp("file_path") ?: "" }
+            )
+            .mapNotNull { it.optStringOrNullCp("file_path") }
+            .map { "https://image.tmdb.org/t/p/w1280$it" }
+
         fun rowOf(e: JSONObject): EpRow = EpRow(
             name = e.optStringOrNullCp("name"),
             overview = e.optStringOrNullCp("overview"),
@@ -6656,6 +6833,327 @@ internal object WizEpisodeTable {
         val tableSeasons = out.mapValues { (_, rows) ->
             rows.mapIndexed { idx, r -> (idx + 1) to r }.toMap()
         }
-        return Table(tableSeasons, artBackdrop, artLogo)
+        return Table(tableSeasons, artBackdrop, artLogo, pool)
+    }
+
+    /**
+     * (v80) Pick a DISTINCT landscape header for ONE de-stacked entry.
+     *
+     * The problem: AniList has no stacked items — every season, cour part and
+     * long special is its own entry — while TMDB has a single show-level
+     * backdrop, so all of them rendered the same header image.
+     *
+     * TMDB has no per-season backdrops either (`/tv/{id}/season/{n}/images`
+     * returns POSTERS only — verified live), so the fix is a priority chain
+     * that is deterministic, offline-provable and costs no extra requests:
+     *
+     *   A. the show's backdrop POOL, dealt one-per-entry by [entryIndex]
+     *      (real key art, ranked best-first, never repeats);
+     *   B. else the best-voted EPISODE STILL from inside this entry's OWN
+     *      stacked episode window (always season-accurate, and every season
+     *      has them — AoT S1 25/25, S3 22/22, S4 28/28);
+     *   C. else the shared show backdrop (previous behaviour, last resort).
+     *
+     * @param entryIndex position of this entry in its franchise (0-based,
+     *        oldest first) — the deal index into the pool.
+     * @param season     this entry's STACKED season number.
+     * @param epFrom/epTo this entry's stacked episode window (inclusive).
+     */
+    fun entryBackdrop(
+        table: Table?,
+        entryIndex: Int,
+        season: Int?,
+        epFrom: Int?,
+        epTo: Int?,
+    ): String? {
+        if (table == null) return null
+        // A — deal a distinct pool image to this entry.
+        table.backdropPool.getOrNull(entryIndex)?.let { return it }
+        // B — best-voted still inside this entry's own window.
+        if (season != null && epFrom != null && epTo != null) {
+            val rows = table.seasons[season]
+            if (rows != null) {
+                val best = rows.entries
+                    .filter { it.key in epFrom..epTo }
+                    .mapNotNull { e -> e.value.stillUrl?.let { u -> u to (e.value.score ?: 0.0) } }
+                    .maxByOrNull { it.second }
+                    ?.first
+                // Stills are w780 in the table; ask for the wide variant so
+                // the header isn't upscaled.
+                if (best != null) return best.replace("/t/p/w780", "/t/p/w1280")
+            }
+        }
+        // C — shared show backdrop (what every entry used to get).
+        return table.backdropUrl
+    }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  (v78) WizWyzieSubs — Wyzie Subs subtitle integration (sub.wyzie.io)
+// ═════════════════════════════════════════════════════════════════════════════
+//
+// Wyzie is a subtitle-scraping API keyed by IMDB or TMDB id, which is exactly
+// what every Wizstream page already carries — so it works for BDIX .mkv files
+// (which expose no subtitle track to the player), for web sources, and for
+// anime alike, independently of where the video itself came from.
+//
+//   GET https://sub.wyzie.io/search?id=<tt…|tmdbId>[&season=&episode=]
+//                                  [&language=][&format=]&key=<KEY>
+//
+// Response = a JSON ARRAY of objects: { url, display, language, format,
+// isHearingImpaired, source, encoding, … }. `url` is a ready-to-play
+// subtitle file, so each entry maps 1:1 onto a Cloudstream SubtitleFile.
+//
+// KEY POLICY: a key is REQUIRED by the service and is NEVER shipped in this
+// extension — the user pastes their own into Settings (WizSourcePrefs
+// KEY_WYZIE). No key = this whole object no-ops instantly.
+
+// (v78) File-level aliases: the integration objects below live at TOP level
+// (outside the WizstreamSources object), so they cannot see its PRIVATE
+// TAG/UA constants. Same values, one place.
+private const val WIZ_TAG = "WizstreamSources"
+private const val WIZ_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+
+internal object WizWyzieSubs {
+    private const val API = "https://sub.wyzie.io/search"
+    private const val LABEL = "Wyzie"
+    private const val TIMEOUT_MS = 8_000
+    // Free tier is 1 000 requests/day — a short cache keeps rapid
+    // re-taps/rotations of the same episode from spending quota twice.
+    private const val CACHE_MS = 10 * 60 * 1000L
+    private const val MAX_SUBS = 40
+
+    private val cache =
+        java.util.concurrent.ConcurrentHashMap<String, Pair<Long, List<Pair<String, String>>>>()
+
+    /** True when the user has pasted a key. */
+    fun enabled(): Boolean =
+        WizstreamSources.WizSourcePrefs.isEnabled("wyziesubs") &&
+            WizstreamSources.WizSourcePrefs.apiKey(WizstreamSources.WizSourcePrefs.KEY_WYZIE) != null
+
+    /**
+     * Fetch and emit subtitles for one episode/movie. Fail-soft in every
+     * direction: no key, no ids, HTTP error, malformed body or zero results
+     * all just return quietly — a subtitle service must never be able to
+     * break link resolution.
+     */
+    suspend fun emit(
+        app: Requests,
+        imdbId: String?,
+        tmdbId: Int?,
+        season: Int?,
+        episode: Int?,
+        subtitleCallback: (SubtitleFile) -> Unit,
+    ) {
+        val key = WizstreamSources.WizSourcePrefs.apiKey(WizstreamSources.WizSourcePrefs.KEY_WYZIE) ?: return
+        if (!WizstreamSources.WizSourcePrefs.isEnabled("wyziesubs")) return
+        // IMDB id preferred (Wyzie matches it most reliably); TMDB accepted.
+        val id = imdbId?.takeIf { it.startsWith("tt") } ?: tmdbId?.takeIf { it > 0 }?.toString()
+        if (id.isNullOrBlank()) return
+
+        val ck = "$id|$season|$episode"
+        val now = System.currentTimeMillis()
+        cache[ck]?.let { (ts, subs) ->
+            if (now - ts < CACHE_MS) {
+                Log.d(WIZ_TAG, "Wyzie: cache hit $ck (${subs.size} sub(s))")
+                subs.forEach { (lang, url) -> runCatching { subtitleCallback(SubtitleFile(lang, url)) } }
+                return
+            }
+        }
+
+        val sb = StringBuilder("$API?id=${WizstreamSources.encodeUrl(id)}")
+        if (season != null && episode != null && season > 0 && episode > 0) {
+            sb.append("&season=").append(season).append("&episode=").append(episode)
+        }
+        sb.append("&key=").append(WizstreamSources.encodeUrl(key))
+        val url = sb.toString()
+
+        val body = runCatching {
+            val res = app.get(
+                url,
+                headers = mapOf("User-Agent" to WIZ_UA, "Accept" to "application/json"),
+                timeout = TIMEOUT_MS.toLong(),
+            )
+            if (res.code !in 200..299) {
+                // 401/403 = bad or exhausted key: say so ONCE, plainly.
+                Log.w(WIZ_TAG, "Wyzie: HTTP ${res.code} — " + when (res.code) {
+                    401, 403 -> "key rejected (check Settings → Integrations)"
+                    429 -> "daily quota exhausted"
+                    else -> "service error"
+                })
+                null
+            } else res.text
+        }.getOrNull() ?: return
+
+        val arr = runCatching { JSONArray(body.trim()) }.getOrNull() ?: run {
+            Log.w(WIZ_TAG, "Wyzie: response was not a JSON array")
+            return
+        }
+
+        val out = ArrayList<Pair<String, String>>()
+        for (i in 0 until arr.length().coerceAtMost(MAX_SUBS)) {
+            val o = arr.optJSONObject(i) ?: continue
+            val subUrl = o.optStringOrNullCp("url") ?: continue
+            val display = o.optStringOrNullCp("display")
+                ?: o.optStringOrNullCp("language") ?: "Unknown"
+            val hi = o.optBoolean("isHearingImpaired", false)
+            val fmt = o.optStringOrNullCp("format")?.uppercase()
+            val src = o.optStringOrNullCp("source")
+            // Label carries language first (the app sorts/labels by it),
+            // then the useful qualifiers. NEVER a resolution — house rule.
+            val label = buildString {
+                append("[$LABEL] ").append(display)
+                if (hi) append(" · HI")
+                if (fmt != null) append(" · ").append(fmt)
+                if (src != null) append(" · ").append(src)
+            }
+            out += label to subUrl
+        }
+        if (out.isEmpty()) {
+            Log.d(WIZ_TAG, "Wyzie: no subtitles for id=$id s=$season e=$episode")
+            return
+        }
+        cache[ck] = now to out
+        out.forEach { (lang, u) -> runCatching { subtitleCallback(SubtitleFile(lang, u)) } }
+        Log.i(WIZ_TAG, "Wyzie: emitted ${out.size} subtitle(s) for id=$id s=$season e=$episode")
+    }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  (v78) WizMdbList — MDBList ratings integration (api.mdblist.com)
+// ═════════════════════════════════════════════════════════════════════════════
+//
+// IMPORTANT, DOCUMENTED FINDING: MDBList is a RATINGS + LISTS api, NOT an
+// artwork api. Its published OpenAPI schema (api.mdblist.com/schema/) contains
+// ZERO `backdrop`, `logo` or `fanart` fields; the only `poster` is
+// `append_to_response=poster` on LIST endpoints ("up to 5 cached list
+// posters" = list thumbnails, not show art). The media endpoint returns
+// id / imdb_id / title / year / type / score / ratings / streams.
+// So logo + landscape art keep coming from TMDB (WizEpisodeTable already
+// fetches both), and MDBList is integrated for what it actually serves:
+// aggregated ratings from IMDb, TMDb, Trakt, Letterboxd, RogerEbert,
+// Rotten Tomatoes, Metacritic and MyAnimeList.
+//
+//   GET https://api.mdblist.com/{provider}/{type}/{id}/?apikey=<KEY>
+//       provider ∈ imdb|tmdb|tvdb|trakt|mal|mdblist ; type ∈ movie|show|any
+//
+// KEY POLICY: same as Wyzie — user-supplied, never bundled. No key = OFF.
+internal object WizMdbList {
+    private const val API = "https://api.mdblist.com"
+    private const val TIMEOUT_MS = 8_000L
+    private const val CACHE_MS = 6 * 60 * 60 * 1000L   // ratings barely move
+    private const val NEG_CACHE_MS = 10 * 60 * 1000L
+
+    class Ratings(
+        /** 0-10 normalised aggregate for the page's score ring, or null. */
+        val score10: Double?,
+        /** Pretty one-line summary for the plot header. */
+        val line: String?,
+    )
+
+    private val cache =
+        java.util.concurrent.ConcurrentHashMap<String, Pair<Long, Ratings?>>()
+
+    fun enabled(): Boolean =
+        WizstreamSources.WizSourcePrefs.isEnabled("mdblist") &&
+            WizstreamSources.WizSourcePrefs.apiKey(WizstreamSources.WizSourcePrefs.KEY_MDBLIST) != null
+
+    /** Pretty source names for the ratings line. */
+    private val NICE = mapOf(
+        "imdb" to "IMDb", "tmdb" to "TMDb", "trakt" to "Trakt",
+        "letterboxd" to "Letterboxd", "tomatoes" to "RT",
+        "audience" to "RT Audience", "metacritic" to "Metacritic",
+        "myanimelist" to "MAL", "roger_ebert" to "Ebert",
+    )
+
+    /**
+     * Aggregated ratings for one title. Fail-soft: any error → null, and the
+     * page renders exactly as it does today.
+     */
+    suspend fun ratings(
+        app: Requests,
+        imdbId: String?,
+        tmdbId: Int?,
+        isMovie: Boolean,
+    ): Ratings? {
+        val key = WizstreamSources.WizSourcePrefs.apiKey(WizstreamSources.WizSourcePrefs.KEY_MDBLIST) ?: return null
+        if (!WizstreamSources.WizSourcePrefs.isEnabled("mdblist")) return null
+        val provider: String
+        val id: String
+        when {
+            !imdbId.isNullOrBlank() && imdbId.startsWith("tt") -> {
+                provider = "imdb"; id = imdbId
+            }
+            tmdbId != null && tmdbId > 0 -> {
+                provider = "tmdb"; id = tmdbId.toString()
+            }
+            else -> return null
+        }
+        val type = if (isMovie) "movie" else "show"
+        val ck = "$provider|$type|$id"
+        val now = System.currentTimeMillis()
+        cache[ck]?.let { (ts, v) ->
+            if (now - ts < (if (v == null) NEG_CACHE_MS else CACHE_MS)) return v
+        }
+
+        val url = "$API/$provider/$type/$id/?apikey=${WizstreamSources.encodeUrl(key)}"
+        val parsed = runCatching {
+            val res = app.get(
+                url,
+                headers = mapOf("User-Agent" to WIZ_UA, "Accept" to "application/json"),
+                timeout = TIMEOUT_MS,
+            )
+            if (res.code !in 200..299) {
+                Log.w(WIZ_TAG, "MDBList: HTTP ${res.code} — " + when (res.code) {
+                    401, 403 -> "key rejected (check Settings → Integrations)"
+                    429 -> "daily quota exhausted"
+                    else -> "service error"
+                })
+                return@runCatching null
+            }
+            val o = JSONObject(res.text)
+            val arr = o.optJSONArray("ratings")
+            val parts = ArrayList<String>()
+            var imdbVal: Double? = null
+            if (arr != null) {
+                for (i in 0 until arr.length()) {
+                    val r = arr.optJSONObject(i) ?: continue
+                    val srcName = r.optStringOrNullCp("source") ?: continue
+                    // `value` is on the source's own scale (IMDb 0-10,
+                    // RT/Metacritic 0-100, …) — shown verbatim, which is
+                    // what a ratings line should do.
+                    val v = r.opt("value")
+                    val num = when (v) {
+                        is Number -> v.toDouble()
+                        is String -> v.toDoubleOrNull()
+                        else -> null
+                    } ?: continue
+                    if (num <= 0.0) continue
+                    if (srcName.equals("imdb", true)) imdbVal = num
+                    val nice = NICE[srcName.lowercase()] ?: srcName
+                    val shown = if (num == Math.floor(num)) num.toInt().toString()
+                        else String.format(java.util.Locale.US, "%.1f", num)
+                    parts += "$nice $shown"
+                }
+            }
+            // Page score ring: prefer IMDb (already 0-10), else MDBList's
+            // own `score` field, which it publishes as a 0-100 percentage.
+            val score10 = imdbVal
+                ?: o.opt("score")?.let { s ->
+                    when (s) {
+                        is Number -> s.toDouble()
+                        is String -> s.toDoubleOrNull()
+                        else -> null
+                    }
+                }?.takeIf { it > 0 }?.let { if (it > 10.0) it / 10.0 else it }
+            if (parts.isEmpty() && score10 == null) null
+            else Ratings(score10, parts.takeIf { it.isNotEmpty() }?.joinToString("  ·  "))
+        }.getOrNull()
+        cache[ck] = now to parsed
+        if (parsed != null) {
+            Log.i(WIZ_TAG, "MDBList: $ck → ${parsed.line ?: "score only"}")
+        }
+        return parsed
     }
 }

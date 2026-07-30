@@ -83,6 +83,54 @@ private fun JSONArray.toActorsWz(limit: Int = 20): List<ActorData> =
         ActorData(Actor(name, profile), roleString = role ?: "")
     }.take(limit)
 
+/**
+ * (v79) DIRECTOR(s) pinned to the front of the cast row.
+ *
+ * User asked for director+cast "from MDBList". Verified against MDBList's own
+ * OpenAPI schema (api.mdblist.com/schema/ — `director`/`cast`/`crew`/`writer`
+ * = ZERO matches) and against a real-world client written on live responses
+ * (luckylittle/mdblist-cli MediaInfo struct: title/year/released/description/
+ * runtime/score/ids/ratings/streams/watch_providers/language/country/
+ * certification/status/trailer/poster/backdrop/reviews/keywords): MDBList
+ * serves NO credits of any kind. Its only people endpoint, /people/dates,
+ * maps TMDb person IDs to birthday/deathday and cannot name anyone.
+ *
+ * TMDB has it, and we ALREADY pay for it: `append_to_response=credits` is in
+ * the detail request, so `credits.crew` is sitting in the response unused.
+ * Zero extra network calls, no new API key.
+ *
+ * Movies → job == "Director". TV → TMDB usually leaves `crew` thin and puts
+ * the showrunner in `created_by`, so that is used as the fallback.
+ */
+private fun pickDirectorsWz(
+    credits: JSONObject?,
+    createdBy: JSONArray?,
+    limit: Int = 2,
+): List<ActorData> {
+    val out = LinkedHashMap<String, ActorData>()   // de-dupe, keep order
+    fun add(o: JSONObject?, role: String) {
+        val c = o ?: return
+        val name = c.optStringOrNullWz("name") ?: c.optStringOrNullWz("original_name") ?: return
+        if (out.containsKey(name)) return
+        val profile = c.optStringOrNullWz("profile_path").toTmdbImg("w185")
+        out[name] = ActorData(Actor(name, profile), roleString = role)
+    }
+    credits?.optJSONArray("crew")?.let { crew ->
+        for (i in 0 until crew.length()) {
+            val c = crew.optJSONObject(i) ?: continue
+            if (c.optStringOrNullWz("job").equals("Director", true)) add(c, "Director")
+            if (out.size >= limit) break
+        }
+    }
+    if (out.isEmpty() && createdBy != null) {
+        for (i in 0 until createdBy.length()) {
+            add(createdBy.optJSONObject(i), "Creator")
+            if (out.size >= limit) break
+        }
+    }
+    return out.values.take(limit)
+}
+
 private fun pickLogoWz(logos: JSONArray?): String? {
     if (logos == null || logos.length() == 0) return null
     var enSvg: String? = null; var anyPng: String? = null
@@ -410,6 +458,22 @@ class WizstreamProvider : MainAPI() {
         val isAnime = detail.isAnime
         val enrich = if (isAnime) fetchAnimeEnrich(tmdbId) else null
 
+        // (v78) MDBList aggregated ratings (IMDb/RT/Metacritic/MAL/…).
+        // Opt-in: no user API key in Settings → this is null and the page
+        // renders exactly as before. Never throws, never blocks playback.
+        val mdb = if (WizMdbList.enabled()) {
+            runCatching {
+                WizMdbList.ratings(
+                    app, imdbId, tmdbId, mediaType == "movie"
+                )
+            }.getOrNull()
+        } else null
+        // MDBList's aggregate replaces TMDB's lone vote average when present
+        // (that is the entire point of the integration); its per-source line
+        // is prepended to the description.
+        val ratingOut = mdb?.score10 ?: rating
+        val plotOut = mdb?.line?.let { line -> "⭐ $line\n\n" + (plot ?: "") } ?: plot
+
         return if (mediaType == "movie") {
             val data = LinkContext(
                 imdbId = imdbId,
@@ -428,14 +492,28 @@ class WizstreamProvider : MainAPI() {
                 title, url, if (isAnime) TvType.AnimeMovie else TvType.Movie, data
             ) {
                 this.posterUrl = posterUrl
-                this.backgroundPosterUrl = enrich?.bannerUrl ?: backdropUrl
-                this.plot = plot
+                // (v80, user preference) TMDB landscape FIRST — AniList's banner
+                // quality was called out as poor; it stays only as the
+                // fallback for shows TMDB has no backdrop for. (This page is
+                // one-per-show, so there is no per-entry duplication to solve
+                // here — that fix lives in the de-stacked anime module.)
+                this.backgroundPosterUrl = backdropUrl ?: enrich?.bannerUrl
+                this.plot = plotOut
                 this.year = year
                 this.duration = detail.runtime
                 this.tags = tags
                 this.recommendations = detail.recommendations
-                runCatching { rating?.let { score = Score.from10(it) } }
-                runCatching { (enrich?.actors ?: actors)?.let { this.actors = it } }
+                runCatching { ratingOut?.let { score = Score.from10(it) } }
+                runCatching {
+                    // (v79) This movie branch serves BOTH live-action and
+                    // ANIME movies, so the director is gated on isAnime:
+                    // live-action → director pinned first; anime → AniList
+                    // JA voice cast, falling back to the DIRECTOR-FREE TMDB
+                    // cast (user rule: "not for the animes").
+                    val people = if (isAnime) (enrich?.actors ?: detail.castNoDirector)
+                        else actors
+                    people?.let { this.actors = it }
+                }
                 runCatching { trailerUrl?.let { addTrailer(it) } }
                 runCatching { logoUrl?.let { this.logoUrl = it } }
                 runCatching { imdbId?.let { addImdbId(it) } }
@@ -498,13 +576,22 @@ class WizstreamProvider : MainAPI() {
                 // tracking ids, banner art and the JA cast.
                 newAnimeLoadResponse(title, url, TvType.Anime) {
                     this.posterUrl = posterUrl
-                    this.backgroundPosterUrl = enrich?.bannerUrl ?: backdropUrl
-                    this.plot = plot
+                    // (v80, user preference) TMDB landscape FIRST — AniList's banner
+                // quality was called out as poor; it stays only as the
+                // fallback for shows TMDB has no backdrop for. (This page is
+                // one-per-show, so there is no per-entry duplication to solve
+                // here — that fix lives in the de-stacked anime module.)
+                this.backgroundPosterUrl = backdropUrl ?: enrich?.bannerUrl
+                    this.plot = plotOut
                     this.year = year
                     this.tags = tags
                     this.recommendations = detail.recommendations
-                    runCatching { rating?.let { score = Score.from10(it) } }
-                    runCatching { (enrich?.actors ?: actors)?.let { this.actors = it } }
+                    runCatching { ratingOut?.let { score = Score.from10(it) } }
+                    runCatching {
+                    // (v79) anime page: AniList JA voice cast, else the
+                    // DIRECTOR-FREE TMDB cast (user rule: no director on anime).
+                    (enrich?.actors ?: detail.castNoDirector)?.let { this.actors = it }
+                }
                     runCatching { trailerUrl?.let { addTrailer(it) } }
                     runCatching { logoUrl?.let { this.logoUrl = it } }
                     runCatching { imdbId?.let { addImdbId(it) } }
@@ -518,11 +605,11 @@ class WizstreamProvider : MainAPI() {
                 newTvSeriesLoadResponse(title, url, TvType.TvSeries, episodesAll) {
                     this.posterUrl = posterUrl
                     this.backgroundPosterUrl = backdropUrl
-                    this.plot = plot
+                    this.plot = plotOut
                     this.year = year
                     this.tags = tags
                     this.recommendations = detail.recommendations
-                    runCatching { rating?.let { score = Score.from10(it) } }
+                    runCatching { ratingOut?.let { score = Score.from10(it) } }
                     runCatching { actors?.let { this.actors = it } }
                     runCatching { trailerUrl?.let { addTrailer(it) } }
                     runCatching { logoUrl?.let { this.logoUrl = it } }
@@ -750,6 +837,12 @@ class WizstreamProvider : MainAPI() {
         val imdbId: String?,
         val simklId: Int?,
         val actors: List<ActorData>?,
+        // (v79) The SAME people row WITHOUT the pinned director(s). Anime
+        // pages use this: they normally show AniList's Japanese VA cast, but
+        // when that enrichment fails they fall back to TMDB — and the user's
+        // rule is "director, but not for the animes", so the fallback must
+        // stay director-free too.
+        val castNoDirector: List<ActorData>?,
         val trailerUrl: String?,
         val seasons: List<Int>,
         val recommendations: List<SearchResponse>,
@@ -793,7 +886,16 @@ class WizstreamProvider : MainAPI() {
         val imdbId = detail.optJSONObject("external_ids")?.optStringOrNullWz("imdb_id")
             ?.takeIf { it.startsWith("tt") }
         val simklId = fetchSimklId(imdbId, mediaType)
-        val actors = detail.optJSONObject("credits")?.optJSONArray("cast")?.toActorsWz()
+        // (v79) Director(s) FIRST, then the cast — one list, because the app
+        // renders exactly one people row. Anime pages are excluded at the
+        // call site (they use AniList's Japanese VA cast by design).
+        val castOnly = detail.optJSONObject("credits")?.optJSONArray("cast")?.toActorsWz()
+        val directors = pickDirectorsWz(
+            detail.optJSONObject("credits"),
+            detail.optJSONArray("created_by"),
+        )
+        val actors = if (directors.isEmpty()) castOnly
+        else directors + (castOnly ?: emptyList())
         val seasons = if (mediaType == "tv") {
             detail.optJSONArray("seasons")
                 ?.let { arr ->
@@ -843,6 +945,7 @@ class WizstreamProvider : MainAPI() {
             imdbId = imdbId,
             simklId = simklId,
             actors = actors,
+            castNoDirector = castOnly,
             trailerUrl = trailerUrl,
             seasons = seasons.ifEmpty { if (mediaType == "tv") listOf(1) else emptyList() },
             recommendations = recs,
