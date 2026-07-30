@@ -10,7 +10,7 @@
 
 [![Cloudstream](https://img.shields.io/badge/Cloudstream-extension-blueviolet?logo=android)](https://github.com/recloudstream/cloudstream)
 [![Extensions](https://img.shields.io/badge/extensions-9-success)](#-the-extensions)
-[![Latest build](https://img.shields.io/badge/Wizstream-v75-orange)](#-changelog)
+[![Latest build](https://img.shields.io/badge/Wizstream-v76-orange)](#-changelog)
 
 ---
 
