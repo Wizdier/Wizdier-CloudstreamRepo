@@ -14,17 +14,18 @@ import com.wizdier.WizstreamSources.BingrResolver
 import com.wizdier.WizstreamSources.MoonflixResolver
 
 /**
- * WizstreamPlugin — ONE extension hosting the main catalogue (since v54),
- * StreamPlay-style:
+ * WizstreamPlugin — ONE extension hosting BOTH catalogues,
+ * StreamPlay-style (single install → two sources):
  *
  *   • WizstreamProvider — the TMDB catalogue (movies, TV series, Asian
  *     drama, cartoons). Japanese-animation pages are ENRICHED from AniList
  *     (via api.ani.zip mapping + GraphQL): MAL/AniList/Kitsu tracking ids,
  *     AniList banner art, Japanese voice-actor cast.
- *
- * (v56) The AniList catalogue is NOT bundled here anymore — it lives in
- * the separate WizstreamAnime module (PURE AniList metadata, registered
- * there as "Wizstream-Anime").
+ *   • WizstreamAnimeProvider ("Wizstream-Anime" in-app) — the PURE
+ *     AniList-metadata catalogue. (v81) BOUND into this single install;
+ *     (v82) the separate WizstreamAnime extension module is RETIRED — the
+ *     provider + resolvers now live here permanently, no build-time
+ *     mirroring anywhere.
  *
  * Link resolution comes from the bundled `WizstreamSources` resolver
  * engine: BDIX sources (Cineplex BD, FTPBD, Circle FTP, CTGMovies, FM FTP,

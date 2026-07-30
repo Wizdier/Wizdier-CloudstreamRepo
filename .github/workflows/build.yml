@@ -67,6 +67,49 @@ jobs:
           echo "--- Final artefacts ---"
           ls -la builds/
 
+      # (v82) Fail loudly on a partial/broken build instead of publishing a
+      # half-update to the repo index. Checks: at least one package exists,
+      # every package carries a real manifest version, the Wizstream entry
+      # is in the index, and the retired separate WizstreamAnime module is
+      # NOT (it would make the anime catalogue appear twice in-app).
+      - name: Sanity-check artefacts
+        run: |
+          set -euo pipefail
+          count=$(ls builds/*.cs3 2>/dev/null | wc -l)
+          echo "cs3 count: $count"
+          if [ "$count" -lt 1 ]; then
+            echo "::error::no .cs3 packages were produced"
+            exit 1
+          fi
+          for f in builds/*.cs3; do
+            ver=$(unzip -p "$f" manifest.json | grep -o '"version":[0-9]*' | head -1)
+            echo "$f -> $ver"
+            if [ -z "$ver" ]; then
+              echo "::error::$f has no readable manifest version"
+              exit 1
+            fi
+          done
+          if ! grep -q 'Wizstream' builds/plugins.json; then
+            echo "::error::plugins.json is missing the Wizstream entry"
+            exit 1
+          fi
+          if grep -q 'WizstreamAnime' builds/plugins.json; then
+            echo "::error::retired WizstreamAnime module still in plugins.json (v82 ships ONE extension)"
+            exit 1
+          fi
+          echo "--- plugins.json ---"
+          cat builds/plugins.json
+
+      # (v82) Archive every build's artefacts as a workflow artifact too, so
+      # the published packages never depend on a single deploy step working.
+      - name: Archive build artefacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: wizstream-builds
+          path: builds/
+          retention-days: 30
+          if-no-files-found: error
+
       - name: Deploy to 'builds' branch
         uses: peaceiris/actions-gh-pages@v4
         with:

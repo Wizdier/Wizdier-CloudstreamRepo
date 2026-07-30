@@ -8,7 +8,7 @@
 
 [![CloudStream](https://img.shields.io/badge/CloudStream-extension-blueviolet?logo=android)](https://github.com/recloudstream/cloudstream)
 [![Extensions](https://img.shields.io/badge/extensions-8-success)](#-whats-inside)
-[![Latest build](https://img.shields.io/badge/Wizstream-v81-orange)](CHANGELOG.md)
+[![Latest build](https://img.shields.io/badge/Wizstream-v82-orange)](CHANGELOG.md)
 
 ---
 
@@ -26,6 +26,12 @@
 **That single install gives you both catalogues** — the main Movies/TV
 catalogue *and* the dedicated Anime catalogue. You don't need to hunt for a
 second extension; they ship bound together and share one settings screen.
+
+> ⚠️ **Migrating from v81 or earlier?** If you previously installed the
+> separate **Wizstream Anime** extension, uninstall it after updating
+> (*Settings → Extensions → Wizstream Anime → Delete*). The single v82
+> Wizstream extension registers the same `Wizstream` and `Wizstream-Anime`
+> sources — keeping the old package would show the anime catalogue twice.
 
 ---
 
