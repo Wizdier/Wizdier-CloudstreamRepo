@@ -35,6 +35,12 @@ import com.wizdier.WizstreamSources.MoonflixResolver
 class WizstreamPlugin : Plugin() {   // (v68) app-side Plugin ⇒ openSettings button
     override fun load() {
         registerMainAPI(WizstreamProvider())
+        // (v81) BOUND: one install now provides BOTH catalogues. The
+        // separate "Wizstream-Anime" extension no longer has to be found
+        // and installed by hand — installing Wizstream registers the pure
+        // AniList anime catalogue too, under its same in-app name, so
+        // existing pages/bookmarks/tracking keep resolving unchanged.
+        registerMainAPI(WizstreamAnimeProvider())
 
         // VsEmbed handles vidsrc.to / vidsrc.mov / vidsrc-embed.su /
         // vidsrc.me redirects (they all 302 to vsembed.ru).

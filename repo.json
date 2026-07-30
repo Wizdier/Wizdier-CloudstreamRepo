@@ -1,6 +1,6 @@
 {
     "name": "Wizdier BDIX Repository",
-    "description": "9 extensions: Wizstream — the main catalogue (TMDB with StreamPlay-style AniList enrichment for anime) & WizstreamAnime (\"Wizstream-Anime\" in-app) — the PURE AniList-metadata anime catalogue, zero TMDB — sharing one BDIX + web source engine, plus Circle FTP, Cineplex BD, CTGMovies, FTPBD, FlixHub, FM FTP & Mediaserver standalone BDIX sources. MAL, AniList, Kitsu & Simkl tracking. Health-checked 2026-07-25.",
+    "description": "Free movies, series & anime for CloudStream, built for Bangladesh. Install Wizstream — one extension that gives you BOTH the main Movies/TV catalogue and a dedicated AniList-powered Anime catalogue, backed by six BDIX servers (Circle FTP, Cineplex BD, FTPBD, CTGMovies, FM FTP, Mediaserver) with Cineby/Bingr/Moonflix as web backup. Dead-link pruning, correct multi-season anime episode mapping, AniList/MAL/Kitsu/Simkl tracking, plus optional Wyzie subtitles and MDBList ratings. Seven standalone BDIX extensions also included.",
     "manifestVersion": 1,
     "pluginLists": [
         "https://raw.githubusercontent.com/Wizdier/Wizdier-CloudstreamRepo/builds/plugins.json"

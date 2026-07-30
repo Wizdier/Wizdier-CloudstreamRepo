@@ -951,49 +951,146 @@ object WizstreamSources {
             val dm = context.resources.displayMetrics.density
             fun dp(v: Int) = (v * dm).toInt()
             val accent = 0xFF9C6BFF.toInt()      // Cloudstream-ish violet
+            val accentDim = 0x339C6BFF.toInt()
             val textPrimary = 0xFFF1F1F1.toInt()
             val textMuted = 0xFF9AA0A6.toInt()
+            val cardBg = 0xFF17181C.toInt()
+            val chipOn = 0xFF1F6F43.toInt()
+            val chipOff = 0xFF5A2230.toInt()
+
+            /** Rounded card container — the extension ships no XML/drawables,
+             *  so every shape is built with GradientDrawable at runtime. */
+            fun card(): android.widget.LinearLayout =
+                android.widget.LinearLayout(context).apply {
+                    orientation = android.widget.LinearLayout.VERTICAL
+                    background = android.graphics.drawable.GradientDrawable().apply {
+                        setColor(cardBg)
+                        cornerRadius = dp(14).toFloat()
+                        setStroke(dp(1), 0x22FFFFFF)
+                    }
+                    setPadding(dp(14), dp(10), dp(14), dp(12))
+                    layoutParams = android.widget.LinearLayout.LayoutParams(
+                        android.widget.LinearLayout.LayoutParams.MATCH_PARENT,
+                        android.widget.LinearLayout.LayoutParams.WRAP_CONTENT
+                    ).apply { topMargin = dp(10) }
+                }
+
+            fun pill(text: String, bg: Int): android.widget.TextView =
+                android.widget.TextView(context).apply {
+                    this.text = text
+                    setTextColor(textPrimary)
+                    textSize = 11f
+                    setPadding(dp(9), dp(3), dp(9), dp(3))
+                    background = android.graphics.drawable.GradientDrawable().apply {
+                        setColor(bg); cornerRadius = dp(999).toFloat()
+                    }
+                }
 
             val root = android.widget.LinearLayout(context).apply {
                 orientation = android.widget.LinearLayout.VERTICAL
-                setPadding(dp(20), dp(12), dp(16), dp(4))
+                setPadding(dp(18), dp(14), dp(18), dp(6))
             }
 
             // ── Header ────────────────────────────────────────────────
             root.addView(android.widget.TextView(context).apply {
-                text = "⚙  Sources"
+                text = "⚙  Wizstream Settings"
                 setTextColor(textPrimary)
-                textSize = 20f
+                textSize = 21f
                 setTypeface(typeface, android.graphics.Typeface.BOLD)
             })
-            root.addView(android.widget.TextView(context).apply {
-                text = "Flip a switch — it applies on the very next episode you tap. No restart needed."
+            val summary = android.widget.TextView(context).apply {
                 setTextColor(textMuted)
                 textSize = 12.5f
-                setPadding(0, dp(2), 0, dp(8))
+                setPadding(0, dp(3), 0, dp(2))
+            }
+            root.addView(summary)
+            root.addView(android.widget.TextView(context).apply {
+                text = "Changes apply on the very next episode you tap — no restart."
+                setTextColor(textMuted)
+                textSize = 11.5f
+                setPadding(0, 0, 0, dp(2))
             })
 
-            // ── Sections + switch rows ────────────────────────────────
+            // ── Live filter box ───────────────────────────────────────
+            val search = android.widget.EditText(context).apply {
+                hint = "Search sources…"
+                setHintTextColor(textMuted)
+                setTextColor(textPrimary)
+                textSize = 13f
+                setSingleLine(true)
+                setPadding(dp(12), dp(8), dp(12), dp(8))
+                background = android.graphics.drawable.GradientDrawable().apply {
+                    setColor(cardBg)
+                    cornerRadius = dp(10).toFloat()
+                    setStroke(dp(1), accentDim)
+                }
+                layoutParams = android.widget.LinearLayout.LayoutParams(
+                    android.widget.LinearLayout.LayoutParams.MATCH_PARENT,
+                    android.widget.LinearLayout.LayoutParams.WRAP_CONTENT
+                ).apply { topMargin = dp(10) }
+            }
+            root.addView(search)
+
             val switches = mutableListOf<android.widget.Switch>()
-            // (v78) key-id → text box, saved together when Done is pressed.
             val keyEditors = mutableListOf<Pair<String, android.widget.EditText>>()
+            // row view + its source, so the filter can hide/show and the
+            // header counters can refresh without rebuilding the dialog.
+            val rowIndex = mutableListOf<Triple<Src, android.view.View, android.widget.TextView>>()
+            val sectionCards = mutableListOf<Triple<String, android.view.View, android.widget.TextView>>()
+
+            fun refreshSummary() {
+                val on = sources.count { isEnabled(it.id) }
+                summary.text = "$on of ${sources.size} sources enabled"
+                sectionCards.forEach { (sec, _, counter) ->
+                    val g = sources.filter { it.section == sec }
+                    counter.text = "${g.count { isEnabled(it.id) }}/${g.size}"
+                }
+            }
+
+            // ── Section cards + switch rows ───────────────────────────
             val bySection = sources.groupBy { it.section }
             bySection.forEach { (section, group) ->
-                root.addView(android.widget.TextView(context).apply {
-                    text = section + if (section.contains("BDIX"))
-                        "   ·  needs a BDIX ISP connection" else ""
+                val c = card()
+                val head = android.widget.LinearLayout(context).apply {
+                    orientation = android.widget.LinearLayout.HORIZONTAL
+                    gravity = android.view.Gravity.CENTER_VERTICAL
+                }
+                head.addView(android.widget.TextView(context).apply {
+                    text = section
                     setTextColor(accent)
                     textSize = 12f
-                    letterSpacing = 0.12f
+                    letterSpacing = 0.10f
                     setTypeface(typeface, android.graphics.Typeface.BOLD)
-                    setPadding(0, dp(10), 0, dp(2))
+                    layoutParams = android.widget.LinearLayout.LayoutParams(
+                        0, android.widget.LinearLayout.LayoutParams.WRAP_CONTENT, 1f
+                    )
                 })
+                val counter = pill("", accentDim)
+                head.addView(counter)
+                c.addView(head)
+                if (section.contains("BDIX")) {
+                    c.addView(android.widget.TextView(context).apply {
+                        text = "Needs a BDIX ISP connection"
+                        setTextColor(textMuted)
+                        textSize = 11f
+                        setPadding(0, dp(1), 0, 0)
+                    })
+                }
+                // per-section bulk toggle
+                val bulk = android.widget.TextView(context).apply {
+                    text = "Toggle all in this group"
+                    setTextColor(accent)
+                    textSize = 11.5f
+                    setPadding(0, dp(6), 0, dp(2))
+                }
+                c.addView(bulk)
+                sectionCards += Triple(section, c, counter)
 
                 group.forEach { src ->
                     val row = android.widget.LinearLayout(context).apply {
                         orientation = android.widget.LinearLayout.HORIZONTAL
                         gravity = android.view.Gravity.CENTER_VERTICAL
-                        setPadding(0, dp(4), 0, dp(4))
+                        setPadding(0, dp(6), 0, dp(6))
                     }
                     val labels = android.widget.LinearLayout(context).apply {
                         orientation = android.widget.LinearLayout.VERTICAL
@@ -1019,44 +1116,54 @@ object WizstreamSources {
                         setOnCheckedChangeListener { _, checked ->
                             setEnabled(src.id, checked)
                             name.setTextColor(if (checked) textPrimary else textMuted)
+                            refreshSummary()
                         }
                     }
                     switches += sw
                     row.addView(labels)
                     row.addView(sw)
-                    // whole row also toggles the switch (bigger touch target)
                     row.setOnClickListener { sw.toggle() }
-                    root.addView(row)
+                    c.addView(row)
+                    rowIndex += Triple(src, row as android.view.View, name)
                 }
+                bulk.setOnClickListener {
+                    val allOn = group.all { isEnabled(it.id) }
+                    group.forEach { setEnabled(it.id, !allOn) }
+                    switches.forEachIndexed { _, _ -> }
+                    rowIndex.filter { it.first.section == section }.forEach { (s, r, _) ->
+                        val v = (r as android.widget.LinearLayout).getChildAt(1)
+                        if (v is android.widget.Switch) v.isChecked = isEnabled(s.id)
+                    }
+                    refreshSummary()
+                }
+                root.addView(c)
             }
 
-            // ── (v78) INTEGRATIONS: services that need a user API key ────
-            // Rendered as: switch row (same look as a source) + a text box
-            // for the key. Both services REQUIRE a per-user key and Wyzie's
-            // terms forbid shipping one inside an app, so the box is the
-            // only way they can ever be on. Empty box = feature off, no
-            // requests made at all.
-            root.addView(android.widget.TextView(context).apply {
-                text = "INTEGRATIONS   ·  your own API key, stored on this device only"
+            // ── INTEGRATIONS card ─────────────────────────────────────
+            val intCard = card()
+            intCard.addView(android.widget.TextView(context).apply {
+                text = "INTEGRATIONS"
                 setTextColor(accent)
                 textSize = 12f
-                letterSpacing = 0.12f
+                letterSpacing = 0.10f
                 setTypeface(typeface, android.graphics.Typeface.BOLD)
-                setPadding(0, dp(14), 0, dp(2))
+            })
+            intCard.addView(android.widget.TextView(context).apply {
+                text = "Your own API key, stored on this device only. Leave blank to keep off."
+                setTextColor(textMuted)
+                textSize = 11f
+                setPadding(0, dp(1), 0, dp(2))
             })
 
             fun integrationRow(
-                toggleId: String,
-                keyId: String,
-                title: String,
-                blurb: String,
-                where: String,
+                toggleId: String, keyId: String,
+                title: String, blurb: String, where: String,
             ) {
                 val on = isEnabled(toggleId)
                 val head = android.widget.LinearLayout(context).apply {
                     orientation = android.widget.LinearLayout.HORIZONTAL
                     gravity = android.view.Gravity.CENTER_VERTICAL
-                    setPadding(0, dp(6), 0, 0)
+                    setPadding(0, dp(8), 0, 0)
                 }
                 val labels = android.widget.LinearLayout(context).apply {
                     orientation = android.widget.LinearLayout.VERTICAL
@@ -1075,6 +1182,10 @@ object WizstreamSources {
                     setTextColor(textMuted)
                     textSize = 11.5f
                 })
+                val statusPill = pill(
+                    if (apiKey(keyId) != null) "KEY SET" else "NO KEY",
+                    if (apiKey(keyId) != null) chipOn else chipOff
+                )
                 val sw = android.widget.Switch(context).apply {
                     isChecked = on
                     setOnCheckedChangeListener { _, checked ->
@@ -1083,9 +1194,10 @@ object WizstreamSources {
                     }
                 }
                 head.addView(labels)
+                head.addView(statusPill)
                 head.addView(sw)
                 head.setOnClickListener { sw.toggle() }
-                root.addView(head)
+                intCard.addView(head)
 
                 val edit = android.widget.EditText(context).apply {
                     setText(apiKey(keyId) ?: "")
@@ -1094,52 +1206,89 @@ object WizstreamSources {
                     setTextColor(textPrimary)
                     textSize = 13f
                     setSingleLine(true)
-                    setPadding(dp(8), dp(6), dp(8), dp(6))
+                    setPadding(dp(10), dp(7), dp(10), dp(7))
+                    background = android.graphics.drawable.GradientDrawable().apply {
+                        setColor(0xFF101114.toInt())
+                        cornerRadius = dp(9).toFloat()
+                        setStroke(dp(1), 0x33FFFFFF)
+                    }
+                    layoutParams = android.widget.LinearLayout.LayoutParams(
+                        android.widget.LinearLayout.LayoutParams.MATCH_PARENT,
+                        android.widget.LinearLayout.LayoutParams.WRAP_CONTENT
+                    ).apply { topMargin = dp(6) }
                 }
-                root.addView(edit)
-                root.addView(android.widget.TextView(context).apply {
+                intCard.addView(edit)
+                intCard.addView(android.widget.TextView(context).apply {
                     text = where
                     setTextColor(textMuted)
-                    textSize = 11f
-                    setPadding(0, dp(1), 0, dp(4))
+                    textSize = 10.5f
+                    setPadding(0, dp(2), 0, dp(2))
                 })
                 keyEditors += keyId to edit
             }
 
             integrationRow(
-                "wyziesubs", KEY_WYZIE,
-                "Wyzie Subs",
+                "wyziesubs", KEY_WYZIE, "Wyzie Subs",
                 "Subtitles for every source — including BDIX .mkv files",
                 "Free key (1 000/day): store.wyzie.io/redeem",
             )
             integrationRow(
-                "mdblist", KEY_MDBLIST,
-                "MDBList ratings",
+                "mdblist", KEY_MDBLIST, "MDBList ratings",
                 "IMDb · RT · Metacritic · MAL scores on show pages",
                 "Free key (1 000/day): mdblist.com → Preferences",
             )
+            root.addView(intCard)
+
             root.addView(android.widget.TextView(context).apply {
-                text = "Keys are saved when you press Done. They never leave this " +
-                    "device except in requests to that service."
+                text = "Keys save when you press Done and never leave this device " +
+                    "except in requests to that service."
                 setTextColor(textMuted)
-                textSize = 11f
-                setPadding(0, dp(4), 0, dp(2))
+                textSize = 10.5f
+                setPadding(0, dp(8), 0, dp(2))
+            })
+
+            refreshSummary()
+
+            // Live filter: hide non-matching rows and any card left empty.
+            search.addTextChangedListener(object : android.text.TextWatcher {
+                override fun afterTextChanged(e: android.text.Editable?) {
+                    val q = e?.toString()?.trim()?.lowercase().orEmpty()
+                    rowIndex.forEach { (src, view, _) ->
+                        val hit = q.isEmpty() ||
+                            src.label.lowercase().contains(q) ||
+                            src.host.lowercase().contains(q) ||
+                            src.section.lowercase().contains(q)
+                        view.visibility =
+                            if (hit) android.view.View.VISIBLE else android.view.View.GONE
+                    }
+                    sectionCards.forEach { (sec, card, _) ->
+                        val any = rowIndex.any {
+                            it.first.section == sec &&
+                                it.second.visibility == android.view.View.VISIBLE
+                        }
+                        card.visibility =
+                            if (any) android.view.View.VISIBLE else android.view.View.GONE
+                    }
+                }
+                override fun beforeTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
+                override fun onTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
             })
 
             val scroll = android.widget.ScrollView(context).apply { addView(root) }
+            fun saveKeys() = keyEditors.forEach { (id, box) ->
+                setApiKey(id, box.text?.toString().orEmpty())
+            }
             android.app.AlertDialog.Builder(context)
                 .setView(scroll)
-                // (v78) Done also COMMITS the integration keys.
-                .setPositiveButton("Done") { _, _ ->
-                    keyEditors.forEach { (id, box) ->
-                        setApiKey(id, box.text?.toString().orEmpty())
-                    }
+                .setPositiveButton("Done") { _, _ -> saveKeys() }
+                .setNegativeButton("All off") { dlg, _ ->
+                    saveKeys()
+                    sources.forEach { setEnabled(it.id, false) }
+                    dlg.dismiss()
+                    openDialog(context, sources)
                 }
                 .setNeutralButton("All on") { dlg, _ ->
-                    // (v78) keep typed-but-unsaved keys across the rebuild
-                    keyEditors.forEach { (id, box) ->
-                        setApiKey(id, box.text?.toString().orEmpty())
-                    }
+                    saveKeys()
                     sources.forEach { setEnabled(it.id, true) }
                     dlg.dismiss()
                     openDialog(context, sources)
@@ -6867,23 +7016,45 @@ internal object WizEpisodeTable {
         epTo: Int?,
     ): String? {
         if (table == null) return null
-        // A — deal a distinct pool image to this entry.
-        table.backdropPool.getOrNull(entryIndex)?.let { return it }
-        // B — best-voted still inside this entry's own window.
+        // (v81) ORDER INVERTED vs v80 — CORRECTNESS BEFORE PRETTINESS.
+        //
+        // v80 dealt the show-wide backdrop pool one image per entry. That
+        // made every header DIFFERENT, but the images were not RELATED to
+        // the season showing them: TMDB's pool is franchise-wide and
+        // unordered with respect to seasons, so "Season 1" could easily be
+        // handed art from the Final Season (a spoiler) or vice versa —
+        // exactly the user's report ("the poster may indicate a season
+        // before it or after it which does not look good").
+        //
+        // The only landscape art TMDB has that is PROVABLY tied to a given
+        // season is the episode STILL, because it is addressed by
+        // (season, episode). So the still now comes FIRST, chosen from the
+        // entry's own stacked window — Season 3 Part 2 can only ever draw
+        // from stacked S3E13-22, Special 2 only from S4E30, etc. It is
+        // season-accurate by construction and cannot spoil a later arc.
+        // (Verified live: AoT's 6 main entries → 6 distinct stills, each
+        // from inside its own window; every season has full coverage —
+        // S1 25/25, S2 12/12, S3 22/22, S4 28/28.)
         if (season != null && epFrom != null && epTo != null) {
             val rows = table.seasons[season]
             if (rows != null) {
                 val best = rows.entries
                     .filter { it.key in epFrom..epTo }
                     .mapNotNull { e -> e.value.stillUrl?.let { u -> u to (e.value.score ?: 0.0) } }
-                    .maxByOrNull { it.second }
+                    // Highest-voted frame in the window, tie-broken by the
+                    // episode number so the pick is deterministic.
+                    .maxWithOrNull(compareBy({ it.second }, { it.first }))
                     ?.first
                 // Stills are w780 in the table; ask for the wide variant so
                 // the header isn't upscaled.
                 if (best != null) return best.replace("/t/p/w780", "/t/p/w1280")
             }
         }
-        // C — shared show backdrop (what every entry used to get).
+        // Fallback only when this entry has NO stills at all (unaired or
+        // unmapped seasons): deal a distinct pool image so at least the
+        // headers still differ, rather than repeating one picture.
+        table.backdropPool.getOrNull(entryIndex)?.let { return it }
+        // Last resort — the shared show backdrop.
         return table.backdropUrl
     }
 }

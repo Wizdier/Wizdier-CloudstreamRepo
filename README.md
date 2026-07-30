@@ -1,180 +1,110 @@
-# 🎬 Wizdier Cloudstream Repository
+# 🎬 Wizdier CloudStream Repository
 
-> **9 Cloudstream extensions** — the main catalogue plugin **Wizstream**
-> (TMDB with StreamPlay-style AniList enrichment for anime), plus
-> **WizstreamAnime** ("Wizstream-Anime" in-app) — the PURE AniList-metadata
-> anime catalogue (zero TMDB) — sharing one link-scraping engine, plus
-> seven standalone BDIX source extensions for Bangladeshi networks.
-> Movies, web-series, anime, animation, cartoons & documentaries — Bangla,
-> Hindi, English, Korean, Japanese and more. Health-checked **2026-07-25**.
+> **Free movies, series & anime for CloudStream — built for Bangladesh.**
+> Eight extensions, led by **Wizstream**: one install that gives you a full
+> Movies / TV / Anime catalogue backed by BDIX servers (fast and usually
+> free of data charges on Bangladeshi ISPs) with worldwide web sources as
+> backup.
 
-[![Cloudstream](https://img.shields.io/badge/Cloudstream-extension-blueviolet?logo=android)](https://github.com/recloudstream/cloudstream)
-[![Extensions](https://img.shields.io/badge/extensions-9-success)](#-the-extensions)
-[![Latest build](https://img.shields.io/badge/Wizstream-v80-orange)](#-changelog)
+[![CloudStream](https://img.shields.io/badge/CloudStream-extension-blueviolet?logo=android)](https://github.com/recloudstream/cloudstream)
+[![Extensions](https://img.shields.io/badge/extensions-8-success)](#-whats-inside)
+[![Latest build](https://img.shields.io/badge/Wizstream-v81-orange)](CHANGELOG.md)
 
 ---
 
-## 📥 How to install (2 minutes)
+## 📥 Install in 2 minutes
 
-1. Install [**CloudStream**](https://github.com/recloudstream/cloudstream/releases) on your Android phone / TV / box.
-2. In CloudStream go to **Settings → Extensions → Add repository** and paste:
+1. Install [**CloudStream**](https://github.com/recloudstream/cloudstream/releases) on your Android phone, TV or box.
+2. Open **Settings → Extensions → Add repository** and paste:
 
    ```
    https://raw.githubusercontent.com/Wizdier/Wizdier-CloudstreamRepo/main/repo.json
    ```
 
-3. Open the repository, tap **Wizstream** (or any standalone extension) → **Install**.
+3. Open the repo, tap **Wizstream → Install**. Done.
 
-That's it. Search a movie, series or anime, pick an episode, and choose a
-source from the list. Updates arrive automatically when this repo publishes
-a new version.
-
-> **Which one should I install?** Most people only need **Wizstream** — it
-> already includes every BDIX source *and* the big web sources in one app.
-> The seven standalone extensions are the same sources as separate apps, for
-> people who prefer the classic layout or want to compare results.
+**That single install gives you both catalogues** — the main Movies/TV
+catalogue *and* the dedicated Anime catalogue. You don't need to hunt for a
+second extension; they ship bound together and share one settings screen.
 
 ---
 
-## 🗂️ The extensions
+## ✨ What you get
 
-| # | Extension | Lang | What you get | Source host(s) |
-|---|-----------|:----:|--------------|----------------|
-| 1 | **Wizstream** ⭐ | en | Everything below, in one plugin | multi-source (BDIX + web) |
-| 2 | **Cineplex BD** | bn | Movies, web-series, anime, cartoons | `cineplexbd.net` (BDIX) |
-| 3 | **Circle FTP** | en | Movies, series, anime, Asian drama, documentaries | `new.circleftp.net` (BDIX) |
-| 4 | **CTGMovies** | bn | Movies, web-series, anime | `ctgmovies.com` |
-| 5 | **FTPBD** | en | Movies, TV & anime (big Hindi-dubbed section) | `ftpbd.net` |
-| 6 | **FlixHub** | en | Hollywood·Bollywood·South-Indian movies & series | `flixhub.net` (BDIX) |
-| 7 | **FM FTP** | bn | Movies & TV shows via JSON API + direct file index (TMDB-enriched) | `fmftp.net` |
-| 8 | **Mediaserver** | bn | Movies & single episodes from a WordPress video library (TMDB-enriched) | `103.225.94.27/mediaserver` (BDIX) |
-
-> **What is “BDIX”?** Some of these servers sit behind Bangladeshi ISP
-> peering. From outside Bangladesh they simply don't answer — that is normal
-> and not a bug. From a BD connection they are usually your **fastest and
-> highest-quality** options.
+| | |
+|---|---|
+| 🇧🇩 **BDIX first** | Six Bangladeshi FTP servers (Circle FTP, Cineplex BD, FTPBD, CTGMovies, FM FTP, Mediaserver). On a BDIX ISP these stream fast and usually don't count against your data quota. |
+| 🌍 **Web backup** | Cineby, Bingr, Moonflix and the Vid[x] embed family, so you still get a link when BDIX doesn't have the title. |
+| 🍥 **Real anime catalogue** | A dedicated AniList-powered catalogue: proper per-season entries, Japanese voice-actor cast, and seven anime-specific streaming sources. |
+| 📺 **Correct episodes** | Multi-season packs, split cours and hour-long specials are mapped to the right files — the messy part of BDIX anime, handled. |
+| 🔤 **Subtitles anywhere** | Optional Wyzie Subs integration adds subtitles even to raw BDIX `.mkv` files that carry none. |
+| ⭐ **Ratings** | Optional MDBList integration shows IMDb, Rotten Tomatoes, Metacritic and MAL scores together on the page. |
+| 🔄 **Tracking** | Syncs progress with AniList, MAL, Kitsu and Simkl. |
+| ⚡ **Dead-link pruning** | Broken servers are detected and dropped *before* the player tries them, so you don't sit through a 30-second stall. |
 
 ---
 
-## ⭐ Wizstream — what's inside
+## 🗂️ What's inside
 
-**ONE install again (since v54), StreamPlay-style catalogue & metadata:**
+**Wizstream** — the one to install. Movies, TV, Asian drama, cartoons and a
+full anime catalogue in a single extension, with every source below built in.
 
-- **The main catalogue is TMDB** — movies & TV series (Trending, Popular,
-  Top Rated, Upcoming, Now Playing, On The Air, **Trending Anime**).
-  Japanese-animation entries appear right inside the catalogue typed as
-  Anime, and their pages are **enriched from AniList** (the StreamPlay way):
-  MAL·AniList·Kitsu tracking ids, AniList banner art and the Japanese
-  voice-actor cast — episode tables stay TMDB (its packed-cours numbering
-  is exactly what the BDIX sites use).
-- **The anime catalogue is the separate WizstreamAnime module** —
-  "Wizstream-Anime" in-app: anime, OVA & anime movies (Trending, Popular
-  This Season, Top Rated, Upcoming, All-Time Popular), PURE AniList
-  metadata, stacked CircleFTP-style multi-season pages, per-entry AniList
-  episode titles where the streaming feed has them.
-
-Both show posters, backdrops, logos, trailers, ratings, full cast (anime
-pages list up to 25 main+supporting characters with Japanese voice actors)
-and per-episode stills/synopses. MAL · AniList · Kitsu · Simkl
-tracking syncs where applicable.
-
-### 📺 Where links come from (all fetched in parallel, de-duplicated)
-
-| Group | Sources |
-|-------|---------|
-| **BDIX resolvers** | Cineplex BD · FTPBD · Circle FTP · CTGMovies · FM FTP · Mediaserver — searched by exact/alt title with strict + relaxed matching |
-| **Cineby** | Neon · Yoru · Breach · Vyse · Killjoy (German) · Fade (Hindi) · Omen (Spanish) · Raze (Portuguese) — all eight servers of the site, decrypted locally |
-| **Bingr** | Sirius · Elysium · Miller · Mann · Edmunds · Luna · Aditya |
-| **Moonflix** | Multi-audio mp4 ladder (English/Hindi/Original) · HDGhar HLS · VIP/LUL HLS + Stremio-track subtitles |
-| **Vid-embed family** | VidSrc · VidNest · VidPlay · VidUp/VidLink · VidRock · VidFast · VidEasy · MultiEmbed · SuperEmbed · DatabaseGdrive · VidAPI |
-| **Anime sources** (in Wizstream-Anime) | Allmanga (AllAnime family) · AniZone · AniChi · UniqueStream · AniNeko · ReANIME · TokyoInsider (direct MKV/MP4) |
-
-Sub / dub aware: Allmanga emits separate `· DUB` batches; Hindi/German/
-Spanish servers are tagged by language.
-
-### 🏷️ Reading the source picker
-
-```
-Wizstream  • Cineby · Neon      ← source group (server it came from)
-           ├── 1080p · H.264     ← quality chip + codec tag
-Wizstream-A • Allmanga · Ak · DUB   ← anime source + dub batch
-[Neon] English                  ← subtitles, prefixed with their server
-```
-
-- Quality chips (4K/1080p/720p…) are read from the actual stream variants,
-  not from filenames.
-- `· H.264` / `· HEVC` / `· AV1` codec tags — the extension also asks your
-  device what its hardware decoder supports and **never offers a link your
-  device can't play** (this is what fixed the old “HTTP 4003” errors on TVs).
-- `· DUB`, `· Hindi`, `· German`… mark the audio language.
+**Seven standalone extensions** — Circle FTP, Cineplex BD, CTGMovies, FTPBD,
+FlixHub, FM FTP and Mediaserver, each as its own small app. These are the
+same BDIX sources Wizstream already includes, published separately for people
+who prefer one-site-per-extension or want to compare results side by side.
 
 ---
 
-## 🛡️ Why things fail — and what this repo does about it
+## ⚙️ Settings
 
-Streaming sites change constantly: domains move, CDNs die, APIs get
-re-encrypted. The extension **probes before it shows**: links whose server
-answers an error page or an ad-wall instead of a video are dropped silently;
-timeouts are kept (a slow BDIX server never costs you a link). Dead hosts
-are removed in health sweeps. Cineby's cipher is re-verified against the
-site's own code on every update.
+Go to **Settings → Extensions → Wizstream → Open Settings** to:
 
-**Honest expectations:**
+- switch individual sources on or off (handy for trimming slow ones, or
+  going BDIX-only when you're off Wi-Fi),
+- search the source list,
+- paste optional API keys for **Wyzie Subs** (subtitles) and **MDBList**
+  (ratings).
 
-- **BDIX servers** (Circle FTP, Cineplex BD, FlixHub) only respond inside
-  Bangladeshi networks.
-- **AllAnime's own video CDN is currently partly down** (their `clock.json`
-  endpoints return server errors on their *website* too). Allmanga links in
-  the app come back the moment their operator fixes it — nothing you need to
-  do; it's also why YouTube-style external mirrors (Ok.ru etc.) sometimes
-  look lonely.
-- **Yoru** (a Cineby server) has been offline since its CDN domain expired.
-  It will reappear automatically if the provider resurrects it.
-- A source that is empty for one title may be full for another — catalogues
-  differ per title. The app automatically retries searches with the
-  alternate (romaji/English) title for anime.
+Both integrations are **off until you add your own free key**, and keys are
+stored only on your device. Everything applies on the next episode you
+tap — no restart.
 
 ---
 
-## 🛠️ For developers
+## ❓ FAQ
+
+**Do I need a BDIX connection?**
+No, but it's the point of this repo. Without BDIX the Bangladeshi servers
+won't reach and you'll fall back to the web sources.
+
+**Nothing plays / no links found.**
+Check you're on your BDIX ISP, then open Settings and confirm the sources
+aren't switched off. If one server is down, another usually has the title.
+
+**Why do I need my own API keys?**
+Wyzie and MDBList issue free per-user keys (1,000 requests/day each) and
+their terms don't allow shipping a shared key inside an app. Both features
+are entirely optional.
+
+**Is this legal?**
+These extensions only *index* publicly reachable servers — no content is
+hosted, uploaded or owned here. You are responsible for what you access.
+
+---
+
+## 🔧 For developers
+
+Kotlin, built with the [recloudstream](https://github.com/recloudstream) Gradle plugin (AGP 8.7.3 / Kotlin 2.3.0, `compileSdk 35`).
 
 ```bash
-./gradlew make            # build every extension → */build/*.cs3
-./gradlew makePluginsJson # regenerate build/plugins.json (CI parity)
-./gradlew :Wizstream:make # build a single module
+./gradlew :Wizstream:make          # builds Wizstream/build/Wizstream.cs3
 ```
 
-Repo layout:
-
-```
-├── Wizstream/     Main catalogue plugin — TMDB + AniList enrichment,
-│                  StreamPlay-style anime pages (this repo's flagship)
-├── WizstreamAnime/ "Wizstream-Anime" in-app — PURE AniList-metadata anime
-│                  catalogue (zero TMDB; bare "Episode N" rows where AniList
-│                  has no streaming feed — that's the price of purity)
-├── Cineplex BD/   standalone BDIX
-├── Circle FTP/    standalone BDIX
-├── CTGMovies/     standalone BDIX
-├── FTPBD/         standalone BDIX
-├── FlixHub/       standalone BDIX
-├── FM FTP/        standalone (fmftp.net API + file index)
-├── Mediaserver/   standalone BDIX (WordPress video library)
-├── icons/         repo artwork
-├── repo.json      repository index (what you paste into CloudStream)
-└── .github/workflows/build.yml   CI: build → builds branch
-```
+`WizstreamSources.kt` is the shared link-resolving engine. Version history
+lives in [CHANGELOG.md](CHANGELOG.md).
 
 ---
 
-## 📜 Changelog
-
-Moved to **[CHANGELOG.md](CHANGELOG.md)** — the full version history (v1 → latest) lives there now.
-
----
-
-## ❓ Questions or a broken title?
-
-Open an issue with: the extension + version, what you searched for, which
-episode, and whether the same title works in the matching standalone
-extension. “Works on website X but not in the app” reports are the most
-valuable — they usually mean the site changed something we can port.
+<sub>Not affiliated with CloudStream, TMDB, AniList, MDBList or any listed
+site. Made in Dhaka 🇧🇩</sub>
