@@ -1,7 +1,7 @@
-version = 82
+version = 85
 
 cloudstream {
-    description = "Wizstream — ONE install, BOTH catalogues (v82). " +
+    description = "Wizstream — ONE install, BOTH catalogues (v85). " +
         "Main catalogue: movies, TV series, Asian drama & cartoons from " +
         "TMDB. Anime catalogue: a dedicated pure-AniList catalogue with " +
         "per-season entries, Japanese voice-actor cast and correct " +

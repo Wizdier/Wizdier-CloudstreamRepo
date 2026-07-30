@@ -408,11 +408,13 @@ class WizstreamAnimeProvider : MainAPI() {
         // (v81, user request) MAL and Kitsu PROGRESSION removed from the
         // description. Those two lines existed to debug the v58-60
         // root-misbind bug (long dead) and only cluttered the page with
-        // three near-identical progress readouts. AniList's own line
-        // stays — this is a pure-AniList module and the sync sheet still
-        // shows every tracker's real numbers. The fetchMal/KitsuEntryLine
-        // helpers are kept (unused) for future diagnostics.
-        val personalLine = fetchPersonalEntryLine(id)?.let { "👤 $it" }
+        // three near-identical progress readouts.
+        // (v84, user request) AniList's own line is removed TOO — NO sync
+        // status line of ANY tracker appears in the description now. The
+        // app's own sync sheet (below the description) still shows every
+        // tracker's real numbers; fetchPersonal/Mal/KitsuEntryLine stay
+        // in the file (unused) for future diagnostics.
+
         // (v78) MDBList aggregated ratings line (opt-in, user API key in
         // Settings → Integrations; null when no key, so the page is
         // untouched). This module stays PURE AniList for identity — the
@@ -427,7 +429,7 @@ class WizstreamAnimeProvider : MainAPI() {
         // synopsis now starts on a fresh line beneath them instead of
         // running on from the ratings text.
         val displayPlot = listOfNotNull(
-            personalLine, mdbLine?.let { "⭐ $it" }, detail.plot
+            mdbLine?.let { "⭐ $it" }, detail.plot
         ).filter { it.isNotBlank() }.joinToString("\n\n")
         // (v62) Logcat-visible record of the trackers this page binds.
         runCatching {

@@ -3903,61 +3903,43 @@ override suspend fun resolve(
                 )
             }
 
-            // 7. Emit — (v76) PROBE-PRUNE first, then 1:1 with
-            //    CircleFtpProvider.loadLinks emission style (PLAIN links:
-            //    no referer, no extra headers, no playlist fetch — the
-            //    v33 reasons still stand: a Referer made the CDN answer
-            //    403/404 = player HTTP 2004, and up-front m3u8 fetches
-            //    turned a slow CDN box into a load-time stall).
-            //
-            //    User report (2026-07-30): an episode fetched TWO links —
-            //    one played, one sat on a dead CDN box — and the app's
-            //    warm cache / next-episode prefetch then auto-loaded the
-            //    DEAD one instead of the working one. So every link now
-            //    passes a fast PARALLEL liveness probe (see pruneDeadLinks)
-            //    before emit: certainly-dead CDN hosts are dropped,
-            //    survivors go out FASTEST-PROBE-FIRST, and a dead-host
-            //    verdict is cached 150s so the next episode prunes the bad
-            //    server instantly instead of loading it from warm cache.
-            //    (The v33 no-probe rule is narrowed, not broken: we never
-            //    fetch the playlist/body — one HEAD + one-byte fallback,
-            //    exactly what the player itself would do.)
-            val pending = LinkedHashMap<String, String>()   // final url -> link name
-            val collect: (ExtractorLink) -> Unit = { link ->
-                if (link.url.isNotBlank() && !pending.containsKey(link.url)) {
-                    pending[link.url] = link.name
-                }
-            }
+            // 7. Emit — v33: 1:1 with CircleFtpProvider.loadLinks.
+            //    Every link goes out as a PLAIN link: no referer, no extra
+            //    headers, no player-page probing, no payload fetch. The old
+            //    version routed raw URLs through emitDirect, which (a)
+            //    attached Referer/headers the CDN rejects (→ HTTP 2004 in
+            //    Wizstream while the standalone, which attaches nothing,
+            //    played fine) and (b) fetched m3u8 playlists up-front via
+            //    generateM3u8, so a slow/dead CDN box surfaced as a load-time
+            //    timeout instead of a player decision.
+            //    (v83) The v76 pre-emit liveness probe/prune is REMOVED at
+            //    user request — links are emitted exactly as discovered,
+            //    zero pre-checks, zero added latency.
+            Log.d(
+                TAG, "CircleFTP: emit ${mediaUrls.size} url(s) for " +
+                    "'$title' s=$season e=$episode"
+            )
+            var any = false
             mediaUrls.forEach { u ->
                 if (u.contains("movie?data=") || u.contains("episode?data=") ||
                     u.contains("circleftp://")
                 ) {
-                    emitCircleFtpEncoded(u, srcLabel, ipRewriteLinks, collect)
+                    if (emitCircleFtpEncoded(u, srcLabel, ipRewriteLinks, callback)) any = true
                 } else {
                     val resolvedUrl = if (ipRewriteLinks) linkToIp(u) else u
-                    if (resolvedUrl.isNotBlank() && !pending.containsKey(resolvedUrl)) {
-                        pending[resolvedUrl] = srcLabel
+                    if (resolvedUrl.isNotBlank()) {
+                        callback(
+                            newExtractorLink(
+                                source = srcLabel,
+                                name = srcLabel,
+                                url = resolvedUrl,
+                            ) {
+                                this.quality = qualityFromName(resolvedUrl)
+                            }
+                        )
+                        any = true
                     }
                 }
-            }
-            val finalUrls = pruneDeadLinks(pending.keys.toList(), title, season, episode)
-            Log.d(
-                TAG, "CircleFTP: emit ${finalUrls.size}/${mediaUrls.size} url(s) " +
-                    "for '$title' s=$season e=$episode"
-            )
-            var any = false
-            finalUrls.forEach { u ->
-                val linkName = pending[u] ?: srcLabel
-                callback(
-                    newExtractorLink(
-                        source = srcLabel,
-                        name = linkName,
-                        url = u,
-                    ) {
-                        this.quality = qualityFromName(u)
-                    }
-                )
-                any = true
             }
             return any
         }
@@ -4079,182 +4061,6 @@ override suspend fun resolve(
                     ?.let { return pool[it] to "num" }
             }
             return pool.getOrNull(episodeToUse - 1) to "pos"
-        }
-
-        // ════════════════════════════════════════════════════════════════
-        //  (v76) CDN LIVENESS PROBE — fixes the "2 links, the dead one got
-        //  warm-cached and auto-loaded" report (2026-07-30). One cheap
-        //  HEAD per final link, all in parallel, before anything is
-        //  emitted. Verdicts:
-        //    DEAD    — connect refused / connect-timeout / unresolvable
-        //              host / HTTP 404/410: the player would fail the same
-        //              way (his 07-29 logcat: ftp5 connect timed out after
-        //              30s inside android.media.MediaHTTPConnection).
-        //    ALIVE   — 2xx/3xx (or 206 on the Range-GET retry).
-        //    UNKNOWN — HEAD not allowed, read-timeout AFTER connect, odd
-        //              codes: inconclusive → KEEP, ranked after ALIVE.
-        //  Fail-open everywhere: probing NEVER reduces a non-empty list to
-        //  empty, and single-link episodes skip probing entirely (nothing
-        //  to choose between, no added latency).
-        // ════════════════════════════════════════════════════════════════
-        private enum class ProbeKind { ALIVE, UNKNOWN, DEAD }
-        private data class LinkProbe(val kind: ProbeKind, val ms: Long)
-
-        private const val LINK_PROBE_TIMEOUT_MS = 3_500
-        private const val LINK_PROBE_BUDGET_MS = 6_000L
-        private const val LINK_PROBE_ALIVE_TTL_MS = 45_000L
-        private const val LINK_PROBE_DEAD_TTL_MS = 150_000L
-
-        /** host (lowercase) → (wasAlive, timestamp). UNKNOWN is never cached. */
-        private val linkProbeHostCache =
-            java.util.concurrent.ConcurrentHashMap<String, Pair<Boolean, Long>>()
-
-        /**
-         * Raw HttpURLConnection probe — deliberately NOT nicehttp so
-         * connect/read timeouts are exact and no interceptor adds Referer or
-         * cookies (standalone parity; the CDN 403/404s referer-tagged hits).
-         * HEAD first; on 401/403/405/501 retry as a Range bytes=0-0 GET —
-         * plenty of BDIX httpds refuse HEAD while serving GET fine.
-         */
-        private fun probeLink(url: String): LinkProbe {
-            val start = System.currentTimeMillis()
-            fun elapsed() = System.currentTimeMillis() - start
-            fun open(method: String): java.net.HttpURLConnection =
-                (java.net.URL(url).openConnection() as java.net.HttpURLConnection).apply {
-                    connectTimeout = LINK_PROBE_TIMEOUT_MS
-                    readTimeout = LINK_PROBE_TIMEOUT_MS
-                    instanceFollowRedirects = true
-                    useCaches = false
-                    setRequestProperty("User-Agent", UA)
-                    if (method == "GET") setRequestProperty("Range", "bytes=0-0")
-                    requestMethod = method
-                }
-            var conn: java.net.HttpURLConnection? = null
-            try {
-                val parsed = java.net.URL(url)
-                if (parsed.protocol != "http" && parsed.protocol != "https") {
-                    // Not judgeable by HTTP probe — keep it, let the player decide.
-                    return LinkProbe(ProbeKind.UNKNOWN, 0)
-                }
-                conn = open("HEAD")
-                var code = conn.responseCode
-                if (code == 401 || code == 403 || code == 405 || code == 501) {
-                    runCatching { conn?.disconnect() }
-                    conn = open("GET")
-                    code = conn.responseCode
-                }
-                return when {
-                    code in 200..399 -> LinkProbe(ProbeKind.ALIVE, elapsed())
-                    code == 404 || code == 410 -> LinkProbe(ProbeKind.DEAD, elapsed())
-                    else -> LinkProbe(ProbeKind.UNKNOWN, elapsed())
-                }
-            } catch (t: Throwable) {
-                val msg = (t.message ?: "").lowercase()
-                val dead = t is java.net.UnknownHostException ||
-                    t is java.net.ConnectException ||
-                    t is java.net.NoRouteToHostException ||
-                    (t is java.net.SocketTimeoutException && msg.contains("connect"))
-                // Read-timeouts after a successful connect, resets, and odd
-                // IO errors stay inconclusive — the box answered, it may
-                // just be slow; kept and ranked last rather than dropped.
-                return LinkProbe(if (dead) ProbeKind.DEAD else ProbeKind.UNKNOWN, elapsed())
-            } finally {
-                runCatching { conn?.disconnect() }
-            }
-        }
-
-        /** Host-level 45s/150s cache so back-to-back episodes don't re-pay. */
-        private fun probeWithCache(url: String): LinkProbe {
-            val host = runCatching { java.net.URL(url).host.lowercase() }.getOrNull()
-                ?: return LinkProbe(ProbeKind.UNKNOWN, 0)
-            val now = System.currentTimeMillis()
-            linkProbeHostCache[host]?.let { cached ->
-                val ttl = if (cached.first) LINK_PROBE_ALIVE_TTL_MS else LINK_PROBE_DEAD_TTL_MS
-                if (now - cached.second < ttl) {
-                    Log.d(
-                        TAG, "CircleFTP: probe $host cached " +
-                            (if (cached.first) "ALIVE" else "DEAD")
-                    )
-                    return LinkProbe(
-                        if (cached.first) ProbeKind.ALIVE else ProbeKind.DEAD, 0
-                    )
-                }
-            }
-            val p = probeLink(url)
-            when (p.kind) {
-                ProbeKind.ALIVE -> linkProbeHostCache[host] = true to now
-                ProbeKind.DEAD -> linkProbeHostCache[host] = false to now
-                ProbeKind.UNKNOWN -> Unit  // inconclusive is never remembered
-            }
-            Log.d(TAG, "CircleFTP: probe $host ${p.kind} ${p.ms}ms")
-            return p
-        }
-
-        /**
-         * Probe every final link IN PARALLEL (bounded by LINK_PROBE_BUDGET_MS
-         * — stragglers keep running in the background and still fill the
-         * host cache for the NEXT episode), then:
-         *   1. survivors ordered ALIVE-fastest-first, UNKNOWN last;
-         *   2. DEAD links dropped — this is what stops the app warm-caching
-         *      and auto-loading a dead-box link for the next episode;
-         *   3. FAIL-OPEN: all-dead (or all-missing verdicts) returns the
-         *      original list untouched — a blocked probe must never blank
-         *      an episode that had links.
-         */
-        private suspend fun pruneDeadLinks(
-            urls: List<String>,
-            title: String,
-            season: Int?,
-            episode: Int?,
-        ): List<String> {
-            val distinct = urls.distinct()
-            if (distinct.size < 2) return distinct   // nothing to choose between
-            val verdicts = java.util.concurrent.ConcurrentHashMap<String, LinkProbe>()
-            withTimeoutOrNull(LINK_PROBE_BUDGET_MS) {
-                coroutineScope {
-                    distinct.forEach { u ->
-                        launch(Dispatchers.IO) {
-                            verdicts[u] = runCatching { probeWithCache(u) }
-                                .getOrElse { LinkProbe(ProbeKind.UNKNOWN, 0) }
-                        }
-                    }
-                }
-            }
-            val alive = ArrayList<Pair<String, LinkProbe>>()
-            val unknown = ArrayList<String>()
-            val deadHosts = ArrayList<String>()
-            for (u in distinct) {
-                val v = verdicts[u] ?: LinkProbe(ProbeKind.UNKNOWN, LINK_PROBE_BUDGET_MS)
-                when (v.kind) {
-                    ProbeKind.ALIVE -> alive += u to v
-                    ProbeKind.UNKNOWN -> unknown += u
-                    ProbeKind.DEAD -> deadHosts +=
-                        runCatching { java.net.URL(u).host }.getOrElse { u }
-                }
-            }
-            if (deadHosts.isNotEmpty()) {
-                Log.i(
-                    TAG, "CircleFTP: pruned ${deadHosts.size} dead link(s) for " +
-                        "'$title' s=$season e=$episode — dead host(s): " +
-                        deadHosts.distinct().joinToString()
-                )
-            }
-            val ordered = alive.sortedBy { it.second.ms }.map { it.first } + unknown
-            if (ordered.isEmpty()) {
-                Log.w(
-                    TAG, "CircleFTP: probe says ALL ${distinct.size} link(s) DEAD " +
-                        "for '$title' s=$season e=$episode — keeping originals " +
-                        "(probe itself may be unreachable)"
-                )
-                return distinct
-            }
-            if (deadHosts.isNotEmpty()) {
-                Log.i(
-                    TAG, "CircleFTP: links '$title' s=$season e=$episode " +
-                        "kept=${ordered.size} dropped=${deadHosts.size}"
-                )
-            }
-            return ordered
         }
 
         private suspend fun emitCircleFtpEncoded(
@@ -5754,6 +5560,16 @@ override suspend fun resolve(
 
             val serverSourceLabel = "$srcLabel · $srvName"
             var any = false
+            // (v85) WEB-PARITY STARTUP (user report: "bingr-sirius plays
+            // fine on web, in Cloudstream it fetches slowly"): these
+            // sources serve PER-QUALITY ladders in descending order, so
+            // the app's default/auto pick used to grab the TOP rung first
+            // (8 Mbps Sirius 1080p) and buffer on links the web starts at
+            // its adaptive LOW rung. Collect first, then emit LOW-quality-
+            // FIRST at the end — the default pick now starts light like
+            // the web; 1080p stays one tap above, chips unchanged.
+            val pending = ArrayList<ExtractorLink>()
+            val emit: (ExtractorLink) -> Unit = { pending += it }
 
             // Subtitles ride the top-level array.
             val subs = json.optJSONArray("subtitles")
@@ -5801,7 +5617,7 @@ override suspend fun resolve(
                         if (!text.contains("#EXTM3U")) continue
                         // (v28) Demuxed A/V masters: emit the master itself.
                         if (emitDemuxedMaster(url, text, serverSourceLabel,
-                                bingrName(srvName, langPart, ""), "$SITE/", HEADERS, callback)
+                                bingrName(srvName, langPart, ""), "$SITE/", HEADERS, emit)
                         ) {
                             any = true
                             continue
@@ -5820,7 +5636,7 @@ override suspend fun resolve(
                                     Log.d(TAG, "Bingr: skipped ${v.width}x${v.height} (${v.codecs}) on $srvName: $skip")
                                     return@forEach
                                 }
-                                callback(
+                                emit(
                                     newExtractorLink(
                                         source = serverSourceLabel,
                                         name = bingrName(srvName, langPart, codecDisplayTag(v.codecs)),
@@ -5845,7 +5661,7 @@ override suspend fun resolve(
                             Log.d(TAG, "Bingr: skipped media playlist ($codecs) on $srvName: $skip")
                             continue
                         }
-                        callback(
+                        emit(
                             newExtractorLink(
                                 source = serverSourceLabel,
                                 name = bingrName(srvName, langPart, codecDisplayTag(codecs)),
@@ -5865,7 +5681,7 @@ override suspend fun resolve(
                                 cacheTime = 0, timeout = 12_000)
                         }.getOrNull()
                         if (probe == null || probe.code !in 200..299 && probe.code != 206) continue
-                        callback(
+                        emit(
                             newExtractorLink(
                                 source = serverSourceLabel,
                                 name = bingrName(srvName, langPart, ""),
@@ -5882,6 +5698,16 @@ override suspend fun resolve(
                     else -> continue // unknown container — skip (prevents 3003)
                 }
             }
+            // (v85) See the collector note above: emit collected links
+            // LOWEST quality first (stable sort; unknown/last-resort rungs
+            // go last). Server order is untouched.
+            val ordered = pending.sortedBy { l ->
+                if (l.quality in 1..4320) l.quality else Int.MAX_VALUE
+            }
+            if (ordered.isNotEmpty()) {
+                Log.d(TAG, "Bingr: emit ${ordered.size} link(s) low-first on $srvName")
+            }
+            ordered.forEach(callback)
             return any
         }
 
@@ -6009,6 +5835,19 @@ override suspend fun resolve(
             }
             if (links.isEmpty()) return false
 
+            // (v85) WEB-PARITY STARTUP: the site's player starts adaptive/
+            // light and ramps — Cloudstream's default pick used to grab
+            // the first (top) rung and buffer ("Moonflix slow vs web").
+            // Language order preserved (first-seen), LOW resolution first
+            // inside each language; every rung still listed with its chip.
+            val langOrder = links.map { it.lang }.distinct()
+            links.sortWith(compareBy(
+                { langOrder.indexOf(it.lang) },
+                { Regex("""(\d{3,4})""").find(it.resolution)
+                    ?.groupValues?.get(1)?.toIntOrNull() ?: Int.MAX_VALUE },
+            ))
+            Log.d(TAG, "Moonflix CH: ladder ${links.size} link(s) low-first")
+
             // Canary probe — CH's CDN (squid "web cache") hard-denies
             // datacenter IPs with 403 and rate-limits aggressively, so we
             // must NOT fire one probe per link. One probe on the first link:
@@ -6065,6 +5904,12 @@ override suspend fun resolve(
             val json = getJson(app, "$API_HV/$mediaPath") ?: return false
             val streams = json.optJSONArray("streams") ?: return false
             var any = false
+            // (v85) WEB-PARITY STARTUP (same as Bingr, the "HDGhar slow"
+            // report): per-quality ladders arrived descending → the
+            // default/auto pick grabbed the top rung and buffered.
+            // Collect, then emit LOW-quality-first at the end.
+            val pending = ArrayList<ExtractorLink>()
+            val emit: (ExtractorLink) -> Unit = { pending += it }
             val serverSourceLabel = "$srcLabel · HDGhar"
             for (i in 0 until streams.length()) {
                 val st = streams.optJSONObject(i) ?: continue
@@ -6081,7 +5926,7 @@ override suspend fun resolve(
                     ) continue
                     // (v28) Demuxed A/V masters: emit the master itself.
                     if (emitDemuxedMaster(url, master.text, serverSourceLabel,
-                            "Moonflix · HDGhar", "$PLAYER/", HEADERS, callback)
+                            "Moonflix · HDGhar", "$PLAYER/", HEADERS, emit)
                     ) {
                         any = true
                         continue
@@ -6098,7 +5943,7 @@ override suspend fun resolve(
                                 Log.d(TAG, "Moonflix HV: skipped ${v.width}x${v.height} (${v.codecs}): $skip")
                                 return@forEach
                             }
-                            callback(
+                            emit(
                                 newExtractorLink(
                                     source = serverSourceLabel,
                                     name = "Moonflix · HDGhar" + codecDisplayTag(v.codecs),
@@ -6122,7 +5967,7 @@ override suspend fun resolve(
                         Log.d(TAG, "Moonflix HV: skipped media playlist ($codecs): $skip")
                         continue
                     }
-                    callback(
+                    emit(
                         newExtractorLink(
                             source = serverSourceLabel,
                             name = "Moonflix · HDGhar" + codecDisplayTag(codecs),
@@ -6136,7 +5981,7 @@ override suspend fun resolve(
                     )
                     any = true
                 } else {
-                    callback(
+                    emit(
                         newExtractorLink(
                             source = serverSourceLabel,
                             name = "Moonflix · HDGhar",
@@ -6151,6 +5996,15 @@ override suspend fun resolve(
                     any = true
                 }
             }
+            // (v85) Emit collected links LOWEST quality first — see the
+            // collector note at the top of fetchHv.
+            val ordered = pending.sortedBy { l ->
+                if (l.quality in 1..4320) l.quality else Int.MAX_VALUE
+            }
+            if (ordered.isNotEmpty()) {
+                Log.d(TAG, "Moonflix HV: emit ${ordered.size} link(s) low-first")
+            }
+            ordered.forEach(callback)
             return any
         }
 

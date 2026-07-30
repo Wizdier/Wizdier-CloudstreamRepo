@@ -1169,18 +1169,72 @@ class WizstreamProvider : MainAPI() {
         )
     }
 
-    /** One AniList query: the entry's own core fields + its relation edges. */
+    // (v84) Per-entry AniList EPISODE FEED (licensed-stream titles +
+    // thumbnails) + franchise-walk cache — user feature asks #3/#4:
+    // "use AniList for episode titles/metadata" and "make the recursive
+    // multi-season structure more robust and efficient". The walk already
+    // touches every member once, so streamingEpisodes ride ALONG in the
+    // same query (zero extra requests); a cold/missed member backfills
+    // with one small query. All public GraphQL — NO login needed.
+    private val ENTRY_FEED_CACHE_MS = 30 * 60 * 1000L
+    private val FRANCHISE_CACHE_MS = 30 * 60 * 1000L
+
+    /** anilistId → (ts, rows of (title, thumbnail)) */
+    private val entryFeedCacheWz =
+        ConcurrentHashMap<Int, Pair<Long, List<Pair<String?, String?>>>>()
+
+    /** startId → (ts, (members, rootTitles)) for the whole franchise walk */
+    private val franchiseCacheWz =
+        ConcurrentHashMap<Int, Pair<Long, Pair<List<FEntry>, List<String>>?>>()
+
+    private fun recordEntryFeedWz(media: JSONObject?) {
+        val id = media?.optInt("id", 0)?.takeIf { it != 0 } ?: return
+        val arr = media.optJSONArray("streamingEpisodes") ?: return
+        if (arr.length() == 0) return
+        val rows = (0 until arr.length()).mapNotNull { i ->
+            arr.optJSONObject(i)?.let { r ->
+                r.optStringOrNullWz("title") to r.optStringOrNullWz("thumbnail")
+            }
+        }
+        if (rows.isNotEmpty()) {
+            entryFeedCacheWz[id] = System.currentTimeMillis() to rows
+        }
+    }
+
+    private fun entryFeedWz(id: Int): List<Pair<String?, String?>>? {
+        val (ts, rows) = entryFeedCacheWz[id] ?: return null
+        return if (System.currentTimeMillis() - ts < ENTRY_FEED_CACHE_MS) rows else null
+    }
+
+    /** Cold-path backfill for a member whose SELF query the walk skipped. */
+    private suspend fun ensureEntryFeedWz(id: Int) {
+        if (entryFeedWz(id) != null) return
+        val gql = """
+            query (${'$'}id: Int) {
+              Media(id: ${'$'}id, type: ANIME) { id streamingEpisodes { title thumbnail } }
+            }
+        """.trimIndent()
+        recordEntryFeedWz(
+            anilistGraph(gql, JSONObject().put("id", id))?.optJSONObject("Media")
+        )
+    }
+
+    /** One AniList query: the entry's own core fields + its relation edges.
+     *  (v84) also carries streamingEpisodes so the episode-title feed is
+     *  harvested for free — see recordEntryFeedWz. */
     private suspend fun franchiseNodeWz(id: Int): Pair<FEntry?, JSONArray?> {
         val gql = """
             query (${'$'}id: Int) {
               Media(id: ${'$'}id, type: ANIME) {
                 id idMal format episodes title { english romaji native }
+                streamingEpisodes { title thumbnail }
                 relations { edges { node { id type format episodes idMal title { english romaji native } } relationType } }
               }
             }
         """.trimIndent()
         val media = anilistGraph(gql, JSONObject().put("id", id))
             ?.optJSONObject("Media") ?: return null to null
+        recordEntryFeedWz(media)
         val self = media.toFEntry()
         val edges = media.optJSONObject("relations")?.optJSONArray("edges")
         return self to edges
@@ -1211,6 +1265,28 @@ class WizstreamProvider : MainAPI() {
     /** Walk prequels to the root, then sequels forward. OVA/movie nodes
      *  are invisible bridges; long SEQUEL specials absorb at the tail. */
     private suspend fun fetchAnimeFranchise(
+        startId: Int,
+    ): Pair<List<FEntry>, List<String>>? {
+        // (v84) EFFICIENCY (ask #4): the whole prequel/sequel walk is
+        // cached 30 min per entry id — page reloads, auto-advance to the
+        // next episode's page, and re-opens no longer re-walk the chain
+        // (before: N serial AniList queries on EVERY load).
+        val now = System.currentTimeMillis()
+        franchiseCacheWz[startId]?.let { (ts, v) ->
+            if (now - ts < FRANCHISE_CACHE_MS) return v
+        }
+        val walked = fetchAnimeFranchiseUncached(startId)
+        // (v84) ROBUSTNESS (ask #4): drop UNAIRED ghost members — announced
+        // sequels (episodes=0 on AniList) contributed phantom 1-row season
+        // groups. The OPENED entry itself is always kept, even unaired.
+        val cleaned = walked?.let { (ms, rt) ->
+            ms.filter { m -> m.episodes > 0 || m.id == startId } to rt
+        }
+        franchiseCacheWz[startId] = now to cleaned
+        return cleaned
+    }
+
+    private suspend fun fetchAnimeFranchiseUncached(
         startId: Int,
     ): Pair<List<FEntry>, List<String>>? = runCatching {
         val (self, startEdges) = franchiseNodeWz(startId)
@@ -1357,6 +1433,14 @@ class WizstreamProvider : MainAPI() {
         enrich: AnimeEnrich?,
     ): List<Episode> {
         foldFranchiseWz(members)
+        // (v84) Warm every member's AniList episode feed — the walk already
+        // harvested them, so this parallel backfill normally fires zero
+        // requests; cold members cost one small query each, concurrent.
+        coroutineScope {
+            members.forEach { m ->
+                launch(Dispatchers.IO) { runCatching { ensureEntryFeedWz(m.id) } }
+            }
+        }
         val tbl = runCatching { WizEpisodeTable.table(app, tmdbId) }.getOrNull()
         // (v71) ABSOLUTE-PACKED TMDB addressing (JJK: all 59 episodes
         // under TMDB "Season 1"; Oshi no Ko: 35 the same way): meta is
@@ -1373,6 +1457,7 @@ class WizstreamProvider : MainAPI() {
             ).filter { it.isNotBlank() }.distinctBy { it.lowercase() }
         val out = ArrayList<Episode>()
         var groupIdx = 0
+        var anilistTitles = 0
         var i = 0
         while (i < members.size) {
             val head = members[i]
@@ -1393,6 +1478,25 @@ class WizstreamProvider : MainAPI() {
                     } else {
                         tblSeasons?.get(gm.siteSeason)?.get(stacked)
                     }
+                    // (v84) ANILIST EPISODE TITLES (ask #3): prefer the
+                    // entry's own licensed-stream feed whenever it PROVABLY
+                    // aligns — entry-sized (±3, the v53 doctrine from the
+                    // pure module) maps locally; an exactly site-season-
+                    // sized list (whole-season feeds AniList pins on cours
+                    // entries) maps by stacked index. Anything else is
+                    // franchise-polluted and falls through to TMDB.
+                    val feed = entryFeedWz(gm.id)
+                    val feedRow = when {
+                        feed == null -> null
+                        kotlin.math.abs(feed.size - gm.episodes.coerceAtLeast(1)) <= 3 ->
+                            feed.getOrNull(localEp - 1)
+                        !absolutePacked ->
+                            tblSeasons?.get(gm.siteSeason)
+                                ?.takeIf { it.size == feed.size }
+                                ?.let { feed.getOrNull(stacked - 1) }
+                        else -> null
+                    }
+                    if (feedRow?.first != null) anilistTitles++
                     out += newEpisode(
                         LinkContext(
                             imdbId = detail.imdbId,
@@ -1413,12 +1517,13 @@ class WizstreamProvider : MainAPI() {
                             franchiseTitles = franchiseKeys,
                         ).toJson()
                     ) {
-                        name = meta?.name
-                            ?.takeUnless { it.equals("Episode $stacked", true) }
+                        name = feedRow?.first?.takeIf { it.isNotBlank() }
+                            ?: meta?.name
+                                ?.takeUnless { it.equals("Episode $stacked", true) }
                             ?: "Episode $displayCounter"
                         season = groupIdx
                         episode = displayCounter
-                        posterUrl = meta?.stillUrl
+                        posterUrl = meta?.stillUrl ?: feedRow?.second
                         description = meta?.overview
                         runCatching { meta?.score?.let { score = Score.from10(it) } }
                         runTime = meta?.runtime
@@ -1428,13 +1533,19 @@ class WizstreamProvider : MainAPI() {
             }
             i++
         }
+        // (v84) ROBUSTNESS: never emit two rows with the same
+        // (group, episode) coordinates — relation-walk anomalies could
+        // previously double-list an entry.
+        val deduped = out.distinctBy { (it.season ?: 0) to (it.episode ?: 0) }
         Log.d(
             TAG, "Wizstream: franchise de-stack for '$showTitle' — " +
-                "${members.size} entries, $groupIdx groups, ${out.size} rows " +
-                "meta-mode ${if (absolutePacked) "absolute" else "stacked"} " +
+                "${members.size} entries, $groupIdx groups, ${deduped.size} rows" +
+                (if (deduped.size != out.size) " (dropped ${out.size - deduped.size} dup)" else "") +
+                " anilistTitles=$anilistTitles" +
+                " meta-mode ${if (absolutePacked) "absolute" else "stacked"} " +
                 "abs=$absolutePacked"
         )
-        return out
+        return deduped
     }
 
     private suspend fun fetchSeasonEpisodes(
