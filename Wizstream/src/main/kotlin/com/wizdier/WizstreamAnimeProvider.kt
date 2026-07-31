@@ -428,9 +428,15 @@ class WizstreamAnimeProvider : MainAPI() {
         // (v81, user request) MDBList ratings get their OWN line — the
         // synopsis now starts on a fresh line beneath them instead of
         // running on from the ratings text.
+        // (v87) …as HTML: Cloudstream's description view is
+        // HtmlCompat.fromHtml (verified upstream), so raw "\n\n" collapses
+        // to a space and the ratings bled INTO the synopsis on-device
+        // (user screenshot 07-31: "MAL 8.5 The third season of…" mid-
+        // line). <br> is the only break that survives that renderer; the
+        // synopsis' own paragraph newlines are converted too.
         val displayPlot = listOfNotNull(
-            mdbLine?.let { "⭐ $it" }, detail.plot
-        ).filter { it.isNotBlank() }.joinToString("\n\n")
+            mdbLine?.let { "⭐ $it" }, detail.plot?.replace("\n", "<br>")
+        ).filter { it.isNotBlank() }.joinToString("<br><br>")
         // (v62) Logcat-visible record of the trackers this page binds.
         runCatching {
             android.util.Log.i(
@@ -1456,21 +1462,34 @@ class WizstreamAnimeProvider : MainAPI() {
         // final fallback for shows TMDB has no art for at all.
         val openedIdx = members.indexOfFirst { it.id == id }.coerceAtLeast(0)
         val openedM = members.getOrNull(openedIdx)
+        // (v87, user screenshot: JJK S3 header showed S2-era art) the
+        // entry-art lookup below was never taught ABSOLUTE-PACKED
+        // addressing: it asked table.seasons[3] for 1..12, found no rows
+        // on JJK's one-season-59 table, silently skipped the season-true
+        // episode STILL branch and fell to the franchise-wide pool —
+        // which dealt it a Shibuya (S2) image. On absolute-packed shows
+        // the window is (seasons[1], absStart..absStart+episodes-1), the
+        // same v71 addressing the episode-meta lookup already uses; the
+        // still picked inside it is provably THIS season's frame.
+        val artSeason = if (absolutePacked) 1 else openedM?.siteSeason
+        val artFrom = if (absolutePacked) openedM?.absStart else openedM?.seasonStart
+        val artTo = if (absolutePacked) openedM?.let { it.absStart + it.episodes - 1 }
+            else openedM?.let { it.seasonStart + it.episodes - 1 }
         val tmdbEntryArt = runCatching {
             WizEpisodeTable.entryBackdrop(
                 showTable,
                 openedIdx,
-                openedM?.siteSeason,
-                openedM?.seasonStart,
-                openedM?.let { it.seasonStart + it.episodes - 1 },
+                artSeason,
+                artFrom,
+                artTo,
             )
         }.getOrNull()
         if (tmdbEntryArt != null) {
             backdropUrl = tmdbEntryArt
             android.util.Log.i(
                 "WizstreamAnime",
-                "entry-art '$title' idx=$openedIdx s=${openedM?.siteSeason} " +
-                    "eps=${openedM?.seasonStart}..${openedM?.let { it.seasonStart + it.episodes - 1 }} " +
+                "entry-art '$title' idx=$openedIdx s=$artSeason " +
+                    "eps=$artFrom..$artTo abs=$absolutePacked " +
                     "→ ${tmdbEntryArt.substringAfterLast('/')}"
             )
         }

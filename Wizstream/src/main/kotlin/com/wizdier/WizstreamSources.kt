@@ -897,6 +897,28 @@ object WizstreamSources {
         "mdblist" to "MDBList ratings",
     )
 
+    /** (v87, user: "settings can be more beautiful and effective") one
+     *  honest line under each toggle saying what it actually serves, so
+     *  choosing sources is informed instead of a hostname guessing game. */
+    private val TOGGLE_BLURBS: Map<String, String> = mapOf(
+        "cineplexbd" to "BDIX · big movie & series catalogue",
+        "ftpbd" to "BDIX · movies, series & anime",
+        "circleftp" to "BDIX · LAN-speed movies, series & anime",
+        "ctgmovies" to "BDIX · movies & series",
+        "fmftp" to "BDIX · movies & series",
+        "mediaserver" to "BDIX · movies & series",
+        "cineby" to "Web · clean API, keyed by TMDB id",
+        "bingr" to "Web · Bingr servers (incl. Sirius) · lists low-first",
+        "moonflix" to "Web · HDGhar + CH ladders · lists low-first",
+        "anizone" to "Anime site · subs",
+        "allmanga" to "Anime site · subs & dubs",
+        "anichi" to "Anime site · MAL-id mapped",
+        "uniquestream" to "Anime site · subs",
+        "anineko" to "Anime site · subs",
+        "reanime" to "Anime site · subs",
+        "tokyoinsider" to "Anime site · subs",
+    )
+
     object WizSourcePrefs {
         private const val PFX = "wiz_src_"
 
@@ -905,12 +927,14 @@ object WizstreamSources {
             val label: String,
             val section: String,   // "BDIX SOURCES", "WEB SOURCES", "ANIME-WEB SOURCES"
             val host: String,      // cosmetic subtitle, e.g. "new.circleftp.net"
+            val blurb: String = "", // (v87) one-line "what this toggle gives you"
         )
 
         /** Build a dialog entry from a resolver object (label from the map). */
         fun src(o: Any, section: String, host: String): Src {
             val id = wizToggleId(o)
-            return Src(id, TOGGLE_LABELS[id] ?: id, section, host)
+            return Src(id, TOGGLE_LABELS[id] ?: id, section, host,
+                blurb = TOGGLE_BLURBS[id] ?: "")
         }
 
         fun isEnabled(id: String): Boolean = runCatching {
@@ -1061,8 +1085,16 @@ object WizstreamSources {
                     orientation = android.widget.LinearLayout.HORIZONTAL
                     gravity = android.view.Gravity.CENTER_VERTICAL
                 }
+                // (v87) section icons — instant visual scanning instead of
+                // reading grey section text.
+                val sectionIcon = when {
+                    section.contains("BDIX") -> "📡 "
+                    section.contains("ANIME") -> "🎌 "
+                    section.contains("WEB") -> "🌐 "
+                    else -> "▸ "
+                }
                 head.addView(android.widget.TextView(context).apply {
-                    text = section
+                    text = sectionIcon + section
                     setTextColor(accent)
                     textSize = 12f
                     letterSpacing = 0.10f
@@ -1092,7 +1124,15 @@ object WizstreamSources {
                 c.addView(bulk)
                 sectionCards += Triple(section, c, counter)
 
-                group.forEach { src ->
+                group.forEachIndexed { srcIdx, src ->
+                    // (v87) hairline divider between rows — separates the
+                    // list visually without boxes around every row.
+                    if (srcIdx > 0) c.addView(android.view.View(context).apply {
+                        setBackgroundColor(0x14FFFFFF)
+                        layoutParams = android.widget.LinearLayout.LayoutParams(
+                            android.widget.LinearLayout.LayoutParams.MATCH_PARENT, 1
+                        )
+                    })
                     val row = android.widget.LinearLayout(context).apply {
                         orientation = android.widget.LinearLayout.HORIZONTAL
                         gravity = android.view.Gravity.CENTER_VERTICAL
@@ -1111,7 +1151,10 @@ object WizstreamSources {
                         textSize = 15f
                     }
                     val host = android.widget.TextView(context).apply {
-                        text = src.host
+                        // (v87) host + one-line purpose — the toggle now
+                        // tells you what it serves, not just where it lives.
+                        text = if (src.blurb.isBlank()) src.host
+                            else "${src.host} · ${src.blurb}"
                         setTextColor(textMuted)
                         textSize = 11.5f
                     }
@@ -1148,7 +1191,7 @@ object WizstreamSources {
             // ── INTEGRATIONS card ─────────────────────────────────────
             val intCard = card()
             intCard.addView(android.widget.TextView(context).apply {
-                text = "INTEGRATIONS"
+                text = "🔑 INTEGRATIONS"
                 setTextColor(accent)
                 textSize = 12f
                 letterSpacing = 0.10f
@@ -1263,7 +1306,8 @@ object WizstreamSources {
                         val hit = q.isEmpty() ||
                             src.label.lowercase().contains(q) ||
                             src.host.lowercase().contains(q) ||
-                            src.section.lowercase().contains(q)
+                            src.section.lowercase().contains(q) ||
+                            src.blurb.lowercase().contains(q)
                         view.visibility =
                             if (hit) android.view.View.VISIBLE else android.view.View.GONE
                     }
@@ -7183,6 +7227,9 @@ internal object WizMdbList {
         "letterboxd" to "Letterboxd", "tomatoes" to "RT",
         "audience" to "RT Audience", "metacritic" to "Metacritic",
         "myanimelist" to "MAL", "roger_ebert" to "Ebert",
+        // (v87) two MDBList sources that rendered raw and ugly on-device
+        // ("metacriticuser 8.1", "popcorn 89" — user screenshot 07-31).
+        "metacriticuser" to "MC Users", "popcorn" to "Popcorn",
     )
 
     /**
@@ -7265,14 +7312,14 @@ internal object WizMdbList {
                         else -> null
                     }
                 }?.takeIf { it > 0 }?.let { if (it > 10.0) it / 10.0 else it }
-            // (v86, user request) ONE RATING PER LINE — the old
-            // "IMDb 8.6  ·  TMDb 85  ·  RT 92 …" single mega-line wrapped
-            // into a dense brick above the synopsis on phone screens and
-            // read as one unorganized blob. Lines stack vertically now,
-            // and both providers already leave a blank line before the
-            // synopsis, so the ratings block reads as its own section.
+            // (v86→v87, user report) Cloudstream renders the description
+            // through HtmlCompat.fromHtml (ResultFragmentPhone → setTextHtml
+            // → String.html() — VERIFIED upstream source), where raw \n
+            // whitespace COLLAPSES into single spaces. The v86 one-per-line
+            // newline join displayed as one flowing brick. Line breaks must
+            // be <br> to survive — one rating per line is the design.
             if (parts.isEmpty() && score10 == null) null
-            else Ratings(score10, parts.takeIf { it.isNotEmpty() }?.joinToString("\n"))
+            else Ratings(score10, parts.takeIf { it.isNotEmpty() }?.joinToString("<br>"))
         }.getOrNull()
         cache[ck] = now to parsed
         if (parsed != null) {

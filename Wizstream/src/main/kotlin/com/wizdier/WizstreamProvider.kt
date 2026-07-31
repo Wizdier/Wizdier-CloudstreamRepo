@@ -472,7 +472,9 @@ class WizstreamProvider : MainAPI() {
         // (that is the entire point of the integration); its per-source line
         // is prepended to the description.
         val ratingOut = mdb?.score10 ?: rating
-        val plotOut = mdb?.line?.let { line -> "⭐ $line\n\n" + (plot ?: "") } ?: plot
+        // (v87) HTML breaks — the description view is HtmlCompat.fromHtml
+        // (verified upstream): raw "\n\n" collapses, <br> survives.
+        val plotOut = mdb?.line?.let { line -> "⭐ $line<br><br>" + (plot ?: "") } ?: plot
 
         return if (mediaType == "movie") {
             val data = LinkContext(
