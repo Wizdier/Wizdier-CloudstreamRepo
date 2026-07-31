@@ -4470,7 +4470,10 @@ override suspend fun resolve(
         )
 
         private val SERVERS = listOf(
-            CinebyServer("Neon",    "neon2",    audioLabel = "Original"),
+            // (v90c) Neon dropped — its /neon2 route was removed server-side
+            // alongside /mbx (404, verified 2026-07-31). Dead upstreams
+            // (hdmovie/superflix currently 500) stay: they fail quietly
+            // under the bounded fan-out and recover when their hosts heal.
             // (v19) Yoru serves TV series too — verified against the live API
             // (mediaType=tv returns sources+subtitles). The old movieOnly flag
             // was the only reason it never appeared for series.
@@ -4525,28 +4528,21 @@ override suspend fun resolve(
             }
 
             var any = false
-            // Primary: aggregate endpoint (what the site's own player calls).
-            // Retried once with a fresh seed on a 401, mirroring the site's BV().
-            for (attempt in 0..1) {
-                try {
-                    any = resolveMbx(
-                        app, tmdbId, title, yearStr, imdbIdStr,
-                        mediaType, seasonId, episodeId, isMovie,
-                        seed, srcLabel, subtitleCallback, callback,
+            // (v90c) The /mbx aggregate endpoint was RETIRED server-side —
+            // a fresh-seed call now answers 404 "Route GET:/mbx/sources-
+            // with-title … not found" (verified 2026-07-31). The per-server
+            // fan-out below is no longer a fallback, it IS the flow — which
+            // matches the site's own BV() behaviour anyway, since its
+            // fallback was always this same fan-out.
+            if (true) {
+                // Videasy subtitle search runs ONCE per media item (it used
+                // to ride the mbx call — kept, now on the fan-out path so
+                // the [Videasy] tracks aren't lost with the dead route).
+                runCatching {
+                    fetchVideasySubs(
+                        app, tmdbId, isMovie, seasonId, episodeId, subtitleCallback,
                     )
-                    break
-                } catch (e: SeedInvalidException) {
-                    Log.d(TAG, "Cineby: mbx seed rejected, refreshing (attempt $attempt)")
-                    if (attempt == 1 || !refreshSeed()) break
-                } catch (e: Exception) {
-                    Log.d(TAG, "Cineby: mbx failed: ${e.message}")
-                    break
                 }
-            }
-
-            // Fallback: per-server fan-out, bounded concurrency (same as before,
-            // but now with local mvm1 decryption instead of enc-dec.app).
-            if (!any) {
                 val eligible = SERVERS.filter { !it.movieOnly || isMovie }
                 val gate = Semaphore(3)
                 val refreshedOnce = java.util.concurrent.atomic.AtomicBoolean(false)
@@ -4662,145 +4658,6 @@ override suspend fun resolve(
             return j.takeIf { it.has("sources") || it.has("subtitles") }
         }
 
-        /** v30 primary path: the aggregate /mbx endpoint — one request returns
-         *  sources for every server the backend considers alive. */
-        private suspend fun resolveMbx(
-            app: Requests,
-            tmdbId: Int,
-            title: String,
-            yearStr: String,
-            imdbIdStr: String,
-            mediaType: String,
-            seasonId: String,
-            episodeId: String,
-            isMovie: Boolean,
-            seed: String,
-            srcLabel: String,
-            subtitleCallback: (SubtitleFile) -> Unit,
-            callback: (ExtractorLink) -> Unit,
-        ): Boolean {
-            val query = buildSourcesQuery(
-                "mbx", tmdbId, doubleEncode(title), mediaType, yearStr,
-                imdbIdStr, seasonId, episodeId, language = null,
-            )
-            val plaintext = fetchAndDecrypt(app, query, tmdbId, seed) ?: return false
-            val result = unwrapResult(plaintext) ?: return false
-
-            var any = false
-            val sourcesArr = result.optJSONArray("sources")
-            if (sourcesArr != null) {
-                emitSubtitles(result.optJSONArray("subtitles"), "Cineby", subtitleCallback)
-                for (i in 0 until sourcesArr.length()) {
-                    val s = sourcesArr.optJSONObject(i) ?: continue
-                    val url = s.optStringOrNullCp("url") ?: continue
-                    if (!url.startsWith("http")) continue
-                    val safeUrl = if (url.startsWith("http://")) {
-                        url.replaceFirst("http://", "https://")
-                    } else url
-                    val quality = s.optStringOrNullCp("quality") ?: "Auto"
-                    val tag = serverTagOf(s, safeUrl)
-                    val group = if (tag != null) "$srcLabel · $tag" else srcLabel
-                    val name = "Cineby" + (tag?.let { " · $it" } ?: "") + languageTagOf(quality)
-                    if (emitMedia(app, safeUrl, quality, group, name, callback)) {
-                        any = true
-                    }
-                }
-            }
-            if (any) {
-                // The site fetches subtitles for the player from subs.videasy.to
-                // separately — mirror that so Cineby picks keep subtitles.
-                fetchVideasySubs(app, tmdbId, isMovie, seasonId, episodeId, subtitleCallback)
-            }
-            return any
-        }
-
-        /** v30: shared emission ladder for the aggregate path — same probe and
-         *  device gates the per-server path applies inline. */
-        private suspend fun emitMedia(
-            app: Requests,
-            safeUrl: String,
-            qualityRaw: String,
-            serverSourceLabel: String,
-            name: String,
-            callback: (ExtractorLink) -> Unit,
-        ): Boolean {
-            if (emitTaggedMedia(app, safeUrl, serverSourceLabel, name, callback)) return true
-            when {
-                safeUrl.contains(".m3u8", true) -> {
-                    M3u8Helper.generateM3u8(
-                        source = serverSourceLabel,
-                        streamUrl = safeUrl,
-                        referer = "$SITE/",
-                        headers = API_HEADERS,
-                    ).forEach { link ->
-                        callback(
-                            newExtractorLink(
-                                source = serverSourceLabel,
-                                name = name,
-                                url = link.url,
-                                type = ExtractorLinkType.M3U8,
-                            ) {
-                                this.referer = "$SITE/"
-                                this.quality = link.quality
-                                this.headers = API_HEADERS
-                            }
-                        )
-                    }
-                    return true
-                }
-                safeUrl.contains(".mp4", true) || safeUrl.contains(".mkv", true) ||
-                    safeUrl.contains(".webm", true) -> {
-                    callback(
-                        newExtractorLink(
-                            source = serverSourceLabel,
-                            name = name,
-                            url = safeUrl,
-                            type = ExtractorLinkType.VIDEO,
-                        ) {
-                            this.referer = "$SITE/"
-                            this.quality = qualityFromName(safeUrl).takeIf { it > 0 }
-                                ?: qualityFromName(qualityRaw)
-                            this.headers = API_HEADERS
-                        }
-                    )
-                    return true
-                }
-                safeUrl.contains(".mpd", true) -> {
-                    callback(
-                        newExtractorLink(
-                            source = serverSourceLabel,
-                            name = name,
-                            url = safeUrl,
-                            type = ExtractorLinkType.DASH,
-                        ) {
-                            this.referer = "$SITE/"
-                            this.quality = qualityFromName(safeUrl).takeIf { it > 0 }
-                                ?: qualityFromName(qualityRaw)
-                            this.headers = API_HEADERS
-                        }
-                    )
-                    return true
-                }
-            }
-            return false
-        }
-
-        /** Emit a subtitles JSON array with the "[Tag] Lang" labelling convention. */
-        private fun emitSubtitles(
-            arr: JSONArray?,
-            tag: String,
-            subtitleCallback: (SubtitleFile) -> Unit,
-        ) {
-            if (arr == null) return
-            for (i in 0 until arr.length()) {
-                val s = arr.optJSONObject(i) ?: continue
-                val subUrl = s.optStringOrNullCp("url") ?: s.optStringOrNullCp("file")
-                    ?: s.optStringOrNullCp("src") ?: continue
-                val rawSubLabel = s.optStringOrNullCp("language") ?: s.optStringOrNullCp("label")
-                    ?: s.optStringOrNullCp("lang") ?: s.optStringOrNullCp("name") ?: "Subtitle"
-                subtitleCallback(SubtitleFile("[$tag] $rawSubLabel", subUrl))
-            }
-        }
 
         /** v30: the site's player fetches subtitles from subs.videasy.to. */
         private suspend fun fetchVideasySubs(
@@ -4829,32 +4686,6 @@ override suspend fun resolve(
             }
         }
 
-        private val KNOWN_SERVER_TAGS = listOf(
-            "neon" to "Neon", "yoru" to "Yoru", "breach" to "Breach",
-            "vyse" to "Vyse", "gekko" to "Gekko", "kayo" to "Kayo",
-            "jett" to "Jett", "sage" to "Sage", "omen" to "Omen",
-            "cypher" to "Cypher", "tejo" to "Tejo", "chamber" to "Chamber",
-            "harbor" to "Harbor", "killjoy" to "Killjoy", "fade" to "Fade",
-            "raze" to "Raze",
-        )
-
-        /** Identify which backend server an aggregate source came from — explicit
-         *  JSON keys when present, CDN host fingerprints otherwise. */
-        private fun serverTagOf(src: JSONObject, url: String): String? {
-            for (key in listOf("server", "provider", "source", "site")) {
-                val v = src.optStringOrNullCp(key) ?: continue
-                val low = v.lowercase()
-                if (low.contains("http") || v.length > 24) continue
-                KNOWN_SERVER_TAGS.firstOrNull { it.first in low }?.let { return it.second }
-            }
-            val host = runCatching { java.net.URI(url).host.orEmpty().lowercase() }
-                .getOrDefault("")
-            return when {
-                "ironwall" in host || "interkh" in host -> "Neon"
-                "cdntv" in host -> "Yoru"
-                else -> null
-            }
-        }
 
         private val LANGUAGE_WORDS = listOf(
             "hindi" to "Hindi", "german" to "German", "spanish" to "Spanish",
@@ -4932,9 +4763,16 @@ override suspend fun resolve(
                 val n = st.s[i] xor (K * (counter + 1))
                 val r = a
                 var c = (r xor n) or (r and n and uBit)
-                c = rotl(c + a, i and 31) xor rotl(a, (31 * (i * 7)) and 31)
-                c += K
-                a = f(c)
+                // (v90c) Re-verified against the live site chunk 831
+                // (2026-07-31): the second rotate is (i*7) & 31 — the v30
+                // transcription double-applied the 31 factor (217*i mod 32
+                // ≠ 7*i mod 32), so keystream words diverged and the
+                // "mvm1" magic check failed on real payloads, silently
+                // nulling every Cineby link. One-line rotation fix, now
+                // proven against live /cdn payloads (movie + TV, decrypts
+                // to sources+subtitles JSON).
+                c = rotl(c + a, i and 31) xor rotl(a, (i * 7) and 31)
+                a = f(c + K)
                 st.s[i] = a
                 st.assigned[i] = true
                 st.acc = a

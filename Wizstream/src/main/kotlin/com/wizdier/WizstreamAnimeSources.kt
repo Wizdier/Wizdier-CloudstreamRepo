@@ -997,7 +997,42 @@ object WizstreamAnimeSources {
                 firstOrNull { it.anilistId != null && it.anilistId == anilistId }
                     ?: maxByOrNull { bestTitleSim(it.title, title, altTitle) }
                         ?.takeIf { bestTitleSim(it.title, title, altTitle) >= 0.5 }
-            var best = doSearch(title).pick()
+            // (v90c) EXACT-ID SHORT-CIRCUIT: AnimeX's schema exposes a
+            // direct handle — anime(anilistId:) — so when the AniList
+            // entry id is already known (the common case) one exact call
+            // replaces the search + similarity dance entirely and can
+            // never land on a sibling (verified live 2026-07-31:
+            // anilist 110277 → "attack-on-titan-final-season-5ugtv").
+            // The search ladder below stays as the fallback for id-less
+            // contexts.
+            suspend fun directByAnilist(aid: Int): Hit? {
+                val q = "query(\$aid: Int) { anime(anilistId: \$aid) { " +
+                    "id anilistId malId titleRomaji titleEnglish } }"
+                val payload = JSONObject()
+                    .put("query", q)
+                    .put("variables", JSONObject().put("aid", aid))
+                    .toString()
+                val body = wizRetryOnce("animex by-anilist") {
+                    runCatching {
+                        app.post(
+                            GQL,
+                            headers = HEADERS + ("Content-Type" to "application/json"),
+                            requestBody = payload
+                                .toRequestBody("application/json".toMediaTypeOrNull()),
+                            cacheTime = 0,
+                            timeout = 15_000,
+                        ).text
+                    }.getOrNull()
+                } ?: return null
+                val o = runCatching { JSONObject(body) }.getOrNull()
+                    ?.optJSONObject("data")?.optJSONObject("anime") ?: return null
+                val id = o.optStringOrNull("id") ?: return null
+                val t = o.optStringOrNull("titleEnglish")
+                    ?: o.optStringOrNull("titleRomaji") ?: return null
+                return Hit(id, aid, t)
+            }
+            var best = anilistId?.let { aid -> directByAnilist(aid) }
+            if (best == null) best = doSearch(title).pick()
             if (best == null && !altTitle.isNullOrBlank() && !altTitle.equals(title, true)) {
                 best = doSearch(altTitle).pick()
             }
@@ -1050,6 +1085,14 @@ object WizstreamAnimeSources {
                         h.optStringOrNull(k)?.let { v -> apiHeaders[k] = v }
                     }
                 }
+                // (v90c) Header superset — backends answering with only an
+                // Origin (owocdn/anidb-app today) can still hotlink-gate on
+                // Referer deeper in the chain (the HTTP 2004 class the user
+                // hit on TV). Send both unless the response already dictated
+                // the pair (sora's kaa.lt Referer is required as-is and
+                // arrives in the map untouched).
+                apiHeaders.putIfAbsent("Referer", "$SITE/")
+                apiHeaders.putIfAbsent("Origin", SITE)
                 val referer = apiHeaders["Referer"] ?: "$SITE/"
                 val pname = pid.replaceFirstChar {
                     if (it.isLowerCase()) it.titlecase() else it.toString()

@@ -604,10 +604,21 @@ class WizstreamAnimeProvider : MainAPI() {
                         if (pairs.isNotEmpty() && pairs.size * 2 >= sEpList.size &&
                             pairs.map { it.first }.toSet().size == pairs.size
                         ) {
-                            val off = (pairs.minOf { it.first } - 1).coerceAtLeast(0)
+                            // (v90c) Numbered feeds are SELF-ADDRESSED: the
+                            // number inside the feed title IS the entry-local
+                            // episode. The old min-offset window slid every
+                            // partial feed down onto row 1 — AniList's
+                            // Crunchyroll feed for One Piece starts at
+                            // "Episode 62" (69 eps, 62-130, verified live
+                            // 2026-07-31), so the page's first 69 rows all
+                            // wore titles from 61 episodes ahead ("1. Episode
+                            // 62 - The First Line of Defense?…"). Rows whose
+                            // number the feed doesn't carry now get NO feed
+                            // title and fall through to ani.zip/Kitsu — the
+                            // entry-true sources the same ladder prefers.
                             val byRow = HashMap<Int, StreamEp>()
-                            pairs.forEach { (n, ep) -> byRow.putIfAbsent(n - off, ep) }
-                            byRow[localEp] ?: sEpList.getOrNull(localEp - 1)
+                            pairs.forEach { (n, ep) -> byRow.putIfAbsent(n, ep) }
+                            byRow[localEp]
                         } else sEpList.getOrNull(localEp - 1)
                     }
                     // (v64) Row-name chain: real stream title → real
