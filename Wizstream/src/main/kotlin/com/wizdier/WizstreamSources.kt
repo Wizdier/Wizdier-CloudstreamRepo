@@ -2686,6 +2686,17 @@ override suspend fun resolve(
                 .replace(Regex("""(?i)\bseasons?\b\.?\s*\d{0,2}"""), " ")
                 .replace(Regex("""(?i)\bs\d{1,2}\b"""), " ")
                 .replace(Regex("""(?i)\b(final|part|cour)\b\.?\s*\d{0,2}"""), " ")
+                // (v90b) Sequel-wording leftovers that kept SPECIAL/CHAPTER
+                // entries from baring down to their franchise root:
+                // "Attack on Titan Final Season THE FINAL CHAPTERS
+                // Special 1" lost "final"/"season" above but still carried
+                // "THE CHAPTERS Special" — unusable as a search term or
+                // alias key. Fold those words away too (and a dangling
+                // trailing "the" left behind by "…: The Final Season").
+                .replace(Regex("""(?i)\bthe\s+final\s+chapters?\b"""), " ")
+                .replace(Regex("""(?i)\b(final\s+)?chapters?\b"""), " ")
+                .replace(Regex("""(?i)\bspecials?\b\.?\s*\d{0,2}"""), " ")
+                .replace(Regex("""(?i)\s+\bthe\s*$"""), " ")
                 .replace(
                     Regex("""(?i)\b(dual|multi)[- ]?audio\b|\b\w{2,9}[- ](dub|dubbed|sub|subbed|audio)\b|\bdubbed\b"""),
                     " "
@@ -3376,6 +3387,16 @@ override suspend fun resolve(
             val merged = LinkedHashMap<Int, org.json.JSONObject>()
             var ipRewriteLinks = false
             var searchHit = false
+            // (v90b) SERIES asks fetch EVERY variant, not just the first
+            // one that answers. Root cause of the "Attack on Titan after
+            // Season 3" no-links report: sequel re-uploads ("Attack on
+            // Titan: The Final Season …") satisfy the full-title variant,
+            // and the early break then kept the bare "Attack on Titan"
+            // variant — the only one that surfaces the 2013 season-labeled
+            // mega post whose "Season 4" bucket actually serves Final
+            // Season / Part 2 / SP 1-2 — from ever being queried. Movie
+            // asks keep the cheap first-hit break.
+            val isSeriesAsk = season != null && episode != null
             for (q in queryVariants) {
                 var page = 0
                 var sawAny = false
@@ -3404,7 +3425,7 @@ override suspend fun resolve(
                         TAG, "CircleFTP: search '$q' rows=${merged.size} " +
                             "(query variant hit)"
                     )
-                    break
+                    if (!isSeriesAsk) break
                 } else {
                     Log.d(TAG, "CircleFTP: search '$q' rows=0 — next variant")
                 }
@@ -3468,6 +3489,10 @@ override suspend fun resolve(
             // (v32) second-chance pool for loosely-decorated anime/BDIX
             // posts that the strict gate kills; used ONLY when tier 1 empty.
             val fuzzyFiltered = mutableListOf<Pair<Int, String>>()
+            // (v90b) tier-3 franchise-rescue pool, now collected on EVERY
+            // series pass (it used to be consulted only when both tiers
+            // above came back empty — see the additive-union note below).
+            val rescueFiltered = mutableListOf<Pair<Int, String>>()
             //
             //    FIX (v17): The previous code filtered posts by title similarity
             //    (score >= 0.5 AND pNorm.contains(qNorm)) which was TOO STRICT.
@@ -3499,13 +3524,40 @@ override suspend fun resolve(
                     identityFiltered += p.optInt("id", -1) to ptitle
                 } else if (isFuzzySameMedia(ptitle, title, effectiveYear)) {
                     fuzzyFiltered += p.optInt("id", -1) to ptitle
+                } else if (isSeriesAsk && isSeriesRescueMatch(ptitle, title)) {
+                    rescueFiltered += p.optInt("id", -1) to ptitle
                 }
             }
-            var matchingPostIds = identityFiltered.ifEmpty { fuzzyFiltered }
+            // (v90b) TIER-3 RESCUE IS NOW ADDITIVE for series (was: only
+            // when strict+fuzzy found nothing). A sibling post that passes
+            // strict/fuzzy for a sequel title (the "Final Season"-named
+            // re-uploads) silently dead-ends at the bucket stage — it has
+            // no "Season 4" labels to satisfy a stacked Final-Season ask —
+            // while its mere existence suppressed the rescue that would
+            // have found the season-labeled mega post. Union the rescue
+            // picks in (deduped by id, shortest-title-first, capped):
+            // downstream per-post gates (v70 coverage guard, v63
+            // label-first pools, v60 strict cours equality, v48
+            // positional-title guard) still decide whether ANY post may
+            // serve an episode, so an added rescue post can never emit a
+            // wrong link — worst case it adds nothing.
+            val basePicks = identityFiltered.ifEmpty { fuzzyFiltered }
+            val rescueExtras = if (isSeriesAsk) {
+                val already = basePicks.map { it.first }.toHashSet()
+                rescueFiltered.asSequence()
+                    .filter { it.first !in already }
+                    .sortedBy { it.second.length }
+                    .take(8)
+                    .toList()
+            } else {
+                emptyList()
+            }
+            var matchingPostIds = basePicks + rescueExtras
             Log.d(
                 TAG, "CircleFTP: '$title' s=$season e=$episode hit=$searchHit " +
                     "posts=${merged.size} identity=${identityFiltered.size} " +
-                    "fuzzy=${fuzzyFiltered.size}"
+                    "fuzzy=${fuzzyFiltered.size} " +
+                    "rescue+${rescueExtras.size}/${rescueFiltered.size}"
             )
 
             // ── (v45) TIER 3: multi-season anime rescue ─────────────────
@@ -3522,25 +3574,12 @@ override suspend fun resolve(
             // only ever taken from content seasons whose markers match the
             // requested season (the v11 guard below), so a rescued post can
             // never serve the wrong season — worst case it yields nothing.
-            if (matchingPostIds.isEmpty() && season != null && episode != null) {
-                val rescue = mutableListOf<Pair<Int, String>>()
-                for (i in 0 until postsArr.length()) {
-                    val p = postsArr.optJSONObject(i) ?: continue
-                    val ptitle = p.optString("title").ifBlank { p.optString("name") ?: "" }
-                    if (ptitle.isBlank()) continue
-                    if (isSeriesRescueMatch(ptitle, title)) {
-                        rescue += p.optInt("id", -1) to ptitle
-                    }
-                }
-                if (rescue.isNotEmpty()) {
-                    Log.d(
-                        TAG,
-                        "CircleFTP: tier-3 season-aware rescue matched " +
-                            "${rescue.size} post(s) for '$title' s=$season e=$episode"
-                    )
-                    matchingPostIds = rescue
-                }
-            }
+            // (v90b) The old gated tier-3 block ("rescue ONLY when strict+
+            // fuzzy found nothing") is gone: the same rescue test now runs
+            // inside the collection pass above and its picks are UNIONED
+            // into matchingPostIds for every series ask, empty base or
+            // not. That gate was the exact mechanism that let a dead-ending
+            // sequel re-upload suppress the season-labeled mega post.
             // ── (v48) Anime-category browse rescue ───────────────────────
             // The text search is opaque (not plain substring — final and
             // cours entries got zero rows despite correct titles). For

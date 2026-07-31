@@ -629,15 +629,29 @@ class WizstreamAnimeProvider : MainAPI() {
                     val aziTitle = azi?.title?.takeUnless { isBareEpisodeLabel(it) }
                     val streamTitle = sEp?.title?.takeUnless { isBareEpisodeLabel(it) }
                     val tmdbTitle = epMeta?.name?.takeUnless { isBareEpisodeLabel(it) }
-                    val kitsuTitle = if (streamTitle == null && tmdbTitle == null && aziTitle == null) {
+                    val kitsuTitle = if (streamTitle == null && aziTitle == null) {
                         detail.kitsuId?.let { kid ->
                             (kitsuTitles
                                 ?: fetchKitsuEpisodeTitles(kid).also { kitsuTitles = it })
                                 .get(localEp)
                         }?.takeUnless { isBareEpisodeLabel(it) }
                     } else null
-                    val rowName = streamTitle ?: tmdbTitle ?: aziTitle ?: kitsuTitle
-                        ?: sEp?.title ?: epMeta?.name ?: azi?.title ?: "Episode $localEp"
+                    // (v90, user: "make tmdb the last fallback for title
+                    // name extraction it is showing wrong titles" — the
+                    // One Piece page titled row 1 'Episode 62 - The First
+                    // Line of Defense?…', i.e. the TMDB canon table landed
+                    // the giant single-entry show a WHOLE SEASON off
+                    // (+61) — episode mapping by season window is fragile
+                    // exactly on the biggest shows. ani.zip/Kitsu key by
+                    // the AniList ENTRY itself, entry-local numbering, so
+                    // they cannot shift.) TITLE ladder is now:
+                    //   AniList feed → ani.zip → Kitsu → TMDB (LAST).
+                    // The same demotion applies to every per-row display
+                    // field below (still/overview/score/runtime/date) so a
+                    // row can never wear one episode's title with another
+                    // episode's date/rating from the mis-mapped table.
+                    val rowName = streamTitle ?: aziTitle ?: kitsuTitle ?: tmdbTitle
+                        ?: sEp?.title ?: azi?.title ?: epMeta?.name ?: "Episode $localEp"
                     newEpisode(LinkContext(
                         anilistId = m.id, imdbId = imdbId, tmdbId = tmdbId, malId = m.malId,
                         season = m.siteSeason, episode = stackedEp, entryEpisode = localEp,
@@ -665,18 +679,28 @@ class WizstreamAnimeProvider : MainAPI() {
                         // same picture while real per-episode stills sat
                         // unused (the side-by-side "same thumbnail
                         // everywhere" from the user's screenshot).
-                        // (v86) ani.zip fills whichever episode fields
-                        // TMDB/feed left empty (image/overview/date/
-                        // runtime/score) — still AniList-first ordering.
-                        posterUrl = epMeta?.stillUrl ?: sEp?.thumb
-                            ?: azi?.image ?: detail.posterUrl
-                        description = epMeta?.overview ?: azi?.overview
+                        // (v90) ani.zip-first field fills — the v86 order
+                        // (TMDB table first) put the mis-mapped table's
+                        // date/rating/still on rows whose title was
+                        // already ani.zip's, splitting one row between two
+                        // different episodes (see the row-1/\'Episode 62\'
+                        // report). TMDB remains accepted ONLY for fields
+                        // ani.zip + the stream feed don't carry at all —
+                        // it is now the LAST resort per field too.
+                        // (Feed thumb stays ahead of the TMDB still: v71's
+                        // "generic key visual" complaint class is covered
+                        // by ani.zip stills above it, and a real feed
+                        // frame of THIS episode beats a still of the
+                        // canon table's possibly-shifted episode.)
+                        posterUrl = azi?.image ?: sEp?.thumb
+                            ?: epMeta?.stillUrl ?: detail.posterUrl
+                        description = azi?.overview ?: epMeta?.overview
                         runCatching {
-                            (epMeta?.score ?: azi?.score10)
+                            (azi?.score10 ?: epMeta?.score)
                                 ?.let { score = Score.from10(it) }
                         }
-                        runTime = epMeta?.runtime ?: azi?.runtime
-                        this.date = epMeta?.airDate ?: azi?.airMs
+                        runTime = azi?.runtime ?: epMeta?.runtime
+                        this.date = azi?.airMs ?: epMeta?.airDate
                     }
                 }
             }
