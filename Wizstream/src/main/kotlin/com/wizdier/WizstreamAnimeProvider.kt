@@ -1198,15 +1198,18 @@ class WizstreamAnimeProvider : MainAPI() {
         // flaky/absent TMDB table both lack. Entry-local keys: no
         // alignment math needed.
         var aniEps: Map<Int, WizAniZip.Ep> = emptyMap()
-        runCatching {
+        // (v88) one retry — this single call carries the page's imdb/tmdb/
+        // kitsu ids AND the v86 episode fallback map; two vars per id
+        wizRetryOnce("ani-zip ids $id") {
             val text = app.get("https://api.ani.zip/mappings?anilist_id=$id",
                 headers = mapOf("User-Agent" to A_UA), timeout = 8000).text
             val mapJson = JSONObject(text)
-            val mappings = mapJson.optJSONObject("mappings")
-            imdbId = mappings?.aOptStr("imdb_id")
-            tmdbId = mappings?.aOptStr("themoviedb_id")?.toIntOrNull()
-            kitsuId = mappings?.aOptStr("kitsu_id")
+            val mappings = mapJson.optJSONObject("mappings") ?: return@wizRetryOnce null
+            imdbId = mappings.aOptStr("imdb_id")
+            tmdbId = mappings.aOptStr("themoviedb_id")?.toIntOrNull()
+            kitsuId = mappings.aOptStr("kitsu_id")
             aniEps = WizAniZip.parse(mapJson)
+            true
         }
 
         // (v55, PURE ANILIST) AniList itself supplies all metadata — the
@@ -1928,12 +1931,15 @@ class WizstreamAnimeProvider : MainAPI() {
     // (v54) module-internal (not private) so the unified WizstreamProvider
     // can reuse it for StreamPlay-style AniList enrichment on TMDB anime
     // pages after the re-merge.
+    // (v88) one bounded retry — a transient AniList blip previously killed
+    // the WHOLE page (load() throws when the detail query fails) or
+    // silently shorted a franchise walk. Happy path = one call, unchanged.
     internal suspend fun anilistQuery(
         query: String,
         variables: JSONObject,
         bearerToken: String? = null,
     ): JSONObject? =
-        runCatching {
+        wizRetryOnce("anilist") {
             val body = JSONObject().apply {
                 put("query", query); put("variables", variables)
             }.toString().toRequestBody("application/json".toMediaTypeOrNull())
@@ -1949,7 +1955,7 @@ class WizstreamAnimeProvider : MainAPI() {
                 timeout = 12_000)
             if (res.code !in 200..299) null
             else JSONObject(res.text).optJSONObject("data")
-        }.getOrNull()
+        }
 
     // ── (v45) Personal AniList homepage rows ─────────────────────────────
     // Served ONLY while the user is logged into AniList in Cloudstream.

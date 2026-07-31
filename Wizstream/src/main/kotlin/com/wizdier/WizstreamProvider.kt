@@ -1618,8 +1618,11 @@ class WizstreamProvider : MainAPI() {
         }
     }
 
+    // (v88) one bounded retry — TMDB detail/season calls are the main
+    // catalogue's spine; a single dropped call used to lose a whole
+    // season's episode rows for that load.
     private suspend fun tmdbGet(path: String, query: Map<String, Any?> = emptyMap()): JSONObject? {
-        return runCatching {
+        return wizRetryOnce("tmdb-get") {
             val q = mapOf("api_key" to TMDB_KEY) + query
             val params = q.entries.filter { it.value != null }.joinToString("&") { (k, v) ->
                 "${URLEncoder.encode(k, "UTF-8")}=${URLEncoder.encode(v.toString(), "UTF-8")}"
@@ -1630,7 +1633,7 @@ class WizstreamProvider : MainAPI() {
                 "Accept" to "application/json",
             ), timeout = 10_000)
             if (res.code in 200..299) JSONObject(res.text) else null
-        }.getOrNull()
+        }
     }
 
     private suspend fun fetchSimklId(imdbId: String?, mediaType: String): Int? {

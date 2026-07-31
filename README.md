@@ -8,7 +8,7 @@
 
 [![CloudStream](https://img.shields.io/badge/CloudStream-extension-blueviolet?logo=android)](https://github.com/recloudstream/cloudstream)
 [![Extensions](https://img.shields.io/badge/extensions-8-success)](#-whats-inside)
-[![Latest build](https://img.shields.io/badge/Wizstream-v87-orange)](CHANGELOG.md)
+[![Latest build](https://img.shields.io/badge/Wizstream-v88-orange)](CHANGELOG.md)
 
 ---
 
@@ -46,7 +46,8 @@ second extension; they ship bound together and share one settings screen.
 | 🔤 **Subtitles anywhere** | Optional Wyzie Subs integration adds subtitles even to raw BDIX `.mkv` files that carry none. |
 | ⭐ **Ratings** | Optional MDBList integration shows IMDb, Rotten Tomatoes, Metacritic and MAL scores together on the page. |
 | 🔄 **Tracking** | Syncs progress with AniList, MAL, Kitsu and Simkl. |
-| ⚡ **Dead-link pruning** | Broken servers are detected and dropped *before* the player tries them, so you don't sit through a 30-second stall. |
+| ⚡ **Web-like fast start** | Streams that ladder by quality are listed lowest-first, so playback starts light and ramps up — just like a web player — instead of stalling on a heavy 1080p file your line can't hold yet. |
+| 🛟 **Honest fallback** | Links are listed exactly as servers publish them (no fake "verified" checks). If one pick stalls on a dead box, tap the next link for that episode — recovery is one tap, not minutes. |
 
 ---
 
@@ -66,8 +67,9 @@ who prefer one-site-per-extension or want to compare results side by side.
 
 Go to **Settings → Extensions → Wizstream → Open Settings** to:
 
-- switch individual sources on or off (handy for trimming slow ones, or
-  going BDIX-only when you're off Wi-Fi),
+- switch individual sources on or off — grouped under 📡 BDIX, 🌐 Web and
+  🎌 Anime-web, each labelled with what it actually serves (handy for
+  trimming slow ones, or going BDIX-only when you're off Wi-Fi),
 - search the source list,
 - paste optional API keys for **Wyzie Subs** (subtitles) and **MDBList**
   (ratings).

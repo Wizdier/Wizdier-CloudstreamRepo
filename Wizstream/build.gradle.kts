@@ -1,4 +1,4 @@
-version = 87
+version = 88
 
 cloudstream {
     description = "Wizstream — ONE install, BOTH catalogues (v85). " +

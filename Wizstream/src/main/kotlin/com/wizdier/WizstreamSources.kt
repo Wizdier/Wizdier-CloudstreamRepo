@@ -6664,7 +6664,7 @@ internal object WizEpisodeTable {
         }.getOrNull()
     }
 
-    private suspend fun getJson(app: Requests, path: String): JSONObject? = runCatching {
+    private suspend fun getJson(app: Requests, path: String): JSONObject? = wizRetryOnce("tmdb-json") {
         val joiner = if ('?' in path) "&" else "?"
         val url = "$TABLE_API$path$joiner" + "api_key=$TABLE_KEY&language=en-US"
         val res = app.get(url, headers = mapOf(
@@ -6672,7 +6672,7 @@ internal object WizEpisodeTable {
             "Accept" to "application/json",
         ), timeout = 10_000)
         if (res.code !in 200..299) null else JSONObject(res.text)
-    }.getOrNull()
+    }
 
     /** Site-stacked episode table + show art. */
     suspend fun table(app: Requests, tmdbId: Int): Table? {
@@ -7121,6 +7121,25 @@ internal object WizWyzieSubs {
 //  once and shares it with both providers (the main catalogue fetches it
 //  per franchise member, 30-min cached).
 // ─────────────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+//  (v88, user: "robustify the extension") ONE bounded retry for the
+//  page-load-critical metadata APIs. Before this, a single transient
+//  mobile-network blip (TMDB/AniList/ani.zip/MDBList timing out once)
+//  silently degraded a whole page: no episode table → bare "Episode N"
+//  rows, no id-map → no episode fallback art/titles at all. On the happy
+//  path nothing changes (one call, as always); on failure the block runs
+//  ONE more time after 350 ms and only then gives up — worst-case +one
+//  timeout, which beats a permanently broken page for that session.
+// ─────────────────────────────────────────────────────────────────────────────
+internal suspend fun <T> wizRetryOnce(tag: String, block: suspend () -> T?): T? {
+    val first = runCatching { block() }.getOrNull()
+    if (first != null) return first
+    kotlinx.coroutines.delay(350)
+    val second = runCatching { block() }.getOrNull()
+    if (second == null) Log.w(WIZ_TAG, "$tag: failed twice — giving up this round")
+    return second
+}
+
 internal object WizAniZip {
     data class Ep(
         val title: String?,
@@ -7180,15 +7199,16 @@ internal object WizAniZip {
     suspend fun episodes(app: Requests, anilistId: Int): Map<Int, Ep> {
         val now = System.currentTimeMillis()
         cache[anilistId]?.let { (ts, v) -> if (now - ts < CACHE_MS) return v }
-        val parsed = runCatching {
+        // (v88) one retry — this map is the v86 episode-title/art fallback,
+        // so a single dropped request must not strip a page for 30 minutes.
+        val parsed: Map<Int, Ep> = wizRetryOnce("ani-zip eps $anilistId") {
             val res = app.get(
                 "https://api.ani.zip/mappings?anilist_id=$anilistId",
                 headers = mapOf("User-Agent" to WIZ_UA),
                 timeout = 8_000,
             )
-            if (res.code !in 200..299) return emptyMap()
-            parse(JSONObject(res.text))
-        }.getOrDefault(emptyMap())
+            if (res.code !in 200..299) null else parse(JSONObject(res.text))
+        } ?: emptyMap()
         cache[anilistId] = now to parsed
         return parsed
     }
@@ -7263,7 +7283,9 @@ internal object WizMdbList {
         }
 
         val url = "$API/$provider/$type/$id/?apikey=${WizstreamSources.encodeUrl(key)}"
-        val parsed = runCatching {
+        // (v88) one bounded retry — a single timeout shouldn't strip the
+        // ratings line from a page for the user's remaining session.
+        val parsed = wizRetryOnce("mdblist $ck") {
             val res = app.get(
                 url,
                 headers = mapOf("User-Agent" to WIZ_UA, "Accept" to "application/json"),
@@ -7275,7 +7297,7 @@ internal object WizMdbList {
                     429 -> "daily quota exhausted"
                     else -> "service error"
                 })
-                return@runCatching null
+                return@wizRetryOnce null
             }
             val o = JSONObject(res.text)
             val arr = o.optJSONArray("ratings")
@@ -7312,15 +7334,15 @@ internal object WizMdbList {
                         else -> null
                     }
                 }?.takeIf { it > 0 }?.let { if (it > 10.0) it / 10.0 else it }
-            // (v86→v87, user report) Cloudstream renders the description
-            // through HtmlCompat.fromHtml (ResultFragmentPhone → setTextHtml
-            // → String.html() — VERIFIED upstream source), where raw \n
-            // whitespace COLLAPSES into single spaces. The v86 one-per-line
-            // newline join displayed as one flowing brick. Line breaks must
-            // be <br> to survive — one rating per line is the design.
+            // (v88, user choice) Ratings stay on ONE flowing line
+            // ("⭐ IMDb 8.5 · TMDb 85 · Trakt 85 · MAL 8.5") — the blank
+            // line after the block comes from the callers' <br><br>
+            // separator before the synopsis. (Line breaks MUST be HTML:
+            // Cloudstream's description view is HtmlCompat.fromHtml —
+            // raw \n collapses, v87-verified.)
             if (parts.isEmpty() && score10 == null) null
-            else Ratings(score10, parts.takeIf { it.isNotEmpty() }?.joinToString("<br>"))
-        }.getOrNull()
+            else Ratings(score10, parts.takeIf { it.isNotEmpty() }?.joinToString("  ·  "))
+        }
         cache[ck] = now to parsed
         if (parsed != null) {
             Log.i(WIZ_TAG, "MDBList: $ck → ${parsed.line ?: "score only"}")
