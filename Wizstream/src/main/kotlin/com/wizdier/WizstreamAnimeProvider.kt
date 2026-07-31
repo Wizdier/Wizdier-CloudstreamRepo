@@ -611,17 +611,27 @@ class WizstreamAnimeProvider : MainAPI() {
                     // 2.5 Dimensional Seduction) and TMDB auto-names
                     // untitled episodes the same way ("Episode 1" is what
                     // its API returns for nameless rows).
+                    // (v86, user report JJK S3 07-31) ani.zip slot for
+                    // THIS entry's own row — AniList 172463's stream feed
+                    // is EMPTY (verified live), so when the TMDB table
+                    // also misses, rows were bare "Episode N" wearing the
+                    // same key visual. ani.zip's hand-mapped TVDB rows
+                    // carry real EN titles/stills/overviews/dates per
+                    // entry-local episode; inserted between TMDB and
+                    // Kitsu in the fallback ladder.
+                    val azi = detail.aniEps[localEp]
+                    val aziTitle = azi?.title?.takeUnless { isBareEpisodeLabel(it) }
                     val streamTitle = sEp?.title?.takeUnless { isBareEpisodeLabel(it) }
                     val tmdbTitle = epMeta?.name?.takeUnless { isBareEpisodeLabel(it) }
-                    val kitsuTitle = if (streamTitle == null && tmdbTitle == null) {
+                    val kitsuTitle = if (streamTitle == null && tmdbTitle == null && aziTitle == null) {
                         detail.kitsuId?.let { kid ->
                             (kitsuTitles
                                 ?: fetchKitsuEpisodeTitles(kid).also { kitsuTitles = it })
                                 .get(localEp)
                         }?.takeUnless { isBareEpisodeLabel(it) }
                     } else null
-                    val rowName = streamTitle ?: tmdbTitle ?: kitsuTitle
-                        ?: sEp?.title ?: epMeta?.name ?: "Episode $localEp"
+                    val rowName = streamTitle ?: tmdbTitle ?: aziTitle ?: kitsuTitle
+                        ?: sEp?.title ?: epMeta?.name ?: azi?.title ?: "Episode $localEp"
                     newEpisode(LinkContext(
                         anilistId = m.id, imdbId = imdbId, tmdbId = tmdbId, malId = m.malId,
                         season = m.siteSeason, episode = stackedEp, entryEpisode = localEp,
@@ -649,11 +659,18 @@ class WizstreamAnimeProvider : MainAPI() {
                         // same picture while real per-episode stills sat
                         // unused (the side-by-side "same thumbnail
                         // everywhere" from the user's screenshot).
-                        posterUrl = epMeta?.stillUrl ?: sEp?.thumb ?: detail.posterUrl
-                        description = epMeta?.overview
-                        runCatching { epMeta?.score?.let { score = Score.from10(it) } }
-                        runTime = epMeta?.runtime
-                        this.date = epMeta?.airDate
+                        // (v86) ani.zip fills whichever episode fields
+                        // TMDB/feed left empty (image/overview/date/
+                        // runtime/score) — still AniList-first ordering.
+                        posterUrl = epMeta?.stillUrl ?: sEp?.thumb
+                            ?: azi?.image ?: detail.posterUrl
+                        description = epMeta?.overview ?: azi?.overview
+                        runCatching {
+                            (epMeta?.score ?: azi?.score10)
+                                ?.let { score = Score.from10(it) }
+                        }
+                        runTime = epMeta?.runtime ?: azi?.runtime
+                        this.date = epMeta?.airDate ?: azi?.airMs
                     }
                 }
             }
@@ -971,6 +988,10 @@ class WizstreamAnimeProvider : MainAPI() {
         // (v66 sheet poison); franchise-isolated entries keep real 1:1
         // Simkl tracking.
         val coursLinked: Boolean = false,
+        // (v86) ani.zip entry-local episode fallback (titles, overviews,
+        // stills, air dates, runtimes) — parsed from the id-map response
+        // fetchAniDetail already made; emptyMap when ani.zip is down.
+        val aniEps: Map<Int, WizAniZip.Ep> = emptyMap(),
     )
 
     private fun parseAnilistUrl(url: String): Int? {
@@ -1164,6 +1185,13 @@ class WizstreamAnimeProvider : MainAPI() {
         var imdbId: String? = null
         var tmdbId: Int? = null
         var kitsuId: String? = null
+        // (v86, user report JJK S3 07-31) PER-EPISODE fallback from the
+        // SAME response: ani.zip hand-maps every AniList ENTRY to TVDB
+        // episode rows with real EN titles/overviews/stills/dates — the
+        // fields this entry's EMPTY AniList streamingEpisodes feed and a
+        // flaky/absent TMDB table both lack. Entry-local keys: no
+        // alignment math needed.
+        var aniEps: Map<Int, WizAniZip.Ep> = emptyMap()
         runCatching {
             val text = app.get("https://api.ani.zip/mappings?anilist_id=$id",
                 headers = mapOf("User-Agent" to A_UA), timeout = 8000).text
@@ -1172,6 +1200,7 @@ class WizstreamAnimeProvider : MainAPI() {
             imdbId = mappings?.aOptStr("imdb_id")
             tmdbId = mappings?.aOptStr("themoviedb_id")?.toIntOrNull()
             kitsuId = mappings?.aOptStr("kitsu_id")
+            aniEps = WizAniZip.parse(mapJson)
         }
 
         // (v55, PURE ANILIST) AniList itself supplies all metadata — the
@@ -1487,6 +1516,7 @@ class WizstreamAnimeProvider : MainAPI() {
             members = members,
             epTable = epTable,
             absolutePacked = absolutePacked,
+            aniEps = aniEps,
             recommendations = recs,
             franchiseTitles = franchiseTitles,
             // (v67) cours-linked ⇒ Simkl merges this entry into one franchise

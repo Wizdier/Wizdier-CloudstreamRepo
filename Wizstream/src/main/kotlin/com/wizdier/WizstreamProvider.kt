@@ -1436,9 +1436,13 @@ class WizstreamProvider : MainAPI() {
         // (v84) Warm every member's AniList episode feed — the walk already
         // harvested them, so this parallel backfill normally fires zero
         // requests; cold members cost one small query each, concurrent.
+        // (v86) …and warm ani.zip's per-entry episode maps alongside (the
+        // rows below fall back to them when both the feed and the TMDB
+        // table miss — JJK S3 Culling Game P1, user report 07-31).
         coroutineScope {
             members.forEach { m ->
                 launch(Dispatchers.IO) { runCatching { ensureEntryFeedWz(m.id) } }
+                launch(Dispatchers.IO) { runCatching { WizAniZip.episodes(app, m.id) } }
             }
         }
         val tbl = runCatching { WizEpisodeTable.table(app, tmdbId) }.getOrNull()
@@ -1497,6 +1501,13 @@ class WizstreamProvider : MainAPI() {
                         else -> null
                     }
                     if (feedRow?.first != null) anilistTitles++
+                    // (v86) ani.zip per-entry fallback (cached by the
+                    // warm-up above): for entries whose AniList feed is
+                    // EMPTY — JJK S3 Culling Game P1's streamingEpisodes
+                    // is verified-empty — and whose TMDB row misses, the
+                    // row still gets a real title/still/overview/date.
+                    val azi = runCatching { WizAniZip.episodes(app, gm.id) }
+                        .getOrDefault(emptyMap())[localEp]
                     out += newEpisode(
                         LinkContext(
                             imdbId = detail.imdbId,
@@ -1517,17 +1528,23 @@ class WizstreamProvider : MainAPI() {
                             franchiseTitles = franchiseKeys,
                         ).toJson()
                     ) {
+                        // (v86) title ladder: AniList feed → TMDB →
+                        // ani.zip (entry-local, fixes JJK S3) → bare.
                         name = feedRow?.first?.takeIf { it.isNotBlank() }
                             ?: meta?.name
                                 ?.takeUnless { it.equals("Episode $stacked", true) }
+                            ?: azi?.title
                             ?: "Episode $displayCounter"
                         season = groupIdx
                         episode = displayCounter
-                        posterUrl = meta?.stillUrl ?: feedRow?.second
-                        description = meta?.overview
-                        runCatching { meta?.score?.let { score = Score.from10(it) } }
-                        runTime = meta?.runtime
-                        this.date = meta?.airDate
+                        posterUrl = meta?.stillUrl ?: feedRow?.second ?: azi?.image
+                        description = meta?.overview ?: azi?.overview
+                        runCatching {
+                            (meta?.score ?: azi?.score10)
+                                ?.let { score = Score.from10(it) }
+                        }
+                        runTime = meta?.runtime ?: azi?.runtime
+                        this.date = meta?.airDate ?: azi?.airMs
                     }
                 }
             }

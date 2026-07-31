@@ -59,6 +59,10 @@ object WizstreamSources {
         if (title.isBlank() && tmdbId == null && imdbId == null) {
             return@coroutineScope false
         }
+        // (v86) Request fingerprint — with the per-resolver "served" line
+        // below, one filtered logcat answers "which source answered THIS
+        // (season, episode) ask" in one glance (JJK S3 report, 07-31).
+        Log.i(TAG, "resolveAll req '$title' s=$season e=$episode tmdb=$tmdbId entryEp=$entryEpisode")
 
         // (v61) BDIX vs web bookkeeping kept separate: rescue passes below
         // exist to fix BDIX catalog mismatch (cours splits, franchise
@@ -107,7 +111,9 @@ object WizstreamSources {
                         // resolver crash now leaves a log line only, never
                         // a chip in the user's source list.
                         Log.w(TAG, "resolver crashed: ${t.javaClass.simpleName}: ${t.message}")
-                    }.getOrDefault(false)
+                    }.getOrDefault(false).also { served ->
+                        if (served) Log.i(TAG, "${src.toggleId}: served s=$season e=$episode")
+                    }
                 }
             }
         }
@@ -7057,6 +7063,93 @@ internal object WizWyzieSubs {
 // id / imdb_id / title / year / type / score / ratings / streams.
 // So logo + landscape art keep coming from TMDB (WizEpisodeTable already
 // fetches both), and MDBList is integrated for what it actually serves:
+// ─────────────────────────────────────────────────────────────────────────────
+//  (v86, user report) ani.zip PER-EPISODE fallback layer.
+//
+//  The JJK S3 "Culling Game Part 1" page (AniList 172463) shipped bare
+//  "Episode N" rows and one key-visual thumbnail on every row: its
+//  AniList streamingEpisodes feed is EMPTY (verified live) and when the
+//  absolute-packed TMDB table misses on-device, nothing remained. Yet the
+//  ani.zip id-map call every anime page already makes hand-maps each
+//  ENTRY to TVDB episode rows carrying real EN titles, overviews, stills,
+//  air dates and runtimes — entry-locally keyed ("1".."12"), so NO
+//  season/absolute alignment math is needed. This parses that payload
+//  once and shares it with both providers (the main catalogue fetches it
+//  per franchise member, 30-min cached).
+// ─────────────────────────────────────────────────────────────────────────────
+internal object WizAniZip {
+    data class Ep(
+        val title: String?,
+        val overview: String?,
+        val image: String?,
+        val airMs: Long?,
+        val runtime: Int?,
+        val score10: Double?,
+    )
+
+    private const val CACHE_MS = 30 * 60 * 1000L
+    private val cache = java.util.concurrent.ConcurrentHashMap<Int, Pair<Long, Map<Int, Ep>>>()
+
+    private fun airMsOf(s: String?): Long? {
+        if (s.isNullOrBlank()) return null
+        return runCatching {
+            java.text.SimpleDateFormat("yyyy-MM-dd", java.util.Locale.US)
+                .apply { isLenient = false }
+                .parse(s.take(10))?.time
+        }.getOrNull()
+    }
+
+    /** Parse the `episodes` object of an ani.zip /mappings response. */
+    fun parse(mapJson: JSONObject?): Map<Int, Ep> {
+        val epsObj = mapJson?.optJSONObject("episodes") ?: return emptyMap()
+        val out = LinkedHashMap<Int, Ep>()
+        val keys = epsObj.keys()
+        while (keys.hasNext()) {
+            val k = keys.next()
+            val localEp = k.toIntOrNull() ?: continue
+            val o = epsObj.optJSONObject(k) ?: continue
+            val titles = o.optJSONObject("title")
+            val title = titles?.optStringOrNullCp("en")
+                ?: titles?.optStringOrNullCp("x-jat")
+                ?: titles?.optStringOrNullCp("ja")
+            val rating = o.optStringOrNullCp("rating")?.toDoubleOrNull()
+                ?: o.opt("rating")?.let { (it as? Number)?.toDouble() }
+            out[localEp] = Ep(
+                title = title?.takeIf { it.isNotBlank() },
+                overview = (o.optStringOrNullCp("overview")
+                    ?: o.optStringOrNullCp("summary")
+                        ?.substringBefore("\nSource:"))?.takeIf { it.isNotBlank() },
+                image = o.optStringOrNullCp("image")?.takeIf { it.startsWith("http") },
+                airMs = airMsOf(o.optStringOrNullCp("airDate")
+                    ?: o.optStringOrNullCp("airdate")),
+                runtime = (o.opt("runtime") as? Number)?.toInt()?.takeIf { it > 0 }
+                    ?: (o.opt("length") as? Number)?.toInt()?.takeIf { it > 0 },
+                score10 = rating?.takeIf { it > 0.0 && it <= 10.0 },
+            )
+        }
+        return out
+    }
+
+    /** Cached per-entry episode map (anime pages already hold the response
+     *  from their own id-map call — they use [parse] directly; the main
+     *  catalogue calls this per franchise member). */
+    suspend fun episodes(app: Requests, anilistId: Int): Map<Int, Ep> {
+        val now = System.currentTimeMillis()
+        cache[anilistId]?.let { (ts, v) -> if (now - ts < CACHE_MS) return v }
+        val parsed = runCatching {
+            val res = app.get(
+                "https://api.ani.zip/mappings?anilist_id=$anilistId",
+                headers = mapOf("User-Agent" to WIZ_UA),
+                timeout = 8_000,
+            )
+            if (res.code !in 200..299) return emptyMap()
+            parse(JSONObject(res.text))
+        }.getOrDefault(emptyMap())
+        cache[anilistId] = now to parsed
+        return parsed
+    }
+}
+
 // aggregated ratings from IMDb, TMDb, Trakt, Letterboxd, RogerEbert,
 // Rotten Tomatoes, Metacritic and MyAnimeList.
 //
@@ -7172,8 +7265,14 @@ internal object WizMdbList {
                         else -> null
                     }
                 }?.takeIf { it > 0 }?.let { if (it > 10.0) it / 10.0 else it }
+            // (v86, user request) ONE RATING PER LINE — the old
+            // "IMDb 8.6  ·  TMDb 85  ·  RT 92 …" single mega-line wrapped
+            // into a dense brick above the synopsis on phone screens and
+            // read as one unorganized blob. Lines stack vertically now,
+            // and both providers already leave a blank line before the
+            // synopsis, so the ratings block reads as its own section.
             if (parts.isEmpty() && score10 == null) null
-            else Ratings(score10, parts.takeIf { it.isNotEmpty() }?.joinToString("  ·  "))
+            else Ratings(score10, parts.takeIf { it.isNotEmpty() }?.joinToString("\n"))
         }.getOrNull()
         cache[ck] = now to parsed
         if (parsed != null) {
