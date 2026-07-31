@@ -13,29 +13,20 @@ import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
-import org.jsoup.Jsoup
 import java.net.URLDecoder
 import java.net.URLEncoder
-import java.security.MessageDigest
-import java.util.Base64
 import java.util.concurrent.TimeUnit
-import javax.crypto.Cipher
-import javax.crypto.spec.GCMParameterSpec
-import javax.crypto.spec.SecretKeySpec
 
 /**
  * WizstreamAnimeSources — bundled anime-specific source resolver.
  *
- * Adds 7 anime-focused streaming sources on top of the BDIX resolvers in
- * WizstreamSources:
+ * Adds 3 anime-focused streaming sources on top of the BDIX resolvers in
+ * WizstreamSources (v89 — user request: keep ONLY AniNeko from the old
+ * roster, add KickAssAnime + AnimeX):
  *
- *   1. AniZone     — https://anizone.to              (direct .m3u8 in <media-player>)
- *   2. Allmanga    — https://allmanga.to             (AllAnime-family API + AA-CRYPTO)
- *   3. AniChi      — https://anichi.to               (mapper.nekostream.site API)
- *   4. UniqueStream— https://anime.uniquestream.net  (open FastAPI, signed HLS)
- *   5. AniNeko     — https://anineko.to             (server-video embeds → direct HLS)
- *   6. ReANIME     — https://reanime.to             (SvelteKit __data.json scan)
- *   7. TokyoInsider — https://www.tokyoinsider.com  (direct MKV/MP4 downloads)
+ *   1. AniNeko      — https://anineko.to   (server-video embeds → direct HLS)
+ *   2. KickAssAnime — https://kaa.lt        (open Nuxt JSON API → CatStream HLS)
+ *   3. AnimeX       — https://animex.one    (GraphQL id-map + pp.animex.one HLS)
  *
  * All are invoked in parallel from `resolveAnime()`. Each returns
  * `true` on the first playable link it emits; the aggregator returns true
@@ -71,13 +62,9 @@ object WizstreamAnimeSources {
         // (v68) per-source toggles apply here too (shared WizSourcePrefs
         // prefs object; keys "wiz_src_<id>").
         val sources = listOf(
-            AniZoneResolver,
-            AllmangaResolver,
-            AniChiResolver,
-            UniqueStreamResolver,
             AniNekoResolver,
-            ReAnimeResolver,
-            TokyoInsiderResolver,
+            KaaResolver,
+            AnimexResolver,
         ).filter { WizstreamSources.WizSourcePrefs.isEnabled(it.toggleId) }
 
         val gate = Semaphore(4)
@@ -109,7 +96,7 @@ object WizstreamAnimeSources {
 
     internal interface AnimeSourceResolver {
         /** (v68) toggle identity — same class-name derivation as the shared
-         *  engine (AniZoneResolver → "anizone"), shared pref namespace. */
+         *  engine (AniNekoResolver → "anineko"), shared pref namespace. */
         val toggleId: String
             get() = WizstreamSources.wizToggleId(this)
 
@@ -134,18 +121,6 @@ object WizstreamAnimeSources {
 
     internal fun encodeUrl(s: String): String =
         URLEncoder.encode(s, "UTF-8").replace("+", "%20")
-
-    internal fun urlSafeB64Encode(bytes: ByteArray): String =
-        Base64.getUrlEncoder().withoutPadding().encodeToString(bytes)
-
-    internal fun urlSafeB64Decode(s: String): ByteArray {
-        val padded = s.padEnd((s.length + 3) / 4 * 4, '=')
-        return Base64.getUrlDecoder().decode(padded)
-    }
-
-    internal fun urlSafeB64DecodeText(s: String): String? = runCatching {
-        String(urlSafeB64Decode(s))
-    }.getOrNull()
 
     internal fun ExtractorLink.relabel(newSource: String, newName: String): ExtractorLink =
         runBlocking {
@@ -492,1079 +467,6 @@ object WizstreamAnimeSources {
     }
 
     // ════════════════════════════════════════════════════════════════════════
-    //  Resolver 1: AniZone  (https://anizone.to)
-    //
-    //  Pattern: Browse the public /anime list page (no Cloudflare challenge
-    //  on it), pick the best title match, then load
-    //    /anime/{8-char-id}/{episode}
-    //  and regex-extract the .m3u8 URL from the Vidstack <media-player> tag.
-    //
-    //  Verified sample:
-    //    <media-player src="https://seiryuu.vid-cdn.xyz/{uuid}/master.m3u8" ...>
-    //
-    //  Direct m3u8 — no iframe, no third-party host. Subtitle .ass tracks
-    //  are also exposed as <track> elements on the same page.
-    // ════════════════════════════════════════════════════════════════════════
-
-    internal object AniZoneResolver : AnimeSourceResolver {
-        private const val SITE = "https://anizone.to"
-        private const val LABEL = "AniZone"
-        private val HEADERS = mapOf(
-            "User-Agent" to UA,
-            "Referer" to "$SITE/",
-            "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language" to "en-US,en;q=0.9",
-        )
-
-        override suspend fun resolve(
-            app: Requests,
-            title: String,
-            altTitle: String?,
-            anilistId: Int?,
-            malId: Int?,
-            isMovie: Boolean,
-            season: Int?,
-            episode: Int?,
-            labelPrefix: String,
-            subtitleCallback: (SubtitleFile) -> Unit,
-            callback: (ExtractorLink) -> Unit,
-        ): Boolean {
-            if (title.isBlank()) return false
-            val srcLabel = "$labelPrefix • $LABEL"
-
-            // 1. (v19) Try the direct search endpoint first — the /anime?q=
-            //    Cloudflare challenge only triggers for some UAs, and when it
-            //    doesn't challenge this is far more reliable than paging the
-            //    browse list (which earlier missed anything not in the first
-            //    ~90 catalogue entries).
-            val candidates = mutableListOf<Pair<String, String>>() // (8-char-id, title)
-            for (q in listOfNotNull(title, altTitle).distinct()) {
-                if (candidates.isNotEmpty()) break
-                runCatching {
-                    val searchUrl = "$SITE/anime?q=${encodeUrl(q)}"
-                    val html = app.get(searchUrl, headers = HEADERS, timeout = 12_000).text
-                    Jsoup.parse(html, searchUrl).select("a[href~=/anime/[a-z0-9]{8}$]").forEach { a ->
-                        val id = Regex("""/anime/([a-z0-9]{8})""").find(a.attr("href"))?.groupValues?.getOrNull(1)
-                            ?: return@forEach
-                        val t = a.selectFirst("img")?.attr("alt")?.trim() ?: a.text().trim()
-                        if (t.isNotBlank() && id.isNotBlank()) candidates += id to t
-                    }
-                }
-            }
-            // Fall back to paging the public /anime browse list.
-            for (page in 1..3) {
-                val listUrl = "$SITE/anime?page=$page"
-                val html = runCatching {
-                    app.get(listUrl, headers = HEADERS, timeout = 12_000).text
-                }.getOrNull() ?: continue
-                val doc = Jsoup.parse(html, listUrl)
-                doc.select("a[href~=/anime/[a-z0-9]{8}$]").forEach { a ->
-                    val href = a.attr("href")
-                    val id = Regex("""/anime/([a-z0-9]{8})""").find(href)?.groupValues?.getOrNull(1)
-                        ?: return@forEach
-                    val t = a.selectFirst("img")?.attr("alt")?.trim()
-                        ?: a.text().trim()
-                        ?: return@forEach
-                    if (t.isNotBlank() && id.isNotBlank()) candidates += id to t
-                }
-                if (candidates.size >= 30) break
-            }
-            if (candidates.isEmpty()) return false
-            if (candidates.isEmpty()) return false
-
-            // 2. Pick the best title match (against both of our aliases).
-            val best = candidates
-                .distinctBy { it.first }
-                .firstOrNull { (_, ct) -> matchesEitherTitle(ct, title, altTitle) }
-                ?: candidates.distinctBy { it.first }
-                    .maxByOrNull { (_, ct) -> bestTitleSim(ct, title, altTitle) }
-                ?: return false
-            if (bestTitleSim(best.second, title, altTitle) < 0.5) return false
-
-            val animeId = best.first
-            val epNum = episode ?: 1
-
-            // 3. Fetch the episode page and extract the .m3u8 from
-            //    <media-player src="…">.
-            val epUrl = "$SITE/anime/$animeId/$epNum"
-            val html = runCatching {
-                app.get(epUrl, headers = HEADERS, timeout = 15_000).text
-            }.getOrNull() ?: return false
-
-            val mediaSrc = Regex(
-                """<media-player[^>]*\ssrc=["']([^"']+\.m3u8[^"']*)["']""",
-                RegexOption.IGNORE_CASE
-            ).find(html)?.groupValues?.getOrNull(1)?.trim()
-            if (mediaSrc.isNullOrBlank()) return false
-
-            // 4. Subtitle tracks — same page has <track src="…/subtitles/0_en.ass">.
-            Jsoup.parse(html, epUrl).select("track[src]").forEach { el ->
-                val src = el.attr("src").trim()
-                if (src.isNotBlank() && src != "data:,") {
-                    val abs = if (src.startsWith("http")) src else "$SITE/${src.trimStart('/')}"
-                    val label = el.attr("label").ifBlank { el.attr("srclang") }.ifBlank { "Subtitle" }
-                    subtitleCallback(SubtitleFile(label, abs))
-                }
-            }
-
-            // (v19) Emit EVERY <media-player> source on the page (some
-            // episodes carry several hosts) instead of just the first match —
-            // and probe each one so dead hosts never reach the player.
-            val mediaSrcs = Regex("""<media-player[^>]*\ssrc=["']([^"']+\.m3u8[^"']*)["']""", RegexOption.IGNORE_CASE)
-                .findAll(html).map { it.groupValues[1].trim() }.distinct().toList()
-            val cands = mediaSrcs.map { src ->
-                MediaCandidate(
-                    url = src,
-                    sourceLabel = srcLabel,
-                    name = srcLabel,
-                    referer = epUrl,
-                    headers = HEADERS,
-                )
-            }
-            return emitMediaCandidates(cands, subtitleCallback, callback)
-        }
-    }
-
-    // ════════════════════════════════════════════════════════════════════════
-    //  Resolver 2: Allmanga  (https://allmanga.to/anime)
-    //
-    //  Allmanga (allmanga.to) is the current flagship front-end of the
-    //  AllAnime network. Clicking an episode there redirects to the shared
-    //  SvelteKit player on mkissa.to, and both are backed by the same Apollo
-    //  persisted-query database — so this resolver replaces the retired
-    //  Mkissa resolver (the old CLOCK_BASE host allanime.day started
-    //  500ing/redirect-looping, which is what made Mkissa appear "broken").
-    //
-    //  Flow:
-    //    1. Search the show via persisted-query POST against
-    //       api.mkissa.net (Cloudflare-free mirror of api.allanime.day).
-    //    2. Fetch episode `sourceUrls` via a persisted-query GET that must
-    //       carry an `aaReq` AES-256-GCM token (the "AA crypto" scheme).
-    //    3. Sources come in three flavours:
-    //         • third-party iframe hosts (ok.ru, mp4upload, streamsb, …)
-    //           → handed to loadExtractor()
-    //         • "--" XOR-encoded paths → allanime.day /apivtwo/clock.json
-    //           link lists (CDN ladder) — currently 5xx operator-side, kept
-    //           for when the host recovers
-    //         • rare direct mp4/m3u8 endpoints → media candidates
-    //    Every candidate passes through the emitMediaCandidates probe gate,
-    //    so dead links never reach the player (no 2004/3003/4003 cascade).
-    //
-    //  The AA crypto bootstrap (all material live-verified):
-    //    window.__aaCrypto on https://mkissa.to (plain page, no challenge)
-    //      = {"epoch":N,"switchAt":Ms,"graceMs":Ms,"partB":"<b64>"}
-    //    app chunk → crypto chunk holds ONE 64-hex "mask"
-    //    AES key = mask XOR base64decode(partB)     (rotates every ~3 days)
-    //    aaReq   = b64( 0x01 ‖ iv ‖ AES-256-GCM(key, iv, payload) )
-    //    payload = {"v":1,"ts":bucketMs,"epoch":N,"buildId":"B","qh":"<sha256>"}
-    //    iv      = sha256("N:B:qh:bucketMs")[0:12]   (5-minute ts bucket)
-    //    episode response carries encrypted `tobeparsed`, decrypted with the
-    //    same key.
-    //
-    //  Fallback chain: live bootstrap → anipy-cli keygen.json mirror →
-    //  embedded snapshot. On AA_CRYPTO_* errors we re-bootstrap once.
-    // ════════════════════════════════════════════════════════════════════════
-
-    internal object AllmangaResolver : AnimeSourceResolver {
-        // (v22) SITE is the player front-end that hosts window.__aaCrypto and
-        // the _app/immutable JS chunks. allmanga.to itself is a Nuxt SPA that
-        // forwards viewers to mkissa.to to actually watch, but both share the
-        // API (api.mkissa.net — sending tokens to api.allanime.day used to
-        // produce AA_CRYPTO_STALE and that host is now mostly dead anyway).
-        private const val SITE = "https://mkissa.to"
-        private const val API = "https://api.mkissa.net/api"
-        private const val API_BOOTSTRAP = "https://api.mkissa.net/client-crypto/v1/bootstrap"
-        // clock.json hosts, tried in order — canonical host first, then the
-        // api-t edges (api-t.mkissa.net added v32; the current mkissa.to
-        // frontend defines it as its apivtwo host). As of 2026-07-24 all of
-        // them 5xx/11xx-crash operator-side (Express "error" / Cloudflare
-        // Worker 1101), i.e. the internal CDN streams are dead for the
-        // website itself too. The code path stays so the sources revive
-        // automatically the moment the operator fixes the endpoints.
-        private val CLOCK_BASES = listOf(
-            "https://allanime.day",
-            "https://api-t.mkissa.net",
-            "https://api-t.allanime.day",
-        )
-        private const val CDN_IMMUTABLE = "https://cdn.allanime.day/all/mk/_app/immutable/"
-        private const val KEYGEN_URL =
-            "https://raw.githubusercontent.com/sdaqo/anipy-cli/refs/heads/key-gen/scripts/keygen/keygen.json"
-        private const val LABEL = "Allmanga"
-        private const val SEARCH_HASH =
-            "a24c500a1b765c68ae1d8dd85174931f661c71369c89b92b88b75a725afc471c"
-        private const val FALLBACK_EPOCH = 6885L
-        // Embedded snapshot harvested live (epoch 6885, ~3-day rotation).
-        private const val FALLBACK_KEY_HEX =
-            "ff102360a5065bb72fc128f7efa5042dbf4db582e5c58754078265926a76bfd8"
-        private const val FALLBACK_QH =
-            "f4662f4b7510b26795dd53ef824a0bf1740fbbc5d1273fab18222ac831bca8d0"
-        private const val FALLBACK_BUILD = "51"
-        private const val STATIC_KEY = "Xot36i3lK3:v1"
-        // (v32) /client-crypto/v1/bootstrap — the CURRENT frontend's own
-        // one-request crypto bootstrap (mkissa.to chunk DB0rFWAa.js):
-        // GET ?buildId=64 → {epoch, partB, switchAt, graceMs}; the 32-byte
-        // key = b64decode(partB) XOR this hardcoded mask (the chunk's `Ba`
-        // constant). Verified live 2026-07-24: yields the same key as the
-        // page/chunk scrape below.
-        private const val BOOTSTRAP_BUILD_ID = "64"
-        private const val BOOTSTRAP_MASK_HEX =
-            "70bb5e6260e19a806b3609dc0b6eb718899b09edbd0c23703a5de00e544de128"
-
-        private val HEADERS = mapOf(
-            "User-Agent" to UA,
-            "Referer" to "$SITE/",
-            "Origin" to SITE,
-            "Accept" to "application/json, text/plain, */*",
-        )
-
-        private data class AaCrypto(
-            val epoch: Long,
-            val key: ByteArray,
-            val queryHash: String,
-            val buildId: String,
-        )
-
-        @Volatile private var cachedCrypto: AaCrypto? = null
-        @Volatile private var cryptoCachedAt: Long = 0L
-        private const val CRYPTO_TTL = 30 * 60 * 1000L
-
-        override suspend fun resolve(
-            app: Requests,
-            title: String,
-            altTitle: String?,
-            anilistId: Int?,
-            malId: Int?,
-            isMovie: Boolean,
-            season: Int?,
-            episode: Int?,
-            labelPrefix: String,
-            subtitleCallback: (SubtitleFile) -> Unit,
-            callback: (ExtractorLink) -> Unit,
-        ): Boolean {
-            if (title.isBlank()) return false
-            val srcLabel = "$labelPrefix • $LABEL"
-            val epToUse = episode ?: 1
-
-            // 1. Search (POST — a raw query= in the GET URL trips the site's
-            //    WAF; a JSON body POST sails through the public gateway).
-            suspend fun searchEdges(q: String): JSONArray {
-                val searchBody = JSONObject().apply {
-                    put("variables", JSONObject().apply {
-                        put("search", JSONObject().apply {
-                            put("allowAdult", false)
-                            put("allowUnknown", false)
-                            put("query", q)
-                        })
-                        put("limit", 26)
-                        put("page", 1)
-                        put("translationType", "sub")
-                        put("countryOrigin", "ALL")
-                    })
-                    put("extensions", """{"persistedQuery":{"version":1,"sha256Hash":"$SEARCH_HASH"}}""")
-                }.toString()
-                return postJson(app, searchBody)?.optJSONObject("data")
-                    ?.optJSONObject("shows")?.optJSONArray("edges") ?: JSONArray()
-            }
-
-            // 2. (v29) Match against ALL the aliases the edge ships
-            //    (name / englishName / nativeName) AND both of ours
-            //    (title / altTitle). This is what was killing Allmanga:
-            //    AniList feeds us ENGLISH titles ("Frieren: Beyond Journey's
-            //    End", "1P"→"One Piece") while Allmanga's `name` is often
-            //    ROMAJI ("Sousou no Frieren", "1P") — a 0.17-similarity and
-            //    the resolver gave up, so AniNeko was all the user ever saw.
-            data class Show(val id: String, val names: List<String>, val sub: Int, val dub: Int)
-            fun pickShow(edges: JSONArray): Show? {
-                val shows = (0 until edges.length()).mapNotNull { i ->
-                    val e = edges.optJSONObject(i) ?: return@mapNotNull null
-                    val id = e.optStringOrNull("_id") ?: return@mapNotNull null
-                    val nm = e.optStringOrNull("name") ?: return@mapNotNull null
-                    val av = e.optJSONObject("availableEpisodes")
-                    val names = listOfNotNull(
-                        nm,
-                        e.optStringOrNull("englishName"),
-                        e.optStringOrNull("nativeName"),
-                    )
-                    Show(id, names, av?.optInt("sub", 0) ?: 0, av?.optInt("dub", 0) ?: 0)
-                }
-                fun Show.sim() = names.maxOf { bestTitleSim(it, title, altTitle) }
-                return shows.firstOrNull { s ->
-                    s.names.any { matchesEitherTitle(it, title, altTitle) }
-                } ?: shows.maxByOrNull { it.sim() }?.takeIf { it.sim() >= 0.5 }
-            }
-
-            var best = pickShow(searchEdges(title))
-            if (best == null && !altTitle.isNullOrBlank() && !altTitle.equals(title, true)) {
-                best = pickShow(searchEdges(altTitle))
-            }
-            if (best == null) return false
-
-            val wantDub = best.dub >= epToUse
-            if (best.sub < epToUse && !wantDub) return false
-
-            // 3. Episode sourceUrls for sub AND dub (dub only when it has
-            //    this episode — saves an API call and halves rate-limit risk).
-            var crypto = ensureCrypto(app) ?: return false
-            val cands = mutableListOf<MediaCandidate>()
-            var any = false
-
-            val langs = buildList {
-                if (best.sub >= epToUse) add("sub" to false)
-                if (wantDub) add("dub" to true)
-            }
-            for ((tt, isDub) in langs) {
-                val epJson = fetchEpisode(app, crypto, best.id, tt, epToUse, attempt = 0)
-                    ?: continue
-                val srcs = epJson.optJSONObject("episode")?.optJSONArray("sourceUrls")
-                    ?: continue
-                for (i in 0 until srcs.length()) {
-                    val src = srcs.optJSONObject(i) ?: continue
-                    val rawUrl = src.optStringOrNull("sourceUrl") ?: continue
-                    val serverName = src.optStringOrNull("sourceName")
-                        ?: src.optStringOrNull("source") ?: "Server"
-                    val dubTag = if (isDub) " · DUB" else ""
-                    val label = "$srcLabel · $serverName$dubTag"
-                    when {
-                        // Direct stream endpoint bypass (rare)
-                        rawUrl.contains("tools.fast4speed") -> {
-                            cands += MediaCandidate(
-                                url = rawUrl, sourceLabel = srcLabel, name = label,
-                                referer = SITE, headers = HEADERS, forceHls = true,
-                            )
-                        }
-                        // Third-party iframe hosts (ok.ru, streamsb, …).
-                        // Note: some servers are emitted protocol-relative
-                        // ("//host/e/...") — promote them to https first.
-                        rawUrl.startsWith("http") || rawUrl.startsWith("//") -> {
-                            val iframeUrl =
-                                if (rawUrl.startsWith("//")) "https:$rawUrl" else rawUrl
-                            runCatching {
-                                loadExtractor(iframeUrl, "$SITE/", subtitleCallback) { link ->
-                                    callback(link.relabel(srcLabel, "$label — ${link.name}"))
-                                    any = true
-                                }
-                            }
-                        }
-                        // "--" XOR-encoded internal paths → clock.json link list
-                        rawUrl.startsWith("--") -> {
-                            val path = xorDecodePath(rawUrl)
-                            if (path.isBlank()) continue
-                            resolveClock(app, path, srcLabel, label, cands)
-                        }
-                    }
-                }
-            }
-            if (emitMediaCandidates(cands, subtitleCallback, callback)) any = true
-            return any
-        }
-
-        // ── AA crypto bootstrap ─────────────────────────────────────────────
-
-        private suspend fun ensureCrypto(app: Requests): AaCrypto? {
-            cachedCrypto?.let {
-                if (System.currentTimeMillis() - cryptoCachedAt < CRYPTO_TTL) return it
-            }
-            return bootstrapCrypto(app)?.also {
-                cachedCrypto = it
-                cryptoCachedAt = System.currentTimeMillis()
-            } ?: cachedCrypto
-        }
-
-        private suspend fun bootstrapCrypto(app: Requests): AaCrypto? {
-            // 1. Live bootstrap straight from the player front-end.
-            runCatching {
-                val html = app.get("$SITE/", headers = HEADERS, timeout = 12_000).text
-                val aaRaw = Regex("""window\.__aaCrypto\s*=\s*(\{.*?\})""")
-                    .find(html)?.groupValues?.getOrNull(1)
-                if (aaRaw != null) {
-                    val aa = JSONObject(aaRaw)
-                    val partB = aa.optStringOrNull("partB")
-                    val epoch = if (aa.has("epoch")) aa.optLong("epoch") else null
-                    val switchAt = aa.optLong("switchAt", 0L)
-                    val graceMs = aa.optLong("graceMs", 0L)
-                    val materialDead = switchAt > 0 &&
-                        System.currentTimeMillis() >= switchAt + graceMs
-                    if (partB != null && epoch != null) {
-                        val appChunk = Regex("""_app/immutable/(entry/app\.[^"']+\.js)""")
-                            .find(html)?.groupValues?.getOrNull(1)
-                        if (appChunk != null) {
-                            val appJs = app.get(
-                                CDN_IMMUTABLE + appChunk, headers = HEADERS, timeout = 12_000
-                            ).text
-                            val chunks = Regex("""\s*["']\.\./(chunks/[A-Za-z0-9_\-]+\.js)["']""")
-                                .findAll(appJs).map { it.groupValues[1] }.toList()
-                            for (chunk in chunks) {
-                                val js = runCatching {
-                                    app.get(CDN_IMMUTABLE + chunk, headers = HEADERS, timeout = 12_000).text
-                                }.getOrNull() ?: continue
-                                if ("__aaCrypto" !in js) continue
-                                val masks = Regex("""[0-9a-f]{64}""")
-                                    .findAll(js).map { it.value }.toList()
-                                if (masks.size != 1) continue
-                                val buildId = Regex("""xr\s*=\s*[^,;?]*\?\s*"(\d+)"\s*:""")
-                                    .find(js)?.groupValues?.getOrNull(1) ?: FALLBACK_BUILD
-                                val qh = resolveQueryHash(js) ?: FALLBACK_QH
-                                if (materialDead) continue
-                                val key = xorBytes(
-                                    hexToBytes(masks[0]),
-                                    Base64.getDecoder().decode(partB),
-                                )
-                                if (key.size == 32) {
-                                    return AaCrypto(epoch, key, qh, buildId)
-                                }
-                            }
-                        }
-                    }
-                }
-            }.onFailure { Log.d(TAG, "Allmanga live bootstrap failed: ${it.message}") }
-
-            // 1.5 (v32) Server-side crypto bootstrap — one request, the
-            //     exact endpoint today's frontend uses (partB XOR mask).
-            runCatching {
-                val resp = app.get(
-                    "$API_BOOTSTRAP?buildId=$BOOTSTRAP_BUILD_ID",
-                    headers = HEADERS + mapOf("x-build-id" to BOOTSTRAP_BUILD_ID),
-                    timeout = 10_000,
-                ).text
-                val bs = JSONObject(resp)
-                val partB = bs.optStringOrNull("partB")
-                val epoch = if (bs.has("epoch")) bs.optLong("epoch") else null
-                val switchAt = bs.optLong("switchAt", 0L)
-                val graceMs = bs.optLong("graceMs", 0L)
-                val materialDead = switchAt > 0 &&
-                    System.currentTimeMillis() >= switchAt + graceMs
-                if (partB != null && epoch != null && !materialDead) {
-                    val key = xorBytes(
-                        hexToBytes(BOOTSTRAP_MASK_HEX),
-                        Base64.getDecoder().decode(partB),
-                    )
-                    if (key.size == 32) {
-                        // The query hash is build-independent (it hashes the
-                        // episode GraphQL template); keygen snapshot value
-                        // still matches the live template as of 2026-07.
-                        return AaCrypto(epoch, key, FALLBACK_QH, BOOTSTRAP_BUILD_ID)
-                    }
-                }
-            }.onFailure { Log.d(TAG, "Allmanga API bootstrap failed: ${it.message}") }
-
-            // 2. anipy-cli keygen.json mirror (CI-updated every few hours).
-            runCatching {
-                val kg = JSONObject(
-                    app.get(KEYGEN_URL, headers = mapOf("User-Agent" to UA), timeout = 10_000).text
-                )
-                val key = hexToBytes(kg.optString("key"))
-                val qh = kg.optStringOrNull("query_hash")
-                val epoch = if (kg.has("epoch")) kg.optLong("epoch") else null
-                if (key.size == 32 && qh != null && epoch != null) {
-                    return AaCrypto(epoch, key, qh, FALLBACK_BUILD)
-                }
-            }
-
-            // 3. Embedded snapshot — last resort, may itself be stale.
-            return AaCrypto(
-                FALLBACK_EPOCH,
-                hexToBytes(FALLBACK_KEY_HEX),
-                FALLBACK_QH,
-                FALLBACK_BUILD,
-            )
-        }
-
-        /** sha256 of the fully-resolved episode-sources GraphQL template. */
-        private fun resolveQueryHash(js: String): String? {
-            var template = Regex("""(\nquery\([^`]*)`""").findAll(js)
-                .map { it.groupValues[1] }
-                .firstOrNull { "sourceUrls" in it && "episode(" in it }
-                ?: return null
-            fun resolve(tmpl: String, depth: Int): String {
-                if (depth > 6) return tmpl
-                var out = tmpl
-                for (m in Regex("""\$\{([^}]+)\}""").findAll(tmpl)) {
-                    val name = m.groupValues[1]
-                    val rep: String = if (name.endsWith("()")) {
-                        Regex("""\b""" + Regex.escape(name.dropLast(2)) +
-                            """\s*=\s*\w+\s*=>\s*\w+\s*\?\s*`[^`]*`\s*:\s*`([^`]*)`""")
-                            .find(js)?.groupValues?.getOrNull(1) ?: ""
-                    } else {
-                        Regex("""\b""" + Regex.escape(name) + """\s*=\s*`([^`]*)`""")
-                            .find(js)?.groupValues?.getOrNull(1)?.let { resolve(it, depth + 1) } ?: ""
-                    }
-                    out = out.replace("\${" + name + "}", rep)
-                }
-                return out
-            }
-            template = resolve(template, 0)
-            if ("\${" in template) return null
-            return sha256Hex(template.toByteArray(Charsets.UTF_8))
-        }
-
-        // ── token + episode fetch ───────────────────────────────────────────
-
-        private fun buildAaReq(c: AaCrypto): String {
-            val ts = System.currentTimeMillis() / 300_000L * 300_000L
-            val payload = """{"v":1,"ts":$ts,"epoch":${c.epoch},""" +
-                """"buildId":"${c.buildId}","qh":"${c.queryHash}"}"""
-            val iv = sha256("${c.epoch}:${c.buildId}:${c.queryHash}:$ts")
-                .copyOfRange(0, 12)
-            val cipher = Cipher.getInstance("AES/GCM/NoPadding")
-            cipher.init(
-                Cipher.ENCRYPT_MODE,
-                SecretKeySpec(c.key, "AES"),
-                GCMParameterSpec(128, iv),
-            )
-            val ct = cipher.doFinal(payload.toByteArray(Charsets.UTF_8))
-            return Base64.getEncoder().encodeToString(byteArrayOf(1) + iv + ct)
-        }
-
-        private suspend fun fetchEpisode(
-            app: Requests,
-            c: AaCrypto,
-            showId: String,
-            translationType: String,
-            ep: Int,
-            attempt: Int,
-        ): JSONObject? {
-            val variables = """{"showId":"$showId","translationType":"$translationType",""" +
-                """"episodeString":"$ep"}"""
-            val extensions = """{"persistedQuery":{"version":1,"sha256Hash":"${c.queryHash}"},""" +
-                """"aaReq":"${buildAaReq(c)}"}"""
-            val url = "$API?variables=${encodeUrl(variables)}&extensions=${encodeUrl(extensions)}"
-            val resp = runCatching {
-                app.get(url, headers = HEADERS, timeout = 15_000)
-            }.getOrNull() ?: return null
-            if (resp.code !in 200..299 || resp.text.isBlank()) return null
-            val json = runCatching { JSONObject(resp.text) }.getOrNull() ?: return null
-
-            val err = json.optJSONArray("errors")?.optJSONObject(0)?.optString("message")
-            if (!err.isNullOrBlank()) {
-                when {
-                    err.startsWith("Too many requests") && attempt < 2 -> {
-                        val wait = Regex("""(\d+)\s*seconds?""").find(err)
-                            ?.groupValues?.getOrNull(1)?.toLongOrNull() ?: 5L
-                        delay((wait + 1).coerceAtMost(9L) * 1000L)
-                        return fetchEpisode(app, c, showId, translationType, ep, attempt + 1)
-                    }
-                    err.startsWith("AA_CRYPTO") && attempt < 1 -> {
-                        // Stale material — rebuild from scratch and retry once.
-                        cachedCrypto = null
-                        val fresh = ensureCrypto(app) ?: return null
-                        if (fresh === c) return null
-                        return fetchEpisode(app, fresh, showId, translationType, ep, attempt + 1)
-                    }
-                    else -> return null
-                }
-            }
-            var data = json.optJSONObject("data") ?: return null
-            data.optStringOrNull("tobeparsed")?.let { tbp ->
-                data = decryptToBeParsed(tbp, c) ?: return null
-            }
-            return data
-        }
-
-        /** tobeparsed = b64( 0x01 ‖ iv(12) ‖ ciphertext ‖ gcmTag(16) ). */
-        private fun decryptToBeParsed(tbp: String, c: AaCrypto): JSONObject? {
-            val raw = runCatching { Base64.getDecoder().decode(tbp) }.getOrNull()
-                ?: return null
-            if (raw.size < 1 + 12 + 16 + 1) return null
-            val iv = raw.copyOfRange(1, 13)
-            val ctAndTag = raw.copyOfRange(13, raw.size)
-            for (candidate in listOf(c.key, STATIC_KEY.toByteArray(Charsets.UTF_8))) {
-                try {
-                    val cipher = Cipher.getInstance("AES/GCM/NoPadding")
-                    cipher.init(
-                        Cipher.DECRYPT_MODE,
-                        SecretKeySpec(candidate, "AES"),
-                        GCMParameterSpec(128, iv),
-                    )
-                    val plain = cipher.doFinal(ctAndTag)
-                    return JSONObject(String(plain, Charsets.UTF_8))
-                } catch (t: Throwable) {
-                    // try the next key
-                }
-            }
-            return null
-        }
-
-        // ── clock.json link resolution ──────────────────────────────────────
-
-        /** "--" prefixed sources: hex pairs XOR 0x38, then clock→clock.json. */
-        private fun xorDecodePath(enc: String): String {
-            val hex = enc.removePrefix("--")
-            if (hex.length % 2 != 0) return ""
-            return runCatching {
-                buildString(hex.length / 2) {
-                    var i = 0
-                    while (i < hex.length) {
-                        append((hex.substring(i, i + 2).toInt(16) xor 56).toChar())
-                        i += 2
-                    }
-                }.replace("clock", "clock.json")
-            }.getOrDefault("")
-        }
-
-        /** GET the clock.json link list on the AllAnime hosts + harvest. */
-        private suspend fun resolveClock(
-            app: Requests,
-            path: String,
-            srcLabel: String,
-            label: String,
-            out: MutableList<MediaCandidate>,
-        ) {
-            for (base in CLOCK_BASES) {
-                val body = runCatching {
-                    app.get(
-                        base + path,
-                        headers = mapOf("User-Agent" to UA, "Referer" to "$SITE/"),
-                        timeout = 12_000,
-                    ).text
-                }.getOrNull() ?: continue
-                val json = runCatching { JSONObject(body) }.getOrNull() ?: continue
-                val links = json.optJSONArray("links") ?: continue
-                for (i in 0 until links.length()) {
-                    val l = links.optJSONObject(i) ?: continue
-                    var link = l.optStringOrNull("link") ?: continue
-                    val linkRef = l.optJSONObject("headers")?.optStringOrNull("Referer")
-                        ?: base
-                    if ("repackager.wixmp.com" in link) {
-                        // Comma-joined quality ladder — rebuild one URL per quality.
-                        link = link.substringBefore(".urlset")
-                            .replace("repackager.wixmp.com/", "")
-                        val parts = link.split(",")
-                        if (parts.size >= 3) {
-                            for (qi in 1 until parts.size - 1) {
-                                val qual = parts[qi].trim()
-                                if (qual.isBlank()) continue
-                                val u = parts[0] + qual + parts.last()
-                                out += MediaCandidate(
-                                    url = u, sourceLabel = srcLabel,
-                                    name = "$label · $qual",
-                                    referer = linkRef, forceHls = true,
-                                    quality = qualityFromLabel(qual),
-                                )
-                            }
-                            continue
-                        }
-                    }
-                    out += MediaCandidate(
-                        url = link, sourceLabel = srcLabel, name = label,
-                        referer = linkRef,
-                        forceHls = !link.contains(".mp4", ignoreCase = true),
-                        quality = qualityFromLabel(l.optStringOrNull("resolutionStr")),
-                    )
-                }
-                return // got a parseable link list — don't fall through
-            }
-        }
-
-        // ── small utilities ─────────────────────────────────────────────────
-
-        private suspend fun postJson(app: Requests, body: String): JSONObject? {
-            val resp = runCatching {
-                app.post(
-                    API,
-                    headers = HEADERS,
-                    requestBody = body.toRequestBody("application/json".toMediaTypeOrNull()),
-                    timeout = 15_000,
-                )
-            }.getOrNull() ?: return null
-            if (resp.code !in 200..299 || resp.text.isBlank()) return null
-            return runCatching { JSONObject(resp.text) }.getOrNull()
-        }
-
-        private fun sha256(input: String): ByteArray =
-            MessageDigest.getInstance("SHA-256").digest(input.toByteArray(Charsets.UTF_8))
-
-        private fun sha256Hex(b: ByteArray): String =
-            MessageDigest.getInstance("SHA-256").digest(b)
-                .joinToString("") { "%02x".format(it) }
-
-        private fun hexToBytes(hex: String): ByteArray =
-            ByteArray(hex.length / 2) { i ->
-                hex.substring(i * 2, i * 2 + 2).toInt(16).toByte()
-            }
-
-        private fun xorBytes(a: ByteArray, b: ByteArray): ByteArray =
-            ByteArray(minOf(a.size, b.size)) { i -> (a[i].toInt() xor b[i].toInt()).toByte() }
-    }
-
-    // ════════════════════════════════════════════════════════════════════════
-    //  Resolver 4: AniChi  (https://anichi.to)
-    //
-    //  AniChi uses the KuAnime framework. The watch page loads an external
-    //  mapper at mapper.nekostream.site that returns server tokens keyed by
-    //  MAL ID. Each token is fed to /ajax/server?get={token} which returns
-    //  a URL — either:
-    //    • https://mewcdn.online/player/plyr.php#{base64(m3u8_url)} — decode
-    //      the fragment to get the raw .m3u8 (fast path)
-    //    • https://megaplay.buzz/stream/… — needs an iframe extractor
-    //
-    //  If we have a MAL ID, we use the mapper directly — no search needed.
-    //  Otherwise, we scrape /filter?keyword= for the slug-id.
-    // ════════════════════════════════════════════════════════════════════════
-
-    internal object AniChiResolver : AnimeSourceResolver {
-        private const val SITE = "https://anichi.to"
-        private const val MAPPER = "https://mapper.nekostream.site/api"
-        private const val LABEL = "AniChi"
-        private val HEADERS = mapOf(
-            "User-Agent" to UA,
-            "Referer" to "$SITE/",
-            "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language" to "en-US,en;q=0.9",
-        )
-        private val AJAX_HEADERS = mapOf(
-            "User-Agent" to UA,
-            "Referer" to "$SITE/",
-            "Accept" to "application/json, text/plain, */*",
-            "X-Requested-With" to "XMLHttpRequest",
-        )
-
-        override suspend fun resolve(
-            app: Requests,
-            title: String,
-            altTitle: String?,
-            anilistId: Int?,
-            malId: Int?,
-            isMovie: Boolean,
-            season: Int?,
-            episode: Int?,
-            labelPrefix: String,
-            subtitleCallback: (SubtitleFile) -> Unit,
-            callback: (ExtractorLink) -> Unit,
-        ): Boolean {
-            val srcLabel = "$labelPrefix • $LABEL"
-            val epToUse = episode ?: 1
-
-            // 1. Find the anime's slug-id on AniChi by searching the title.
-            //    (The slug-id is the URL identifier like "naruto-eybxz" —
-            //    needed to build the watch URL.)
-            val slugId = findAniChiSlugId(app, title)
-                ?: altTitle?.takeIf { !it.equals(title, true) }
-                    ?.let { findAniChiSlugId(app, it) }
-                ?: return false
-
-            // 2. Fetch the watch page for the specific episode. The watch
-            //    page contains `data-mal`, `data-slug`, `data-timestamp`
-            //    attrs on the episode <a> elements, which we feed to the
-            //    mapper API.
-            val watchUrl = "$SITE/watch/$slugId/ep-$epToUse"
-            val watchHtml = runCatching {
-                app.get(watchUrl, headers = HEADERS, timeout = 12_000).text
-            }.getOrNull() ?: return false
-
-            // Extract MAL ID, episode slug, and timestamp from the watch page.
-            // If multiple episodes are listed, pick the one matching epToUse.
-            val epAnchor = Regex(
-                """<a[^>]*data-num=["']?$epToUse["']?[^>]*>""",
-                RegexOption.IGNORE_CASE
-            ).find(watchHtml)
-            val epAttrs = epAnchor?.value ?: ""
-
-            val malIdToUse = malId
-                ?: Regex("""data-mal=["']?(\d+)["']?""").find(epAttrs)?.groupValues?.getOrNull(1)?.toIntOrNull()
-                ?: Regex("""data-mal-id=["']?(\d+)["']?""").find(watchHtml)?.groupValues?.getOrNull(1)?.toIntOrNull()
-                ?: return false
-
-            val epSlug = Regex("""data-slug=["']?([^"'\s>]+)["']?""").find(epAttrs)?.groupValues?.getOrNull(1)
-                ?: epToUse.toString()
-            val epTimestamp = Regex("""data-timestamp=["']?(\d+)["']?""").find(epAttrs)?.groupValues?.getOrNull(1)
-                ?: (System.currentTimeMillis() / 1000).toString()
-
-            // 3. Call the mapper API with (mal_id, episode_slug, timestamp).
-            val mapperUrl = "$MAPPER/mal/$malIdToUse/${encodeUrl(epSlug)}/$epTimestamp"
-            val mapperResp = runCatching {
-                app.get(mapperUrl, headers = AJAX_HEADERS, timeout = 12_000).text
-            }.getOrNull() ?: return false
-            val mapperJson = runCatching { JSONObject(mapperResp) }.getOrNull() ?: return false
-
-            // 4. The mapper returns server tokens keyed by server name
-            //    (e.g. "Kiwi-Stream", "Vidstream", "Vibe-Stream").
-            //    Each entry has {"sub":{"url":"<token>"}, "dub":{"url":"<token>"}}.
-            // (v19) Take BOTH sub and dub tokens — previously only "sub" was
-            // read, so AniChi dubs never appeared. Dub tokens are labelled.
-            val tokens = mutableListOf<Triple<String, String, Boolean>>() // (serverName, token, isDub)
-            val keys = mapperJson.keys()
-            while (keys.hasNext()) {
-                val k = keys.next()
-                if (k == "status") continue
-                val serverObj = mapperJson.optJSONObject(k) ?: continue
-                val serverName = k.trim().trimEnd('-').trim()
-                val subToken = serverObj.optJSONObject("sub")?.optStringOrNull("url")
-                val dubToken = serverObj.optJSONObject("dub")?.optStringOrNull("url")
-                if (!subToken.isNullOrBlank()) tokens += Triple(serverName, subToken, false)
-                if (!dubToken.isNullOrBlank()) tokens += Triple(serverName, dubToken, true)
-            }
-            if (tokens.isEmpty()) return false
-
-            // 5. For each token, call /ajax/server?get={token} to get the
-            //    iframe URL. If it's a mewcdn.online URL with a base64
-            //    fragment, decode it directly to a .m3u8.
-            val anichiCands = mutableListOf<MediaCandidate>()
-            var any = false
-            for ((serverName, token, isDub) in tokens) {
-                val serverLabel = "$srcLabel · $serverName" + (if (isDub) " · DUB" else "")
-                val serverUrl = "$SITE/ajax/server?get=${encodeUrl(token)}"
-                val serverResp = runCatching {
-                    app.get(serverUrl, headers = AJAX_HEADERS, timeout = 10_000).text
-                }.getOrNull() ?: continue
-                val serverJson = runCatching { JSONObject(serverResp) }.getOrNull() ?: continue
-                val result = serverJson.optJSONObject("result") ?: continue
-                val iframeUrl = result.optStringOrNull("url") ?: continue
-
-                // Fast path: mewcdn.online/player/plyr.php#{base64(m3u8)}
-                if (iframeUrl.contains("mewcdn.online") && iframeUrl.contains("#")) {
-                    val b64 = iframeUrl.substringAfter("#").substringBefore("&").trim()
-                    val decoded = urlSafeB64DecodeText(b64) ?: continue
-                    if (decoded.contains(".m3u8", true)) {
-                        anichiCands += MediaCandidate(
-                            url = decoded,
-                            sourceLabel = serverLabel,
-                            name = serverLabel,
-                            referer = iframeUrl,
-                            headers = mapOf("Referer" to iframeUrl, "User-Agent" to UA),
-                        )
-                    }
-                    continue
-                }
-
-                // Slow path: megaplay.buzz/stream/… — try the generic
-                // extractor (Cloudstream's loadExtractor) which may or may
-                // not support megaplay. If it doesn't, we silently skip.
-                if (iframeUrl.startsWith("http")) {
-                    runCatching {
-                        loadExtractor(iframeUrl, "$SITE/", subtitleCallback) { link ->
-                            callback(link.relabel(serverLabel, "$serverLabel — ${link.name}"))
-                            any = true
-                        }
-                    }
-                }
-            }
-            if (emitMediaCandidates(anichiCands, subtitleCallback, callback)) any = true
-            return any
-        }
-
-        /** Search AniChi by title and return the slug-id (e.g., "naruto-eybxz"). */
-        private suspend fun findAniChiSlugId(app: Requests, title: String): String? {
-            if (title.isBlank()) return null
-            val searchUrl = "$SITE/filter?keyword=${encodeUrl(title)}"
-            val html = runCatching {
-                app.get(searchUrl, headers = HEADERS, timeout = 12_000).text
-            }.getOrNull() ?: return null
-            val doc = Jsoup.parse(html, searchUrl)
-            val candidates = mutableListOf<Pair<String, String>>() // (slug-id, title)
-            // Primary selector: <a class="name d-title" href="/anime/{slug-id}">
-            doc.select("a.name.d-title, a.d-title").forEach { a ->
-                val href = a.attr("href").ifBlank { return@forEach }
-                val slugId = Regex("""/anime/([a-z0-9\-]+)""").find(href)?.groupValues?.getOrNull(1)
-                    ?: return@forEach
-                val t = a.attr("data-en").ifBlank { a.attr("data-jp") }.ifBlank { a.text() }
-                if (t.isNotBlank() && slugId.isNotBlank()) candidates += slugId to t
-            }
-            // Fallback: any <a href="/anime/…"> with an <img alt="…">
-            if (candidates.isEmpty()) {
-                doc.select("a[href~=/anime/[a-z0-9]+-[a-z0-9]{5}$]").forEach { a ->
-                    val href = a.attr("href")
-                    val slugId = Regex("""/anime/([a-z0-9\-]+)""").find(href)?.groupValues?.getOrNull(1)
-                        ?: return@forEach
-                    val t = a.selectFirst("img")?.attr("alt")?.ifBlank { null } ?: a.text()
-                    if (t.isNotBlank() && slugId.isNotBlank()) candidates += slugId to t
-                }
-            }
-            if (candidates.isEmpty()) return null
-            val qNorm = title.normaliseTitle()
-            val best = candidates.firstOrNull { (_, t) -> t.normaliseTitle() == qNorm }
-                ?: candidates.maxByOrNull { (_, t) -> titleSimilarity(t, title) }
-                ?: return null
-            return if (titleSimilarity(best.second, title) >= 0.5) best.first else null
-        }
-    }
-
-    // ════════════════════════════════════════════════════════════════════════
-    //  Resolver 5: UniqueStream  (https://anime.uniquestream.net)
-    //
-    //  Public FastAPI backend (full schema at /api/v1/openapi.json):
-    //    GET /api/v1/search?query=…           → series[] / episodes[]
-    //    GET /api/v1/series/{contentId}       → seasons[] (arcs, each with
-    //                                           content_id + episode_count)
-    //    GET /api/v1/season/{id}/episodes     → [{content_id, episode_number}]
-    //    GET /api/v1/episode/{id}/media/hls/{sub|dub}
-    //        → {hls:{locale, playlist, subtitles[], hard_subs[{locale,playlist}]}}
-    //
-    //  The playlists are signed HLS masters on mediacache.cc — direct links,
-    //  no extractor games. Seasons are story ARCS (e.g. "East Blue (1-61)"),
-    //  so we map Cloudstream's absolute episode number onto the right arc.
-    // ════════════════════════════════════════════════════════════════════════
-
-    internal object UniqueStreamResolver : AnimeSourceResolver {
-        private const val SITE = "https://anime.uniquestream.net"
-        private const val API = "$SITE/api/v1"
-        private const val LABEL = "UniqueStream"
-        private val HEADERS = mapOf(
-            "User-Agent" to UA,
-            "Accept" to "application/json",
-            "Referer" to "$SITE/",
-        )
-
-        override suspend fun resolve(
-            app: Requests,
-            title: String,
-            altTitle: String?,
-            anilistId: Int?,
-            malId: Int?,
-            isMovie: Boolean,
-            season: Int?,
-            episode: Int?,
-            labelPrefix: String,
-            subtitleCallback: (SubtitleFile) -> Unit,
-            callback: (ExtractorLink) -> Unit,
-        ): Boolean {
-            if (title.isBlank()) return false
-            val srcLabel = "$labelPrefix • $LABEL"
-            val epToUse = episode ?: 1
-
-            // 1. Search (both title aliases — (v29) the site's index is
-            //    romaji-heavy while our primary title is usually English).
-            data class SMatch(val cid: String, val title: String)
-            var search: JSONObject? = null
-            var bestSeries: SMatch? = null
-            for (q in listOfNotNull(title, altTitle).distinct()) {
-                val s = getJson(app, "$API/search?query=${encodeUrl(q)}&limit=5") ?: continue
-                search = s
-                val seriesArr = s.optJSONArray("series")
-                val series = (0 until (seriesArr?.length() ?: 0)).mapNotNull { i ->
-                    val o = seriesArr?.optJSONObject(i) ?: return@mapNotNull null
-                    val cid = o.optStringOrNull("content_id") ?: return@mapNotNull null
-                    val t = o.optStringOrNull("title") ?: return@mapNotNull null
-                    SMatch(cid, t)
-                }
-                bestSeries = series.firstOrNull { matchesEitherTitle(it.title, title, altTitle) }
-                    ?: series.maxByOrNull { bestTitleSim(it.title, title, altTitle) }
-                        ?.takeIf { bestTitleSim(it.title, title, altTitle) >= 0.5 }
-                if (bestSeries != null) break
-            }
-            if (search == null) return false
-
-            // 2. Track down the episode content_id.
-            var epContentId: String? = null
-            if (bestSeries != null) {
-                epContentId = findEpisodeContentId(app, bestSeries.cid, epToUse)
-            }
-            if (epContentId == null && isMovie) {
-                // Movies may also surface as bare "episodes" in the search payload.
-                val epsArr = search.optJSONArray("episodes")
-                val movieHits = (0 until (epsArr?.length() ?: 0)).mapNotNull { i ->
-                    val o = epsArr?.optJSONObject(i) ?: return@mapNotNull null
-                    val cid = o.optStringOrNull("content_id") ?: return@mapNotNull null
-                    val t = o.optStringOrNull("title") ?: return@mapNotNull null
-                    SMatch(cid, t)
-                }
-                epContentId = (movieHits.firstOrNull { matchesEitherTitle(it.title, title, altTitle) }
-                    ?: movieHits.maxByOrNull { bestTitleSim(it.title, title, altTitle) }
-                        )?.takeIf { bestTitleSim(it.title, title, altTitle) >= 0.5 }?.cid
-            }
-            if (epContentId.isNullOrBlank()) return false
-
-            // 3. Ask for both language variants; dedupe identical playlists.
-            val cands = mutableListOf<MediaCandidate>()
-            val seenPlaylists = mutableSetOf<String>()
-            val seenSubs = mutableSetOf<String>()
-            for ((tt, tag) in listOf("sub" to " · SUB", "dub" to " · DUB")) {
-                val media = getJson(app, "$API/episode/$epContentId/media/hls/$tt") ?: continue
-                val hls = media.optJSONObject("hls") ?: continue
-                hls.optStringOrNull("playlist")?.let { pl ->
-                    if (seenPlaylists.add(pl)) {
-                        cands += MediaCandidate(
-                            url = pl, sourceLabel = srcLabel, name = "$srcLabel$tag",
-                            referer = "$SITE/", headers = HEADERS, forceHls = true,
-                        )
-                    }
-                }
-                hls.optJSONArray("subtitles")?.let { subs ->
-                    for (i in 0 until subs.length()) {
-                        val sub = subs.optJSONObject(i) ?: continue
-                        val su = sub.optStringOrNull("url")
-                            ?: sub.optStringOrNull("src")
-                            ?: sub.optStringOrNull("file") ?: continue
-                        if (seenSubs.add(su)) {
-                            val subName = sub.optStringOrNull("label")
-                                ?: sub.optStringOrNull("locale")
-                                ?: sub.optStringOrNull("lang") ?: "Subtitle"
-                            subtitleCallback(SubtitleFile(subName, su))
-                        }
-                    }
-                }
-                hls.optJSONArray("hard_subs")?.let { hard ->
-                    for (i in 0 until hard.length()) {
-                        val hs = hard.optJSONObject(i) ?: continue
-                        val pl = hs.optStringOrNull("playlist") ?: continue
-                        if (!seenPlaylists.add(pl)) continue
-                        val short = (hs.optStringOrNull("locale") ?: "??")
-                            .substringBefore("-").uppercase()
-                        cands += MediaCandidate(
-                            url = pl, sourceLabel = srcLabel,
-                            name = "$srcLabel · Hardsub $short$tag",
-                            referer = "$SITE/", headers = HEADERS, forceHls = true,
-                        )
-                    }
-                }
-                // DUB call frequently returns the very same ja-JP playlist;
-                // if sub already produced it there's nothing more to harvest.
-            }
-            return emitMediaCandidates(cands, subtitleCallback, callback)
-        }
-
-        /** Walk the arc-seasons in order and map absolute ep → (season, local ep). */
-        private suspend fun findEpisodeContentId(app: Requests, seriesCid: String, ep: Int): String? {
-            val detail = getJson(app, "$API/series/$seriesCid") ?: return null
-            val seasonsArr = detail.optJSONArray("seasons") ?: return null
-            data class Season(val cid: String, val number: Int, val count: Int)
-            val seasons = (0 until seasonsArr.length()).mapNotNull { i ->
-                val o = seasonsArr.optJSONObject(i) ?: return@mapNotNull null
-                val cid = o.optStringOrNull("content_id") ?: return@mapNotNull null
-                val count = o.optInt("episode_count",
-                    o.optInt("episodes_count", o.optInt("episodes", 0)))
-                if (count <= 0) return@mapNotNull null
-                Season(cid, o.optInt("season_number", i + 1), count)
-            }.sortedBy { it.number }
-            var acc = 0
-            for (sz in seasons) {
-                if (ep <= acc + sz.count) {
-                    val localEp = ep - acc
-                    // API caps limit at 20 — jump straight to the right page.
-                    val page = (localEp - 1) / 20 + 1
-                    val eps = getJson(app, "$API/season/${sz.cid}/episodes?page=$page&limit=20")
-                        ?: return null
-                    // Endpoint returns a bare JSON array (getJson wraps it).
-                    val arr = eps.optJSONArray("episodes") ?: return null
-                    for (i in 0 until arr.length()) {
-                        val o = arr.optJSONObject(i) ?: continue
-                        val num = o.optDouble("episode_number",
-                            o.optDouble("episode", Double.NaN))
-                        if (!num.isNaN() && num.toInt() == localEp) {
-                            return o.optStringOrNull("content_id")
-                        }
-                    }
-                    return null
-                }
-                acc += sz.count
-            }
-            return null
-        }
-
-        private suspend fun getJson(app: Requests, url: String): JSONObject? {
-            val resp = runCatching {
-                app.get(url, headers = HEADERS, timeout = 15_000)
-            }.getOrNull() ?: return null
-            if (resp.code !in 200..299 || resp.text.isBlank()) return null
-            val t = resp.text.trim()
-            if (t.startsWith("[")) {
-                // Bare array — wrap it so the caller can uniform-parse.
-                return runCatching { JSONObject().put("episodes", JSONArray(t)) }.getOrNull()
-            }
-            return runCatching { JSONObject(t) }.getOrNull()
-        }
-    }
-
-    // ════════════════════════════════════════════════════════════════════════
     //  Resolver 6: AniNeko  (https://anineko.to)
     //
     //  /ajax/search?q=… → [{title, url:"/watch/{slug}"}] (X-Requested-With).
@@ -1741,24 +643,36 @@ object WizstreamAnimeSources {
         }
     }
 
+
     // ════════════════════════════════════════════════════════════════════════
-    //  Resolver 7: ReANIME  (https://reanime.to)
+    //  Resolver 2: KickAssAnime  (https://kaa.lt)   — v89
     //
-    //  Open SvelteKit API:
-    //    GET /api/v1/search?q=… → [{anime_id:"slug", title:{english,romaji,native}}]
-    //    GET /watch/{slug}/__data.json?ep=N → devalue flat-array page state,
-    //        which (once the site has seeded an episode) embeds the stream
-    //        URLs. We scan the resolved JSON text for any direct media URL.
+    //  The HTML pages sit behind a Cloudflare challenge, but the whole Nuxt
+    //  JSON API answers to a plain User-Agent — so we never touch HTML:
+    //    POST /api/search {"query":"…"} → [{slug, title, title_en, year, …}]
+    //    GET  /api/show/{slug}          → {…, watch_uri:"/{slug}/{latestEpSlug}"}
+    //    GET  /api/show/{slug}/episode/{epSlug}
+    //        → {episode_number, prev_ep_slug,
+    //           servers:[{name, shortName, src:"https://krussdomi.com/cat-player/player?id=…"}]}
     //
-    //  Honest note: at the time of writing the site answers every episode
-    //  with an EMPTY source folder ("No streaming servers available"), so
-    //  this resolver quietly returns false until they flip the switch —
-    //  at which point it starts working with no code change.
+    //  Episode slugs are only discoverable by walking the prev_ep_slug linked
+    //  list backwards from the latest episode (their /api/episodes endpoint
+    //  returns just the newest NUMBERS, no slugs — useless). Cost: 1 request
+  //  when the wanted episode IS the latest, +1 per hop back (cap MAX_WALK,
+    //  logged when the chain doesn't contain the episode).
+    //
+    //  The CatStream player page is a static Astro island whose `props`
+    //  attribute holds devalue-encoded JSON with
+    //    "manifest":[0,"//bl.krussdomi.com/playlist/<hash>/master.m3u8"]
+    //  plus subtitle entries whose src URLs carry a "https:///" triple-slash
+    //  typo that we normalise. Emission is probe-free (v83 doctrine): the
+    //  master playlist goes straight through the shared M3u8Helper ladder.
     // ════════════════════════════════════════════════════════════════════════
 
-    internal object ReAnimeResolver : AnimeSourceResolver {
-        private const val SITE = "https://reanime.to"
-        private const val LABEL = "ReANIME"
+    internal object KaaResolver : AnimeSourceResolver {
+        private const val SITE = "https://kaa.lt"
+        private const val LABEL = "KAA"
+        private const val MAX_WALK = 130
         private val HEADERS = mapOf(
             "User-Agent" to UA,
             "Referer" to "$SITE/",
@@ -1780,120 +694,249 @@ object WizstreamAnimeSources {
         ): Boolean {
             if (title.isBlank()) return false
             val srcLabel = "$labelPrefix • $LABEL"
-            val epToUse = episode ?: 1
+            val targetEp = if (isMovie) 1 else (episode ?: 1)
 
-            // 1. Search the open API (both aliases — v29).
-            data class Hit(val slug: String, val names: List<String>)
+            // 1. Search — both aliases, sim-gated (no AniList mapping exists).
+            data class Hit(val slug: String, val title: String, val titleNative: String?)
             suspend fun doSearch(q: String): List<Hit> {
-                val body = runCatching {
-                    app.get(
-                        "$SITE/api/v1/search?q=${encodeUrl(q)}&limit=5",
-                        headers = HEADERS, timeout = 12_000,
-                    ).text
-                }.getOrNull() ?: return emptyList()
-                val results = runCatching { JSONObject(body) }.getOrNull()
-                    ?.optJSONArray("results") ?: return emptyList()
-                return (0 until results.length()).mapNotNull { i ->
-                    val o = results.optJSONObject(i) ?: return@mapNotNull null
-                    val slug = o.optStringOrNull("anime_id") ?: return@mapNotNull null
-                    val t = o.optJSONObject("title")
-                    val names = listOfNotNull(
-                        t?.optStringOrNull("english"),
-                        t?.optStringOrNull("romaji"),
-                        t?.optStringOrNull("native"),
-                    )
-                    if (names.isEmpty()) return@mapNotNull null
-                    Hit(slug, names)
+                val body = wizRetryOnce("kaa search") {
+                    runCatching {
+                        app.post(
+                            "$SITE/api/search",
+                            headers = HEADERS + ("Content-Type" to "application/json"),
+                            requestBody = JSONObject().put("query", q).toString()
+                                .toRequestBody("application/json".toMediaTypeOrNull()),
+                            cacheTime = 0,
+                            timeout = 12_000,
+                        ).text
+                    }.getOrNull()
+                } ?: return emptyList()
+                val arr = runCatching { JSONArray(body) }.getOrNull() ?: return emptyList()
+                return (0 until arr.length()).mapNotNull { i ->
+                    val o = arr.optJSONObject(i) ?: return@mapNotNull null
+                    val slug = o.optStringOrNull("slug") ?: return@mapNotNull null
+                    val t = o.optStringOrNull("title_en") ?: o.optStringOrNull("title")
+                        ?: return@mapNotNull null
+                    Hit(slug, t, o.optStringOrNull("title"))
                 }
             }
-            fun Hit.bestSim(): Double = names.maxOf { bestTitleSim(it, title, altTitle) }
-            fun List<Hit>.pickBest() = firstOrNull { h ->
-                h.names.any { matchesEitherTitle(it, title, altTitle) }
-            } ?: maxByOrNull { it.bestSim() }?.takeIf { it.bestSim() >= 0.5 }
-            var best = doSearch(title).pickBest()
+            fun simOf(h: Hit): Double = maxOf(
+                bestTitleSim(h.title, title, altTitle),
+                h.titleNative?.let { bestTitleSim(it, title, altTitle) } ?: 0.0,
+            )
+            fun List<Hit>.pickBest() = firstOrNull {
+                matchesEitherTitle(it.title, title, altTitle) ||
+                    (it.titleNative != null &&
+                        matchesEitherTitle(it.titleNative, title, altTitle))
+            } ?: maxByOrNull { simOf(it) }?.takeIf { simOf(it) >= 0.5 }
+            // Their matcher is phrase-strict (the FULL title "Jujutsu Kaisen:
+            // The Culling Game Part 1" returns ZERO while "jujutsu kaisen"
+            // lists every cours entry) — so each alias walks a query ladder
+            // (full → first-two tokens → last-two tokens → first-three) until
+            // one comes back non-empty; the sim gate picks the right entry.
+            fun queryLadder(q: String): List<String> {
+                val toks = q.normaliseTitle().split(Regex("\\s+"))
+                    .filter { it.isNotBlank() }
+                val out = mutableListOf(q)
+                if (toks.size >= 3) out += toks.take(2).joinToString(" ")
+                if (toks.size >= 3) out += toks.takeLast(2).joinToString(" ")
+                if (toks.size >= 5) out += toks.take(3).joinToString(" ")
+                return out.distinct()
+            }
+            suspend fun searchAlias(q: String): List<Hit> {
+                for (cand in queryLadder(q)) {
+                    val hits = doSearch(cand)
+                    if (hits.isNotEmpty()) return hits
+                }
+                return emptyList()
+            }
+            var best = searchAlias(title).pickBest()
             if (best == null && !altTitle.isNullOrBlank() && !altTitle.equals(title, true)) {
-                best = doSearch(altTitle).pickBest()
+                best = searchAlias(altTitle).pickBest()
             }
             if (best == null) return false
 
-            // 2. SvelteKit data payload for the episode — may be sizeable.
-            val watchUrl = "$SITE/watch/${best.slug}"
-            val dataJson = runCatching {
+            // 2. Show payload → LATEST episode slug = the walking start point.
+            val show = wizRetryOnce("kaa show") {
+                runCatching {
+                    app.get(
+                        "$SITE/api/show/${best.slug}",
+                        headers = HEADERS, timeout = 12_000,
+                    ).text
+                }.getOrNull()?.let { runCatching { JSONObject(it) }.getOrNull() }
+            } ?: return false
+            val watchUri = show.optStringOrNull("watch_uri") ?: return false
+            val parts = watchUri.trim('/').split('/').filter { it.isNotBlank() }
+            if (parts.size < 2) return false
+            val showSlug = parts[parts.size - 2]
+            var epSlug = parts.last()
+
+            // 3. Back-walk the prev_ep_slug chain to episode_number == target.
+            suspend fun fetchEp(slug: String): JSONObject? = runCatching {
                 app.get(
-                    "$watchUrl/__data.json?ep=$epToUse",
-                    headers = HEADERS, timeout = 15_000,
+                    "$SITE/api/show/$showSlug/episode/$slug",
+                    headers = HEADERS, timeout = 12_000,
                 ).text
-            }.getOrNull() ?: return false
-
-            // 3. Pull every direct media URL out of the flat devalue payload.
-            val urls = Regex("""https?://[^"\s]+?\.(?:m3u8|mp4)(?:\?[^"\s]*)?""")
-                .findAll(dataJson).map { it.value }.distinct().toList()
-            if (urls.isEmpty()) return false
-
-            val cands = urls.map { u ->
-                MediaCandidate(
-                    url = u, sourceLabel = srcLabel, name = srcLabel,
-                    referer = watchUrl, headers = HEADERS,
-                    forceHls = !u.contains(".mp4", ignoreCase = true),
-                )
+            }.getOrNull()?.let { runCatching { JSONObject(it) }.getOrNull() }
+            var epJson: JSONObject? = null
+            var hops = 0
+            while (hops <= MAX_WALK) {
+                val cur = fetchEp(epSlug) ?: return false
+                val num = cur.optDouble("episode_number", -1.0)
+                if ((isMovie && hops == 0) || num == targetEp.toDouble()) {
+                    epJson = cur
+                    break
+                }
+                if (num >= 0.0 && num < targetEp.toDouble()) {
+                    Log.d(TAG, "kaa: ep $targetEp below chain floor ($num) for ${best.slug}")
+                    return false
+                }
+                epSlug = cur.optStringOrNull("prev_ep_slug") ?: run {
+                    Log.d(TAG, "kaa: ep $targetEp not in chain for ${best.slug}")
+                    return false
+                }
+                hops++
             }
-            return emitMediaCandidates(cands, subtitleCallback, callback)
+            if (epJson == null) {
+                Log.d(TAG, "kaa: walk cap hit hunting ep $targetEp of ${best.slug}")
+                return false
+            }
+
+            // 4. Every server page → devalue-props manifest (+ subtitles).
+            val servers = epJson.optJSONArray("servers") ?: return false
+            val manifestRe = Regex(""""manifest"\s*:\s*(?:\[\s*\d+\s*,\s*)?"([^"]+)""")
+            val subSrcRe = Regex(
+                """"src"\s*:\s*(?:\[\s*\d+\s*,\s*)?"(https?:/+[^"]+\.(?:srt|vtt|ass))""",
+                RegexOption.IGNORE_CASE,
+            )
+            val subNameRe = Regex(""""name"\s*:\s*(?:\[\s*\d+\s*,\s*)?"([^"]+)""")
+            val subLangRe = Regex(""""language"\s*:\s*(?:\[\s*\d+\s*,\s*)?"([^"]+)""")
+            val seenSrc = mutableSetOf<String>()
+            val seenSubs = mutableSetOf<String>()
+            val cands = mutableListOf<MediaCandidate>()
+            var any = false
+            for (i in 0 until servers.length()) {
+                val srv = servers.optJSONObject(i) ?: continue
+                val src = srv.optStringOrNull("src") ?: continue
+                if (!src.startsWith("http") || !seenSrc.add(src)) continue
+                val short = srv.optStringOrNull("shortName")
+                    ?: srv.optStringOrNull("name") ?: "Server"
+                val label = "$srcLabel · $short"
+
+                val pageRaw = wizRetryOnce("kaa player $short") {
+                    runCatching {
+                        app.get(src, headers = HEADERS, timeout = 12_000).text
+                    }.getOrNull()?.takeIf { it.isNotBlank() }
+                }
+                // The Astro-island props attribute arrives RAW on some edges
+                // and HTML-ESCAPED (&quot;) on others — normalise once and
+                // regex the unescaped text either way.
+                val page = pageRaw
+                    ?.replace("&quot;", "\"")
+                    ?.replace("&#39;", "'")
+                    ?.replace("&amp;", "&")
+                var manifest: String? = null
+                if (!page.isNullOrBlank()) {
+                    manifest = manifestRe.find(page)?.groupValues?.getOrNull(1)?.let { m ->
+                        when {
+                            m.startsWith("//") -> "https:$m"
+                            m.startsWith("/") -> "https://krussdomi.com$m"
+                            else -> m
+                        }
+                    }
+                    subSrcRe.findAll(page).forEach { sm ->
+                        val raw = sm.groupValues.getOrNull(1) ?: return@forEach
+                        val su = if (raw.startsWith("https")) {
+                            "https://" + raw.removePrefix("https:").trimStart('/')
+                        } else {
+                            "http://" + raw.removePrefix("http:").trimStart('/')
+                        }
+                        if (seenSubs.add(su)) {
+                            // Each sub object is {language,name,src} — so the
+                            // CLOSEST preceding name/language is this track's.
+                            val w0 = maxOf(0, sm.range.first - 240)
+                            val preceding = page.substring(w0, sm.range.first)
+                            val subName = (
+                                subNameRe.findAll(preceding).lastOrNull()
+                                    ?: subLangRe.findAll(preceding).lastOrNull()
+                                )?.groupValues?.getOrNull(1)
+                                ?.replaceFirstChar { c ->
+                                    if (c.isLowerCase()) c.titlecase() else c.toString()
+                                } ?: "Track"
+                            subtitleCallback(SubtitleFile(subName, su))
+                        }
+                    }
+                }
+                when {
+                    !manifest.isNullOrBlank() -> cands += MediaCandidate(
+                        url = manifest, sourceLabel = label, name = label,
+                        referer = src, forceHls = true,
+                    )
+                    !page.isNullOrBlank() -> {
+                        val stream = findMediaUrlIn(page)
+                        if (!stream.isNullOrBlank()) {
+                            cands += MediaCandidate(
+                                url = stream, sourceLabel = label, name = label,
+                                referer = src,
+                                forceHls = !stream.contains(".mp4", ignoreCase = true),
+                            )
+                        } else {
+                            runCatching {
+                                loadExtractor(src, "$SITE/", subtitleCallback) { link ->
+                                    callback(link.relabel(label, "$label — ${link.name}"))
+                                    any = true
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            for (c in cands.distinctBy { it.url }) {
+                if (emitOneCandidate(c, callback)) any = true
+            }
+            Log.d(TAG, "kaa: served ${best.slug} ep=$targetEp hops=$hops links=${cands.size}")
+            return any
         }
     }
 
-    // ─────────────────────────────────────────────────────────────────────
-    //  Resolver 8: Tokyo Insider — https://www.tokyoinsider.com
+    // ════════════════════════════════════════════════════════════════════════
+    //  Resolver 3: AnimeX  (https://animex.one)   — v89
     //
-    //  Old-school direct-download fansub site: every release row is a
-    //  progressive MKV/MP4 file on media.tokyoinsider.com:8080 (signed,
-    //  time-limited URLs — hence resolved fresh on every user click).
+    //  Fully open server-to-server API (no Cloudflare turnstile, no auth —
+    //  verified live v89):
+    //    POST https://graphql.animex.one/graphql   FastSearch → items:
+    //        {id:"<slug>-<rand>", anilistId, malId, titleRomaji, titleEnglish}
+    //    GET  https://pp.animex.one/rest/api/servers?id={id}&epNum={N}
+    //        → {subProviders:[{id,default,tip}], dubProviders:[…]}
+    //    GET  https://pp.animex.one/rest/api/sources?id={id}&providerId={p}
+    //             &epNum={N}&type=sub|dub
+    //        → {sources:[{url,quality:"auto"|"1080p",…}], tracks:[{url,label,
+    //          lang,default}], headers:{Referer|Origin:…}}
     //
-    //  Pipeline:
-    //   1. /upload/autocomplete.js — static ~420KB JS containing the ENTIRE
-    //      catalogue (~5,600 series) as [["Title (Type)","\/anime\/L\/Slug"],…].
-    //      Static file, so it's NOT behind the Cloudflare challenge that
-    //      protects the dynamic pages — search works even when CF is grumpy.
-    //   2. /anime/L/Slug — episode index: rows of
-    //      div.episode a.download-link (episode number in <strong>, href
-    //      /anime/…/episode/N; movies use /movie/1).
-    //   3. /anime/…/episode/N — release rows (div.c_h2 / div.c_h2b) whose
-    //      download anchors point at media.tokyoinsider.com:8080/dl/<sig>/FILE.
-    //
-    //  Anti-scrape note: dynamic pages interleave decoy
-    //  <i class="<hash>" aria-hidden="true">junk</i> nodes inside visible
- 	//  text (CSS display:none hides them for humans). Jsoup doesn't apply
-    //  CSS, so we strip those nodes BEFORE reading any text(). Hrefs are
-    //  never obfuscated.
-    //
-    //  3003/4003 safety: only .mkv/.mp4/.webm rows are emitted (AVI/WMV
-    //  would hard-crash ExoPlayer's parser), and every link gets the v18
-    //  codec tag parsed out of the release filename (x265/HEVC → " · HEVC ⚠"
-    //  …) so old-TVs can avoid HEVC/AV1. All links pass through the
- 	//  emitMediaCandidates range-probe gate (drops 4xx/5xx/HTML bodies → the
-    //  2004/3003 protection).
-    // ─────────────────────────────────────────────────────────────────────
-    internal object TokyoInsiderResolver : AnimeSourceResolver {
-        private const val SITE = "https://www.tokyoinsider.com"
-        private const val MEDIA_HOST = "media.tokyoinsider.com"
-        private const val LABEL = "TokyoInsider"
-        private const val MAX_LINKS = 12
+    //  Stream URLs are DIRECT m3u8s ("auto" = master ladder; named qualities
+    //  are per-quality playlists). The `headers` object is REQUIRED for
+  //  playback (each backend hotlink-gates by its own Referer/Origin), so it
+    //  is attached to every emitted link instead of guessing. Streams are
+  //  deduped by URL (their "kiwi" backend currently serves the same file as
+    //  "mimi"). Matching is cours-safe: exact anilistId hit first — AnimeX
+    //  files cours entries under the same AniList ids we resolve — with the
+    //  title-similarity gate as fallback.
+    // ════════════════════════════════════════════════════════════════════════
+
+    internal object AnimexResolver : AnimeSourceResolver {
+        private const val SITE = "https://animex.one"
+        private const val GQL = "https://graphql.animex.one/graphql"
+        private const val PP = "https://pp.animex.one"
+        private const val LABEL = "AnimeX"
+        private const val FAST_SEARCH_QUERY =
+            "query FastSearch(\$query: String, \$limit: Int, \$includeAdult: Boolean) { " +
+            "catalogAnime(filter: { query: \$query, includeAdult: \$includeAdult }, limit: \$limit) { " +
+            "items { id anilistId malId titleRomaji titleEnglish } } }"
         private val HEADERS = mapOf(
             "User-Agent" to UA,
             "Referer" to "$SITE/",
-            "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language" to "en-US,en;q=0.9",
+            "Accept" to "application/json, text/plain, */*",
         )
-
-        /** Catalogue entry regex: `["Bleach (TV)","\/anime\/B\/Bleach_(TV)"]` */
-        private val ENTRY_RX = Regex("""\["([^"]+)","([^"]+)"\]""")
-        private val TYPE_RX = Regex("""\(([^()]+)\)\s*$""")
-
-        /** Series-page slug, e.g. `/anime/C/Chainsaw_Man_(TV)` (absolute or relative). */
-        private val SLUG_RX = Regex(
-            """^(?:https?://www\.tokyoinsider\.com)?""" +
-                """(/anime/[A-Za-z0-9]/[^?#"']+\((?:TV|Movie|OVA|ONA|Special)\))$"""
-        )
-        private val VIDEO_FILE_RX = Regex("""\.(mkv|mp4|webm)$""", RegexOption.IGNORE_CASE)
 
         override suspend fun resolve(
             app: Requests,
@@ -1909,188 +952,164 @@ object WizstreamAnimeSources {
             callback: (ExtractorLink) -> Unit,
         ): Boolean {
             if (title.isBlank()) return false
-            if (!isMovie && episode == null) return false
             val srcLabel = "$labelPrefix • $LABEL"
+            val targetEp = if (isMovie) 1 else (episode ?: 1)
 
-            // 1. Title candidates. PRIMARY: the live server-side search
-            //    (GET /anime/search?k=…) — the static autocomplete.js the
-            //    site's own search box uses is stuck in ~2021 (no Chainsaw
-            //    Man, no Mob Psycho III, no Frieren). FALLBACK: that same
-            //    static JS anyway, since it's not behind the Cloudflare
-            //    challenge the dynamic pages sometimes throw.
-            // (title w/o type suffix, type, /anime path)
-            val entries = mutableListOf<Triple<String, String, String>>()
-
-            runCatching {
-                val searchUrl = "$SITE/anime/search?k=${encodeUrl(title)}"
-                val html = app.get(searchUrl, headers = HEADERS, timeout = 15_000).text
-                // A CF "Just a moment" page has no series links — harmless.
-                val doc = Jsoup.parse(html, searchUrl)
-                doc.select("i[aria-hidden=true]").remove()
-                doc.select("a[href]").forEach { a ->
-                    val m = SLUG_RX.matchEntire(a.attr("href").trim()) ?: return@forEach
-                    val path = m.groupValues[1]
-                    val type = TYPE_RX.find(path)?.groupValues?.getOrNull(1)?.trim() ?: return@forEach
-                    // Card text-links read "Chainsaw Man (TV)"; if a link
-                    // only wraps the cover image, fall back to its title
-                    // attribute ("Chainsaw Man"). The type comes from the
-                    // slug either way.
-                    val txt = a.text().trim()
-                    val clean = if (TYPE_RX.containsMatchIn(txt)) txt.replace(TYPE_RX, "").trim()
-                        else a.attr("title").trim().ifBlank {
-                            a.selectFirst("img")?.attr("alt")?.trim() ?: ""
-                        }
-                    if (clean.isNotBlank()) entries += Triple(clean, type, path)
-                }
-            }
-
-            if (entries.isEmpty()) {
-                val indexText = runCatching {
-                    app.get("$SITE/upload/autocomplete.js", headers = HEADERS, timeout = 15_000).text
-                }.getOrNull() ?: return false
-                ENTRY_RX.findAll(indexText).forEach { m ->
-                    val raw = m.groupValues[1]
-                    val path = m.groupValues[2].replace("\\/", "/")
-                    if (!path.startsWith("/anime/")) return@forEach
-                    val type = TYPE_RX.find(raw)?.groupValues?.getOrNull(1)?.trim() ?: ""
-                    val clean = raw.replace(TYPE_RX, "").trim()
-                    if (clean.isNotBlank()) entries += Triple(clean, type, path)
-                }
-            }
-            if (entries.isEmpty()) return false
-
-            // 2. Season-aware fuzzy match. TMDB-tracked anime passes the BASE
-            //    title + season, but Tokyo Insider splits seasons into their
-            //    own catalogue entries ("Mob Psycho 100 III (TV)").
-            val queries = buildList {
-                add(title)
-                if (!altTitle.isNullOrBlank() && !altTitle.equals(title, true)) add(altTitle)
-                val s = season ?: 1
-                if (!isMovie && s > 1) {
-                    val roman = arrayOf("", "I", "II", "III", "IV", "V", "VI", "VII", "VIII", "IX", "X")
-                    if (s in 1..10) add("$title ${roman[s]}")
-                    add("$title Season $s")
-                    val ord = when (s) { 1 -> "1st"; 2 -> "2nd"; 3 -> "3rd"; else -> "${s}th" }
-                    add("$title $ord Season")
-                    add("$title S$s")
-                    add("$title Part $s")
-                }
-            }
-
-            // Prefer the right container type; soft-penalise mismatches.
-            fun kindRank(t: String): Int = when {
-                isMovie && t.equals("Movie", true) -> 0
-                isMovie && (t.equals("OVA", true) || t.equals("ONA", true) ||
-                    t.equals("Special", true)) -> 1
-                !isMovie && (t.equals("TV", true) || t.equals("ONA", true) ||
-                    t.equals("OVA", true) || t.equals("Special", true)) -> 0
-                !isMovie && t.equals("Movie", true) -> 1
-                t.isBlank() -> 1
-                else -> 2
-            }
-
-            var best: Triple<String, String, String>? = null
-            var bestScore = 0.0
-            for (e in entries.distinctBy { it.third }) {
-                val qn = e.first.normaliseTitle()
-                var s = 0.0
-                var variantHit = false
-                queries.forEachIndexed { qi, q ->
-                    val qq = q.normaliseTitle()
-                    val sc = if (qn == qq) 1.0 else titleSimilarity(e.first, q)
-                    if (sc > s) { s = sc; variantHit = qi > 0 }
-                }
-                // Ties between the base series and its season entry
-                // (both 1.00 vs their best query) go to the season-variant
-                // match — "Mob Psycho 100" S3 must pick "…III", not S1.
-                if (variantHit) s += 0.04
-                s -= kindRank(e.second) * 0.25
-                if (s > bestScore) { bestScore = s; best = e }
-            }
-            if (best == null || bestScore < 0.5) return false
-
-            // 3. Anime page → episode/movie entry URL. Hrefs are plain text;
-            //    only visible text carries the decoy nodes.
-            val animeUrl = SITE + best.third
-            val animeHtml = runCatching {
-                app.get(animeUrl, headers = HEADERS, timeout = 15_000).text
-            }.getOrNull() ?: return false
-            val animeDoc = Jsoup.parse(animeHtml, animeUrl)
-            animeDoc.select("i[aria-hidden=true]").remove()
-
-            val targetPath: String = if (isMovie) {
-                animeDoc.select("div.episode a.download-link[href*=/movie/]")
-                    .firstOrNull()?.attr("href")
-            } else {
-                val want = episode ?: return false
-                animeDoc.select("div.episode a.download-link").firstNotNullOfOrNull { a ->
-                    val href = a.attr("href")
-                    if (!href.contains("/episode/")) return@firstNotNullOfOrNull null
-                    val n = a.selectFirst("strong")?.text()?.trim()?.toIntOrNull()
-                        ?: Regex("""/episode/(\d+)""").find(href)?.groupValues?.getOrNull(1)?.toIntOrNull()
-                    if (n == want) href else null
-                }
-            }?.takeIf { it.isNotBlank() } ?: return false
-
-            // 4. Episode page → direct file rows.
-            val epUrl = if (targetPath.startsWith("http")) targetPath else SITE + targetPath
-            val epHtml = runCatching {
-                app.get(epUrl, headers = HEADERS, timeout = 15_000).text
-            }.getOrNull() ?: return false
-            val epDoc = Jsoup.parse(epHtml, epUrl)
-            epDoc.select("i[aria-hidden=true]").remove()
-
-            data class Row(val url: String, val fname: String)
-            val rows = epDoc.select(
-                "div.c_h2 a[href*=\"$MEDIA_HOST\"], div.c_h2b a[href*=\"$MEDIA_HOST\"]"
-            ).mapNotNull { a ->
-                val url = a.attr("href").trim()
-                if (!url.startsWith("http")) return@mapNotNull null
-                val fname = a.text().trim().ifBlank {
+            // 1. FastSearch → internal id (exact anilistId match, sim fallback).
+            data class Hit(val id: String, val anilistId: Int?, val title: String)
+            suspend fun doSearch(q: String): List<Hit> {
+                val payload = JSONObject()
+                    .put("query", FAST_SEARCH_QUERY)
+                    .put(
+                        "variables",
+                        JSONObject()
+                            .put("query", q)
+                            .put("limit", 8)
+                            .put("includeAdult", false),
+                    ).toString()
+                val body = wizRetryOnce("animex search") {
                     runCatching {
-                        java.net.URLDecoder.decode(
-                            url.substringAfterLast('/'), Charsets.UTF_8.name()
-                        )
-                    }.getOrDefault(url.substringAfterLast('/')).trim()
-                }
-                // AVI/WMV/etc. can't be parsed by ExoPlayer → certain 3003.
-                if (!VIDEO_FILE_RX.containsMatchIn(if (fname.isNotBlank()) fname else url)) null
-                else Row(url, fname.ifBlank { url.substringAfterLast('/') })
-            }.distinctBy { it.url }
-            if (rows.isEmpty()) return false
-
-            fun codecTag(f: String): String {
-                val fLower = f.lowercase()
-                return when {
-                    fLower.contains("hevc") || fLower.contains("x265") ||
-                        fLower.contains("h.265") || fLower.contains("h265") -> " · HEVC ⚠"
-                    fLower.contains("av1") -> " · AV1 ⚠"
-                    else -> " · H.264"
+                        app.post(
+                            GQL,
+                            headers = HEADERS + ("Content-Type" to "application/json"),
+                            requestBody = payload
+                                .toRequestBody("application/json".toMediaTypeOrNull()),
+                            cacheTime = 0,
+                            timeout = 15_000,
+                        ).text
+                    }.getOrNull()
+                } ?: return emptyList()
+                val items = runCatching { JSONObject(body) }.getOrNull()
+                    ?.optJSONObject("data")?.optJSONObject("catalogAnime")
+                    ?.optJSONArray("items") ?: return emptyList()
+                return (0 until items.length()).mapNotNull { i ->
+                    val o = items.optJSONObject(i) ?: return@mapNotNull null
+                    val id = o.optStringOrNull("id") ?: return@mapNotNull null
+                    val al = if (o.has("anilistId") && !o.isNull("anilistId")) {
+                        o.optInt("anilistId")
+                    } else null
+                    val t = o.optStringOrNull("titleEnglish")
+                        ?: o.optStringOrNull("titleRomaji") ?: return@mapNotNull null
+                    Hit(id, al, t)
                 }
             }
+            fun List<Hit>.pick(): Hit? =
+                firstOrNull { it.anilistId != null && it.anilistId == anilistId }
+                    ?: maxByOrNull { bestTitleSim(it.title, title, altTitle) }
+                        ?.takeIf { bestTitleSim(it.title, title, altTitle) >= 0.5 }
+            var best = doSearch(title).pick()
+            if (best == null && !altTitle.isNullOrBlank() && !altTitle.equals(title, true)) {
+                best = doSearch(altTitle).pick()
+            }
+            if (best == null) return false
 
-            val cands = rows.map { r ->
-                val f = r.fname
-                val q = qualityFromLabel(f)
-                val group = Regex("""^\[([^\]]+)\]""").find(f)
-                    ?.groupValues?.getOrNull(1)?.trim()
-                val qb = if (q > 0) " · ${q}p" else ""
-                val codec = codecTag(f)
-                val dub = if (Regex("""(?i)\b(?:english\s+)?dub(?:bed)?\b""")
-                        .containsMatchIn(f) &&
-                    !f.contains("Multiple Subtitle", ignoreCase = true)) " · DUB" else ""
-                val multiSub = if (f.contains("Multiple Subtitle", ignoreCase = true) ||
-                    f.contains("multi-sub", ignoreCase = true) ||
-                    f.contains("multisub", ignoreCase = true)) " · Multi-Sub" else ""
-                val name = srcLabel +
-                    (group?.let { " · $it" } ?: "") + qb + codec + dub + multiSub
-                MediaCandidate(
-                    url = r.url, sourceLabel = srcLabel, name = name,
-                    referer = epUrl, headers = HEADERS, quality = q,
-                )
-            }.sortedByDescending { it.quality }.take(MAX_LINKS)
+            // 2. Server list for this episode (subs first; dubs only when the
+            //    episode has no subs at all).
+            val serversBody = wizRetryOnce("animex servers") {
+                runCatching {
+                    app.get(
+                        "$PP/rest/api/servers?id=${best.id}&epNum=$targetEp",
+                        headers = HEADERS, timeout = 15_000,
+                    ).text
+                }.getOrNull()
+            } ?: return false
+            val serversJson = runCatching { JSONObject(serversBody) }.getOrNull()
+                ?: return false
+            fun providerIds(key: String): List<String> {
+                val arr = serversJson.optJSONArray(key) ?: return emptyList()
+                return (0 until arr.length()).mapNotNull { i ->
+                    arr.optJSONObject(i)?.optStringOrNull("id")
+                }
+            }
+            val subIds = providerIds("subProviders")
+            val plan = if (subIds.isNotEmpty()) {
+                subIds.map { it to false }
+            } else {
+                providerIds("dubProviders").map { it to true }
+            }
+            if (plan.isEmpty()) return false
 
-            return emitMediaCandidates(cands, subtitleCallback, callback)
+            // 3. Each provider → direct sources + tracks + per-stream headers.
+            val seenSubs = mutableSetOf<String>()
+            val seenStream = mutableSetOf<String>()
+            var any = false
+            for ((pid, isDub) in plan) {
+                val body = wizRetryOnce("animex src $pid") {
+                    runCatching {
+                        app.get(
+                            "$PP/rest/api/sources?id=${best.id}&providerId=$pid" +
+                                "&epNum=$targetEp&type=${if (isDub) "dub" else "sub"}",
+                            headers = HEADERS, timeout = 15_000,
+                        ).text
+                    }.getOrNull()
+                } ?: continue
+                val json = runCatching { JSONObject(body) }.getOrNull() ?: continue
+                val apiHeaders = mutableMapOf<String, String>()
+                json.optJSONObject("headers")?.let { h ->
+                    h.keys().forEach { k ->
+                        h.optStringOrNull(k)?.let { v -> apiHeaders[k] = v }
+                    }
+                }
+                val referer = apiHeaders["Referer"] ?: "$SITE/"
+                val pname = pid.replaceFirstChar {
+                    if (it.isLowerCase()) it.titlecase() else it.toString()
+                }
+                val label = "$srcLabel · $pname${if (isDub) " · DUB" else ""}"
+
+                json.optJSONArray("sources")?.let { arr ->
+                    for (i in 0 until arr.length()) {
+                        val s = arr.optJSONObject(i) ?: continue
+                        val url = s.optStringOrNull("url") ?: continue
+                        if (!seenStream.add(url)) continue
+                        val qLabel = s.optStringOrNull("quality")
+                        if (qLabel == null || qLabel.equals("auto", ignoreCase = true)) {
+                            // Master playlist → shared M3u8Helper ladder.
+                            if (emitOneCandidate(
+                                    MediaCandidate(
+                                        url = url, sourceLabel = label, name = label,
+                                        referer = referer, headers = apiHeaders,
+                                        forceHls = true,
+                                    ),
+                                    callback,
+                                )
+                            ) any = true
+                        } else {
+                            // Per-quality playlist — emit as-is.
+                            callback(
+                                newExtractorLink(
+                                    source = label,
+                                    name = "$label · $qLabel",
+                                    url = url,
+                                    type = ExtractorLinkType.M3U8,
+                                ) {
+                                    this.referer = referer
+                                    this.quality = qualityFromLabel(qLabel)
+                                    this.headers = apiHeaders
+                                }
+                            )
+                            any = true
+                        }
+                    }
+                }
+
+                // Subtitle tracks — default-flagged language first.
+                val tracks = json.optJSONArray("tracks")
+                if (tracks != null) {
+                    (0 until tracks.length()).mapNotNull { i ->
+                        val t = tracks.optJSONObject(i) ?: return@mapNotNull null
+                        val u = t.optStringOrNull("url") ?: return@mapNotNull null
+                        Triple(
+                            t.optStringOrNull("label") ?: t.optStringOrNull("lang") ?: "Track",
+                            u,
+                            t.optBoolean("default", false),
+                        )
+                    }.sortedByDescending { it.third }.forEach { (tLabel, tUrl, _) ->
+                        if (seenSubs.add(tUrl)) subtitleCallback(SubtitleFile(tLabel, tUrl))
+                    }
+                }
+            }
+            Log.d(TAG, "animex: served ${best.id} ep=$targetEp providers=${plan.size}")
+            return any
         }
     }
 }

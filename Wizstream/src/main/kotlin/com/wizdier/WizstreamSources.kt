@@ -885,13 +885,11 @@ object WizstreamSources {
         "moonflix" to "Moonflix",
         // (v70) anime-web resolvers (WizstreamAnimeSources) — now toggled
         // from BOTH extensions' settings menus.
-        "anizone" to "AniZone",
-        "allmanga" to "AllAnime (Mkissa)",
-        "anichi" to "AniChi",
-        "uniquestream" to "UniqueStream",
         "anineko" to "AniNeko",
-        "reanime" to "ReAnime",
-        "tokyoinsider" to "TokyoInsider",
+        // (v89, user: "remove all the anime sources apart from anineko,
+        // add kaa.lt + animex.one")
+        "kaa" to "KickAssAnime",
+        "animex" to "AnimeX",
         // (v78) integrations — not video sources; both need a user API key.
         "wyziesubs" to "Wyzie Subs",
         "mdblist" to "MDBList ratings",
@@ -910,13 +908,9 @@ object WizstreamSources {
         "cineby" to "Web · clean API, keyed by TMDB id",
         "bingr" to "Web · Bingr servers (incl. Sirius) · lists low-first",
         "moonflix" to "Web · HDGhar + CH ladders · lists low-first",
-        "anizone" to "Anime site · subs",
-        "allmanga" to "Anime site · subs & dubs",
-        "anichi" to "Anime site · MAL-id mapped",
-        "uniquestream" to "Anime site · subs",
         "anineko" to "Anime site · subs",
-        "reanime" to "Anime site · subs",
-        "tokyoinsider" to "Anime site · subs",
+        "kaa" to "Anime site · subs · CatStream HLS",
+        "animex" to "Anime site · exact AniList match · subs",
     )
 
     object WizSourcePrefs {

@@ -904,10 +904,10 @@ class WizstreamAnimeProvider : MainAPI() {
         }
 
         // ── Anime-focused source resolvers ──────────────────────────────
-        // AniZone, Allmanga (AllAnime-family persisted API), AniChi
-        // (via mapper.nekostream.site). These are dedicated anime streaming
-        // sites that complement the BDIX sources above. AniChi uses the MAL
-        // ID directly via the mapper API — no search needed.
+        // (v89) AniNeko (embed scrape), KickAssAnime (open Nuxt JSON API →
+        // CatStream HLS) and AnimeX (GraphQL anilistId match → pp.animex.one
+        // direct HLS) — dedicated anime streaming sites that complement the
+        // BDIX sources above.
         val animeSourceJob = async(Dispatchers.IO) {
             runCatching {
                 WizstreamAnimeSources.resolveAnime(

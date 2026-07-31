@@ -486,7 +486,7 @@ class WizstreamProvider : MainAPI() {
                 isMovie = true,
                 year = year,
                 // (v70) anime movies carry the AniList entry ids too, so the
-                // anime-web resolvers (AniZone/Allmanga/…) resolve them.
+                // anime-web resolvers (AniNeko/KickAssAnime/AnimeX) resolve them.
                 anilistId = enrich?.anilistId,
                 malId = enrich?.malId,
             ).toJson()
@@ -724,11 +724,10 @@ class WizstreamProvider : MainAPI() {
 
         // ── (v70) Anime-web source resolvers ─────────────────────────────
         // De-stacked anime rows carry their owning AniList entry's ids and
-        // entry-local episode, so the 7 anime streaming resolvers
-        // (AniZone, Allmanga, AniChi, UniqueStream, AniNeko, ReANIME,
-        // TokyoInsider — mirrored from the WizstreamAnime module) resolve
-        // them exactly like they do in Wizstream-Anime: an entry is a
-        // whole show there, episodes 1..N.
+        // entry-local episode, so the 3 anime streaming resolvers
+        // (v89: AniNeko, KickAssAnime, AnimeX) resolve them exactly like
+        // they do in Wizstream-Anime: an entry is a whole show there,
+        // episodes 1..N.
         val animeJob = if (ctx.anilistId == null) null else async(Dispatchers.IO) {
             runCatching {
                 WizstreamAnimeSources.resolveAnime(

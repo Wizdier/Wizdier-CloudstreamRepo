@@ -68,13 +68,10 @@ class WizstreamPlugin : Plugin() {   // (v68) app-side Plugin ⇒ openSettings b
             // ("CircleFTP structure") resolve through these too. Mirrored
             // from the WizstreamAnime module; same shared pref keys, so a
             // toggle here also applies in Wizstream-Anime and vice versa.
-            WizSourcePrefs.src(WizstreamAnimeSources.AniZoneResolver, "ANIME-WEB SOURCES", "anizone.to"),
-            WizSourcePrefs.src(WizstreamAnimeSources.AllmangaResolver, "ANIME-WEB SOURCES", "allmanga.to"),
-            WizSourcePrefs.src(WizstreamAnimeSources.AniChiResolver, "ANIME-WEB SOURCES", "anichi.to"),
-            WizSourcePrefs.src(WizstreamAnimeSources.UniqueStreamResolver, "ANIME-WEB SOURCES", "anime.uniquestream.net"),
+            // (v89) roster cut to AniNeko + KickAssAnime + AnimeX per user.
             WizSourcePrefs.src(WizstreamAnimeSources.AniNekoResolver, "ANIME-WEB SOURCES", "anineko.to"),
-            WizSourcePrefs.src(WizstreamAnimeSources.ReAnimeResolver, "ANIME-WEB SOURCES", "reanime.to"),
-            WizSourcePrefs.src(WizstreamAnimeSources.TokyoInsiderResolver, "ANIME-WEB SOURCES", "tokyoinsider.com"),
+            WizSourcePrefs.src(WizstreamAnimeSources.KaaResolver, "ANIME-WEB SOURCES", "kaa.lt"),
+            WizSourcePrefs.src(WizstreamAnimeSources.AnimexResolver, "ANIME-WEB SOURCES", "animex.one"),
         )
         openSettings = {
                 ctx -> WizstreamSources.WizSourcePrefs.openDialog(ctx, toggleSources)
