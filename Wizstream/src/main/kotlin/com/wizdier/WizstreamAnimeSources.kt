@@ -376,6 +376,15 @@ object WizstreamAnimeSources {
                             callback(l.relabel(c.sourceLabel, c.name + q))
                         }
                     } else {
+                        // (v90c) HEADER parity with the ladder path: when the
+                        // app's M3u8Helper can't expand the master (older
+                        // Cloudstream builds — exactly the user's Android-TV
+                        // case — refetch it WITHOUT the headers map), the link
+                        // must still carry every header the backend demanded.
+                        // This branch previously stripped them, so header-
+                        // gated hosts (yuki/MegaPlay, beep, sora…) 403'd on
+                        // playback → HTTP 2004 on TV while gateless Mimi
+                        // kept working — matching the report exactly.
                         callback(
                             newExtractorLink(
                                 source = c.sourceLabel,
@@ -385,6 +394,7 @@ object WizstreamAnimeSources {
                             ) {
                                 this.referer = c.referer
                                 this.quality = c.quality
+                                if (c.headers.isNotEmpty()) this.headers = c.headers
                             }
                         )
                     }
@@ -400,6 +410,7 @@ object WizstreamAnimeSources {
                         ) {
                             this.referer = c.referer
                             this.quality = c.quality
+                            if (c.headers.isNotEmpty()) this.headers = c.headers
                         }
                     )
                     true
@@ -415,6 +426,7 @@ object WizstreamAnimeSources {
                             this.referer = c.referer
                             this.quality =
                                 if (c.quality > 0) c.quality else qualityFromLabel(c.url)
+                            if (c.headers.isNotEmpty()) this.headers = c.headers
                         }
                     )
                     true
