@@ -53,8 +53,11 @@ import java.util.concurrent.ConcurrentHashMap
  *        ONLY working episodes endpoint — /seasons/ and /episodes/ sub-
  *        endpoints are server bugs (500 "Unknown column 'NaN'") or 404.
  *   • Show detail "url" = public DIRECTORY path → nginx autoindex HTML
- *        lists "Season N <quality>/" folders holding files named
- *        "Title (Year) - SxxEyy - Name.mkv".
+ *        lists season folders holding episode files. LAYOUT CHANGED
+ *        2026-08-01 (v4): folders are now "s01/", "s02/" and files are
+ *        "Title S01 E01.mkv"; the old "Season N <quality>/" +
+ *        "Title (Year) - SxxEyy - Name.mkv" forms are still matched —
+ *        both layouts are accepted.
  *
  * Verified: sample movie + episode files both answer HTTP 206 (seekable,
  * direct playback) with no auth.
@@ -93,6 +96,10 @@ class FmFtpProvider : MainAPI() {
         private val YEAR_RE = Regex("""(?<!\d)(19\d{2}|20\d{2})(?!\d)""")
         private val SEP_RE = Regex("""[()\[\]{}.,:_\-!'·]""")
         private val WS_RE = Regex("""\s+""")
+        // (v3) Episode-coordinate tokens from the synthetic epdata URL —
+        // hoisted out of loadLinks so each playback doesn't recompile them.
+        private val EPDATA_S_RE = Regex("""(?:^|&)s=(\d+)""")
+        private val EPDATA_E_RE = Regex("""(?:^|&)e=(\d+)""")
     }
 
     /** Site title → bare display title (junk tail + year removed, separators
@@ -114,7 +121,10 @@ class FmFtpProvider : MainAPI() {
     )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        val text = app.get(request.data + page).text
+        // (v3) was a bare app.get().text — any network wobble here became an
+        // error banner on the user's HOME SCREEN. Now: retried + graceful.
+        val text = getText(request.data + page)
+            ?: return newHomePageResponse(request.name, emptyList(), hasNext = false)
         val json = runCatching { JSONObject(text) }.getOrNull()
             ?: return newHomePageResponse(request.name, emptyList(), hasNext = false)
         val data = json.optJSONArray("data") ?: JSONArray()
@@ -127,7 +137,7 @@ class FmFtpProvider : MainAPI() {
 
     override suspend fun search(query: String): List<SearchResponse> {
         val q = URLEncoder.encode(query, "UTF-8")
-        val text = app.get("$api/search?search=$q").text
+        val text = getText("$api/search?search=$q") ?: return emptyList()
         val arr = runCatching { JSONArray(text) }.getOrNull() ?: return emptyList()
         return (0 until arr.length()).mapNotNull { i ->
             arr.optJSONObject(i)?.toSearchResponse()
@@ -278,9 +288,9 @@ class FmFtpProvider : MainAPI() {
         if (data.contains("/epdata?")) {
             val base = data.substringBefore("/epdata?")
             val query = data.substringAfter("/epdata?")
-            val s = Regex("""(?:^|&)s=(\d+)""").find(query)?.groupValues?.get(1)?.toIntOrNull()
+            val s = EPDATA_S_RE.find(query)?.groupValues?.get(1)?.toIntOrNull()
                 ?: return false
-            val e = Regex("""(?:^|&)e=(\d+)""").find(query)?.groupValues?.get(1)?.toIntOrNull()
+            val e = EPDATA_E_RE.find(query)?.groupValues?.get(1)?.toIntOrNull()
                 ?: return false
             val d = fetchJson(base) ?: return false
             val dir = d.optString("url").trim()
@@ -304,8 +314,9 @@ class FmFtpProvider : MainAPI() {
 
     /**
      * Walk the show's autoindex directory to find the requested episode's
-     * file(s). Layout: <show>/Season N <quality?>/…SxxEyy… .mkv — season
-     * folders often carry the QUALITY tag (folded into the link quality).
+     * file(s). Layouts seen live: <show>/s01/…S01 E01.mkv (current) and
+     * <show>/Season 1 720p/…S01E01… .mkv (legacy) — season folders often
+     * carry the QUALITY tag (folded into the link quality).
      */
     private suspend fun emitEpisodeFiles(
         dir: String,
@@ -315,8 +326,16 @@ class FmFtpProvider : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         val base = mainUrl + encodePath(dir.trimEnd('/') + "/")
-        val seasonRe = Regex("""(?i)season[\s._-]*0*""" + season + """(\D|$)""")
-        val epRe = Regex("""(?i)S0*""" + season + """E0*""" + episode + """(\D|$)""")
+        // (v4) The site restructured its show archives (verified on the live
+        // autoindex 2026-08-01): season folders are now "s01/", "s02/" (was
+        // "Season 1 1080p/"), and episode files are "Title S01 E01.mkv" —
+        // with a SPACE between S01 and E01 (was "Title (Year) - S01E01 -…").
+        // seasonRe therefore accepts the sNN form at a path/filename
+        // boundary in addition to "season N", and epRe allows separators
+        // (space/dot/underscore/dash) between the Sxx and Eyy tokens.
+        // The lookahead keeps "Season 1" from matching inside "Season 12".
+        val seasonRe = Regex("""(?i)(?:^|[\s._-])(?:season[\s._-]*|s)0*""" + season + """(?=\D|$)""")
+        val epRe = Regex("""(?i)S0*""" + season + """[\s._-]*E0*""" + episode + """(\D|$)""")
         val eOnlyRe = Regex("""(?i)(\s|\.|_|-|^)E0*""" + episode + """(\D|$)""")
 
         val topDoc = fetchDoc(base) ?: return false
@@ -406,17 +425,29 @@ class FmFtpProvider : MainAPI() {
             }
             .distinctBy { it.first }
 
+    // (v3) One bounded retry on network failure. The SPA host sleeps its
+    // disks, so a first hit routinely stalls into a dropped connection; a
+    // single 500 ms-spaced second attempt turns most of those hard blanks
+    // into slow-but-working loads. Non-2xx codes are NOT retried (a 404 is
+    // final) — only transport-level failures are.
+    private suspend fun getText(url: String): String? {
+        repeat(2) { attempt ->
+            val resp = runCatching { app.get(url) }.getOrNull()
+            if (resp != null && resp.code in 200..299) return resp.text
+            if (attempt == 0) kotlinx.coroutines.delay(500)
+        }
+        return null
+    }
+
     private suspend fun fetchJson(url: String): JSONObject? {
-        val resp = runCatching { app.get(url) }.getOrNull() ?: return null
-        if (resp.code !in 200..299 || resp.text.isBlank()) return null
-        return runCatching { JSONObject(resp.text) }.getOrNull()
+        val text = getText(url)?.takeIf { it.isNotBlank() } ?: return null
+        return runCatching { JSONObject(text) }.getOrNull()
     }
 
     private suspend fun fetchDoc(url: String): org.jsoup.nodes.Document? {
-        val resp = runCatching { app.get(url) }.getOrNull() ?: return null
-        if (resp.code !in 200..299) return null
+        val text = getText(url) ?: return null
         // A junk-200 (SPA shell returned for a missing dir) has no anchors.
-        return runCatching { Jsoup.parse(resp.text, url) }.getOrNull()
+        return runCatching { Jsoup.parse(text, url) }.getOrNull()
     }
 
     private fun encodePath(p: String): String = buildString(p.length + 16) {

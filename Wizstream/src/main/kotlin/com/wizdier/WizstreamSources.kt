@@ -253,6 +253,79 @@ object WizstreamSources {
     //  Shared helpers
     // ───────────────────────────────────────────────────────────────────────
 
+    // (v90) ────────────────────────────────────────────────────────────────
+    //  Rx — the regex holding pen. Every Pattern below used to be compiled
+    //  at its call site: the title-identity ladder (toTitleMeta etc.) runs
+    //  for EVERY BDIX candidate post, bareSeriesTitle runs per tier-3 rescue
+    //  candidate, and the row-numbering ladder runs per episode link — so a
+    //  single resolve used to allocate and compile 40+ Patterns. They are
+    //  now compiled exactly once. Every pattern is byte-identical to the
+    //  inline one it replaces; nothing about matching behaviour changes.
+    // ─────────────────────────────────────────────────────────────────────
+    internal object Rx {
+        // shared helpers / title identity
+        val WS_SPLIT_RE = Regex("\\s+")
+        val TAIL_BRACKET_RE = Regex("\\s*[–-]\\s*\\[[^]]+]\\s*$")
+        val BRACKET_ALL_RE = Regex("\\[[^]]+]")
+        val MEDIA_JUNK_RE = Regex("(?i)\\b(hindi|dubbed|dual audio|multi audio|season \\d+|eng sub|bengali|korean|english|japanese|subbed)\\b")
+        val NON_ALNUM_RE = Regex("[^a-z0-9]+")
+        val YEAR_TOKEN_RE = Regex("\\b(19|20)\\d{2}\\b")
+        // toTitleMeta ladder
+        val TM_BRACKET_RE = Regex("\\[[^]]*]")
+        val TM_PAREN_RE = Regex("\\([^)]*\\)")
+        val TM_YEARI_RE = Regex("(?i)\\b(19|20)\\d{2}\\b")
+        val TM_SEASON_RE = Regex("(?i)\\bseason\\s*\\d{1,2}\\b")
+        val TM_SXE_RE = Regex("(?i)\\bs\\d{1,2}\\s*e\\d{1,3}\\b")
+        val TM_SESS_RE = Regex("(?i)\\bs\\d{1,2}\\b")
+        val TM_EPS_RE = Regex("(?i)\\be\\d{1,3}\\b")
+        val TM_EPWORD_RE = Regex("(?i)\\b(?:ep|episode)\\s*\\d{1,3}\\b")
+        val TM_SIZE_RE = Regex("(?i)\\b\\d+(?:[.,]\\d+)?\\s*(?:gb|mb|tb)\\b")
+        val TM_RESP_RE = Regex("(?i)\\b\\d{3,4}p\\b")
+        val TM_BIT_RE = Regex("(?i)\\b(?:8|10)bit\\b")
+        // media-url hygiene
+        val THUMB_SIZE_RE = Regex("""-\d{2,4}x\d{2,4}\.[a-zA-Z0-9]{2,4}(?:\?|$)""")
+        val SCHEMELESS_HOST_RE = Regex("""^[\w.-]+\.[a-zA-Z]{2,}/\S*$""")
+        // CircleFTP resolver: post-title cleaning + search-query hygiene
+        val AUDIO_TAG_RE = Regex("(?i)\\b(dual[- ]?audio|multi[- ]?audio|dubbed|hindi[- ]?dubbed|eng[- ]?sub|bengali|hindi|dual|multi)\\b")
+        val EXT_STRIP_RE = Regex("\\.[a-zA-Z0-9]{2,4}$")
+        val SEARCH_PUNCT_RE = Regex("""[!?,.:;'""" + '"' + """()\-–—~*]+""")
+        val PART_NUM_RE = Regex("(?i)\\bpart\\s*\\d{1,2}\\b")
+        // bareSeriesTitle ladder
+        val BST_BRACKET_RE = Regex("""\[[^\]]*\]""")
+        val BST_PAREN_RE = Regex("""\([^)]*\)""")
+        val BST_KIND_RE = Regex("""(?i)\b(tv series|tv anime|anime|animation|cartoon|series)\b""")
+        val BST_ORDINAL_RE = Regex("""(?i)\b\d{1,2}(?:st|nd|rd|th)\b""")
+        val BST_SEASON_RE = Regex("""(?i)\bseasons?\b\.?\s*\d{0,2}""")
+        val BST_S_RE = Regex("""(?i)\bs\d{1,2}\b""")
+        val BST_PART_RE = Regex("""(?i)\b(final|part|cour)\b\.?\s*\d{0,2}""")
+        val BST_FINAL_CHAPTERS_RE = Regex("""(?i)\bthe\s+final\s+chapters?\b""")
+        val BST_CHAPTER_RE = Regex("""(?i)\b(final\s+)?chapters?\b""")
+        val BST_SPECIAL_RE = Regex("""(?i)\bspecials?\b\.?\s*\d{0,2}""")
+        val BST_TRAIL_THE_RE = Regex("""(?i)\s+\bthe\s*$""")
+        val BST_AUDIO_RE = Regex("""(?i)\b(dual|multi)[- ]?audio\b|\b\w{2,9}[- ](dub|dubbed|sub|subbed|audio)\b|\bdubbed\b""")
+        val BST_QUALITY_RE = Regex("""(?i)\b(480p|576p|720p|1080p|2160p|4k|uhd|hdrip|webrip|web-?dl|bluray|bdrip|brrip|hdtc|x264|x265|hevc|h\.?26[45]|aac|ac3|eac3|10bit|8bit|batch|uncut|extended)\b""")
+        val BST_YEAR_RE = Regex("""\b(19|20)\d{2}\b""")
+        val BST_TRAIL_PUNCT_RE = Regex("""[\s.,:;_\-!]+$""")
+        val VOWEL_RUN_RE = Regex("([aeiou])\\1+")
+        // season/episode coordinate extraction
+        val SEASON_ORDINAL_RE = Regex("(?i)\\b(\\d{1,2})(?:st|nd|rd|th)\\s+season\\b")
+        val SEASON_WORD_RE = Regex("(?i)\\bseason\\s*(\\d+)\\b")
+        val SEASON_S_RE = Regex("(?i)\\bS(\\d{1,2})\\b")
+        val E_TOKEN_RE = Regex("(?i)E(\\d+)")
+        val SXE_TOKEN_RE = Regex("""(?i)S\d+E(\d+)""")
+        // main-site row numbering ladder
+        val ROW_S_DOT_RE = Regex("""(?i)\.S\s*:?\s*(\d{1,2})(?=\.|\s|$)""")
+        val ROW_S_COLON_E_RE = Regex("""(?i)\bS\s*:\s*(\d{1,2})\s*E""")
+        val ROW_S_E_RE = Regex("""(?i)\bS(\d{1,2})\s*E\d{1,4}\b""")
+        val ROW_S_RANGE_RE = Regex("""(?i)\bS(\d{1,2})\s*-\s*\d{1,3}\b""")
+        val ROW_EP_WORD_RE = Regex("""(?i)\bepisode\s*:?\s*(\d{1,4})""")
+        val ROW_S_E2_RE = Regex("""(?i)\bS\s*:?\s*\d{1,2}\s*\.?\s*E\s*:?\s*(\d{1,4})""")
+        val ROW_S_RANGE2_RE = Regex("""(?i)\bS\d{1,2}\s*-\s*(\d{1,3})\s*(?:\(|$|\.)""")
+        val ROW_DASH_EP_RE = Regex("""(?i)\s-\s(\d{1,2})\s\(""")
+        // misc single sites
+        val CH_RUNG_RE = Regex("""(\d{3,4})""")
+    }
+
     /**
      * Title similarity score (Jaccard token overlap, 0..1). Used as a
      * secondary check after exact-match normalised comparison.
@@ -262,8 +335,8 @@ object WizstreamSources {
         val bx = b.normaliseTitle()
         if (ax == bx) return 1.0
         if (ax.isEmpty() || bx.isEmpty()) return 0.0
-        val ta = ax.split(Regex("\\s+")).toSet()
-        val tb = bx.split(Regex("\\s+")).toSet()
+        val ta = ax.split(Rx.WS_SPLIT_RE).toSet()
+        val tb = bx.split(Rx.WS_SPLIT_RE).toSet()
         val inter = ta.intersect(tb).size.toDouble()
         val union = ta.union(tb).size.toDouble()
         return if (union == 0.0) 0.0 else inter / union
@@ -276,18 +349,18 @@ object WizstreamSources {
      * "One Piece".
      */
     internal fun String.cleanMediaTitle(): String =
-        replace(Regex("\\s*[–-]\\s*\\[[^]]+]\\s*$"), "")
-            .replace(Regex("\\[[^]]+]"), "")
-            .replace(Regex("(?i)\\b(hindi|dubbed|dual audio|multi audio|season \\d+|eng sub|bengali|korean|english|japanese|subbed)\\b"), "")
+        replace(Rx.TAIL_BRACKET_RE, "")
+            .replace(Rx.BRACKET_ALL_RE, "")
+            .replace(Rx.MEDIA_JUNK_RE, "")
             .trim()
             .ifBlank { this }
 
     internal fun String.normaliseTitle(): String =
         cleanMediaTitle()
             .lowercase()
-            .replace(Regex("[^a-z0-9]+"), " ")
+            .replace(Rx.NON_ALNUM_RE, " ")
             .trim()
-            .replace(Regex("\\s+"), " ")
+            .replace(Rx.WS_SPLIT_RE, " ")
 
     internal fun encodeUrl(s: String): String =
         URLEncoder.encode(s, "UTF-8").replace("+", "%20")
@@ -358,23 +431,23 @@ object WizstreamSources {
 
     internal fun String.toTitleMeta(): TitleMeta {
         var t = this
-        val yr = Regex("\\b(19|20)\\d{2}\\b").find(t)?.value?.toIntOrNull()
+        val yr = Rx.YEAR_TOKEN_RE.find(t)?.value?.toIntOrNull()
         t = t
-            .replace(Regex("\\[[^]]*]"), " ")
-            .replace(Regex("\\([^)]*\\)"), " ")
-            .replace(Regex("(?i)\\b(19|20)\\d{2}\\b"), " ")
+            .replace(Rx.TM_BRACKET_RE, " ")
+            .replace(Rx.TM_PAREN_RE, " ")
+            .replace(Rx.TM_YEARI_RE, " ")
             .replace(IDENTITY_JUNK_REGEX, " ")
-            .replace(Regex("(?i)\\bseason\\s*\\d{1,2}\\b"), " ")
-            .replace(Regex("(?i)\\bs\\d{1,2}\\s*e\\d{1,3}\\b"), " ")
-            .replace(Regex("(?i)\\bs\\d{1,2}\\b"), " ")
-            .replace(Regex("(?i)\\be\\d{1,3}\\b"), " ")
-            .replace(Regex("(?i)\\b(?:ep|episode)\\s*\\d{1,3}\\b"), " ")
-            .replace(Regex("(?i)\\b\\d+(?:[.,]\\d+)?\\s*(?:gb|mb|tb)\\b"), " ")
-            .replace(Regex("(?i)\\b\\d{3,4}p\\b"), " ")
-            .replace(Regex("(?i)\\b(?:8|10)bit\\b"), " ")
+            .replace(Rx.TM_SEASON_RE, " ")
+            .replace(Rx.TM_SXE_RE, " ")
+            .replace(Rx.TM_SESS_RE, " ")
+            .replace(Rx.TM_EPS_RE, " ")
+            .replace(Rx.TM_EPWORD_RE, " ")
+            .replace(Rx.TM_SIZE_RE, " ")
+            .replace(Rx.TM_RESP_RE, " ")
+            .replace(Rx.TM_BIT_RE, " ")
         val toks = t.lowercase()
-            .replace(Regex("[^a-z0-9]+"), " ")
-            .split(Regex("\\s+"))
+            .replace(Rx.NON_ALNUM_RE, " ")
+            .split(Rx.WS_SPLIT_RE)
             .filter { it.isNotBlank() }
             .map { ROMAN_EQUIV[it] ?: it }
             .toSet()
@@ -704,7 +777,7 @@ object WizstreamSources {
      */
     internal fun isLikelyThumbnailMediaUrl(url: String): Boolean {
         if (!url.contains("/wp-content/uploads/", ignoreCase = true)) return false
-        return Regex("""-\d{2,4}x\d{2,4}\.[a-zA-Z0-9]{2,4}(?:\?|$)""")
+        return Rx.THUMB_SIZE_RE
             .containsMatchIn(url)
     }
 
@@ -718,7 +791,7 @@ object WizstreamSources {
         // "fzgbzcajzbbb.interkh.com/12_30/…/index-v1.m3u8?key=…"). Without
         // this they were concatenated onto the playlist path and every
         // emitted Neon variant 404'd — silently killing the server.
-        if (Regex("""^[\w.-]+\.[a-zA-Z]{2,}/\S*$""").matches(u)) return "https://$u"
+        if (Rx.SCHEMELESS_HOST_RE.matches(u)) return "https://$u"
 
         // (v39) RFC 3986 resolution — THE movie-2004/series-death fix.
         // The old code appended relative refs onto the FULL page URL,
@@ -1664,7 +1737,7 @@ override suspend fun resolve(
                             val epNum = v.optStringOrNullCp("episode_number")?.toIntOrNull()
                                 ?: v.optInt("episode_number", 0).takeIf { it != 0 }
                                 ?: k.toIntOrNull()
-                                ?: Regex("(?i)E(\\d+)").find(rawName)
+                                ?: Rx.E_TOKEN_RE.find(rawName)
                                     ?.groupValues?.getOrNull(1)?.toIntOrNull()
                                 ?: 0
                             val path = v.optStringOrNullCp("path") ?: v.optStringOrNullCp("url")
@@ -1679,7 +1752,7 @@ override suspend fun resolve(
                                 ?: v.optStringOrNullCp("name") ?: ""
                             val epNum = v.optStringOrNullCp("episode_number")?.toIntOrNull()
                                 ?: v.optInt("episode_number", 0).takeIf { it != 0 }
-                                ?: Regex("(?i)E(\\d+)").find(rawName)
+                                ?: Rx.E_TOKEN_RE.find(rawName)
                                     ?.groupValues?.getOrNull(1)?.toIntOrNull()
                                 ?: (i + 1)
                             val path = v.optStringOrNullCp("path") ?: v.optStringOrNullCp("url")
@@ -2459,7 +2532,7 @@ override suspend fun resolve(
                     val href = a.attr("href").takeIf { it.isNotBlank() } ?: return@forEach
                     val holder = a.closest(".jws-post-item, .post-inner, .episode-item, li")
                     val num = holder?.selectFirst(".episodes-number")?.text()?.trim()?.toIntOrNull()
-                        ?: Regex("""(?i)S\d+E(\d+)""").find(holder?.text().orEmpty())
+                        ?: Rx.SXE_TOKEN_RE.find(holder?.text().orEmpty())
                             ?.groupValues?.get(1)?.toIntOrNull()
                     if (num == episode) return resolveAbs(gridUrl, href)
                 }
@@ -2586,19 +2659,18 @@ override suspend fun resolve(
          *   "Naruto Season 2"          → ("Naruto Season 2", null)
          */
         private fun cleanFtpTitle(postName: String?, postTitle: String): Pair<String, String?> {
-            val audioRegex = Regex("(?i)\\b(dual[- ]?audio|multi[- ]?audio|dubbed|hindi[- ]?dubbed|eng[- ]?sub|bengali|hindi|dual|multi)\\b")
-            val audioMatches = audioRegex.findAll(postTitle).map { it.value.trim() }.toList()
+            val audioMatches = Rx.AUDIO_TAG_RE.findAll(postTitle).map { it.value.trim() }.toList()
             val audioTag = if (audioMatches.isNotEmpty()) {
                 audioMatches.joinToString(" ").uppercase()
             } else null
 
             var cleaned = postName?.trim().orEmpty()
             if (cleaned.isEmpty() || cleaned.equals("null", ignoreCase = true)) {
-                cleaned = postTitle.replace(Regex("\\.[a-zA-Z0-9]{2,4}$"), "")
+                cleaned = postTitle.replace(Rx.EXT_STRIP_RE, "")
                     .replace(".", " ")
                     .replace("_", " ")
                     .replace("-", " ")
-                    .replace(Regex("\\b(19|20)\\d{2}\\b"), "")
+                    .replace(Rx.YEAR_TOKEN_RE, "")
                     .trim()
             }
             cleaned = cleaned.split(" ").joinToString(" ") {
@@ -2610,17 +2682,17 @@ override suspend fun resolve(
         /** Normalised title for grouping. Ported from CircleFtpProvider.normalizedGroupTitle. */
         private fun normalizedGroupTitle(title: String): String =
             title.lowercase()
-                .replace(Regex("[^a-z0-9]+"), " ")
+                .replace(Rx.NON_ALNUM_RE, " ")
                 .trim()
-                .replace(Regex("\\s+"), " ")
+                .replace(Rx.WS_SPLIT_RE, " ")
 
         /** (v46) Query hygiene for the site search: drop punctuation the
          *  server's substring matcher chokes on ("Haikyuu!!", "Re:ZERO",
          *  "Don't Toy with Me, Miss Nagatoro"). Only used to widen the
          *  SEARCH call — matching runs on the original title. */
         private fun cleanedSearchTerm(t: String): String =
-            t.replace(Regex("""[!?,.:;'""" + '"' + """()\-–—~*]+"""), " ")
-                .replace(Regex("""\s+"""), " ")
+            t.replace(Rx.SEARCH_PUNCT_RE, " ")
+                .replace(Rx.WS_SPLIT_RE, " ")
                 .trim()
 
         // (v48) ── Anime-category BROWSE rescue ──────────────────────────
@@ -2677,15 +2749,15 @@ override suspend fun resolve(
          *  season numbers, part/cour/final markers, quality/audio junk and
          *  years — the residual string is the site's bare show name. */
         private fun bareSeriesTitle(t: String): String =
-            t.replace(Regex("""\[[^\]]*\]"""), " ")
-                .replace(Regex("""\([^)]*\)"""), " ")
-                .replace(Regex("""(?i)\b(tv series|tv anime|anime|animation|cartoon|series)\b"""), " ")
+            t.replace(Rx.BST_BRACKET_RE, " ")
+                .replace(Rx.BST_PAREN_RE, " ")
+                .replace(Rx.BST_KIND_RE, " ")
                 // (v47) ordinal season wording: "HAIKYU!! 2nd Season" must
                 // bare down to "HAIKYU!!", not "HAIKYU!! 2nd".
-                .replace(Regex("""(?i)\b\d{1,2}(?:st|nd|rd|th)\b"""), " ")
-                .replace(Regex("""(?i)\bseasons?\b\.?\s*\d{0,2}"""), " ")
-                .replace(Regex("""(?i)\bs\d{1,2}\b"""), " ")
-                .replace(Regex("""(?i)\b(final|part|cour)\b\.?\s*\d{0,2}"""), " ")
+                .replace(Rx.BST_ORDINAL_RE, " ")
+                .replace(Rx.BST_SEASON_RE, " ")
+                .replace(Rx.BST_S_RE, " ")
+                .replace(Rx.BST_PART_RE, " ")
                 // (v90b) Sequel-wording leftovers that kept SPECIAL/CHAPTER
                 // entries from baring down to their franchise root:
                 // "Attack on Titan Final Season THE FINAL CHAPTERS
@@ -2693,21 +2765,15 @@ override suspend fun resolve(
                 // "THE CHAPTERS Special" — unusable as a search term or
                 // alias key. Fold those words away too (and a dangling
                 // trailing "the" left behind by "…: The Final Season").
-                .replace(Regex("""(?i)\bthe\s+final\s+chapters?\b"""), " ")
-                .replace(Regex("""(?i)\b(final\s+)?chapters?\b"""), " ")
-                .replace(Regex("""(?i)\bspecials?\b\.?\s*\d{0,2}"""), " ")
-                .replace(Regex("""(?i)\s+\bthe\s*$"""), " ")
-                .replace(
-                    Regex("""(?i)\b(dual|multi)[- ]?audio\b|\b\w{2,9}[- ](dub|dubbed|sub|subbed|audio)\b|\bdubbed\b"""),
-                    " "
-                )
-                .replace(
-                    Regex("""(?i)\b(480p|576p|720p|1080p|2160p|4k|uhd|hdrip|webrip|web-?dl|bluray|bdrip|brrip|hdtc|x264|x265|hevc|h\.?26[45]|aac|ac3|eac3|10bit|8bit|batch|uncut|extended)\b"""),
-                    " "
-                )
-                .replace(Regex("""\b(19|20)\d{2}\b"""), " ")
-                .replace(Regex("""[\s.,:;_\-!]+$"""), "")
-                .replace(Regex("""\s+"""), " ")
+                .replace(Rx.BST_FINAL_CHAPTERS_RE, " ")
+                .replace(Rx.BST_CHAPTER_RE, " ")
+                .replace(Rx.BST_SPECIAL_RE, " ")
+                .replace(Rx.BST_TRAIL_THE_RE, " ")
+                .replace(Rx.BST_AUDIO_RE, " ")
+                .replace(Rx.BST_QUALITY_RE, " ")
+                .replace(Rx.BST_YEAR_RE, " ")
+                .replace(Rx.BST_TRAIL_PUNCT_RE, "")
+                .replace(Rx.WS_SPLIT_RE, " ")
                 .trim()
 
         /**
@@ -2721,7 +2787,7 @@ override suspend fun resolve(
          */
         private fun seriesRootAliasKey(t: String): String =
             bareSeriesTitle(t).normaliseTitle()
-                .replace(Regex("([aeiou])\\1+"), "$1")
+                .replace(Rx.VOWEL_RUN_RE, "$1")
 
         /** Shared tier-3 test for the new API, category browse and old
          * WordPress searches. The normal containment test protects franchise
@@ -2891,26 +2957,26 @@ override suspend fun resolve(
                 // first, then the shared title parser (its "Season 1"
                 // pattern catches the decoded URL path /FILE/.../Season 1/).
                 val seasonNum =
-                    Regex("""(?i)\.S\s*:?\s*(\d{1,2})(?=\.|\s|$)""").find(basis)
+                    Rx.ROW_S_DOT_RE.find(basis)
                         ?.groupValues?.getOrNull(1)?.toIntOrNull()
-                        ?: Regex("""(?i)\bS\s*:\s*(\d{1,2})\s*E""").find(basis)
+                        ?: Rx.ROW_S_COLON_E_RE.find(basis)
                             ?.groupValues?.getOrNull(1)?.toIntOrNull()
-                        ?: Regex("""(?i)\bS(\d{1,2})\s*E\d{1,4}\b""").find(basis)
+                        ?: Rx.ROW_S_E_RE.find(basis)
                             ?.groupValues?.getOrNull(1)?.toIntOrNull()
-                        ?: Regex("""(?i)\bS(\d{1,2})\s*-\s*\d{1,3}\b""").find(basis)
+                        ?: Rx.ROW_S_RANGE_RE.find(basis)
                             ?.groupValues?.getOrNull(1)?.toIntOrNull()
                         ?: extractSeasonFromTitle(basis)
                 // Episode number — number-true doctrine; the captures prove
                 // the forms: "Episode:1", "S:4E:29", "S2 E0",
                 // Judas "S1 - 01", KaiDubs "S4 - 01 (60)".
                 val epNum =
-                    Regex("""(?i)\bepisode\s*:?\s*(\d{1,4})""").find(basis)
+                    Rx.ROW_EP_WORD_RE.find(basis)
                         ?.groupValues?.getOrNull(1)?.toIntOrNull()
-                        ?: Regex("""(?i)\bS\s*:?\s*\d{1,2}\s*\.?\s*E\s*:?\s*(\d{1,4})""").find(basis)
+                        ?: Rx.ROW_S_E2_RE.find(basis)
                             ?.groupValues?.getOrNull(1)?.toIntOrNull()
-                        ?: Regex("""(?i)\bS\d{1,2}\s*-\s*(\d{1,3})\s*(?:\(|$|\.)""").find(basis)
+                        ?: Rx.ROW_S_RANGE2_RE.find(basis)
                             ?.groupValues?.getOrNull(1)?.toIntOrNull()
-                        ?: Regex("""(?i)\s-\s(\d{1,2})\s\(""").find(basis)
+                        ?: Rx.ROW_DASH_EP_RE.find(basis)
                             ?.groupValues?.getOrNull(1)?.toIntOrNull()
                 rows += MainSiteRow(seasonNum, epNum, href)
             }
@@ -3031,8 +3097,8 @@ override suspend fun resolve(
             // concurrent coroutines.
             val sawHttpOk = java.util.concurrent.atomic.AtomicBoolean(false)
             val partStripped = title
-                .replace(Regex("(?i)\\bpart\\s*\\d{1,2}\\b"), " ")
-                .replace(Regex("\\s+"), " ").trim()
+                .replace(Rx.PART_NUM_RE, " ")
+                .replace(Rx.WS_SPLIT_RE, " ").trim()
             val queryVariants = listOf(
                 title,
                 cleanedSearchTerm(title),
@@ -3375,8 +3441,8 @@ override suspend fun resolve(
             // below page 1 on busy root-title searches, and single-page
             // reads silently missed them.
             val partStripped = title
-                .replace(Regex("(?i)\\bpart\\s*\\d{1,2}\\b"), " ")
-                .replace(Regex("\\s+"), " ").trim()
+                .replace(Rx.PART_NUM_RE, " ")
+                .replace(Rx.WS_SPLIT_RE, " ").trim()
             val queryVariants = listOf(
                 title,
                 cleanedSearchTerm(title),
@@ -4039,16 +4105,16 @@ override suspend fun resolve(
          */
         private fun extractSeasonFromTitle(title: String): Int? {
             // (v47) Match ordinal wording first: "Haikyuu 2nd Season" → 2.
-            Regex("(?i)\\b(\\d{1,2})(?:st|nd|rd|th)\\s+season\\b").find(title)?.let {
+            Rx.SEASON_ORDINAL_RE.find(title)?.let {
                 return it.groupValues.getOrNull(1)?.toIntOrNull()
             }
             // Match "Season N" or "SeasonN" (case-insensitive).
-            Regex("(?i)\\bseason\\s*(\\d+)\\b").find(title)?.let {
+            Rx.SEASON_WORD_RE.find(title)?.let {
                 return it.groupValues.getOrNull(1)?.toIntOrNull()
             }
             // Match "S<N>" but not "S" alone or "s03e15" (which is episode).
             // We require a word boundary before S and the number to be 1-2 digits.
-            Regex("(?i)\\bS(\\d{1,2})\\b").find(title)?.let {
+            Rx.SEASON_S_RE.find(title)?.let {
                 return it.groupValues.getOrNull(1)?.toIntOrNull()
             }
             return null
@@ -5764,7 +5830,7 @@ override suspend fun resolve(
             val langOrder = links.map { it.lang }.distinct()
             links.sortWith(compareBy(
                 { langOrder.indexOf(it.lang) },
-                { Regex("""(\d{3,4})""").find(it.resolution)
+                { Rx.CH_RUNG_RE.find(it.resolution)
                     ?.groupValues?.get(1)?.toIntOrNull() ?: Int.MAX_VALUE },
             ))
             Log.d(TAG, "Moonflix CH: ladder ${links.size} link(s) low-first")
@@ -6161,8 +6227,13 @@ override suspend fun resolve(
         }
 
         /** Mirror of FmFtpProvider.emitEpisodeFiles: walk the show dir →
-         *  matching "Season N …" folder(s) → SxxEyy file(s); bare-Exx only
-         *  as a last resort (covers flat show roots). */
+         *  matching season folder(s) → Sxx Eyy file(s); bare-Exx only
+         *  as a last resort (covers flat show roots).
+         *  (v90 — 2026-08-01 site-update fix) fmftp.net restructured its
+         *  show archives to "s01/" folders holding "Title S01 E01.mkv"
+         *  (was "Season N <quality>/" + "S01E01"). Both layouts accepted:
+         *  seasonRe matches the sNN form at a boundary, epRe tolerates
+         *  separators between the Sxx and Eyy tokens. */
         private suspend fun emitFmEpisode(
             app: Requests,
             dir: String,
@@ -6173,8 +6244,8 @@ override suspend fun resolve(
             callback: (ExtractorLink) -> Unit,
         ): Boolean {
             val base = SITE + encodeFmPath(dir.trimEnd('/') + "/")
-            val seasonRe = Regex("""(?i)season[\s._-]*0*""" + season + """(\D|$)""")
-            val epRe = Regex("""(?i)S0*""" + season + """E0*""" + episode + """(\D|$)""")
+            val seasonRe = Regex("""(?i)(?:^|[\s._-])(?:season[\s._-]*|s)0*""" + season + """(?=\D|$)""")
+            val epRe = Regex("""(?i)S0*""" + season + """[\s._-]*E0*""" + episode + """(\D|$)""")
             val eOnlyRe = Regex("""(?i)(\s|\.|_|-|^)E0*""" + episode + """(\D|$)""")
 
             val topDoc = fetchDoc(app, base) ?: return false
@@ -6568,11 +6639,11 @@ internal object WizEpisodeTable {
 
     private fun normCmp(t: String): String =
         t.lowercase()
-            .replace(Regex("""\[[^]]*]"""), " ")
-            .replace(Regex("""\([^)]*\)"""), " ")
-            .replace(Regex("""[^a-z0-9]+"""), " ")
+            .replace(WizstreamSources.Rx.TM_BRACKET_RE, " ")
+            .replace(WizstreamSources.Rx.TM_PAREN_RE, " ")
+            .replace(WizstreamSources.Rx.NON_ALNUM_RE, " ")
             .trim()
-            .replace(Regex("""\s+"""), " ")
+            .replace(WizstreamSources.Rx.WS_SPLIT_RE, " ")
 
     /** TMDB tv-show id for an unmapped AniList entry, or null. */
     suspend fun findShow(app: Requests, title: String, year: Int?): Int? {

@@ -44,6 +44,47 @@ class FTPBD : MainAPI() {
 
         // TTL cache for TMDB metadata so repeat loads return instantly.
         private val tmdbMetaCache = FTPBDConcurrent.TtlCache<String, TmdbMeta>(ttlMs = 10 * 60 * 1000L)
+
+        // (v4) Hoisted regexes. These used to be recompiled on EVERY call —
+        // the buildQualityInitials / cleanSourceLabel / title-cleaning cluster
+        // alone compiled ~15 Patterns PER CARD on listing pages, and the
+        // media/subtitle scanners recompiled on every playback. Patterns are
+        // byte-identical to the old inline ones; only the allocation moved.
+        private val YEAR_ANY_RE = Regex("(?<!\\d)(?:19|20)\\d{2}(?!\\d)")
+        private val YEAR4_RE = Regex("\\d{4}")
+        private val RATING_NUM_RE = Regex("\\d+(?:\\.\\d+)?")
+        private val SEASON_Q_RE = Regex("season=(\\d+)")
+        private val NUM_RE = Regex("(\\d+)")
+        private val SXE_EP_RE = Regex("(?i)S\\d+E(\\d+)")
+        private val DUR_H_RE = Regex("(\\d+)\\s*h")
+        private val DUR_M_RE = Regex("(\\d+)\\s*m")
+        private val DUR_MIN_RE = Regex("(\\d+)\\s*mins?")
+        private val SRC_M3U8_RE = Regex("""(?i)<source[^>]+src=["']([^"']+?\.m3u8[^"']*)["']""")
+        private val HLS_LOAD_RE = Regex("""(?i)hls\.loadSource\(["']([^"']+?\.m3u8[^"']*)["']\)""")
+        private val DATA_URL_RE = Regex("""(?i)data-url=["']([^"']+)["']""")
+        private val MEDIA_URL_RE = Regex("""https?://[^\s"'<>]+(?:\.m3u8|\.mp4|\.mkv|\.webm|\.avi|\.mov|\.m4v)(?:\?[^\s"'<>]*)?""", RegexOption.IGNORE_CASE)
+        private val SUB_URL_ABS_RE = Regex("""https?://[^\s"'<>]+\.(?:srt|vtt|ass)(?:\?[^\s"'<>]*)?""", RegexOption.IGNORE_CASE)
+        private val SUB_URL_REL_RE = Regex("""["']([^"']+\.(?:srt|vtt|ass)(?:\?[^"']*)?)["']""", RegexOption.IGNORE_CASE)
+        private val M3U8_MEDIA_RE = Regex("""#EXT-X-MEDIA:([^\r\n]+)""", RegexOption.IGNORE_CASE)
+        private val B3D_RE = Regex("\\b3d\\b", RegexOption.IGNORE_CASE)
+        private val UHD_RE = Regex("\\b(?:4k|2160p|uhd)\\b", RegexOption.IGNORE_CASE)
+        private val RES_P_RE = Regex("(?i)\\b(1080|720|576|540|480|360)p\\b")
+        private val HD_WORD_RE = Regex("\\bHD\\b", RegexOption.IGNORE_CASE)
+        private val SRC_VARIANT_RES = listOf(
+            "WEB-DL" to Regex("(?i)\\bweb[- ]?dl\\b"),
+            "WEBRip" to Regex("(?i)\\bwebrip\\b"),
+            "BluRay" to Regex("(?i)\\b(?:bluray|blu ray|brrip)\\b"),
+            "HDRip" to Regex("(?i)\\bhdrip\\b"),
+            "HEVC" to Regex("(?i)\\b(?:hevc|x265|h265)\\b"),
+            "10bit" to Regex("(?i)\\b10[- ]?bit\\b"),
+        )
+        private val SRC_LABEL_WORDS_RE = Regex("(?i)\\b(?:web series|movies?|series|tv)\\b")
+        private val SLASH_WS_RE = Regex("\\s*/\\s*")
+        private val WS_RUN_RE = Regex("\\s+")
+        private val TAIL_BRACKET_RE = Regex("\\s*[–-]\\s*\\[[^]]+]\\s*$")
+        private val BRACKET_ALL_RE = Regex("\\[[^]]+]")
+        private val MEDIA_TITLE_JUNK_RE = Regex("(?i)\\b(hindi|dubbed|dual audio|season \\d+)\\b")
+        private val NON_ALNUM_RE = Regex("[^a-z0-9]+")
     }
 
     private val headers = mapOf(
@@ -96,10 +137,20 @@ class FTPBD : MainAPI() {
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val url = pageUrl(request.data, page)
-        val doc = app.get(url, headers = headers, timeout = 10_000).document
+        // (v4) Homepage fetch now goes through the bounded retry helper that
+        // already existed in FTPBDConcurrent but was never wired in — one
+        // dropped connection no longer kills the home screen. On total
+        // failure the row degrades to empty (and no next page).
+        val doc = FTPBDConcurrent.retry(maxAttempts = 2, initialDelayMs = 400) {
+            app.get(url, headers = headers, timeout = 10_000).document
+        } ?: return newHomePageResponse(HomePageList(request.name, emptyList(), isHorizontalImages = false), hasNext = false)
         val expected = if (request.data == "tv_shows") "/tv_shows/" else "/movie/"
         val items = parseCards(doc, expected)
-        val hasNext = doc.select("a.next, .page-numbers.next, a[href*='/page/${page + 1}/']").isNotEmpty() || items.isNotEmpty()
+        // (v4) hasNext used to OR "items non-empty", which paged FOREVER
+        // (every full page looked like it had a next one, and the WP 404
+        // past the end then crashed the scroller). The site's own
+        // pagination links now decide — exactly like the theme does.
+        val hasNext = doc.select("a.next, .page-numbers.next, a[href*='/page/${page + 1}/']").isNotEmpty()
         return newHomePageResponse(HomePageList(request.name, items, isHorizontalImages = false), hasNext)
     }
 
@@ -145,7 +196,11 @@ class FTPBD : MainAPI() {
         }
 
         val fixedUrl = url.toAbsoluteUrl()
-        val doc = app.get(fixedUrl, headers = headers, timeout = 10_000).document
+        // (v4) Same bounded retry as the homepage; a transport failure now
+        // yields a graceful null instead of the raw network exception.
+        val doc = FTPBDConcurrent.retry(maxAttempts = 2, initialDelayMs = 400) {
+            app.get(fixedUrl, headers = headers, timeout = 10_000).document
+        } ?: return null
         return when {
             fixedUrl.contains("/tv_shows/") -> loadSeries(fixedUrl, doc)
             fixedUrl.contains("/episodes/") -> loadEpisodeAsMovie(fixedUrl, doc)
@@ -224,21 +279,24 @@ class FTPBD : MainAPI() {
             return true
         }
 
-        val html = runCatching { app.get(sourcePage, headers = headers, timeout = 15_000).text }.getOrNull() ?: return false
+        // (v4) Bounded retry instead of a single shot.
+        val html = FTPBDConcurrent.retry(maxAttempts = 2, initialDelayMs = 400) {
+            app.get(sourcePage, headers = headers, timeout = 15_000).text
+        } ?: return false
         val urls = linkedSetOf<String>()
         val parsed = Jsoup.parse(html, sourcePage)
         collectSubtitles(parsed, html, sourcePage, subtitleCallback)
 
         // HLS player sources used by the site.
-        Regex("""(?i)<source[^>]+src=["']([^"']+?\.m3u8[^"']*)["']""")
+        SRC_M3U8_RE
             .findAll(html)
             .mapTo(urls) { it.groupValues[1].htmlDecode().toAbsoluteUrl(sourcePage) }
-        Regex("""(?i)hls\.loadSource\(["']([^"']+?\.m3u8[^"']*)["']\)""")
+        HLS_LOAD_RE
             .findAll(html)
             .mapTo(urls) { it.groupValues[1].htmlDecode().toAbsoluteUrl(sourcePage) }
 
         // Direct download links are normally hidden in data-url attributes.
-        Regex("""(?i)data-url=["']([^"']+)["']""")
+        DATA_URL_RE
             .findAll(html)
             .map { it.groupValues[1].htmlDecode() }
             .filter { it.looksLikeMedia() }
@@ -251,7 +309,7 @@ class FTPBD : MainAPI() {
             }
 
         // Extra fallback for any direct media URL in page scripts/HTML.
-        Regex("""https?://[^\s"'<>]+(?:\.m3u8|\.mp4|\.mkv|\.webm|\.avi|\.mov|\.m4v)(?:\?[^\s"'<>]*)?""", RegexOption.IGNORE_CASE)
+        MEDIA_URL_RE
             .findAll(html)
             .mapTo(urls) { it.value.htmlDecode().toAbsoluteUrl(sourcePage) }
 
@@ -468,7 +526,7 @@ class FTPBD : MainAPI() {
         val poster = doc.poster()
         val background = doc.background()
         val plot = doc.plot()
-        val year = doc.selectFirst(".video-years")?.text()?.let { Regex("\\d{4}").find(it)?.value?.toIntOrNull() }
+        val year = doc.selectFirst(".video-years")?.text()?.let { YEAR4_RE.find(it)?.value?.toIntOrNull() }
         val duration = parseDuration(doc.selectFirst(".video-time")?.text())
         val tags = doc.select(".jws-category a[href*='movies_cat']").map { it.text().trim() }.filter { it.isNotBlank() }.distinct()
         val tvType = if (tags.any { it.contains("anime", ignoreCase = true) }) TvType.AnimeMovie else TvType.Movie
@@ -503,7 +561,7 @@ class FTPBD : MainAPI() {
         val poster = doc.poster()
         val background = doc.background()
         val plot = doc.plot()
-        val year = doc.selectFirst(".video-years")?.text()?.let { Regex("\\d{4}").find(it)?.value?.toIntOrNull() }
+        val year = doc.selectFirst(".video-years")?.text()?.let { YEAR4_RE.find(it)?.value?.toIntOrNull() }
         val duration = parseDuration(doc.selectFirst(".video-time")?.text())
         val tags = doc.select(".jws-category a[href*='movies_cat']").map { it.text().trim() }.filter { it.isNotBlank() }.distinct()
         val tvType = if (tags.any { it.contains("anime", ignoreCase = true) }) TvType.AnimeMovie else TvType.Movie
@@ -548,13 +606,13 @@ class FTPBD : MainAPI() {
         val poster = doc.poster()
         val background = doc.background()
         val plot = doc.plot()
-        val year = doc.selectFirst(".video-years")?.text()?.let { Regex("\\d{4}").find(it)?.value?.toIntOrNull() }
+        val year = doc.selectFirst(".video-years")?.text()?.let { YEAR4_RE.find(it)?.value?.toIntOrNull() }
         val tags = doc.select(".jws-category a[href*='tv_shows_cat']").map { it.text().trim() }.filter { it.isNotBlank() }.distinct()
         val seasons = doc.select(".select-seasion .dropdown-item[data-index], a[href*='season=']")
             .mapNotNull { el ->
                 el.attr("data-index").toIntOrNull()?.plus(1)
-                    ?: Regex("season=(\\d+)").find(el.attr("href"))?.groupValues?.get(1)?.toIntOrNull()
-                    ?: Regex("(\\d+)").find(el.text())?.value?.toIntOrNull()
+                    ?: SEASON_Q_RE.find(el.attr("href"))?.groupValues?.get(1)?.toIntOrNull()
+                    ?: NUM_RE.find(el.text())?.value?.toIntOrNull()
             }
             .filter { it > 0 }
             .distinct()
@@ -603,7 +661,7 @@ class FTPBD : MainAPI() {
         val poster = doc.poster()
         val background = doc.background()
         val plot = doc.plot()
-        val year = doc.selectFirst(".video-years")?.text()?.let { Regex("\\d{4}").find(it)?.value?.toIntOrNull() }
+        val year = doc.selectFirst(".video-years")?.text()?.let { YEAR4_RE.find(it)?.value?.toIntOrNull() }
         val tags = doc.select(".jws-category a[href*='tv_shows_cat']").map { it.text().trim() }.filter { it.isNotBlank() }.distinct()
         val allSeasons = loaded.flatMap { seasonNumbers(it.second) }.distinct().ifEmpty { listOf(1) }
         val meta = fetchTmdbMeta(title, "tv", year, allSeasons.toSet())
@@ -676,7 +734,7 @@ class FTPBD : MainAPI() {
             val href = a.absUrl("href").ifBlank { a.attr("href").toAbsoluteUrl() }
             if (href.isBlank()) return@forEachIndexed
             val epNum = item.selectFirst(".episodes-number")?.text()?.toIntOrNull()
-                ?: Regex("(?i)S\\d+E(\\d+)").find(item.text())?.groupValues?.get(1)?.toIntOrNull()
+                ?: SXE_EP_RE.find(item.text())?.groupValues?.get(1)?.toIntOrNull()
                 ?: (index + 1)
             val tmdbEp = tmdbEpisodes?.getOrNull(epNum - 1)
             val title = tmdbEp?.name?.takeIf { it.isNotBlank() }
@@ -746,7 +804,7 @@ class FTPBD : MainAPI() {
         if (title.isBlank() || title.equals("Play Now", true)) return null
         val poster = selectFirst("img")?.imgUrl()
         val fullText = text() + " " + title + " " + href
-        val year = selectFirst(".video-years, .year")?.text()?.let { Regex("\\d{4}").find(it)?.value?.toIntOrNull() }
+        val year = selectFirst(".video-years, .year")?.text()?.let { YEAR4_RE.find(it)?.value?.toIntOrNull() }
             ?: extractYear(fullText)
         val type = when {
             expectedPath.contains("tv_shows") -> TvType.TvSeries
@@ -839,14 +897,14 @@ class FTPBD : MainAPI() {
             ?: selectFirst("meta[name=description]")?.attr("content")?.trim()?.takeIf { it.isNotBlank() }
 
     private fun Document.rating(): Double? =
-        selectFirst(".jws-raring-number")?.text()?.let { Regex("\\d+(?:\\.\\d+)?").find(it)?.value?.toDoubleOrNull() }
+        selectFirst(".jws-raring-number")?.text()?.let { RATING_NUM_RE.find(it)?.value?.toDoubleOrNull() }
 
     private fun seasonNumbers(doc: Document): List<Int> =
         doc.select(".select-seasion .dropdown-item[data-index], a[href*='season=']")
             .mapNotNull { el ->
                 el.attr("data-index").toIntOrNull()?.plus(1)
-                    ?: Regex("season=(\\d+)").find(el.attr("href"))?.groupValues?.get(1)?.toIntOrNull()
-                    ?: Regex("(\\d+)").find(el.text())?.value?.toIntOrNull()
+                    ?: SEASON_Q_RE.find(el.attr("href"))?.groupValues?.get(1)?.toIntOrNull()
+                    ?: NUM_RE.find(el.text())?.value?.toIntOrNull()
             }
             .filter { it > 0 }
             .distinct()
@@ -870,7 +928,7 @@ class FTPBD : MainAPI() {
                 subtitleCallback(newSubtitleFile(label, subUrl))
             }
 
-        Regex("""https?://[^\s"'<>]+\.(?:srt|vtt|ass)(?:\?[^\s"'<>]*)?""", RegexOption.IGNORE_CASE)
+        SUB_URL_ABS_RE
             .findAll(html)
             .map { it.value.htmlDecode() }
             .forEach { raw ->
@@ -879,7 +937,7 @@ class FTPBD : MainAPI() {
                     subtitleCallback(newSubtitleFile(subtitleLabelFromUrl(subUrl), subUrl))
                 }
             }
-        Regex("""["']([^"']+\.(?:srt|vtt|ass)(?:\?[^"']*)?)["']""", RegexOption.IGNORE_CASE)
+        SUB_URL_REL_RE
             .findAll(html)
             .map { it.groupValues[1].htmlDecode() }
             .forEach { raw ->
@@ -897,7 +955,7 @@ class FTPBD : MainAPI() {
     ) {
         val manifestHeaders = headers + ("Referer" to referer)
         val manifest = runCatching { app.get(manifestUrl, headers = manifestHeaders).text }.getOrNull() ?: return
-        Regex("""#EXT-X-MEDIA:([^\r\n]+)""", RegexOption.IGNORE_CASE)
+        M3U8_MEDIA_RE
             .findAll(manifest)
             .forEach { match ->
                 val attrs = match.groupValues[1]
@@ -934,28 +992,21 @@ class FTPBD : MainAPI() {
             .replace("_", " ")
             .replace("-", " ")
         if (raw.isBlank()) return null
-        fun has(pattern: String): Boolean = Regex(pattern, RegexOption.IGNORE_CASE).containsMatchIn(raw)
         val parts = linkedSetOf<String>()
-        if (has("\\b3d\\b")) parts += "3D"
-        if (has("\\b(?:4k|2160p|uhd)\\b")) {
+        if (B3D_RE.containsMatchIn(raw)) parts += "3D"
+        if (UHD_RE.containsMatchIn(raw)) {
             parts += "4K"
         } else {
-            Regex("(?i)\\b(1080|720|576|540|480|360)p\\b")
+            RES_P_RE
                 .findAll(raw)
                 .mapNotNull { it.groupValues[1].toIntOrNull() }
                 .maxOrNull()
                 ?.let { parts += "${it}p" }
         }
-        if (parts.isEmpty() && has("\\bHD\\b")) parts += "HD"
+        if (parts.isEmpty() && HD_WORD_RE.containsMatchIn(raw)) parts += "HD"
         if (parts.isEmpty()) {
-            listOf(
-                "WEB-DL" to "(?i)\\bweb[- ]?dl\\b",
-                "WEBRip" to "(?i)\\bwebrip\\b",
-                "BluRay" to "(?i)\\b(?:bluray|blu ray|brrip)\\b",
-                "HDRip" to "(?i)\\bhdrip\\b",
-                "HEVC" to "(?i)\\b(?:hevc|x265|h265)\\b",
-                "10bit" to "(?i)\\b10[- ]?bit\\b",
-            ).firstOrNull { (_, pattern) -> has(pattern) }?.let { (short, _) -> parts += short }
+            SRC_VARIANT_RES.firstOrNull { (_, pattern) -> pattern.containsMatchIn(raw) }
+                ?.let { (short, _) -> parts += short }
         }
         return parts.joinToString(" ").takeIf { it.isNotBlank() }
     }
@@ -972,7 +1023,7 @@ class FTPBD : MainAPI() {
 
     private fun extractYear(text: String?): Int? {
         if (text.isNullOrBlank()) return null
-        return Regex("(?<!\\d)(?:19|20)\\d{2}(?!\\d)")
+        return YEAR_ANY_RE
             .findAll(text)
             .mapNotNull { it.value.toIntOrNull() }
             .firstOrNull { it in 1900..2035 }
@@ -1038,7 +1089,7 @@ class FTPBD : MainAPI() {
         else optString(key, "").toDoubleOrNull() ?: optDouble(key, Double.NaN).takeIf { !it.isNaN() }
 
     private fun yearFromDate(date: String?): Int? =
-        date?.let { Regex("""\d{4}""").find(it)?.value?.toIntOrNull() }
+        date?.let { YEAR4_RE.find(it)?.value?.toIntOrNull() }
 
     private fun Element.imgUrl(): String? =
         attr("data-src").ifBlank { attr("data-lazy-src") }.ifBlank { attr("src") }
@@ -1048,9 +1099,9 @@ class FTPBD : MainAPI() {
     private fun parseDuration(text: String?): Int? {
         if (text.isNullOrBlank()) return null
         val cleaned = text.lowercase()
-        val h = Regex("(\\d+)\\s*h").find(cleaned)?.groupValues?.get(1)?.toIntOrNull() ?: 0
-        val m = Regex("(\\d+)\\s*m").find(cleaned)?.groupValues?.get(1)?.toIntOrNull()
-            ?: Regex("(\\d+)\\s*mins?").find(cleaned)?.groupValues?.get(1)?.toIntOrNull()
+        val h = DUR_H_RE.find(cleaned)?.groupValues?.get(1)?.toIntOrNull() ?: 0
+        val m = DUR_M_RE.find(cleaned)?.groupValues?.get(1)?.toIntOrNull()
+            ?: DUR_MIN_RE.find(cleaned)?.groupValues?.get(1)?.toIntOrNull()
             ?: 0
         val total = h * 60 + m
         return total.takeIf { it > 0 }
@@ -1063,9 +1114,6 @@ class FTPBD : MainAPI() {
                 lower.endsWith(".m4v")
     }
 
-    private fun qualityFromUrl(url: String): String? =
-        Regex("(?i)(2160p|1440p|1080p|720p|480p|360p|4k)").find(url)?.value
-
     private fun String.toAbsoluteUrl(baseUrl: String = mainUrl): String = when {
         startsWith("//") -> baseUrl.substringBefore("://", "https") + ":$this"
         startsWith("http", ignoreCase = true) -> this
@@ -1075,22 +1123,22 @@ class FTPBD : MainAPI() {
     }
 
     private fun String.cleanSourceLabel(): String =
-        replace(Regex("(?i)\\b(?:web series|movies?|series|tv)\\b"), " ")
-            .replace(Regex("\\s*/\\s*"), "/")
-            .replace(Regex("\\s+"), " ")
+        replace(SRC_LABEL_WORDS_RE, " ")
+            .replace(SLASH_WS_RE, "/")
+            .replace(WS_RUN_RE, " ")
             .trim(' ', '/', '-', '•')
 
     private fun String.cleanMediaTitle(): String =
-        replace(Regex("\\s*[–-]\\s*\\[[^]]+]\\s*$"), "")
-            .replace(Regex("\\[[^]]+]"), "")
-            .replace(Regex("(?i)\\b(hindi|dubbed|dual audio|season \\d+)\\b"), "")
+        replace(TAIL_BRACKET_RE, "")
+            .replace(BRACKET_ALL_RE, "")
+            .replace(MEDIA_TITLE_JUNK_RE, "")
             .trim()
             .ifBlank { this }
 
     private fun String.normalizedTitle(): String =
         cleanMediaTitle()
             .lowercase()
-            .replace(Regex("[^a-z0-9]+"), " ")
+            .replace(NON_ALNUM_RE, " ")
             .trim()
 
     private fun String.encodeUrl(): String = URLEncoder.encode(this, "UTF-8")

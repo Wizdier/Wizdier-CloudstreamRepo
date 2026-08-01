@@ -49,6 +49,43 @@ class CineplexBD : MainAPI() {
         "Referer" to "$mainUrl/",
     )
 
+    companion object {
+        // (v9) Hoisted regexes. The label/title-cleaning cluster used to
+        // compile ~15 Patterns PER CARD on listing pages; the link-page
+        // scanners recompiled on every playback. Patterns unchanged — only
+        // the allocation moved to once-per-class.
+        private val YEAR_ANY_RE = Regex("(?<!\\d)(?:19|20)\\d{2}(?!\\d)")
+        private val SEASON_Q_RE = Regex("""season=(\d+)""")
+        private val NUM_RE = Regex("""\d+""")
+        private val E_NUM_RE = Regex("(?i)E(\\d+)")
+        private val VIDEO_SRC_RE = Regex("""const\s+videoSrc\s*=\s*["'](.*?)["']""")
+        private val MEDIA_URL_IDX_RE = Regex("""https?://[^\s"'<>]+(?:\.m3u8|\.mp4|\.mkv|\.webm|\.avi|\.m4v)(?:/index\.m3u8|\?[^\s"'<>]*)?""", RegexOption.IGNORE_CASE)
+        private val MEDIA_URL_RE = Regex("""https?://[^\s"'<>]+(?:\.m3u8|\.mp4|\.mkv|\.webm|\.avi|\.m4v)(?:\?[^\s"'<>]*)?""", RegexOption.IGNORE_CASE)
+        private val QUETTA_ID_RE = Regex("""data-quetta-video-id=["']?(qv_[a-z0-9_]+)["']?""", RegexOption.IGNORE_CASE)
+        private val M3U8_MEDIA_RE = Regex("""#EXT-X-MEDIA:([^\r\n]+)""", RegexOption.IGNORE_CASE)
+        private val SUB_URL_ABS_RE = Regex("""https?://[^\s"'<>]+\.(?:srt|vtt|ass)(?:\?[^\s"'<>]*)?""", RegexOption.IGNORE_CASE)
+        private val SUB_URL_REL_RE = Regex("""["']([^"']+\.(?:srt|vtt|ass)(?:\?[^"']*)?)["']""", RegexOption.IGNORE_CASE)
+        private val B3D_RE = Regex("\\b3d\\b", RegexOption.IGNORE_CASE)
+        private val UHD_RE = Regex("\\b(?:4k|2160p|uhd)\\b", RegexOption.IGNORE_CASE)
+        private val RES_P_RE = Regex("(?i)\\b(1080|720|576|540|480|360)p\\b")
+        private val HD_WORD_RE = Regex("\\bHD\\b", RegexOption.IGNORE_CASE)
+        private val SRC_VARIANT_RES = listOf(
+            "WEB-DL" to Regex("(?i)\\bweb[- ]?dl\\b"),
+            "WEBRip" to Regex("(?i)\\bwebrip\\b"),
+            "BluRay" to Regex("(?i)\\b(?:bluray|blu ray|brrip)\\b"),
+            "HDRip" to Regex("(?i)\\bhdrip\\b"),
+            "HEVC" to Regex("(?i)\\b(?:hevc|x265|h265)\\b"),
+            "10bit" to Regex("(?i)\\b10[- ]?bit\\b"),
+        )
+        private val SRC_LABEL_WORDS_RE = Regex("(?i)\\b(?:web series|movies?|series|tv)\\b")
+        private val SLASH_WS_RE = Regex("\\s*/\\s*")
+        private val WS_RUN_RE = Regex("\\s+")
+        private val DISPLAY_JUNK_RE = Regex("(?i)\\b(1080p|720p|480p|2160p|4k|web[- ]?dl|webrip|bluray|hdrip|x264|x265|hevc|10bit|dual[- ]?audio|hindi[- ]?dubbed|dubbed|esub)\\b")
+        private val BRACKET_ALL_RE = Regex("\\[[^]]+]")
+        private val NON_ALNUM_RE = Regex("[^a-z0-9]+")
+        private val YEAR4_RE = Regex("\\d{4}")
+    }
+
     // ----------------------------- Main page -----------------------------
 
     override val mainPage = mainPageOf(
@@ -69,7 +106,11 @@ class CineplexBD : MainAPI() {
         request: MainPageRequest
     ): HomePageResponse {
         val url = request.data + page
-        val doc = app.get(url, headers = cfHeaders, timeout = 10_000).document
+        // (v9) Bounded retry + graceful empty; the bare call used to throw
+        // straight onto the home screen on any transport wobble.
+        val doc = CineplexConcurrent.retry(maxAttempts = 2, initialDelayMs = 400) {
+            app.get(url, headers = cfHeaders, timeout = 10_000).document
+        } ?: return newHomePageResponse(HomePageList(request.name, emptyList(), isHorizontalImages = false), hasNext = false)
 
         val items = parseAndGroupSearchItems(doc)
             .let { list ->
@@ -95,7 +136,10 @@ class CineplexBD : MainAPI() {
 
     override suspend fun search(query: String): List<SearchResponse> {
         val url = "$mainUrl/search.php?q=${query.encodeUrl()}&page=1"
-        val doc = app.get(url, headers = cfHeaders, timeout = 10_000).document
+        // (v9) Same retry + graceful empty as the homepage.
+        val doc = CineplexConcurrent.retry(maxAttempts = 2, initialDelayMs = 400) {
+            app.get(url, headers = cfHeaders, timeout = 10_000).document
+        } ?: return emptyList()
         return parseAndGroupSearchItems(doc)
     }
 
@@ -107,7 +151,10 @@ class CineplexBD : MainAPI() {
         val allLoadItems = groupedItems ?: listOf(primaryItem)
         val primaryUrl = primaryItem.url
         val absUrl = if (primaryUrl.startsWith("http")) primaryUrl else mainUrl + primaryUrl
-        val doc = app.get(absUrl, headers = cfHeaders, timeout = 10_000).document
+        // (v9) Retried + null-graceful instead of one bare throwing call.
+        val doc = CineplexConcurrent.retry(maxAttempts = 2, initialDelayMs = 400) {
+            app.get(absUrl, headers = cfHeaders, timeout = 10_000).document
+        } ?: return null
 
         // ─── Scrape what the source gives us ───────────────────────────────
         val rawTitle = doc.selectFirst("h1, .movie-title, title")
@@ -135,7 +182,7 @@ class CineplexBD : MainAPI() {
         }
 
         val scrapedYear = doc.select("span.chip:matches(\\d{4})").text()
-            .let { Regex("\\d{4}").find(it)?.value?.toIntOrNull() }
+            .let { YEAR4_RE.find(it)?.value?.toIntOrNull() }
         val scrapedDuration = doc.select("span.chip:matches(\\d+h \\d+m)").text()
             .let { parseDuration(it) }
 
@@ -314,23 +361,28 @@ class CineplexBD : MainAPI() {
         doc.select("[data-season], a[href*='season='], li.season")
             .forEach { el ->
                 el.attr("data-season").takeIf { it.isNotBlank() }?.let(seasonHints::add)
-                Regex("""season=(\d+)""").find(el.attr("href"))?.groupValues?.get(1)
+                SEASON_Q_RE.find(el.attr("href"))?.groupValues?.get(1)
                     ?.let(seasonHints::add)
             }
         // Numeric chips with just a season number in their text
         doc.select(".seasons button, .seasons a, .season-list a").forEach { el ->
-            Regex("""\d+""").find(el.text())?.value?.let(seasonHints::add)
+            NUM_RE.find(el.text())?.value?.let(seasonHints::add)
         }
         if (seasonHints.isEmpty()) seasonHints += "1"
 
         // ── (1)(2) JSON meta endpoint, robust parsing ─────────────────────
-        for (season in seasonHints) {
-            val seasonInt = season.toIntOrNull() ?: continue
+        // (v9) Season-hint probes fan out concurrently (bounded by the
+        // shared semaphore) instead of serially — a 3-season page used to
+        // pay 3 serial round-trips here, now it pays ~1.
+        val hinted = CineplexConcurrent.parallelMapNotNull(seasonHints.toList()) { season ->
+            val seasonInt = season.toIntOrNull() ?: return@parallelMapNotNull null
             val metaUrl = "$mainUrl/watch.php?$seriesIdKey=$seriesId&season=$season&meta=1"
             val text = runCatching { app.get(metaUrl, headers = cfHeaders, timeout = 10_000).text }.getOrNull()
-                ?: continue
-            episodes += parseEpisodesFromMetaJson(text, seasonInt, meta.episodes)
+                ?: return@parallelMapNotNull null
+            val parsed = parseEpisodesFromMetaJson(text, seasonInt, meta.episodes)
+            if (parsed.isEmpty()) null else parsed
         }
+        hinted.forEach { episodes += it }
 
         // If the JSON path returned at least one episode, we're done.
         if (episodes.isNotEmpty()) {
@@ -416,7 +468,7 @@ class CineplexBD : MainAPI() {
         val epNum = v.optStringOrNull("episode_number")?.toIntOrNull()
             ?: v.optInt("episode_number", 0).takeIf { it != 0 }
             ?: fallbackKey.toIntOrNull()
-            ?: Regex("(?i)E(\\d+)").find(rawName)?.groupValues?.get(1)?.toIntOrNull()
+            ?: E_NUM_RE.find(rawName)?.groupValues?.get(1)?.toIntOrNull()
             ?: 0
 
         val tmdbEp = tmdbEps.getOrNull(epNum - 1)
@@ -548,7 +600,7 @@ class CineplexBD : MainAPI() {
         val sources = linkedSetOf<String>()
 
         // Pattern 1: const videoSrc = "..." (legacy player style)
-        Regex("""const\s+videoSrc\s*=\s*["'](.*?)["']""")
+        VIDEO_SRC_RE
             .find(html)?.groupValues?.getOrNull(1)?.let(sources::add)
 
         val parsed = org.jsoup.Jsoup.parse(html, url)
@@ -562,7 +614,7 @@ class CineplexBD : MainAPI() {
             }
 
         // Pattern 3: any direct media URL in the HTML
-        Regex("""https?://[^\s"'<>]+(?:\.m3u8|\.mp4|\.mkv|\.webm|\.avi|\.m4v)(?:/index\.m3u8|\?[^\s"'<>]*)?""", RegexOption.IGNORE_CASE)
+        MEDIA_URL_IDX_RE
             .findAll(html)
             .mapTo(sources) { it.value.replace("&amp;", "&") }
 
@@ -571,10 +623,7 @@ class CineplexBD : MainAPI() {
         // dynamically via JS. We extract the qv_id and try multiple
         // candidate Quetta API endpoints. (The exact endpoint is not
         // publicly documented; we try the most common shapes.)
-        val quettaId = Regex(
-            """data-quetta-video-id=["']?(qv_[a-z0-9_]+)["']?""",
-            RegexOption.IGNORE_CASE
-        ).find(html)?.groupValues?.getOrNull(1)
+        val quettaId = QUETTA_ID_RE.find(html)?.groupValues?.getOrNull(1)
 
         var found = false
         sources.map { it.toAbsoluteMediaUrl(url) }
@@ -672,7 +721,7 @@ class CineplexBD : MainAPI() {
                         }
                     }
                     // Also regex-scan the download.php HTML for any media URLs.
-                    Regex("""https?://[^\s"'<>]+(?:\.m3u8|\.mp4|\.mkv|\.webm|\.avi|\.m4v)(?:\?[^\s"'<>]*)?""", RegexOption.IGNORE_CASE)
+                    MEDIA_URL_RE
                         .findAll(dlHtml)
                         .map { it.value.replace("&amp;", "&") }
                         .forEach { raw ->
@@ -934,7 +983,7 @@ class CineplexBD : MainAPI() {
         }
 
         val cardText = text() + " " + title + " " + href
-        val year = Regex("(?<!\\d)(?:19|20)\\d{2}(?!\\d)")
+        val year = YEAR_ANY_RE
             .find(cardText)?.value?.toIntOrNull()
         val sourceLabel = buildSourceLabel(cardText)
 
@@ -1031,7 +1080,7 @@ class CineplexBD : MainAPI() {
         val manifestHeaders = cfHeaders + ("Referer" to referer)
         val manifest = runCatching { app.get(manifestUrl, headers = manifestHeaders, timeout = 10_000).text }.getOrNull()
             ?: return
-        Regex("""#EXT-X-MEDIA:([^\r\n]+)""", RegexOption.IGNORE_CASE)
+        M3U8_MEDIA_RE
             .findAll(manifest)
             .forEach { match ->
                 val attrs = match.groupValues[1]
@@ -1075,7 +1124,7 @@ class CineplexBD : MainAPI() {
                 subtitleCallback(newSubtitleFile(label, subUrl))
             }
 
-        Regex("""https?://[^\s"'<>]+\.(?:srt|vtt|ass)(?:\?[^\s"'<>]*)?""", RegexOption.IGNORE_CASE)
+        SUB_URL_ABS_RE
             .findAll(html)
             .map { it.value.replace("&amp;", "&") }
             .forEach { raw ->
@@ -1085,7 +1134,7 @@ class CineplexBD : MainAPI() {
                 }
             }
 
-        Regex("""["']([^"']+\.(?:srt|vtt|ass)(?:\?[^"']*)?)["']""", RegexOption.IGNORE_CASE)
+        SUB_URL_REL_RE
             .findAll(html)
             .map { it.groupValues[1].replace("&amp;", "&") }
             .forEach { raw ->
@@ -1113,57 +1162,50 @@ class CineplexBD : MainAPI() {
             .replace("-", " ")
         if (raw.isBlank()) return null
 
-        fun has(pattern: String): Boolean = Regex(pattern, RegexOption.IGNORE_CASE).containsMatchIn(raw)
         val parts = linkedSetOf<String>()
 
         // Keep names short: only the source's own quality/variant initials, not
         // every category/language text that exists elsewhere on the page.
-        if (has("\\b3d\\b")) parts += "3D"
-        if (has("\\b(?:4k|2160p|uhd)\\b")) {
+        if (B3D_RE.containsMatchIn(raw)) parts += "3D"
+        if (UHD_RE.containsMatchIn(raw)) {
             parts += "4K"
         } else {
-            Regex("(?i)\\b(1080|720|576|540|480|360)p\\b")
+            RES_P_RE
                 .findAll(raw)
                 .mapNotNull { it.groupValues[1].toIntOrNull() }
                 .maxOrNull()
                 ?.let { parts += "${it}p" }
         }
 
-        if (parts.isEmpty() && has("\\bHD\\b")) parts += "HD"
+        if (parts.isEmpty() && HD_WORD_RE.containsMatchIn(raw)) parts += "HD"
 
         // Only add release/codec initials when no resolution was found. This
         // keeps the source row compact while still differentiating WEB-DL-only
         // or BluRay-only entries.
         if (parts.isEmpty()) {
-            listOf(
-                "WEB-DL" to "(?i)\\bweb[- ]?dl\\b",
-                "WEBRip" to "(?i)\\bwebrip\\b",
-                "BluRay" to "(?i)\\b(?:bluray|blu ray|brrip)\\b",
-                "HDRip" to "(?i)\\bhdrip\\b",
-                "HEVC" to "(?i)\\b(?:hevc|x265|h265)\\b",
-                "10bit" to "(?i)\\b10[- ]?bit\\b",
-            ).firstOrNull { (_, pattern) -> has(pattern) }?.let { (short, _) -> parts += short }
+            SRC_VARIANT_RES.firstOrNull { (_, pattern) -> pattern.containsMatchIn(raw) }
+                ?.let { (short, _) -> parts += short }
         }
 
         return parts.joinToString(" ").cleanSourceLabel().takeIf { it.isNotBlank() }
     }
 
     private fun String.cleanSourceLabel(): String =
-        replace(Regex("(?i)\\b(?:web series|movies?|series|tv)\\b"), " ")
-            .replace(Regex("\\s*/\\s*"), "/")
-            .replace(Regex("\\s+"), " ")
+        replace(SRC_LABEL_WORDS_RE, " ")
+            .replace(SLASH_WS_RE, "/")
+            .replace(WS_RUN_RE, " ")
             .trim(' ', '/', '-', '•')
 
     private fun String.normalizedTitleKey(): String = cleanDisplayTitle()
         .lowercase()
-        .replace(Regex("[^a-z0-9]+"), " ")
+        .replace(NON_ALNUM_RE, " ")
         .trim()
-        .replace(Regex("\\s+"), " ")
+        .replace(WS_RUN_RE, " ")
 
     private fun String.cleanDisplayTitle(): String =
-        replace(Regex("(?i)\\b(1080p|720p|480p|2160p|4k|web[- ]?dl|webrip|bluray|hdrip|x264|x265|hevc|10bit|dual[- ]?audio|hindi[- ]?dubbed|dubbed|esub)\\b"), " ")
-            .replace(Regex("\\[[^]]+]"), " ")
-            .replace(Regex("\\s+"), " ")
+        replace(DISPLAY_JUNK_RE, " ")
+            .replace(BRACKET_ALL_RE, " ")
+            .replace(WS_RUN_RE, " ")
             .trim()
 
     private fun String.toAbsoluteMediaUrl(baseUrl: String = mainUrl): String = when {
