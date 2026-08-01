@@ -41,6 +41,20 @@ internal object MetadataEnricher {
     // TTL cache so repeat loads of the same title return instantly.
     private val metaCache = CineplexConcurrent.TtlCache<String, MetaInfo>(ttlMs = 10 * 60 * 1000L)
 
+    // (v9) cleanTitle()'s six Patterns used to compile on EVERY enrichment
+    // call (i.e. every load page). Compiled once here. Patterns unchanged.
+    private val CLEAN_BRACKET_RE = Regex("""\[[^\]]+\]""")
+    private val CLEAN_PAREN_RE = Regex("""\([^)]+\)""")
+    private val CLEAN_SEASON_RE = Regex("""(?i)\b(season|s)\s*\d+\b""")
+    private val CLEAN_PART_RE = Regex("""(?i)\b(part|chapter)\s*\d+\b""")
+    private val CLEAN_JUNK_RE = Regex(
+        """(?i)\b(hd|hdrip|web[- ]?dl|blu[- ]?ray|x264|x265|10bit|""" +
+                """1080p|720p|480p|2160p|4k|hevc|dual[- ]?audio|""" +
+                """bangla|dubbed|subbed)\b"""
+    )
+    private val WS_RUN_RE = Regex("""\s+""")
+    private val TAG_STRIP_RE = Regex("<[^>]+>")
+
     data class EpisodeMeta(
         val name: String? = null,
         val overview: String? = null,
@@ -91,19 +105,12 @@ internal object MetadataEnricher {
 
     // Strip junk that breaks remote searches.
     fun cleanTitle(raw: String): String =
-        raw.replace(Regex("""\[[^\]]+\]"""), " ")
-            .replace(Regex("""\([^)]+\)"""), " ")
-            .replace(Regex("""(?i)\b(season|s)\s*\d+\b"""), " ")
-            .replace(Regex("""(?i)\b(part|chapter)\s*\d+\b"""), " ")
-            .replace(
-                Regex(
-                    """(?i)\b(hd|hdrip|web[- ]?dl|blu[- ]?ray|x264|x265|10bit|""" +
-                            """1080p|720p|480p|2160p|4k|hevc|dual[- ]?audio|""" +
-                            """bangla|dubbed|subbed)\b"""
-                ),
-                " "
-            )
-            .replace(Regex("""\s+"""), " ")
+        raw.replace(CLEAN_BRACKET_RE, " ")
+            .replace(CLEAN_PAREN_RE, " ")
+            .replace(CLEAN_SEASON_RE, " ")
+            .replace(CLEAN_PART_RE, " ")
+            .replace(CLEAN_JUNK_RE, " ")
+            .replace(WS_RUN_RE, " ")
             .trim()
 
     // ─────────────────────── Movies / generic TV via TMDB ───────────────────
@@ -134,7 +141,7 @@ internal object MetadataEnricher {
         }
         picked ?: return MetaInfo()
 
-        val mediaType = picked.getString("media_type")
+        val mediaType = picked.optString("media_type")
         val tmdbId = picked.optInt("id").takeIf { it != 0 } ?: return MetaInfo()
 
         val details = safeJson(
@@ -262,7 +269,10 @@ internal object MetadataEnricher {
             return enrichMovieOrTv(rawTitle, null, seasonHint).copy(isAnimeHint = true)
         }
 
-        val best = media.getJSONObject(0)
+        // (v9) opt access — a non-object first element used to throw and
+        // abort the whole anime enrichment instead of falling back to TMDB.
+        val best = media.optJSONObject(0)
+            ?: return enrichMovieOrTv(rawTitle, null, seasonHint).copy(isAnimeHint = true)
         val aniId = best.optInt("id").takeIf { it != 0 }
         val malId = best.optInt("idMal").takeIf { it != 0 }
         val titleObj = best.optJSONObject("title")
@@ -274,7 +284,7 @@ internal object MetadataEnricher {
         val posterFromAni = cover?.optStringOrNull("extraLarge") ?: cover?.optStringOrNull("large")
         val bannerFromAni = best.optStringOrNull("bannerImage")
         val plot = best.optStringOrNull("description")
-            ?.replace(Regex("<[^>]+>"), "")
+            ?.replace(TAG_STRIP_RE, "")
             ?.replace("&quot;", "\"")?.replace("&amp;", "&")?.trim()
         val score = best.optDouble("averageScore", 0.0).takeIf { it > 0.0 }?.let { it / 10.0 }
         val year = best.optJSONObject("startDate")?.optInt("year")?.takeIf { it != 0 }

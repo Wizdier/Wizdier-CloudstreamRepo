@@ -80,6 +80,11 @@ class MediaserverProvider : MainAPI() {
         )
         private val SEP_RE = Regex("""[()\[\]{}.,:_\-!'·]""")
         private val WS_RE = Regex("""\s+""")
+        // (v3) Hoisted: the background-image url() picker used to compile a
+        // fresh Regex PER CARD on the homepage grid; the SxxEyy tokeniser
+        // recompiled per load.
+        private val BG_URL_RE = Regex("""url\((['"]?)(.+?)\1\)""")
+        private val SXE_TOKEN_RE = Regex("""(?i)(?:^|[^\d])S(\d{1,2})E(\d{1,3})(?!\d)""")
     }
 
     override val mainPage = mainPageOf(
@@ -88,16 +93,27 @@ class MediaserverProvider : MainAPI() {
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         if (page > 1) return newHomePageResponse(request.name, emptyList(), hasNext = false)
-        val doc = runCatching { app.get(request.data).document }.getOrNull()
+        val doc = getDoc(request.data)
             ?: return newHomePageResponse(request.name, emptyList(), hasNext = false)
         return newHomePageResponse(request.name, parseCards(doc), hasNext = false)
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
         val q = URLEncoder.encode(query, "UTF-8")
-        val doc = runCatching { app.get("$mainUrl/index.php/?s=$q").document }.getOrNull()
-            ?: return emptyList()
+        val doc = getDoc("$mainUrl/index.php/?s=$q") ?: return emptyList()
         return parseCards(doc)
+    }
+
+    // (v3) One bounded retry on transport failure — the host is a raw IP on
+    // a BDISP network and routinely drops a first connection. Non-answers
+    // still degrade to the graceful null the callers already handle.
+    private suspend fun getDoc(url: String): org.jsoup.nodes.Document? {
+        repeat(2) { attempt ->
+            val doc = runCatching { app.get(url).document }.getOrNull()
+            if (doc != null) return doc
+            if (attempt == 0) kotlinx.coroutines.delay(500)
+        }
+        return null
     }
 
     /** Cards appear as `h2.post-meta__title a` (search/grid) and as
@@ -140,7 +156,7 @@ class MediaserverProvider : MainAPI() {
         // Hero cards use style="background-image: url(...)" on .post-thumbnail.
         (card.selectFirst(".post-thumbnail[style*=\"url(\"]") ?: card).let { el ->
             val style = el?.attr("style").orEmpty()
-            val m = Regex("""url\((['"]?)(.+?)\1\)""").find(style)
+            val m = BG_URL_RE.find(style)
             val u = m?.groupValues?.get(2)?.trim()
             if (!u.isNullOrBlank() && u.startsWith("http")) return u
         }
@@ -148,7 +164,7 @@ class MediaserverProvider : MainAPI() {
     }
 
     override suspend fun load(url: String): LoadResponse? {
-        val doc = runCatching { app.get(url).document }.getOrNull() ?: return null
+        val doc = getDoc(url) ?: return null
         val title = doc.selectFirst("h1.post-title")?.text()?.trim()?.ifBlank { null }
             ?: doc.selectFirst("meta[property=og:title]")?.attr("content")
                 ?.substringBefore(" | ")?.trim()?.ifBlank { null }
@@ -193,7 +209,7 @@ class MediaserverProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        val doc = runCatching { app.get(data).document }.getOrNull() ?: return false
+        val doc = getDoc(data) ?: return false
         val emitted = LinkedHashSet<String>()
         var any = false
 
@@ -289,7 +305,7 @@ class MediaserverProvider : MainAPI() {
         var s: Int? = null
         var e: Int? = null
         var isTv = false
-        val sxe = Regex("""(?i)(?:^|[^\d])S(\d{1,2})E(\d{1,3})(?!\d)""").find(t)
+        val sxe = SXE_TOKEN_RE.find(t)
         if (sxe != null) {
             isTv = true
             s = sxe.groupValues[1].toIntOrNull()

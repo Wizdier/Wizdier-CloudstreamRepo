@@ -38,6 +38,17 @@ import java.util.concurrent.TimeUnit
  */
 object WizstreamAnimeSources {
 
+    // (v90) Hoisted Patterns — normaliseTitle/titleSimilarity run per
+    // candidate across every resolver fan-out; findMediaUrlIn per embed.
+    internal object RxA {
+        val NON_ALNUM_RE = Regex("[^a-z0-9]+")
+        val WS_SPLIT_RE = Regex("\\s+")
+        val WORD_TOKEN_RE = Regex("""\b\w+\b""")
+        val M3U8_URL_RE = Regex("""https?://[^"'\s]+\.m3u8[^"'\s]*""")
+        val SRC_FILE_URL_RE = Regex("""(?:sources?|file)\s*[:=]\s*[\[{]?\s*["'](https?://[^"']+)["']""")
+    }
+
+
     private const val TAG = "WizstreamAnimeSources"
     private const val UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
         "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
@@ -153,9 +164,9 @@ object WizstreamAnimeSources {
     /** Normalised title for fuzzy matching. */
     internal fun String.normaliseTitle(): String =
         lowercase()
-            .replace(Regex("[^a-z0-9]+"), " ")
+            .replace(RxA.NON_ALNUM_RE, " ")
             .trim()
-            .replace(Regex("\\s+"), " ")
+            .replace(RxA.WS_SPLIT_RE, " ")
 
     /** Similarity of a candidate against BOTH our title aliases (v29). */
     internal fun bestTitleSim(candidate: String, title: String, altTitle: String?): Double =
@@ -176,8 +187,8 @@ object WizstreamAnimeSources {
         val bx = b.normaliseTitle()
         if (ax == bx) return 1.0
         if (ax.isEmpty() || bx.isEmpty()) return 0.0
-        val ta = ax.split(Regex("\\s+")).toSet()
-        val tb = bx.split(Regex("\\s+")).toSet()
+        val ta = ax.split(RxA.WS_SPLIT_RE).toSet()
+        val tb = bx.split(RxA.WS_SPLIT_RE).toSet()
         val inter = ta.intersect(tb).size.toDouble()
         val union = ta.union(tb).size.toDouble()
         return if (union == 0.0) 0.0 else inter / union
@@ -466,15 +477,15 @@ object WizstreamAnimeSources {
             }
         }
         return runCatching {
-            Regex("""\b\w+\b""").replace(p) { mr -> map[mr.value] ?: mr.value }
+            RxA.WORD_TOKEN_RE.replace(p) { mr -> map[mr.value] ?: mr.value }
         }.getOrNull()
     }
 
     /** First plausible media URL in a (possibly unpacked) embed page. */
     internal fun findMediaUrlIn(text: String): String? {
-        return Regex("""https?://[^"'\s]+\.m3u8[^"'\s]*""")
+        return RxA.M3U8_URL_RE
             .find(text)?.value?.trim()
-            ?: Regex("""(?:sources?|file)\s*[:=]\s*[\[{]?\s*["'](https?://[^"']+)["']""")
+            ?: RxA.SRC_FILE_URL_RE
                 .find(text)?.groupValues?.getOrNull(1)?.trim()
     }
 

@@ -100,7 +100,7 @@ class CircleFtpProvider : MainAPI() {
     }
 
     private fun selectUntilNonInt(string: String?): Int? =
-        string?.let { Regex("\\d+").find(it)?.value?.toIntOrNull() }
+        string?.let { DIGITS_RE.find(it)?.value?.toIntOrNull() }
 
     private fun getSearchQuality(check: String?): SearchQuality? {
         val c = check?.lowercase() ?: return null
@@ -121,6 +121,19 @@ class CircleFtpProvider : MainAPI() {
     }
 
     companion object {
+        // (v9) Hoisted regexes — cleanFtpTitle/extractYear/isTitleSimilar run
+        // per-post during listing grouping (hundreds of compiles per screen
+        // before). Patterns unchanged; allocation moved to once-per-class.
+        private val AUDIO_TAG_RE = Regex("(?i)\\b(dual[- ]?audio|multi[- ]?audio|dubbed|hindi[- ]?dubbed|eng[- ]?sub|bengali|hindi|dual|multi)\\b")
+        private val EXT_STRIP_RE = Regex("\\.[a-zA-Z0-9]{2,4}$")
+        private val YEAR_TOKEN_RE = Regex("\\b(19|20)\\d{2}\\b")
+        private val YEAR_ANY_RE = Regex("(?<!\\d)(?:19|20)\\d{2}(?!\\d)")
+        private val NON_ALNUM_RE = Regex("[^a-z0-9]+")
+        private val WS_RUN_RE = Regex("\\s+")
+        private val ALNUM_STRIP_RE = Regex("[^a-z0-9]")
+        private val CJK_RE = Regex("[\\u3000-\\u303f\\u3040-\\u309f\\u30a0-\\u30ff\\uff00-\\uff9f\\u4e00-\\u9faf\\u3400-\\u4dbf]")
+        private val DIGITS_RE = Regex("\\d+")
+
         fun JSONObject.optStringOrNull(key: String): String? {
             if (isNull(key)) return null
             return optString(key, "").takeIf { it.isNotBlank() && it != "null" }
@@ -273,7 +286,7 @@ class CircleFtpProvider : MainAPI() {
 
         fun extractYear(text: String?): Int? {
             if (text.isNullOrBlank()) return null
-            return Regex("(?<!\\d)(?:19|20)\\d{2}(?!\\d)")
+            return YEAR_ANY_RE
                 .findAll(text)
                 .mapNotNull { it.value.toIntOrNull() }
                 .firstOrNull { it in 1900..2035 }
@@ -281,15 +294,14 @@ class CircleFtpProvider : MainAPI() {
 
         fun normalizedGroupTitle(title: String): String =
             title.lowercase()
-                .replace(Regex("[^a-z0-9]+"), " ")
+                .replace(NON_ALNUM_RE, " ")
                 .trim()
-                .replace(Regex("\\s+"), " ")
+                .replace(WS_RUN_RE, " ")
 
         // Clean titles: Uses the pre-cleaned, pre-sorted "name" field from CircleFTP directly! (Problem 1)
         fun cleanFtpTitle(postName: String?, postTitle: String): Pair<String, String?> {
             // Extract audio tags if any from the raw file title
-            val audioRegex = Regex("(?i)\\b(dual[- ]?audio|multi[- ]?audio|dubbed|hindi[- ]?dubbed|eng[- ]?sub|bengali|hindi|dual|multi)\\b")
-            val audioMatches = audioRegex.findAll(postTitle).map { it.value.trim() }.toList()
+            val audioMatches = AUDIO_TAG_RE.findAll(postTitle).map { it.value.trim() }.toList()
             val audioTag = if (audioMatches.isNotEmpty()) {
                 audioMatches.joinToString(" ").uppercase()
             } else null
@@ -297,11 +309,11 @@ class CircleFtpProvider : MainAPI() {
             // Use the beautifully sorted "name" field directly. If null or blank, fallback to cleaned title.
             var cleaned = postName?.trim().orEmpty()
             if (cleaned.isEmpty() || cleaned.equals("null", ignoreCase = true) || cleaned.lowercase() == "null") {
-                cleaned = postTitle.replace(Regex("\\.[a-zA-Z0-9]{2,4}$"), "") // strip extension first
+                cleaned = postTitle.replace(EXT_STRIP_RE, "") // strip extension first
                     .replace(".", " ")
                     .replace("_", " ")
                     .replace("-", " ")
-                    .replace(Regex("\\b(19|20)\\d{2}\\b"), "")
+                    .replace(YEAR_TOKEN_RE, "")
                     .trim()
             }
 
@@ -399,8 +411,8 @@ class CircleFtpProvider : MainAPI() {
 
         // Strict Alphanumeric Title Similarity Matcher (Issue 1)
         fun isTitleSimilar(searchTitle: String, matchTitle: String): Boolean {
-            val sClean = searchTitle.lowercase().replace(Regex("[^a-z0-9]"), "").trim()
-            val mClean = matchTitle.lowercase().replace(Regex("[^a-z0-9]"), "").trim()
+            val sClean = searchTitle.lowercase().replace(ALNUM_STRIP_RE, "").trim()
+            val mClean = matchTitle.lowercase().replace(ALNUM_STRIP_RE, "").trim()
             if (sClean.isEmpty() || mClean.isEmpty()) return false
             
             if (sClean == mClean) return true
@@ -493,7 +505,7 @@ class CircleFtpProvider : MainAPI() {
                     if (mediaList != null && mediaList.length() > 0) {
                         if (targetSeason == 1) {
                             for (i in 0 until mediaList.length()) {
-                                val media = mediaList.getJSONObject(i)
+                                val media = mediaList.optJSONObject(i) ?: continue
                                 val eng = media.optJSONObject("title")?.optString("english", "")?.lowercase() ?: ""
                                 val rom = media.optJSONObject("title")?.optString("romaji", "")?.lowercase() ?: ""
                                 
@@ -511,17 +523,18 @@ class CircleFtpProvider : MainAPI() {
                                 break
                             }
                             if (bestMedia == null) {
-                                val fallback = mediaList.getJSONObject(0)
-                                val eng = fallback.optJSONObject("title")?.optString("english", "") ?: ""
-                                val rom = fallback.optJSONObject("title")?.optString("romaji", "") ?: ""
-                                if (isTitleSimilar(title, eng) || isTitleSimilar(title, rom)) {
-                                    bestMedia = fallback
+                                mediaList.optJSONObject(0)?.let { fallback ->
+                                    val eng = fallback.optJSONObject("title")?.optString("english", "") ?: ""
+                                    val rom = fallback.optJSONObject("title")?.optString("romaji", "") ?: ""
+                                    if (isTitleSimilar(title, eng) || isTitleSimilar(title, rom)) {
+                                        bestMedia = fallback
+                                    }
                                 }
                             }
                         } else {
                             val keywords = getSeasonKeywords(targetSeason)
                             for (i in 0 until mediaList.length()) {
-                                val media = mediaList.getJSONObject(i)
+                                val media = mediaList.optJSONObject(i) ?: continue
                                 val eng = media.optJSONObject("title")?.optString("english", "")?.lowercase() ?: ""
                                 val rom = media.optJSONObject("title")?.optString("romaji", "")?.lowercase() ?: ""
                                 
@@ -541,7 +554,7 @@ class CircleFtpProvider : MainAPI() {
                                 for (s in (targetSeason - 1) downTo 1) {
                                     val subKeywords = getSeasonKeywords(s)
                                     for (i in 0 until mediaList.length()) {
-                                        val media = mediaList.getJSONObject(i)
+                                        val media = mediaList.optJSONObject(i) ?: continue
                                         val eng = media.optJSONObject("title")?.optString("english", "")?.lowercase() ?: ""
                                         val rom = media.optJSONObject("title")?.optString("romaji", "")?.lowercase() ?: ""
                                         
@@ -560,11 +573,12 @@ class CircleFtpProvider : MainAPI() {
                             }
                             
                             if (bestMedia == null) {
-                                val fallback = mediaList.getJSONObject(0)
-                                val eng = fallback.optJSONObject("title")?.optString("english", "") ?: ""
-                                val rom = fallback.optJSONObject("title")?.optString("romaji", "") ?: ""
-                                if (isTitleSimilar(title, eng) || isTitleSimilar(title, rom)) {
-                                    bestMedia = fallback
+                                mediaList.optJSONObject(0)?.let { fallback ->
+                                    val eng = fallback.optJSONObject("title")?.optString("english", "") ?: ""
+                                    val rom = fallback.optJSONObject("title")?.optString("romaji", "") ?: ""
+                                    if (isTitleSimilar(title, eng) || isTitleSimilar(title, rom)) {
+                                        bestMedia = fallback
+                                    }
                                 }
                             }
                         }
@@ -601,7 +615,8 @@ class CircleFtpProvider : MainAPI() {
                                 val searchJson = JSONObject(app.get(searchUrl, timeout = 8_000).text)
                                 val results = searchJson.optJSONArray("results")
                                 if (results != null && results.length() > 0) {
-                                    tmdbId = results.getJSONObject(0).optInt("id")
+                                    // (v9) null-safe access; id 0 treated as no-match.
+                                    tmdbId = results.optJSONObject(0)?.optInt("id")?.takeIf { it > 0 }
                                 }
                             } catch (_: Exception) {}
                         }
@@ -628,7 +643,7 @@ class CircleFtpProvider : MainAPI() {
                                         val list = mutableListOf<EpisodeMetadata>()
                                         if (epArr != null) {
                                             for (i in 0 until epArr.length()) {
-                                                val epObj = epArr.getJSONObject(i)
+                                                val epObj = epArr.optJSONObject(i) ?: continue
                                                 val stillPath = epObj.optString("still_path", "")
                                                 val stillUrl = if (stillPath.isNotEmpty() && stillPath != "null") "https://image.tmdb.org/t/p/original$stillPath" else null
                                                 list.add(
@@ -654,9 +669,9 @@ class CircleFtpProvider : MainAPI() {
                                         val videos = tvDetails.optJSONObject("videos")?.optJSONArray("results")
                                         if (videos != null) {
                                             for (i in 0 until videos.length()) {
-                                                val video = videos.getJSONObject(i)
+                                                val video = videos.optJSONObject(i) ?: continue
                                                 if (video.optString("type") == "Trailer" && video.optString("site") == "YouTube") {
-                                                    tr = "https://www.youtube.com/watch?v=${video.getString("key")}"
+                                                    tr = "https://www.youtube.com/watch?v=${video.optString("key")}"
                                                     break
                                                 }
                                             }
@@ -679,14 +694,14 @@ class CircleFtpProvider : MainAPI() {
                         val edgesArr = charObj?.optJSONArray("edges")
                         if (edgesArr != null) {
                             for (i in 0 until edgesArr.length()) {
-                                val edge = edgesArr.getJSONObject(i)
+                                val edge = edgesArr.optJSONObject(i) ?: continue
                                 val nodeObj = edge.optJSONObject("node")
                                 val charName = nodeObj?.optJSONObject("name")?.optString("full", "") ?: ""
                                 val charImg = nodeObj?.optJSONObject("image")?.optStringOrNull("large")
                                 
                                 val vaArr = edge.optJSONArray("voiceActors")
                                 if (vaArr != null && vaArr.length() > 0) {
-                                    val va = vaArr.getJSONObject(0)
+                                    val va = vaArr.optJSONObject(0) ?: continue
                                     val vaName = va.optJSONObject("name")?.optString("full", "") ?: ""
                                     val vaImage = va.optJSONObject("image")?.optStringOrNull("large")
                                     if (vaName.isNotEmpty()) {
@@ -702,7 +717,7 @@ class CircleFtpProvider : MainAPI() {
                         val genresArr = bestMedia.optJSONArray("genres")
                         if (genresArr != null) {
                             for (i in 0 until genresArr.length()) {
-                                genres.add(genresArr.getString(i))
+                                genresArr.optString(i).takeIf { it.isNotBlank() }?.let { genres.add(it) }
                             }
                         }
 
@@ -728,9 +743,9 @@ class CircleFtpProvider : MainAPI() {
                         return metadata
                     }
                 } else {
-                    val yearMatch = Regex("\\b(19|20)\\d{2}\\b").find(title)
+                    val yearMatch = YEAR_TOKEN_RE.find(title)
                     val extractedYear = yearMatch?.value?.toIntOrNull()
-                    val cleanSearchTitle = title.replace(Regex("\\b(19|20)\\d{2}\\b"), "").trim()
+                    val cleanSearchTitle = title.replace(YEAR_TOKEN_RE, "").trim()
 
                     val searchUrl = "https://api.themoviedb.org/3/search/multi?api_key=98ae14df2b8d8f8f8136499daf79f0e0&query=${URLEncoder.encode(cleanSearchTitle, "UTF-8")}" +
                             if (extractedYear != null) "&year=$extractedYear" else ""
@@ -786,9 +801,9 @@ class CircleFtpProvider : MainAPI() {
                         val videos = details.optJSONObject("videos")?.optJSONArray("results")
                         if (videos != null) {
                             for (i in 0 until videos.length()) {
-                                val video = videos.getJSONObject(i)
+                                val video = videos.optJSONObject(i) ?: continue
                                 if (video.optString("type") == "Trailer" && video.optString("site") == "YouTube") {
-                                    trailerUrl = "https://www.youtube.com/watch?v=${video.getString("key")}"
+                                    trailerUrl = "https://www.youtube.com/watch?v=${video.optString("key")}"
                                     break
                                 }
                             }
@@ -821,7 +836,7 @@ class CircleFtpProvider : MainAPI() {
                                 val epArr = seasonRes.optJSONArray("episodes")
                                 if (epArr != null) {
                                     for (i in 0 until epArr.length()) {
-                                        val epObj = epArr.getJSONObject(i)
+                                        val epObj = epArr.optJSONObject(i) ?: continue
                                         val stillPath = epObj.optString("still_path", "")
                                         val stillUrl = if (stillPath.isNotEmpty() && stillPath != "null") "https://image.tmdb.org/t/p/original$stillPath" else null
                                         epList.add(
@@ -842,7 +857,7 @@ class CircleFtpProvider : MainAPI() {
                         val genresArr = details.optJSONArray("genres")
                         if (genresArr != null) {
                             for (i in 0 until genresArr.length()) {
-                                val gObj = genresArr.getJSONObject(i)
+                                val gObj = genresArr.optJSONObject(i) ?: continue
                                 genres.add(gObj.optString("name"))
                                 genreIds.add(gObj.optInt("id"))
                             }
@@ -853,7 +868,7 @@ class CircleFtpProvider : MainAPI() {
                         val castArr = details.optJSONObject("credits")?.optJSONArray("cast")
                         if (castArr != null) {
                             for (i in 0 until castArr.length()) {
-                                val castObj = castArr.getJSONObject(i)
+                                val castObj = castArr.optJSONObject(i) ?: continue
                                 val name = castObj.optString("name", "")
                                 val role = castObj.optStringOrNull("character")
                                 val profilePath = castObj.optString("profile_path", "")
@@ -908,7 +923,7 @@ class CircleFtpProvider : MainAPI() {
             if (movieMeta != null) {
                 val resolvedAnime = isAnime || (movieMeta.genres?.contains("16") == true && 
                               (movieMeta.originalLanguage in setOf("ja", "zh", "ko") || 
-                               movieMeta.origTitle?.contains(Regex("[\\u3000-\\u303f\\u3040-\\u309f\\u30a0-\\u30ff\\uff00-\\uff9f\\u4e00-\\u9faf\\u3400-\\u4dbf]")) == true || 
+                               movieMeta.origTitle?.contains(CJK_RE) == true || 
                                movieMeta.title.contains("anime", true)))
                 if (resolvedAnime) {
                     val retryAnime = fetchMetadata(movieMeta.title, isAnime = true, season = season)
@@ -984,7 +999,7 @@ class CircleFtpProvider : MainAPI() {
             }
             if (categoriesArr != null) {
                 for (i in 0 until categoriesArr.length()) {
-                    val catObj = categoriesArr.getJSONObject(i)
+                    val catObj = categoriesArr.optJSONObject(i) ?: continue
                     val catId = catObj.optInt("id")
                     val catName = catObj.optString("name", "").lowercase()
                     if (catId == 21 || catId == 1 || catName.contains("anime") || catName.contains("animation") || catName.contains("cartoon")) {
@@ -1007,13 +1022,19 @@ class CircleFtpProvider : MainAPI() {
         
         val postsList = parsePostsJson(text)
         val home = groupAndMapPosts(postsList)
-        return newHomePageResponse(request.name, home, true)
+        // (v9) hasNext was hardcoded true — the homepage paged the API
+        // FOREVER (empty pages past the end, infinite scroll jank). Now it
+        // stops as soon as a page comes back empty.
+        return newHomePageResponse(request.name, home, postsList.isNotEmpty())
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
+        // (v9) The search term was interpolated RAW — a query containing '&'
+        // or '+' corrupted the query string. Now properly URL-encoded.
+        val q = URLEncoder.encode(query.trim(), "UTF-8")
         val text = CircleFtpHttp.fetchWithFallback(
-            primary = "$mainApiUrl/api/posts?searchTerm=$query&order=desc",
-            fallback = "$apiUrl/api/posts?searchTerm=$query&order=desc"
+            primary = "$mainApiUrl/api/posts?searchTerm=$q&order=desc",
+            fallback = "$apiUrl/api/posts?searchTerm=$q&order=desc"
         ) ?: ""
         val postsList = parsePostsJson(text)
         return groupAndMapPosts(postsList)
@@ -1028,7 +1049,7 @@ class CircleFtpProvider : MainAPI() {
             val postsArr = jsonObj.optJSONArray("posts")
             if (postsArr != null) {
                 for (i in 0 until postsArr.length()) {
-                    val pObj = postsArr.getJSONObject(i)
+                    val pObj = postsArr.optJSONObject(i) ?: continue
                     postsList.add(
                         Post(
                             id = pObj.getInt("id"),
@@ -1561,10 +1582,6 @@ class CircleFtpProvider : MainAPI() {
         return found
     }
 
-    data class PageData(
-        val posts: List<Post>
-    )
-
     data class Post(
         val id: Int,
         val type: String,
@@ -1572,35 +1589,5 @@ class CircleFtpProvider : MainAPI() {
         val title: String,
         val name: String?,
         val categories: JSONArray? = null
-    )
-
-    data class Data(
-        val type: String,
-        val imageSm: String,
-        val title: String,
-        val image: String,
-        val metaData: String?,
-        val name: String,
-        val quality: String?,
-        val year: String?,
-        val watchTime: String?
-    )
-
-    data class TvSeries(
-        val content: List<Content>,
-    )
-
-    data class Content(
-        val episodes: List<EpisodeData>,
-        val seasonName: String
-    )
-
-    data class EpisodeData(
-        val link: String,
-        val title: String
-    )
-
-    data class Movies(
-        val content: String?
     )
 }

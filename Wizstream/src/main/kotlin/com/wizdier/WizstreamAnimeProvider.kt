@@ -158,6 +158,7 @@ private fun nextSeasonFilter(): Pair<String, Int> {
 
 class WizstreamAnimeProvider : MainAPI() {
 
+
     override var mainUrl = "https://anilist.co"
     // (v56) THE canonical anime source name — the unified Wizstream no
     // longer bundles an AniList catalogue, so this pure module owns it.
@@ -184,6 +185,17 @@ class WizstreamAnimeProvider : MainAPI() {
 
     companion object {
         private const val TAG = "WizstreamAnime"
+
+        // (v90) Hoisted Patterns — URL parsing, description cleanup and the
+        // episode-label classifiers used to recompile per call (the label
+        // classifiers run on EVERY episode row).
+        private val ANILIST_WIZ_RE = Regex("wiz://anilist/(\\d+)")
+        private val ANILIST_PATH_RE = Regex("/anime/(\\d+)")
+        private val ANILIST_ANY_RE = Regex("anilist/(\\d+)")
+        private val TAG_STRIP_RE = Regex("<[^>]+>")
+        private val WS_RUN_RE = Regex("\\s+")
+        private val STREAM_EP_NUM_RE = Regex("""^\s*(?:episode|ep)?\.?\s*(\d{1,4})\b""", RegexOption.IGNORE_CASE)
+        private val BARE_EP_LABEL_RE = Regex("""^(?:episode|ep)?\.?\s*\d{1,4}\s*$""", RegexOption.IGNORE_CASE)
 
         private val META_CACHE = ConcurrentHashMap<Int, Pair<Long, AniDetail>>()
         private const val CACHE_TTL_MS = 10 * 60 * 1000L
@@ -1041,9 +1053,9 @@ class WizstreamAnimeProvider : MainAPI() {
         //   https://anilist.co/anime/<id>                    (v52+)
         //   https://anilist.co/wiz://anilist/<id>            (app-side
         //     fixUrl artifact seen on v51 error screens)
-        val m = Regex("wiz://anilist/(\\d+)").find(url)
-            ?: Regex("/anime/(\\d+)").find(url)
-            ?: Regex("anilist/(\\d+)").find(url)
+        val m = ANILIST_WIZ_RE.find(url)
+            ?: ANILIST_PATH_RE.find(url)
+            ?: ANILIST_ANY_RE.find(url)
             ?: return null
         return m.groupValues[1].toIntOrNull()
     }
@@ -1192,8 +1204,8 @@ class WizstreamAnimeProvider : MainAPI() {
             ?: media.optJSONObject("coverImage")?.aOptStr("large")
         val banner = media.aOptStr("bannerImage")
         val plot = media.aOptStr("description")
-            ?.replace(Regex("<[^>]+>"), "")
-            ?.replace(Regex("\\s+"), " ")
+            ?.replace(TAG_STRIP_RE, "")
+            ?.replace(WS_RUN_RE, " ")
             ?.trim()
         val score = media.optInt("averageScore", 0).takeIf { it > 0 }?.let { it / 10.0 }
         // (v28) AniList's `episodes` is NULL for long-running airing shows
@@ -1631,8 +1643,7 @@ class WizstreamAnimeProvider : MainAPI() {
     /** (v63) Episode number inside a licensed-stream title
      *  ("Episode 6 - To All of You in 2016" → 6). Leading digits only. */
     private fun streamEpNumber(title: String?): Int? = title?.let {
-        Regex("""^\s*(?:episode|ep)?\.?\s*(\d{1,4})\b""", RegexOption.IGNORE_CASE)
-            .find(it)?.groupValues?.getOrNull(1)?.toIntOrNull()
+        STREAM_EP_NUM_RE.find(it)?.groupValues?.getOrNull(1)?.toIntOrNull()
     }
 
     /** (v64) TRUE for titles that carry NO real name: a bare number
@@ -1642,8 +1653,7 @@ class WizstreamAnimeProvider : MainAPI() {
      *  then masquerade as titles while being none. */
     private fun isBareEpisodeLabel(title: String?): Boolean {
         val t = title?.trim() ?: return true
-        return Regex("""^(?:episode|ep)?\.?\s*\d{1,4}\s*$""", RegexOption.IGNORE_CASE)
-            .containsMatchIn(t)
+        return BARE_EP_LABEL_RE.containsMatchIn(t)
     }
 
     // (v64) Kitsu keeps REAL episode titles (verified live: 2.5

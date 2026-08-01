@@ -47,6 +47,18 @@ class FlixHubProvider : MainAPI() {
         TvType.Cartoon,
     )
 
+    companion object {
+        // (v3) Hoisted regexes: these used to be recompiled on EVERY call —
+        // on a 24-card homepage that meant hundreds of Pattern.compile()s
+        // per screen. Compiled once here instead. Patterns unchanged.
+        private val EP_NUM_RE = Regex("""(?:Episode\s*)?(\d+)""", RegexOption.IGNORE_CASE)
+        private val META_RATING_RE = Regex("""(\d+(?:\.\d+)?)\s*·""")
+        private val META_YEAR_RE = Regex("""·\s*((?:19|20)\d{2})\s*·""")
+        private val META_RUNTIME_RE = Regex("""(\d+)h\s*(\d+)?m""")
+        private val META_GENRE_RE = Regex("""·\s*([A-Za-z]+)\s*(?:See more|$)""")
+        private val YEAR4_RE = Regex("""\d{4}""")
+    }
+
     private val cfKiller = CloudflareKiller()
 
     private val headers = mapOf(
@@ -199,6 +211,9 @@ class FlixHubProvider : MainAPI() {
 
         // Emit the stream URL directly as a video link.
         // The .mkv file will be played directly by Cloudstream's player.
+        // (v3) Every emitted URL passes through this set — the mirror scans
+        // below often re-find the exact same file under a different label.
+        val emitted = linkedSetOf(streamUrl)
         callback(
             newExtractorLink(
                 source = "FlixHub",
@@ -219,7 +234,7 @@ class FlixHubProvider : MainAPI() {
             if (doc != null) {
                 // Find data-download-url (the primary stream URL — might differ from what we have)
                 val dlUrl = doc.selectFirst("[data-download-url]")?.attr("data-download-url")
-                if (dlUrl != null && dlUrl.isNotBlank() && dlUrl != streamUrl) {
+                if (dlUrl != null && dlUrl.isNotBlank() && dlUrl != streamUrl && emitted.add(dlUrl)) {
                     callback(
                         newExtractorLink(
                             source = "FlixHub",
@@ -236,7 +251,7 @@ class FlixHubProvider : MainAPI() {
                 // Find any additional <source> tags with src attributes
                 doc.select("video source[src], source[src]").forEach { el ->
                     val src = el.attr("src")
-                    if (src.isNotBlank() && src.startsWith("http") && src != streamUrl) {
+                    if (src.isNotBlank() && src.startsWith("http") && src != streamUrl && emitted.add(src)) {
                         callback(
                             newExtractorLink(
                                 source = "FlixHub",
@@ -255,7 +270,7 @@ class FlixHubProvider : MainAPI() {
                 // Find any <a> tags pointing to /stream/ URLs
                 doc.select("a[href*=/stream/]").forEach { el ->
                     val href = el.attr("href")
-                    if (href.isNotBlank() && href != streamUrl && href != dlUrl) {
+                    if (href.isNotBlank() && href != streamUrl && href != dlUrl && emitted.add(href)) {
                         callback(
                             newExtractorLink(
                                 source = "FlixHub",
@@ -275,44 +290,30 @@ class FlixHubProvider : MainAPI() {
         return true
     }
 
-    private suspend fun emitDirectLink(url: String, callback: (ExtractorLink) -> Unit) {
-        val u = url.trim()
-        if (u.isBlank()) return
-        if (u.contains(".m3u8", true)) {
-            M3u8Helper.generateM3u8(
-                source = "FlixHub",
-                streamUrl = u,
-                referer = mainUrl,
-                headers = headers,
-            ).forEach(callback)
-        } else {
-            callback(
-                newExtractorLink(
-                    source = "FlixHub",
-                    name = "FlixHub",
-                    url = u,
-                    type = ExtractorLinkType.VIDEO,
-                ) {
-                    this.referer = mainUrl
-                    this.quality = getQualityFromUrl(u)
-                }
-            )
-        }
-    }
-
     // ═══════════════════════════════════════════════════════════════════════
     //  HTML parsing helpers
     // ═══════════════════════════════════════════════════════════════════════
 
     private suspend fun fetchDocument(url: String): Document? {
-        return try {
-            val res = app.get(url, headers = headers, interceptor = cfKiller, timeout = 20_000)
-            if (res.code !in 200..299) return null
-            Jsoup.parse(res.text, url)
-        } catch (e: Exception) {
-            Log.d("FlixHub", "fetchDocument failed for $url: ${e.message}")
-            null
+        // (v3) One bounded retry: BDIX hosts flap (sleeping disks, shaky
+        // peering), so a single dropped connection used to blank a whole
+        // homepage/search/load. Network exceptions and 5xx get a second
+        // attempt after 600 ms; 4xx stays final. Two attempts max, so a
+        // dead site still fails fast instead of hanging the UI.
+        repeat(2) { attempt ->
+            try {
+                val res = app.get(url, headers = headers, interceptor = cfKiller, timeout = 20_000)
+                if (res.code in 200..299) return Jsoup.parse(res.text, url)
+                if (res.code !in 500..599 || attempt == 1) return null
+            } catch (e: Exception) {
+                if (attempt == 1) {
+                    Log.d("FlixHub", "fetchDocument failed for $url: ${e.message}")
+                    return null
+                }
+            }
+            kotlinx.coroutines.delay(600)
         }
+        return null
     }
 
     private fun parseCards(doc: Document): List<SearchResponse> {
@@ -325,11 +326,19 @@ class FlixHubProvider : MainAPI() {
                 ?: return@mapNotNull null
             val isSeries = watchUrl.contains("/watch/series/")
             val type = if (isSeries) TvType.TvSeries else TvType.Movie
+            // (v3) Card poster — purely additive: picked from the card's own
+            // <img> when present (shrunk TMDB /original/ -> /w500/ like the
+            // load page does), silently absent otherwise.
+            val poster = card.selectFirst("img")?.let { img ->
+                val raw = img.attr("data-src").trim().ifBlank { img.attr("src").trim() }
+                raw.takeIf { it.isNotBlank() && !it.startsWith("data:") }
+                    ?.replace("/original/", "/w500/")
+            }
 
             if (isSeries) {
-                newTvSeriesSearchResponse(title, watchUrl, type) {}
+                newTvSeriesSearchResponse(title, watchUrl, type) { this.posterUrl = poster }
             } else {
-                newMovieSearchResponse(title, watchUrl, type) {}
+                newMovieSearchResponse(title, watchUrl, type) { this.posterUrl = poster }
             }
         }
     }
@@ -347,8 +356,7 @@ class FlixHubProvider : MainAPI() {
             seenSlugs.add(slug)
 
             val epText = link.text().trim()
-            val epNum = Regex("""(?:Episode\s*)?(\d+)""", RegexOption.IGNORE_CASE)
-                .find(epText)?.groupValues?.getOrNull(1)?.toIntOrNull()
+            val epNum = EP_NUM_RE.find(epText)?.groupValues?.getOrNull(1)?.toIntOrNull()
                 ?: seenSlugs.size
 
             val streamUrl = "$mainUrl/stream/episode/$slug"
@@ -420,14 +428,14 @@ class FlixHubProvider : MainAPI() {
         val infoText = doc.selectFirst(".player-mobile-info-title")?.text()
             ?: doc.selectFirst(".movie-info")?.text()
             ?: ""
-        val rating = Regex("""(\d+(?:\.\d+)?)\s*·""").find(infoText)?.groupValues?.getOrNull(1)?.toDoubleOrNull()
-        val year = Regex("""·\s*((?:19|20)\d{2})\s*·""").find(infoText)?.groupValues?.getOrNull(1)?.toIntOrNull()
-        val runtime = Regex("""(\d+)h\s*(\d+)?m""").find(infoText)?.let { m ->
+        val rating = META_RATING_RE.find(infoText)?.groupValues?.getOrNull(1)?.toDoubleOrNull()
+        val year = META_YEAR_RE.find(infoText)?.groupValues?.getOrNull(1)?.toIntOrNull()
+        val runtime = META_RUNTIME_RE.find(infoText)?.let { m ->
             val h = m.groupValues[1].toIntOrNull() ?: 0
             val min = m.groupValues.getOrNull(2)?.toIntOrNull() ?: 0
             (h * 60 + min).takeIf { it > 0 }
         }
-        val genre = Regex("""·\s*([A-Za-z]+)\s*(?:See more|$)""").find(infoText)?.groupValues?.getOrNull(1)
+        val genre = META_GENRE_RE.find(infoText)?.groupValues?.getOrNull(1)
         return PageMeta(rating, year, runtime, genre)
     }
 
@@ -505,7 +513,7 @@ class FlixHubProvider : MainAPI() {
             val plot = d.optString("overview").takeIf { it.isNotBlank() }
             val rating = d.optDouble("vote_average", 0.0).takeIf { it > 0 }
             val dateStr = if (type == "movie") d.optString("release_date") else d.optString("first_air_date")
-            val yr = Regex("""\d{4}""").find(dateStr)?.value?.toIntOrNull()
+            val yr = YEAR4_RE.find(dateStr)?.value?.toIntOrNull()
             val runtime = if (type == "movie") d.optInt("runtime", 0).takeIf { it > 0 }
                 else d.optJSONArray("episode_run_time")?.optInt(0)?.takeIf { it > 0 }
             val genres = d.optJSONArray("genres")?.let { arr ->
@@ -553,7 +561,7 @@ class FlixHubProvider : MainAPI() {
                     if (rId == 0) return@mapNotNull null
                     val rPoster = r.optString("poster_path").takeIf { it.isNotBlank() }?.let { "$tmdbImg/w500$it" }
                     val rDateStr = if (type == "movie") r.optString("release_date") else r.optString("first_air_date")
-                    val rYear = Regex("""\d{4}""").find(rDateStr)?.value?.toIntOrNull()
+                    val rYear = YEAR4_RE.find(rDateStr)?.value?.toIntOrNull()
 
                     if (type == "movie") {
                         newMovieSearchResponse(rTitle, "$mainUrl/watch/movie/${rTitle.lowercase().replace(" ", "-")}", TvType.Movie) {
@@ -579,22 +587,6 @@ class FlixHubProvider : MainAPI() {
     // ═══════════════════════════════════════════════════════════════════════
     //  Media URL helpers
     // ═══════════════════════════════════════════════════════════════════════
-
-    private fun isDirectMedia(url: String): Boolean {
-        val u = url.lowercase()
-        return u.endsWith(".mkv") || u.endsWith(".mp4") || u.endsWith(".webm") ||
-            u.endsWith(".m3u8") || u.contains(".mkv?") || u.contains(".mp4?") ||
-            u.contains(".m3u8?")
-    }
-
-    private fun extractMediaUrls(html: String, baseUrl: String): LinkedHashSet<String> {
-        val out = linkedSetOf<String>()
-        Regex("""https?://[^\s"'<>]+(?:\.m3u8|\.mp4|\.mkv|\.webm)(?:\?[^\s"'<>]*)?""", RegexOption.IGNORE_CASE)
-            .findAll(html).forEach { m -> out.add(m.value.replace("&amp;", "&")) }
-        Regex("""["'](/(?:stream|storage|Data|video)/[^"']+\.(?:m3u8|mp4|mkv|webm)[^"']*)["']""", RegexOption.IGNORE_CASE)
-            .findAll(html).forEach { m -> out.add("$mainUrl${m.groupValues[1]}") }
-        return out
-    }
 
     private fun getQualityFromUrl(url: String): Int {
         val n = url.lowercase()

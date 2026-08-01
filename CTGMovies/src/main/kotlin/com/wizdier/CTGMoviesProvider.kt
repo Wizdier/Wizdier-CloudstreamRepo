@@ -62,6 +62,29 @@ class CTGMovies(private val prefs: SharedPreferences? = null) : MainAPI() {
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
                     "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
 
+        // (v5) Hoisted regexes — the label/title cluster recompiled ~15
+        // Patterns PER CARD before; token/subtitle scanners recompiled on
+        // every call. Patterns unchanged, allocation moved.
+        private val TOKEN_COOKIE_RE = Regex("(?:ctg_token|ctg\\.token)=([^;]+)")
+        private val M3U8_MEDIA_RE = Regex("""#EXT-X-MEDIA:([^\r\n]+)""", RegexOption.IGNORE_CASE)
+        private val B3D_RE = Regex("\\b3d\\b", RegexOption.IGNORE_CASE)
+        private val UHD_RE = Regex("\\b(?:4k|2160p|uhd)\\b", RegexOption.IGNORE_CASE)
+        private val RES_P_RE = Regex("(?i)\\b(1080|720|576|540|480|360)p\\b")
+        private val HD_WORD_RE = Regex("\\bHD\\b", RegexOption.IGNORE_CASE)
+        private val SRC_VARIANT_RES = listOf(
+            "WEB-DL" to Regex("(?i)\\bweb[- ]?dl\\b"),
+            "WEBRip" to Regex("(?i)\\bwebrip\\b"),
+            "BluRay" to Regex("(?i)\\b(?:bluray|blu ray|brrip)\\b"),
+            "HDRip" to Regex("(?i)\\bhdrip\\b"),
+            "HEVC" to Regex("(?i)\\b(?:hevc|x265|h265)\\b"),
+            "10bit" to Regex("(?i)\\b10[- ]?bit\\b"),
+        )
+        private val DISPLAY_JUNK_RE = Regex("(?i)\\b(1080p|720p|480p|2160p|4k|web[- ]?dl|webrip|bluray|hdrip|x264|x265|hevc|10bit|dual[- ]?audio|hindi[- ]?dubbed|dubbed|esub)\\b")
+        private val BRACKET_ALL_RE = Regex("\\[[^]]+]")
+        private val WS_RUN_RE = Regex("\\s+")
+        private val NON_ALNUM_RE = Regex("[^a-z0-9]+")
+        private val YEAR4_RE = Regex("""\d{4}""")
+
         // TTL cache for TMDB metadata. Keyed by mediaType + tmdbId + seasons.
         // Repeat loads of the same title within the window return instantly.
         private val tmdbMetaCache = CTGConcurrent.TtlCache<String, TmdbMeta>(ttlMs = 10 * 60 * 1000L)
@@ -108,8 +131,11 @@ class CTGMovies(private val prefs: SharedPreferences? = null) : MainAPI() {
             "anime" -> "/anime"
             else -> "/movies"
         }
-        val text = apiGet(path, mapOf("page" to page))
-        val items = parseList(text, request.data)
+        // (v5) Any API/parse failure degrades the row to empty instead of
+        // throwing onto the home screen.
+        val text = runCatching { apiGet(path, mapOf("page" to page)) }.getOrNull()
+            ?: return newHomePageResponse(HomePageList(request.name, emptyList(), isHorizontalImages = false), hasNext = false)
+        val items = runCatching { parseList(text, request.data) }.getOrDefault(emptyList())
         return newHomePageResponse(
             list = HomePageList(request.name, items, isHorizontalImages = false),
             hasNext = items.isNotEmpty()
@@ -171,7 +197,10 @@ class CTGMovies(private val prefs: SharedPreferences? = null) : MainAPI() {
             else -> return null
         }
 
-        val obj = JSONObject(apiGet("/$kind/${idOrSlug.encodeUrl()}"))
+        // (v5) apiGet can legitimately return "" on total network failure,
+        // or an HTML proxy error page; a bare JSONObject() threw here and
+        // killed load(). Now the failure degrades to a clean null.
+        val obj = runCatching { JSONObject(apiGet("/$kind/${idOrSlug.encodeUrl()}")) }.getOrNull() ?: return null
         return when (kind) {
             "movies" -> loadMovie(url, obj)
             "anime" -> loadAnime(url, obj)
@@ -825,12 +854,18 @@ class CTGMovies(private val prefs: SharedPreferences? = null) : MainAPI() {
             // a 404 is a real "not found" and retrying just wastes time.
             if (r.code in 500..599) throw java.io.IOException("HTTP ${r.code}")
             r
-        } ?: app.get(url, headers = apiHeaders(), timeout = 10_000)
+        } ?: runCatching { app.get(url, headers = apiHeaders(), timeout = 10_000) }.getOrNull()
+        // (v5) The post-retry fallback get() above used to be able to throw
+        // past every parser guard in the module. apiGet now NEVER throws:
+        // total transport failure yields an empty body, which every caller
+        // already treats as "no data".
+        ?: return ""
 
         if (response.code == 401 || response.code == 403) {
             // Token expired mid-session — refresh once and retry.
             ensureToken(true)
-            response = app.get(url, headers = apiHeaders(), timeout = 10_000)
+            response = runCatching { app.get(url, headers = apiHeaders(), timeout = 10_000) }.getOrNull()
+                ?: return ""
         }
 
         if (response.code !in 200..299) {
@@ -883,7 +918,7 @@ class CTGMovies(private val prefs: SharedPreferences? = null) : MainAPI() {
         if (direct.isNotBlank() && !direct.contains("=")) return direct
 
         val cookieLike = if (direct.contains("=")) direct else prefs?.getString(PREF_COOKIE, null).orEmpty()
-        return Regex("(?:ctg_token|ctg\\.token)=([^;]+)")
+        return TOKEN_COOKIE_RE
             .find(cookieLike)
             ?.groupValues
             ?.getOrNull(1)
@@ -977,7 +1012,7 @@ class CTGMovies(private val prefs: SharedPreferences? = null) : MainAPI() {
     ) {
         val manifestHeaders = directHeaders(manifestUrl) + ("Referer" to referer)
         val manifest = runCatching { app.get(manifestUrl, headers = manifestHeaders).text }.getOrNull() ?: return
-        Regex("""#EXT-X-MEDIA:([^\r\n]+)""", RegexOption.IGNORE_CASE)
+        M3U8_MEDIA_RE
             .findAll(manifest)
             .forEach { match ->
                 val attrs = match.groupValues[1]
@@ -1024,28 +1059,21 @@ class CTGMovies(private val prefs: SharedPreferences? = null) : MainAPI() {
             .replace("_", " ")
             .replace("-", " ")
         if (raw.isBlank()) return null
-        fun has(pattern: String): Boolean = Regex(pattern, RegexOption.IGNORE_CASE).containsMatchIn(raw)
         val parts = linkedSetOf<String>()
-        if (has("\\b3d\\b")) parts += "3D"
-        if (has("\\b(?:4k|2160p|uhd)\\b")) {
+        if (B3D_RE.containsMatchIn(raw)) parts += "3D"
+        if (UHD_RE.containsMatchIn(raw)) {
             parts += "4K"
         } else {
-            Regex("(?i)\\b(1080|720|576|540|480|360)p\\b")
+            RES_P_RE
                 .findAll(raw)
                 .mapNotNull { it.groupValues[1].toIntOrNull() }
                 .maxOrNull()
                 ?.let { parts += "${it}p" }
         }
-        if (parts.isEmpty() && has("\\bHD\\b")) parts += "HD"
+        if (parts.isEmpty() && HD_WORD_RE.containsMatchIn(raw)) parts += "HD"
         if (parts.isEmpty()) {
-            listOf(
-                "WEB-DL" to "(?i)\\bweb[- ]?dl\\b",
-                "WEBRip" to "(?i)\\bwebrip\\b",
-                "BluRay" to "(?i)\\b(?:bluray|blu ray|brrip)\\b",
-                "HDRip" to "(?i)\\bhdrip\\b",
-                "HEVC" to "(?i)\\b(?:hevc|x265|h265)\\b",
-                "10bit" to "(?i)\\b10[- ]?bit\\b",
-            ).firstOrNull { (_, pattern) -> has(pattern) }?.let { (short, _) -> parts += short }
+            SRC_VARIANT_RES.firstOrNull { (_, pattern) -> pattern.containsMatchIn(raw) }
+                ?.let { (short, _) -> parts += short }
         }
         return parts.joinToString(" ").takeIf { it.isNotBlank() }
     }
@@ -1077,9 +1105,9 @@ class CTGMovies(private val prefs: SharedPreferences? = null) : MainAPI() {
     }
 
     private fun String.cleanDisplayTitle(): String =
-        replace(Regex("(?i)\\b(1080p|720p|480p|2160p|4k|web[- ]?dl|webrip|bluray|hdrip|x264|x265|hevc|10bit|dual[- ]?audio|hindi[- ]?dubbed|dubbed|esub)\\b"), " ")
-            .replace(Regex("\\[[^]]+]"), " ")
-            .replace(Regex("\\s+"), " ")
+        replace(DISPLAY_JUNK_RE, " ")
+            .replace(BRACKET_ALL_RE, " ")
+            .replace(WS_RUN_RE, " ")
             .trim()
 
     private fun LoadResponse.addSyncIds(obj: JSONObject, meta: TmdbMeta) {
@@ -1158,9 +1186,6 @@ class CTGMovies(private val prefs: SharedPreferences? = null) : MainAPI() {
                 lower.endsWith(".m4v")
     }
 
-    private fun qualityFromUrl(url: String): String? =
-        Regex("(?i)(2160p|1440p|1080p|720p|480p|360p|4k)").find(url)?.value
-
     private fun String.cleanSourceName(): String =
         replace("auto:", "")
             .replace(":", " ")
@@ -1170,7 +1195,7 @@ class CTGMovies(private val prefs: SharedPreferences? = null) : MainAPI() {
 
     private fun String.normalizedTitle(): String =
         lowercase()
-            .replace(Regex("[^a-z0-9]+"), " ")
+            .replace(NON_ALNUM_RE, " ")
             .trim()
 
     private fun String.encodeUrl(): String = URLEncoder.encode(this, "UTF-8")
@@ -1181,7 +1206,7 @@ class CTGMovies(private val prefs: SharedPreferences? = null) : MainAPI() {
             .filter { it.isNotBlank() }
 
     private fun yearFromDate(date: String?): Int? =
-        date?.let { Regex("""\d{4}""").find(it)?.value?.toIntOrNull() }
+        date?.let { YEAR4_RE.find(it)?.value?.toIntOrNull() }
 
     private fun JSONObject.optStringOrNull(key: String): String? =
         if (!has(key) || isNull(key)) null

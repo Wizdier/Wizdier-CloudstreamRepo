@@ -52,8 +52,16 @@ private const val WZ_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
 private fun String?.toTmdbImg(size: String): String? =
     this?.takeIf { it.isNotBlank() && it != "null" }?.let { "$IMG/$size$it" }
 
+// (v90) Hoisted Patterns — these used to recompile on every call
+// (normalizedWz runs per search/group comparison).
+private val YEAR4_RE = Regex("""\d{4}""")
+private val NON_ALNUM_RE = Regex("[^a-z0-9]+")
+private val TMDB_WIZ_RE = Regex("wiz://tmdb/(movie|tv)/(\\d+)")
+private val TMDB_PATH_RE = Regex("tmdb/(movie|tv)/(\\d+)")
+private val TMDB_HOST_RE = Regex("themoviedb\\.org/(movie|tv)/(\\d+)")
+
 private fun yearFromDate(d: String?): Int? =
-    d?.let { Regex("""\d{4}""").find(it)?.value?.toIntOrNull() }
+    d?.let { YEAR4_RE.find(it)?.value?.toIntOrNull() }
 
 private fun parseAirDateWz(s: String?): Long? {
     if (s == null) return null
@@ -182,7 +190,7 @@ private fun JSONObject.optDoubleOrNullWz(k: String): Double? =
         ?: optDouble(k, Double.NaN).takeIf { !it.isNaN() }
 
 private fun String.normalizedWz(): String =
-    lowercase().replace(Regex("[^a-z0-9]+"), " ").trim()
+    lowercase().replace(NON_ALNUM_RE, " ").trim()
 
 // Re-label an ExtractorLink while preserving url/type/quality/headers.
 // The `ExtractorLink(...)` constructor is deprecated to ERROR level in the
@@ -779,10 +787,10 @@ class WizstreamProvider : MainAPI() {
 
     private fun parseTmdbUrl(url: String): Pair<Int, String>? {
         val u = url.trim()
-        val m = Regex("wiz://tmdb/(movie|tv)/(\\d+)").find(u)
-            ?: Regex("tmdb/(movie|tv)/(\\d+)").find(u)
+        val m = TMDB_WIZ_RE.find(u)
+            ?: TMDB_PATH_RE.find(u)
             // (v52) real themoviedb.org URLs are what we emit now.
-            ?: Regex("themoviedb\\.org/(movie|tv)/(\\d+)").find(u)
+            ?: TMDB_HOST_RE.find(u)
             ?: return null
         val type = m.groupValues[1]
         val id = m.groupValues[2].toIntOrNull() ?: return null

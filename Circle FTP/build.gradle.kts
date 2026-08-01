@@ -1,4 +1,4 @@
-version = 8
+version = 9
 
 cloudstream {
     description = "Circle FTP — movies, TV series and anime with rich metadata."
