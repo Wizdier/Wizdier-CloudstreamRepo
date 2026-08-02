@@ -732,8 +732,9 @@ class WizstreamProvider : MainAPI() {
 
         // ── (v70) Anime-web source resolvers ─────────────────────────────
         // De-stacked anime rows carry their owning AniList entry's ids and
-        // entry-local episode, so the 3 anime streaming resolvers
-        // (v89: AniNeko, KickAssAnime, AnimeX) resolve them exactly like
+        // entry-local episode, so the 4 anime streaming resolvers
+        // (v89: AniNeko, KickAssAnime, AnimeX; v91: Aniwaves) resolve them
+        // exactly like
         // they do in Wizstream-Anime: an entry is a whole show there,
         // episodes 1..N.
         val animeJob = if (ctx.anilistId == null) null else async(Dispatchers.IO) {

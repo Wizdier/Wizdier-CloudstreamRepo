@@ -41,7 +41,7 @@ second extension; they ship bound together and share one settings screen.
 |---|---|
 | 🇧🇩 **BDIX first** | Six Bangladeshi FTP servers (Circle FTP, Cineplex BD, FTPBD, CTGMovies, FM FTP, Mediaserver). On a BDIX ISP these stream fast and usually don't count against your data quota. |
 | 🌍 **Web backup** | Cineby, Bingr, Moonflix and the Vid[x] embed family, so you still get a link when BDIX doesn't have the title. |
-| 🍥 **Real anime catalogue** | A dedicated AniList-powered catalogue: proper per-season entries, Japanese voice-actor cast, and three anime-specific streaming sources (AniNeko, KickAssAnime, AnimeX). |
+| 🍥 **Real anime catalogue** | A dedicated AniList-powered catalogue: proper per-season entries, Japanese voice-actor cast, and **nine** anime-specific streaming sources (AniNeko, KickAssAnime, AnimeX, Aniwaves, plus everythingmoe top-20 arrivals Anikoto #1, AniDB.app #6, AniZone #7, AnimeStream #9 and Bangladesh's own AniBD #16). Landscape page art is **Kitsu-first** (its per-entry cover banner wins whenever it exists). |
 | 📺 **Correct episodes** | Multi-season packs, split cours and hour-long specials are mapped to the right files — the messy part of BDIX anime, handled. |
 | 🔤 **Subtitles anywhere** | Optional Wyzie Subs integration adds subtitles even to raw BDIX `.mkv` files that carry none. |
 | ⭐ **Ratings** | Optional MDBList integration shows IMDb, Rotten Tomatoes, Metacritic and MAL scores together on the page. |

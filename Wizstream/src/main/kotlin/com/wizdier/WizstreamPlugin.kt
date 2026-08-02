@@ -72,6 +72,13 @@ class WizstreamPlugin : Plugin() {   // (v68) app-side Plugin ⇒ openSettings b
             WizSourcePrefs.src(WizstreamAnimeSources.AniNekoResolver, "ANIME-WEB SOURCES", "anineko.to"),
             WizSourcePrefs.src(WizstreamAnimeSources.KaaResolver, "ANIME-WEB SOURCES", "kaa.lt"),
             WizSourcePrefs.src(WizstreamAnimeSources.AnimexResolver, "ANIME-WEB SOURCES", "animex.one"),
+            WizSourcePrefs.src(WizstreamAnimeSources.AniwavesResolver, "ANIME-WEB SOURCES", "aniwaves.ru"),
+            // (v92) everythingmoe.com anime top-20 sweep — five new arrivals.
+            WizSourcePrefs.src(WizstreamAnimeSources.AnikotoResolver, "ANIME-WEB SOURCES", "anikototv.to"),
+            WizSourcePrefs.src(WizstreamAnimeSources.AnizoneResolver, "ANIME-WEB SOURCES", "anizone.to"),
+            WizSourcePrefs.src(WizstreamAnimeSources.AnimeStreamResolver, "ANIME-WEB SOURCES", "anime.uniquestream.net"),
+            WizSourcePrefs.src(WizstreamAnimeSources.AnibdResolver, "ANIME-WEB SOURCES", "anibd.app"),
+            WizSourcePrefs.src(WizstreamAnimeSources.AnidbResolver, "ANIME-WEB SOURCES", "anidb.app"),
         )
         openSettings = {
                 ctx -> WizstreamSources.WizSourcePrefs.openDialog(ctx, toggleSources)

@@ -963,6 +963,14 @@ object WizstreamSources {
         // add kaa.lt + animex.one")
         "kaa" to "KickAssAnime",
         "animex" to "AnimeX",
+        // (v91, user: "add aniwaves.ru/home as a source")
+        "aniwaves" to "Aniwaves",
+        // (v92, user: everythingmoe.com anime top-20 sweep)
+        "anikoto" to "Anikoto",
+        "anizone" to "AniZone",
+        "animestream" to "AnimeStream",
+        "anibd" to "AniBD",
+        "anidb" to "AniDB.app",
         // (v78) integrations — not video sources; both need a user API key.
         "wyziesubs" to "Wyzie Subs",
         "mdblist" to "MDBList ratings",
@@ -984,6 +992,12 @@ object WizstreamSources {
         "anineko" to "Anime site · subs",
         "kaa" to "Anime site · subs · CatStream HLS",
         "animex" to "Anime site · exact AniList match · subs",
+        "aniwaves" to "Anime site · sub + dub · BYFMS 720p HLS",
+        "anikoto" to "Anime site · sub + hardsub · MegaPlay HLS",
+        "anizone" to "Anime site · multi-audio HLS · many subtitle tracks",
+        "animestream" to "Anime site · signed HLS · sub + dub",
+        "anibd" to "Bangladeshi anime site · subs",
+        "anidb" to "Anime site · sub + dub · self-hosted HLS",
     )
 
     object WizSourcePrefs {

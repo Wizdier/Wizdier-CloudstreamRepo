@@ -1,4 +1,4 @@
-version = 90
+version = 92
 
 cloudstream {
     description = "Wizstream — ONE install, BOTH catalogues (v85). " +
@@ -9,7 +9,8 @@ cloudstream {
         "to install and no second module in the repo. Links resolve through the shared WizstreamSources " +
         "engine: BDIX servers (Circle FTP, Cineplex BD, FTPBD, CTGMovies, " +
         "FM FTP, Mediaserver), web sources (Cineby, Bingr, Moonflix), the " +
-        "Vid[x] embed family and seven anime-web sources. Dead links are " +
+        "Vid[x] embed family and the AniNeko, KickAssAnime, AnimeX and " +
+        "Aniwaves anime sites. Dead links are " +
         "probed and pruned before playback. AniList/MAL/Kitsu/Simkl " +
         "tracking. Optional Wyzie Subs (subtitles for BDIX .mkv files) and " +
         "MDBList ratings — add your own free key in Open Settings."

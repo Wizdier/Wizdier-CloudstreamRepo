@@ -1139,6 +1139,37 @@ class WizstreamAnimeProvider : MainAPI() {
         return found
     }
 
+    // (v92, user request) Kitsu-FIRST landscape poster. Kitsu's per-anime
+    // `coverImage` is a wide banner (original ≈ up to 3360x800 on big shows)
+    // which the API returns even without auth. One GET per entry, cached by
+    // kitsuId; null (and cached-null) when the record has no cover so the
+    // TMDB/AniList ladder stays the fallback. Original is preferred over
+    // `large` — original is the untransformed upload, large is a 3360x800
+    // center-crop that can lop off side text on odd-aspect uploads.
+    private val kitsuCoverCache = HashMap<String, String?>()
+    private suspend fun fetchKitsuCoverArt(kitsuId: String): String? {
+        if (kitsuId.isBlank()) return null
+        if (kitsuCoverCache.containsKey(kitsuId)) return kitsuCoverCache[kitsuId]
+        val found = runCatching {
+            val text = app.get(
+                "https://kitsu.io/api/edge/anime/$kitsuId",
+                headers = mapOf(
+                    "User-Agent" to A_UA,
+                    "Accept" to "application/vnd.api+json",
+                ),
+                timeout = 8000,
+            ).text
+            val cover = JSONObject(text)
+                .optJSONObject("data")
+                ?.optJSONObject("attributes")
+                ?.optJSONObject("coverImage")
+            (cover?.aOptStr("original") ?: cover?.aOptStr("large"))
+                ?.takeIf { it.startsWith("http") }
+        }.getOrNull()
+        kitsuCoverCache[kitsuId] = found
+        return found
+    }
+
     // (v61) Viewer id for logged-in list fetching (MediaListCollection
     // rejects userName:null, so the token path needs userId).
     private suspend fun fetchViewerId(token: String): Int? = runCatching {
@@ -1553,6 +1584,29 @@ class WizstreamAnimeProvider : MainAPI() {
 
         val resolvedKitsuId = malId?.let { fetchKitsuIdByMal(it) }
             ?: kitsuId.takeIf { members.size <= 1 }
+
+        // (v92, user: "make kitsu the first priority for scraping the
+        // landscape poster if it fetches any poster") Kitsu's coverImage
+        // (per-ENTRY landscape banner, up to 3360x800) now wins the header
+        // art slot outright: whenever this entry's Kitsu record carries a
+        // cover, it replaces whatever the ladder above picked (TMDB entry
+        // art / show backdrop / AniList banner). Only when Kitsu has NO
+        // cover for the entry (no mapping, or mapping has coverImage:null)
+        // does the old ladder stand. Kitsu ids follow the same v61 rule as
+        // sync-binding: per-entry MAL-mapped id, or ani.zip's kitsu_id only
+        // for single-entry franchises — so season siblings keep their own
+        // per-entry art instead of all rendering the franchise's image.
+        resolvedKitsuId?.let { kid ->
+            val kitsuArt = runCatching { fetchKitsuCoverArt(kid) }.getOrNull()
+            if (kitsuArt != null) {
+                android.util.Log.i(
+                    "WizstreamAnime",
+                    "entry-art '$title' KITSU-FIRST kitsu=$kid " +
+                        "→ ${kitsuArt.substringAfterLast('/')}"
+                )
+                backdropUrl = kitsuArt
+            }
+        }
 
         val detail = AniDetail(
             title = title,
