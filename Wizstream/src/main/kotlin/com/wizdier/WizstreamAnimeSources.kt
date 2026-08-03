@@ -302,6 +302,15 @@ object WizstreamAnimeSources {
         val headers: Map<String, String> = emptyMap(),
         val forceHls: Boolean = false,
         val quality: Int = Qualities.Unknown.value,
+        // (v93) SPLIT-AUDIO masters (AniZone, AnimeStream): the master keeps
+        // its sound in separate #EXT-X-MEDIA audio renditions and every
+        // #EXT-X-STREAM-INF variant is VIDEO-ONLY. Expanding such a master
+        // with M3u8Helper hands ExoPlayer the variant playlists, and
+        // EXT-X-MEDIA pointers are ignored on non-master playlists →
+        // picture but NO SOUND (user report, v92). keepMaster = emit ONE
+        // link to the master itself and let the player join the audio
+        // renditions (exactly what the sites' own hls.js/vidstack do).
+        val keepMaster: Boolean = false,
     )
 
     private val probeClient: OkHttpClient by lazy {
@@ -392,6 +401,28 @@ object WizstreamAnimeSources {
         return try {
             when {
                 isHls && !isFile -> {
+                    // (v93) SOUND FIX: split-audio masters must reach the
+                    // player AS masters. The expansion below would emit the
+                    // video-only variant playlists (no audio group context)
+                    // → silent playback on every quality row. Headers are
+                    // deliberately NOT attached: v92 proved these CDNs play
+                    // with referer-only requests, so the emitted link keeps
+                    // exactly that known-good profile (headers were only
+                    // used to probe).
+                    if (c.keepMaster) {
+                        callback(
+                            newExtractorLink(
+                                source = c.sourceLabel,
+                                name = c.name,
+                                url = c.url,
+                                type = ExtractorLinkType.M3U8,
+                            ) {
+                                this.referer = c.referer
+                                this.quality = c.quality
+                            }
+                        )
+                        return true
+                    }
                     val variants = runCatching {
                         M3u8Helper.generateM3u8(
                             source = c.sourceLabel,
@@ -2015,14 +2046,16 @@ object WizstreamAnimeSources {
 
 
     // ════════════════════════════════════════════════════════════════════════
-    //  Resolver 6: AniZone  (https://anizone.to)   — v92
+    //  Resolver 6: AniZone  (https://anizone.to)   — v93
     //
     //  Rank #7 on everythingmoe.com. Laravel+Livewire, self-hosted multi-
-    //  audio HLS. Live-verified end to end:
+    //  audio HLS. Live-verified end to end (AGAIN live-verified v93):
     //    GET /anime                → meta[name=csrf-token] + pages.anime-index
     //                                Livewire wire:snapshot (search model)
     //    POST /livewire/update     (X-CSRF-TOKEN + session Cookie — BOTH are
-    //                                required; either one alone = 419)
+    //                                required; either one alone = 419 — and
+    //                                anizone ROTATES the token per update, so
+    //                                repeat searches need a fresh session)
     //         {components:[{calls:[],snapshot,updates:{search:q}}]}
     //                           → effects.html cards: getTitle(this.anmTitles,
     //                               '<en title>') … wire:key="a-<id8>"
@@ -2030,9 +2063,15 @@ object WizstreamAnimeSources {
     //    GET /anime/<id8>/<num>    → <media-player src="…/master.m3u8"> plus
     //                                <track …ass/srt> subtitles (EN forced,
     //                                EN, SDH + 8 more languages)
-    //  The m3u8 (suzaku.xin-cdn.xyz) is a master with ja+en audio groups and
-    //  360p→1080p video ladders; cookies/csrf ride ONE fresh session per
-    //  resolve (no jar kept between resolves).
+    //  Masters now live on seiryuu.vid-cdn.xyz (was suzaku.xin-cdn.xyz) —
+    //  8/8 sampled titles. EVERY master is SPLIT-AUDIO: 9-12 separate
+    //  #EXT-X-MEDIA audio playlists (ja DEFAULT + en/de/es/fr/hi/it/pt/ta/te
+    //  dubs), video variants 360p-1080p carry NO audio. v92 expanded the
+    //  master into per-variant links → video played SILENT on every quality
+    //  row (only old muxed encodes sounded). v93 emits the master as ONE
+    //  keepMaster link → audio renditions join in the player, all qualities
+    //  sound, and the dub picker inside the player still works. Cookies/csrf
+    //  ride ONE fresh session per resolve (no jar kept between resolves).
     // ════════════════════════════════════════════════════════════════════════
 
     internal object AnizoneResolver : AnimeSourceResolver {
@@ -2204,13 +2243,17 @@ object WizstreamAnimeSources {
                     ?: "Subtitle"
                 if (seenSubs.add("$lang|$src")) subtitleCallback(SubtitleFile(lang, src))
             }
-            val label = "$srcLabel · Suzaku · HLS"
+            // (v93) keepMaster: the master references 9-12 separate AUDIO
+            // renditions (ja DEFAULT + dub tracks); variants are video-only.
+            // Expanding it (v92) produced silent 1080p/720p/360p rows.
+            val label = "$srcLabel · Master · HLS"
             return emitMediaCandidates(
                 listOf(
                     MediaCandidate(
                         url = master,
                         sourceLabel = label, name = label,
                         referer = epUrl, headers = PAGE_HEADERS,
+                        keepMaster = true,
                     )
                 ),
                 subtitleCallback, callback,
@@ -2220,7 +2263,7 @@ object WizstreamAnimeSources {
 
 
     // ════════════════════════════════════════════════════════════════════════
-    //  Resolver 7: AnimeStream  (https://anime.uniquestream.net)   — v92
+    //  Resolver 7: AnimeStream  (https://anime.uniquestream.net)   — v93
     //
     //  Rank #9 on everythingmoe.com ("AnimeStream"). Nuxt front over a clean
     //  open JSON API; live-verified to a playing master.m3u8 (bare-fetch 200):
@@ -2228,14 +2271,21 @@ object WizstreamAnimeSources {
     //            → {series:[{content_id,title,image,seasons_count,…}]}
     //    GET /api/v1/series/{content_id}
     //            → {seasons:[{content_id,season_number,episode_count,mal_id}]}
-    //    GET /api/v1/season/{season_id}/episodes?page=&limit=&order_by=asc
+    //    GET /api/v1/season/{season_id}/episodes?page=&limit=20&order_by=asc
     //            → [{episode_number,content_id,title,audio_locales[…]}]
+    //              (v93: the API now 422s limit>20 — "limit lesser than or
+    //               equal to 20" — v92's limit=300 killed EVERY episode
+    //               lookup; paged at 20 restores it. Live-verified.)
     //    GET /api/v1/episode/{ep_id}/media/hls/ja-JP
     //            → {hls:{playlist: "https://get.mediacache.cc/…/master.m3u8?sign=…"},
     //               versions:{hls:[{locale:"en-US",playlist:…}, …]}}
     //  One media call yields BOTH the original-audio master and every dub
-  //  locale; we emit ja-JP as SUB and (when present) en-US as DUB. Signed
+    //  locale; we emit ja-JP as SUB and (when present) en-US as DUB. Signed
     //  playlists (get.mediacache.cc) play without cookies; Referer kept.
+    //  v93: masters are SPLIT-AUDIO too (AUDIO="audio" group + video-only
+    //  variants) → keepMaster emission, same as AniZone. Some episodes ship
+  //  DASH-only (hls:null) — a .mpd carries audio inside, so those get a
+    //  direct DASH fallback row.
     // ════════════════════════════════════════════════════════════════════════
 
     internal object AnimeStreamResolver : AnimeSourceResolver {
@@ -2316,12 +2366,17 @@ object WizstreamAnimeSources {
             }
 
             // 3. Episode rows (paged) → episode content_id.
+            // (v93) API REGRESSION FIX: anime.uniquestream.net now 422s any
+            // episodes request with limit>20 ("limit lesser than or equal
+            // to 20"). The v92 limit=300 therefore 422'd every episode
+            // lookup → AnimeStream served NOTHING. Now page through with
+            // the capped limit (10 pages × 20 covers 200-ep seasons).
             var epCid: String? = null
             var page = 1
-            while (page <= 5 && epCid == null) {
+            while (page <= 10 && epCid == null) {
                 val epsBody = runCatching {
                     app.get(
-                        "$API/season/${seasonToUse.cid}/episodes?page=$page&limit=300&order_by=asc",
+                        "$API/season/${seasonToUse.cid}/episodes?page=$page&limit=20&order_by=asc",
                         headers = JSON_HEADERS, timeout = 12_000,
                     ).text
                 }.getOrNull() ?: break
@@ -2333,7 +2388,7 @@ object WizstreamAnimeSources {
                     val cid = o.optStringOrNull("content_id") ?: continue
                     if (!num.isNaN() && num.toInt() == epToUse) { epCid = cid; break }
                 }
-                if (epCid == null && arr.length() < 300) break
+                if (epCid == null && arr.length() < 20) break
                 page++
             }
             if (epCid == null) return false
@@ -2354,6 +2409,7 @@ object WizstreamAnimeSources {
                 cands += MediaCandidate(
                     url = orig, sourceLabel = label, name = label,
                     referer = "$SITE/watch/$epCid", headers = JSON_HEADERS,
+                    keepMaster = true,   // v93: split-audio master, same fix as AniZone
                 )
             }
             // English dub rides versions.hls; other locales are skipped
@@ -2367,7 +2423,33 @@ object WizstreamAnimeSources {
                     cands += MediaCandidate(
                         url = pl, sourceLabel = label, name = label,
                         referer = "$SITE/watch/$epCid", headers = JSON_HEADERS,
+                        keepMaster = true,   // v93: split-audio master
                     )
+                }
+            }
+            // (v93) DASH FALLBACK: some episodes ship MPEG-DASH only (hls
+            // null, versions.hls empty). One .mpd carries every rendition
+            // incl. audio, so a direct DASH link plays with sound.
+            if (cands.isEmpty()) {
+                val dashOrig = mediaJson.optJSONObject("dash")?.optStringOrNull("playlist")
+                if (dashOrig != null) {
+                    val label = "$srcLabel · ja-JP · SUB · DASH"
+                    cands += MediaCandidate(
+                        url = dashOrig, sourceLabel = label, name = label,
+                        referer = "$SITE/watch/$epCid", headers = JSON_HEADERS,
+                    )
+                }
+                mediaJson.optJSONObject("versions")?.optJSONArray("dash")?.let { arr ->
+                    for (i in 0 until arr.length()) {
+                        val o = arr.optJSONObject(i) ?: continue
+                        if (o.optStringOrNull("locale") != "en-US") continue
+                        val pl = o.optStringOrNull("playlist") ?: continue
+                        val label = "$srcLabel · en-US · DUB · DASH"
+                        cands += MediaCandidate(
+                            url = pl, sourceLabel = label, name = label,
+                            referer = "$SITE/watch/$epCid", headers = JSON_HEADERS,
+                        )
+                    }
                 }
             }
             val ok = emitMediaCandidates(cands, subtitleCallback, callback)

@@ -1146,8 +1146,37 @@ class WizstreamAnimeProvider : MainAPI() {
     // TMDB/AniList ladder stays the fallback. Original is preferred over
     // `large` — original is the untransformed upload, large is a 3360x800
     // center-crop that can lop off side text on odd-aspect uploads.
+    // (v93) Kitsu GUARD — the "wrong landscape poster" fix. v92 trusted the
+    // mapped/fuzzed Kitsu id blindly; when the record behind that id is the
+    // WRONG show (recap movie, franchise sibling, stale DB mapping), the
+    // wrong show's banner won the header. Now the fetched record must
+    // TITLE-MATCH this AniList entry before its cover may win: trigram-Dice
+    // ≥ 0.72 on ANY title pair (calibrated live: correct pairs score 0.90-1.0;
+    // "Solo Leveling -ReAwakening-" vs Season 2 titles = 0.60 → rejected;
+    // "Attack on Titan" (S1) vs "…Season 3 Part 2" = 0.69 → rejected).
+    // Rejected ids are distrusted completely: the old TMDB/AniList ladder
+    // keeps the art slot AND the bad id is not handed to the app (no wrong
+    // Kitsu sync-bind either).
+    private val kitsuRejectedIds = mutableSetOf<String>()
+
+    private val TITLE_GUARD_SPLIT = Regex("[^a-z0-9\\u3040-\\u30ff\\u4e00-\\u9fff]+")
+    private fun titleTrigrams(t: String): Set<String> {
+        val n = t.lowercase().replace(TITLE_GUARD_SPLIT, " ").trim()
+        if (n.isBlank()) return emptySet()
+        val p = " $n "
+        return (0..p.length - 3).map { p.substring(it, it + 3) }.toSet()
+    }
+    private fun titleDiceLike(a: String, b: String): Double {
+        val A = titleTrigrams(a); val B = titleTrigrams(b)
+        if (A.isEmpty() || B.isEmpty()) return 0.0
+        return 2.0 * A.intersect(B).size / (A.size + B.size)
+    }
+
     private val kitsuCoverCache = HashMap<String, String?>()
-    private suspend fun fetchKitsuCoverArt(kitsuId: String): String? {
+    private suspend fun fetchKitsuCoverArt(
+        kitsuId: String,
+        expectedTitles: List<String> = emptyList(),
+    ): String? {
         if (kitsuId.isBlank()) return null
         if (kitsuCoverCache.containsKey(kitsuId)) return kitsuCoverCache[kitsuId]
         val found = runCatching {
@@ -1159,10 +1188,42 @@ class WizstreamAnimeProvider : MainAPI() {
                 ),
                 timeout = 8000,
             ).text
-            val cover = JSONObject(text)
+            val attrs = JSONObject(text)
                 .optJSONObject("data")
                 ?.optJSONObject("attributes")
-                ?.optJSONObject("coverImage")
+            // Only judge when BOTH sides actually offer titles; a title-less
+            // record keeps the legacy trust path (no regression).
+            val wanted = expectedTitles.filter { it.isNotBlank() }
+            if (attrs != null && wanted.isNotEmpty()) {
+                val offered = mutableListOf<String>()
+                attrs.aOptStr("canonicalTitle")?.let { offered += it }
+                attrs.optJSONObject("titles")?.let { t ->
+                    listOf("en", "en_us", "en_jp", "ja_jp").forEach { k ->
+                        t.aOptStr(k)?.let { offered += it }
+                    }
+                }
+                attrs.optJSONArray("abbreviatedTitles")?.let { arr ->
+                    for (i in 0 until arr.length()) {
+                        arr.optString(i).takeIf { it.isNotBlank() }?.let { offered += it }
+                    }
+                }
+                if (offered.isNotEmpty()) {
+                    val best = offered.flatMap { o ->
+                        wanted.map { w -> titleDiceLike(o, w) }
+                    }.maxOrNull() ?: 0.0
+                    if (best < 0.72) {
+                        kitsuRejectedIds += kitsuId
+                        android.util.Log.i(
+                            "WizstreamAnime",
+                            "KITSU-REJECT kitsu=$kitsuId (best=${"%.2f".format(best)}) " +
+                                "'${offered.first().take(48)}' vs '${wanted.first().take(48)}' " +
+                                "— wrong entry suspected, ladder art kept",
+                        )
+                        return@runCatching null
+                    }
+                }
+            }
+            val cover = attrs?.optJSONObject("coverImage")
             (cover?.aOptStr("original") ?: cover?.aOptStr("large"))
                 ?.takeIf { it.startsWith("http") }
         }.getOrNull()
@@ -1597,7 +1658,14 @@ class WizstreamAnimeProvider : MainAPI() {
         // for single-entry franchises — so season siblings keep their own
         // per-entry art instead of all rendering the franchise's image.
         resolvedKitsuId?.let { kid ->
-            val kitsuArt = runCatching { fetchKitsuCoverArt(kid) }.getOrNull()
+            // (v93) The art is only accepted when the Kitsu record's titles
+            // match this AniList entry — see the KITSU-REJECT guard above.
+            val kitsuArt = runCatching {
+                fetchKitsuCoverArt(
+                    kid,
+                    listOfNotNull(title, altTitle, titles?.aOptStr("native")),
+                )
+            }.getOrNull()
             if (kitsuArt != null) {
                 android.util.Log.i(
                     "WizstreamAnime",
@@ -1631,7 +1699,9 @@ class WizstreamAnimeProvider : MainAPI() {
             // app's own getTracker fallback aborts once all three ids
             // exist, so this also stops the app from re-fuzzing it.
             // Root-ani.zip remains only for clean single-entry shows.
-            kitsuId = resolvedKitsuId,
+            // (v93) Ids the title-guard REJECTED are dropped here too —
+            // binding a wrong id would corrupt the user's Kitsu list.
+            kitsuId = resolvedKitsuId?.takeUnless { kitsuRejectedIds.contains(it) },
             episodes = episodes,
             format = format,
             actors = actors,
