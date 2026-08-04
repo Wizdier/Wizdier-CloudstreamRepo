@@ -34,9 +34,12 @@ import java.util.concurrent.TimeUnit
  *   7. AnimeStream  — https://anime.uniquestream.net   (open JSON API → signed HLS)   [#9]
  *   8. AniBD        — https://anibd.app                (BD site, AniList-id JSON API) [#16]
  *   9. AniDB.app    — https://anidb.app                (JSON API → self-hosted HLS)   [#6]
+ *  10. AniHQ        — https://anihq.cc                 (wp-json → VOE-signed HLS)  [v94]
+ *  11. 2Dhive       — https://2dhive.com               (MAL-id → MegaPlay/BabaStream HLS) [v94]
  * (ranks = everythingmoe.com anime streaming section; remaining top-20
  *  entries were excluded — see CHANGELOG's v92 row for the reasons:
- *  Cloudflare walls, official/DRM services, or verified stream-less.)
+ *  Cloudflare walls, official/DRM services, or verified stream-less.
+ *  v94 arrivals are user-requested additions, not from that ranking.)
  *
  * All are invoked in parallel from `resolveAnime()`. Each returns
  * `true` on the first playable link it emits; the aggregator returns true
@@ -95,6 +98,11 @@ object WizstreamAnimeSources {
             AnimeStreamResolver,
             AnibdResolver,
             AnidbResolver,
+            // (v94, user: "add cinejoy.to, 2dhive.com, anihq.cc") — the two
+            // anime-keyed arrivals; cinejoy is TMDB-keyed and lives with the
+            // movie/TV web resolvers in WizstreamSources.
+            AnihqResolver,
+            DhiveResolver,
         ).filter { WizstreamSources.WizSourcePrefs.isEnabled(it.toggleId) }
 
         val gate = Semaphore(5)
@@ -2740,6 +2748,489 @@ object WizstreamAnimeSources {
             }
             val ok = emitMediaCandidates(cands, subtitleCallback, callback)
             if (ok) Log.d(TAG, "anidb.app: served ${best.slugId} ep=$epToUse")
+            return ok
+        }
+    }
+
+
+    // ════════════════════════════════════════════════════════════════════════
+    //  Resolver 10: AniHQ  (https://anihq.cc)   — v94
+    //
+    //  WordPress (kiranime_pro theme). Live-verified end-to-end 2026-08-03:
+    //    GET /wp-json/wp/v2/search?search={q}&subtype=episode&per_page=10
+    //      → [{id, title:"{Show} Episode 10 English Dubbed",
+    //          url:"https://anihq.cc/watch/{slug}/", subtype:"episode"}]
+    //    Searching "{title} episode {N}" returns the exact episode rows
+    //    directly (Dubbed + Subbed variants both kept when offered).
+    //    Watch-page player servers ride in
+    //        data-embed-id="{b64tag}:{b64content}"
+    //    tag decodes to e.g. "Stream-1dub"; content decodes to a bare URL
+    //    (https://v0e.pw/e/{id}) or an iframe snippet (first URL wins).
+    //    VOE chain: v0e.pw/e/{id} → JS mirror hop
+    //    (`window.location.href = '{rotatingHost}/e/{id}'` — hosts rotate:
+    //    jessicachoosemake…, matthewhotelscience…). The final page keeps the
+    //    payload at  <script type="application/json">["{~4kb blob}"]</script>
+    //    Blob decode — verified byte-exact against the page's own jwplayer
+    //    config on two episodes:
+    //        ROT13 → junk-strip (tokens "@$","^^","~@","#&","%?","*~","!!"
+    //        become "_" then every "_" is dropped) → b64 → every char −3
+    //        → reverse → b64 → JSON {source, title, captions[], fallback[]}
+    //    `source` is a SIGNED HLS master on *cloudwindow-route.com whose
+    //    variants are relative re-signed urls (~4h token, minted per resolve
+    //    so always fresh). Master/variants play with ZERO extra headers
+    //    (verified bare), so emitted links carry only the page referer.
+    //    `direct_access_url` (mp4) 403s under every header combo → skipped.
+    //    pixeldrain embeds map to /api/file/{id}/download (direct mp4).
+    //  Every candidate still passes the shared probePlayable gate → no dead
+    //  link (HTTP-2004 class) or HTML payload (3003 class) is ever listed.
+    // ════════════════════════════════════════════════════════════════════════
+
+    internal object AnihqResolver : AnimeSourceResolver {
+        private const val SITE = "https://anihq.cc"
+        private const val SEARCH = "https://anihq.cc/wp-json/wp/v2/search"
+        private const val LABEL = "AniHQ"
+        private val PAGE_HEADERS = mapOf("User-Agent" to UA, "Referer" to "$SITE/")
+        private val JSON_HEADERS = mapOf(
+            "User-Agent" to UA,
+            "Referer" to "$SITE/",
+            "Accept" to "application/json, text/plain, */*",
+        )
+
+        private val EMBED_ATTR_RE =
+            Regex("""data-embed-id\s*=\s*"([^"]+)"""", RegexOption.IGNORE_CASE)
+        private val URL_RE = Regex("""https?://[^\s"'<>\\]+""")
+        private val EP_NUM_RE = Regex("""\bEpisode\s+(\d{1,4})\b""", RegexOption.IGNORE_CASE)
+        private val APP_JSON_RE = Regex(
+            """<script[^>]*type\s*=\s*"application/json"[^>]*>(.*?)</script>""",
+            setOf(RegexOption.DOT_MATCHES_ALL, RegexOption.IGNORE_CASE),
+        )
+        private val JS_REDIRECT_RE = Regex(
+            """window\.location\.href\s*=\s*['"](https?://[^'"]+)['"]""",
+        )
+        private val PIXELDRAIN_RE = Regex(
+            """pixeldrain\.com/(?:api/file/|file/|u/)?([A-Za-z0-9]{6,24})""",
+            RegexOption.IGNORE_CASE,
+        )
+        private val VOE_PATH_RE = Regex("""^https?://[^/]+/e/[^/?#]+/?$""")
+        private val CF_MARKERS = listOf("Just a moment", "challenge-platform", "/cdn-cgi/")
+
+        private fun rot13(s: String): String = buildString(s.length) {
+            for (ch in s) {
+                append(
+                    when (ch) {
+                        in 'a'..'z' -> 'a' + ((ch - 'a' + 13) % 26)
+                        in 'A'..'Z' -> 'A' + ((ch - 'A' + 13) % 26)
+                        else -> ch
+                    },
+                )
+            }
+        }
+
+        private fun b64d(s: String): String? = runCatching {
+            String(java.util.Base64.getMimeDecoder().decode(s.trim()), Charsets.UTF_8)
+        }.getOrNull()
+
+        /** The VOE 6-step scramble (see the header comment). */
+        private fun decodeVoeBlob(blob: String): String? {
+            var s = rot13(blob)
+            for (junk in listOf("@$", "^^", "~@", "#&", "%?", "*~", "!!")) {
+                s = s.replace(junk, "_")
+            }
+            s = s.replace("_", "")
+            val step3 = b64d(s) ?: return null
+            val step4 = buildString(step3.length) {
+                for (ch in step3) append((ch.code - 3).toChar())
+            }
+            return b64d(step4.reversed())
+        }
+
+        private data class VoeOut(
+            val media: String,
+            val pageUrl: String,
+            val captions: List<Pair<String, String>>,   // (langLabel, url)
+        )
+
+        /** Find the application/json script blob on a VOE page and decode it. */
+        private fun extractVoeJson(html: String): JSONObject? {
+            for (m in APP_JSON_RE.findAll(html)) {
+                val inner = m.groupValues[1].trim()
+                val blob = runCatching { JSONArray(inner).optString(0) }.getOrNull()
+                if (blob.isNullOrBlank() || blob.length < 500) continue
+                val dec = decodeVoeBlob(blob) ?: continue
+                val j = runCatching { JSONObject(dec) }.getOrNull() ?: continue
+                if (!j.optStringOrNull("source").isNullOrBlank() ||
+                    j.optJSONArray("fallback") != null
+                ) return j
+            }
+            return null
+        }
+
+        private suspend fun resolveVoe(
+            app: Requests,
+            embedUrl: String,
+            referer: String,
+        ): VoeOut? {
+            var pageUrl = embedUrl
+            var html = runCatching {
+                app.get(
+                    pageUrl,
+                    headers = mapOf("User-Agent" to UA, "Referer" to referer),
+                    timeout = 14_000,
+                ).text
+            }.getOrNull() ?: return null
+            var j = extractVoeJson(html)
+            if (j == null) {
+                // JS mirror hop — the landing page bounces via window.location
+                val nxt = JS_REDIRECT_RE.find(html)?.groupValues?.getOrNull(1)
+                    ?.takeIf { it.startsWith("http") && it != pageUrl } ?: return null
+                pageUrl = nxt
+                html = runCatching {
+                    app.get(
+                        pageUrl,
+                        headers = mapOf("User-Agent" to UA, "Referer" to embedUrl),
+                        timeout = 14_000,
+                    ).text
+                }.getOrNull() ?: return null
+                j = extractVoeJson(html) ?: return null
+            }
+            var media = j.optStringOrNull("source")
+            if (media.isNullOrBlank() || !media.startsWith("http")) {
+                media = null
+                val fb = j.optJSONArray("fallback")
+                for (fi in 0 until (fb?.length() ?: 0)) {
+                    val e = fb?.opt(fi) ?: continue
+                    val u = when (e) {
+                        is String -> e
+                        is JSONObject ->
+                            e.optStringOrNull("url") ?: e.optStringOrNull("src")
+                        else -> null
+                    }
+                    if (!u.isNullOrBlank() && u.startsWith("http")) { media = u; break }
+                }
+            }
+            if (media.isNullOrBlank() || !media.startsWith("http")) return null
+            val caps = mutableListOf<Pair<String, String>>()
+            j.optJSONArray("captions")?.let { arr ->
+                for (ci in 0 until arr.length()) {
+                    val e = arr.opt(ci) ?: continue
+                    when (e) {
+                        is String ->
+                            if (e.startsWith("http")) caps += "Subtitle" to e
+                        is JSONObject -> {
+                            val u = e.optStringOrNull("url") ?: e.optStringOrNull("file")
+                            val lang = e.optStringOrNull("label") ?: e.optStringOrNull("lang")
+                                ?: e.optStringOrNull("language") ?: "Subtitle"
+                            if (!u.isNullOrBlank() && u.startsWith("http")) caps += lang to u
+                        }
+                    }
+                }
+            }
+            return VoeOut(media, pageUrl, caps)
+        }
+
+        override suspend fun resolve(
+            app: Requests,
+            title: String,
+            altTitle: String?,
+            anilistId: Int?,
+            malId: Int?,
+            isMovie: Boolean,
+            season: Int?,
+            episode: Int?,
+            labelPrefix: String,
+            subtitleCallback: (SubtitleFile) -> Unit,
+            callback: (ExtractorLink) -> Unit,
+        ): Boolean {
+            if (title.isBlank()) return false
+            val srcLabel = "$labelPrefix • $LABEL"
+            val epToUse = episode ?: 1
+
+            data class Row(val url: String, val rowTitle: String, val dubbed: Boolean)
+
+            fun cleaned(rowTitle: String): String = rowTitle
+                .replace(
+                    Regex("""\s*[-–:]?\s*Episode\s+\d+.*$""", RegexOption.IGNORE_CASE),
+                    "",
+                )
+                .replace(Regex("""\s*\((dub|sub)\)\s*$""", RegexOption.IGNORE_CASE), "")
+                .trim()
+
+            suspend fun doSearch(q: String): List<Row> {
+                val body = runCatching {
+                    app.get(
+                        "$SEARCH?search=${encodeUrl(q)}&subtype=episode&per_page=10",
+                        headers = JSON_HEADERS, timeout = 12_000,
+                    ).text
+                }.getOrNull() ?: return emptyList()
+                val arr = runCatching { JSONArray(body) }.getOrNull() ?: return emptyList()
+                val rows = mutableListOf<Row>()
+                for (i in 0 until arr.length()) {
+                    val o = arr.optJSONObject(i) ?: continue
+                    val u = o.optStringOrNull("url") ?: continue
+                    val t = o.optStringOrNull("title") ?: continue
+                    rows += Row(u, t, t.contains("dubbed", ignoreCase = true))
+                }
+                return rows
+            }
+
+            fun List<Row>.valid(): List<Row> {
+                val out = mutableListOf<Row>()
+                for (r in this) {
+                    val epn = EP_NUM_RE.find(r.rowTitle)
+                        ?.groupValues?.getOrNull(1)?.toIntOrNull()
+                    val c = cleaned(r.rowTitle)
+                    val titleOk = matchesEitherTitle(c, title, altTitle) ||
+                        bestTitleSim(c, title, altTitle) >= 0.6
+                    val epOk = if (isMovie) (epn == null || epn == epToUse) else epn == epToUse
+                    if (titleOk && epOk) out += r
+                }
+                // keep at most one dubbed + one subbed row
+                val dub = out.firstOrNull { it.dubbed }
+                val sub = out.firstOrNull { !it.dubbed }
+                return listOfNotNull(dub, sub).ifEmpty { out.take(1) }
+            }
+
+            var rows: List<Row> = emptyList()
+            val queries = buildList {
+                add("$title episode $epToUse")
+                altTitle?.takeIf { it.isNotBlank() && !it.equals(title, ignoreCase = true) }
+                    ?.let { add("$it episode $epToUse") }
+                add(title)
+            }
+            for (q in queries) {
+                rows = doSearch(q).valid()
+                if (rows.isNotEmpty()) break
+            }
+            if (rows.isEmpty()) return false
+
+            val cands = mutableListOf<MediaCandidate>()
+            for (row in rows) {
+                val watch = runCatching {
+                    app.get(row.url, headers = PAGE_HEADERS, timeout = 12_000).text
+                }.getOrNull() ?: continue
+                for (em in EMBED_ATTR_RE.findAll(watch).toList().take(4)) {
+                    val blob = em.groupValues[1]
+                    val tag = b64d(blob.substringBefore(':')).orEmpty()
+                    val content = b64d(blob.substringAfter(':', "")) ?: continue
+                    val url = URL_RE.find(content)?.value ?: continue
+                    if (!url.startsWith("http")) continue
+                    val tl = tag.lowercase()
+                    val kind = when {
+                        "dub" in tl -> "DUB"
+                        "sub" in tl -> "SUB"
+                        row.dubbed -> "DUB"
+                        else -> "SUB"
+                    }
+                    val srv = tag
+                        .replace(Regex("""(?i)(dub|sub)$"""), "")
+                        .ifBlank { "Stream" }
+                    val label = "$srcLabel · $srv · $kind"
+                    when {
+                        "pixeldrain.com" in url -> {
+                            val pid = PIXELDRAIN_RE.find(url)
+                                ?.groupValues?.getOrNull(1) ?: continue
+                            cands += MediaCandidate(
+                                url = "https://pixeldrain.com/api/file/$pid/download",
+                                sourceLabel = label, name = label,
+                                referer = url,
+                            )
+                        }
+                        "v0e.pw" in url || VOE_PATH_RE.matches(url) -> {
+                            val v = resolveVoe(app, url, row.url) ?: continue
+                            v.captions.forEach { (lang, u) ->
+                                subtitleCallback(SubtitleFile(lang, u))
+                            }
+                            cands += MediaCandidate(
+                                url = v.media, sourceLabel = label, name = label,
+                                referer = v.pageUrl,
+                                forceHls = v.media.contains(".m3u8", ignoreCase = true),
+                            )
+                        }
+                        else -> {
+                            // Unknown rotating host — conservative generic
+                            // scrape; every byte stays probationary until
+                            // probePlayable signs off, so nothing broken is
+                            // ever listed no matter what this page holds.
+                            val h = runCatching {
+                                app.get(
+                                    url,
+                                    headers = mapOf(
+                                        "User-Agent" to UA, "Referer" to row.url,
+                                    ),
+                                    timeout = 12_000,
+                                ).text
+                            }.getOrNull() ?: continue
+                            if (CF_MARKERS.any { it in h }) continue
+                            val media = findMediaUrlIn(h)
+                                ?: unpackPackedJs(h)?.let { findMediaUrlIn(it) }
+                                ?: continue
+                            if (!media.startsWith("http")) continue
+                            cands += MediaCandidate(
+                                url = media, sourceLabel = label, name = label,
+                                referer = url, headers = mapOf("Referer" to url),
+                                forceHls = media.contains(".m3u8", ignoreCase = true),
+                            )
+                        }
+                    }
+                }
+            }
+            val ok = emitMediaCandidates(cands, subtitleCallback, callback)
+            if (ok) Log.d(TAG, "anihq: served ep=$epToUse rows=${rows.size}")
+            return ok
+        }
+    }
+
+
+    // ════════════════════════════════════════════════════════════════════════
+    //  Resolver 11: 2Dhive  (https://2dhive.com)   — v94
+    //
+    //  Astro site keyed by **MyAnimeList id** (re-verified 2026-08-03 —
+    //  Frieren mal=52991 resolves; anilist ids answer the generic
+    //  "Watching Episode" page, which we treat as "not in catalogue"):
+    //    episode page: /episode?anime={malId}&ep_num={N}
+    //    servers (from their EpisodePlayer island):
+    //      Babastream → https://babastream.top/embed/{malId}/{N}/{sub|dub}
+    //        — default server, but Cloudflare-challenges datacenter fetches.
+    //        On a CF marker we simply DON'T emit that row (never a broken
+    //        link); if the page yields a media URL it is kept — and
+    //        probePlayable still has the final word before any row appears.
+    //      Megaplay  → https://megaplay.buzz/stream/mal/{malId}/{N}/{sub|dub}
+    //        — live-verified end-to-end: page carries data-id="{mid}" →
+    //        /stream/getSources?id={mid} →
+    //        {sources:{file:"https://megap.norami.top/…/master.m3u8"},
+    //         tracks:[≈9 subtitle .vtt]}
+    //        CDN gate PROVEN: the file 403s unless Referer is exactly the
+    //        bare host root https://megaplay.buzz/ (a full-page referer,
+    //        origin-only or no referer all 403), so every megaplay link
+    //        carries exactly that. Masters are muxed (no #EXT-X-MEDIA) →
+    //        the normal quality ladder applies. The subtitle .vtt CDN is
+    //        referer-gated too; tracks are offered regardless — a subtitle
+    //        that fails just stays hidden, it cannot trip the player.
+    //  The MAL id arrives already bound by the AniList metadata layer (same
+    //  trust model as AniZone/AniBD) — no title search on this path at all.
+    // ════════════════════════════════════════════════════════════════════════
+
+    internal object DhiveResolver : AnimeSourceResolver {
+        private const val SITE = "https://2dhive.com"
+        private const val MP = "https://megaplay.buzz"
+        private const val LABEL = "2Dhive"
+
+        private val PAGE_HEADERS = mapOf("User-Agent" to UA, "Referer" to "$SITE/")
+        private val TITLE_RE = Regex("""<title>([^<]*)</title>""", RegexOption.IGNORE_CASE)
+        private val IFRAME_RE = Regex(
+            """<iframe[^>]+src\s*=\s*["']([^"']+)["']""", RegexOption.IGNORE_CASE,
+        )
+        private val MP_ID_RE = Regex("""data-id\s*=\s*"(\d+)"""")
+        private val CF_MARKERS = listOf("Just a moment", "challenge-platform", "/cdn-cgi/")
+
+        override suspend fun resolve(
+            app: Requests,
+            title: String,
+            altTitle: String?,
+            anilistId: Int?,
+            malId: Int?,
+            isMovie: Boolean,
+            season: Int?,
+            episode: Int?,
+            labelPrefix: String,
+            subtitleCallback: (SubtitleFile) -> Unit,
+            callback: (ExtractorLink) -> Unit,
+        ): Boolean {
+            // 2dhive's whole addressing is the MAL id — without it there is
+            // no path in.
+            if (malId == null || malId <= 0) return false
+            val srcLabel = "$labelPrefix • $LABEL"
+            val epToUse = episode ?: 1
+
+            // 0. episode page — show-existence check + babastream embed urls
+            val epPage = "$SITE/episode?anime=$malId&ep_num=$epToUse"
+            val epHtml = runCatching {
+                app.get(epPage, headers = PAGE_HEADERS, timeout = 12_000).text
+            }.getOrNull() ?: return false
+            val pageTitle = TITLE_RE.find(epHtml)?.groupValues?.getOrNull(1).orEmpty()
+            if ("Watching Episode" in pageTitle) return false   // not in catalogue
+
+            val cands = mutableListOf<MediaCandidate>()
+            val seenSubs = mutableSetOf<String>()
+
+            // 1. MegaPlay (sub + dub)
+            for (kind in listOf("sub", "dub")) {
+                val mpPage = "$MP/stream/mal/$malId/$epToUse/$kind"
+                val mpHtml = runCatching {
+                    app.get(
+                        mpPage,
+                        headers = mapOf("User-Agent" to UA, "Referer" to "$SITE/"),
+                        timeout = 12_000,
+                    ).text
+                }.getOrNull() ?: continue
+                val mid = MP_ID_RE.find(mpHtml)?.groupValues?.getOrNull(1) ?: continue
+                val gj = runCatching {
+                    JSONObject(
+                        app.get(
+                            "$MP/stream/getSources?id=$mid",
+                            headers = mapOf(
+                                "User-Agent" to UA,
+                                "Referer" to mpPage,
+                                "X-Requested-With" to "XMLHttpRequest",
+                            ),
+                            timeout = 12_000,
+                        ).text,
+                    )
+                }.getOrNull() ?: continue
+                val file = gj.optJSONObject("sources")?.optStringOrNull("file")
+                    ?: gj.optJSONArray("sources")?.optJSONObject(0)
+                        ?.optStringOrNull("file")
+                if (file.isNullOrBlank() || !file.startsWith("http")) continue
+                gj.optJSONArray("tracks")?.let { arr ->
+                    for (i in 0 until arr.length()) {
+                        val t = arr.optJSONObject(i) ?: continue
+                        val u = t.optStringOrNull("file") ?: continue
+                        if (!u.startsWith("http")) continue
+                        val lang = t.optStringOrNull("label") ?: "Subtitle"
+                        if (seenSubs.add(u)) subtitleCallback(SubtitleFile(lang, u))
+                    }
+                }
+                val kl = kind.uppercase()
+                val lab = "$srcLabel · MegaPlay · $kl"
+                cands += MediaCandidate(
+                    url = file, sourceLabel = lab, name = lab,
+                    referer = "$MP/",
+                    headers = mapOf("Referer" to "$MP/", "Origin" to MP),
+                )
+            }
+
+            // 2. Babastream (sub + derived dub) — Cloudflare-guarded hop
+            val baba = linkedSetOf<String>()
+            IFRAME_RE.findAll(epHtml).forEach { m ->
+                val u = m.groupValues[1]
+                if ("babastream" !in u) return@forEach
+                baba += u
+                if (u.endsWith("/sub")) baba += u.removeSuffix("/sub") + "/dub"
+            }
+            for (embed in baba.take(2)) {
+                val eh = runCatching {
+                    app.get(
+                        embed,
+                        headers = mapOf("User-Agent" to UA, "Referer" to "$SITE/"),
+                        timeout = 12_000,
+                    ).text
+                }.getOrNull() ?: continue
+                if (CF_MARKERS.any { it in eh }) continue   // challenge won — no row
+                val media = findMediaUrlIn(eh)
+                    ?: unpackPackedJs(eh)?.let { findMediaUrlIn(it) }
+                    ?: continue
+                if (!media.startsWith("http")) continue
+                val kl = if (embed.endsWith("/dub")) "DUB" else "SUB"
+                val lab = "$srcLabel · BabaStream · $kl"
+                cands += MediaCandidate(
+                    url = media, sourceLabel = lab, name = lab,
+                    referer = embed, headers = mapOf("Referer" to embed),
+                    forceHls = media.contains(".m3u8", ignoreCase = true),
+                )
+            }
+
+            val ok = emitMediaCandidates(cands, subtitleCallback, callback)
+            if (ok) Log.d(TAG, "2dhive: served mal=$malId ep=$epToUse")
             return ok
         }
     }

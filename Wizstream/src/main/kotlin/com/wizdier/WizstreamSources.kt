@@ -18,7 +18,14 @@ import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import java.net.URLEncoder
+import java.security.MessageDigest
+import java.security.SecureRandom
 import java.util.Base64
+import javax.crypto.Cipher
+import javax.crypto.Mac
+import javax.crypto.spec.GCMParameterSpec
+import javax.crypto.spec.IvParameterSpec
+import javax.crypto.spec.SecretKeySpec
 
 /**
  * WizstreamSources — bundled multi-source resolver.
@@ -943,7 +950,9 @@ object WizstreamSources {
         FmFtpResolver, MediaserverResolver,
     )
     internal val TOGGLE_WEB_RESOLVERS: List<SourceResolver> = listOf(
-        CinebyResolver, BingrResolver, MoonflixResolver,
+        // (v94, user: "add cinejoy.to, 2dhive.com, anihq.cc") +CineJoy —
+        // the two anime-keyed newcomers are toggled from the anime engine.
+        CinebyResolver, BingrResolver, MoonflixResolver, CineJoyResolver,
     )
 
     private val TOGGLE_LABELS: Map<String, String> = mapOf(
@@ -971,6 +980,10 @@ object WizstreamSources {
         "animestream" to "AnimeStream",
         "anibd" to "AniBD",
         "anidb" to "AniDB.app",
+        // (v94, user: "add cinejoy.to, 2dhive.com, anihq.cc")
+        "cinejoy" to "CineJoy",
+        "anihq" to "AniHQ",
+        "dhive" to "2Dhive",
         // (v78) integrations — not video sources; both need a user API key.
         "wyziesubs" to "Wyzie Subs",
         "mdblist" to "MDBList ratings",
@@ -998,6 +1011,9 @@ object WizstreamSources {
         "animestream" to "Anime site · signed HLS · sub + dub",
         "anibd" to "Bangladeshi anime site · subs",
         "anidb" to "Anime site · sub + dub · self-hosted HLS",
+        "cinejoy" to "Web · 5 providers · subs · links verified before listing",
+        "anihq" to "Anime site · sub + dub · VOE HLS · links verified",
+        "dhive" to "Anime site · sub + dub · MegaPlay HLS · links verified",
     )
 
     object WizSourcePrefs {
@@ -6512,6 +6528,438 @@ override suspend fun resolve(
                 Log.d(TAG, "Mediaserver emit: ${t.message}")
                 false
             }
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    //  Resolver: CineJoy  (https://cinejoy.to)   — v94
+    //
+    //  SvelteKit SPA whose streams ride a bespoke wire protocol on
+    //  api.shegu.st ("lumen-wire-v2", proof-of-work gated). The complete
+    //  client was re-implemented from scratch and PROVEN live against the
+    //  api (movie + TV + all five providers, 2026-08-03):
+    //
+    //    rid = Wk(canonical): 16B salt t + AES-256-CTR(kk[32:64],
+    //      counter kk[64:80])( 0x02 | 12B iv m | AES-256-GCM(kk[0:32],
+    //      iv m, aad "lumen-wire-v2|c2s")(canonical) ), base64url — where
+    //      kk = HKDF-SHA256(ikm=IKM, salt=t, info="lumen-wire-v2|{ns}", 80).
+    //    GET /challenge?rid={rid}   → {v,b,s,e,n,r,p,d,k,g}
+    //    token: smallest Q≥0 whose scrypt("pow2|{b}|{s}|{Q}",
+    //      salt=SHA256("pow2-salt|{s}|{b}"), N=n,r=r,p=p) has ≥d leading
+    //      zero bits; header X-At: base64(json(challenge ⊕ {c:Q})).
+    //    GET /{rid} (X-At) → same wire sealed, decrypt info "…|s2c" →
+    //      {"stream":[{"type":"hls","playlist":…,"captions":[…]}]}
+    //    Providers Lisbon/Solara/Joy/Arrow/Sakura each keep their own
+    //    catalogue; a 404 at the watch call = provider lacks the title and
+    //    is skipped silently (never an empty row).
+    //    Canonical paths (both live-verified):
+    //        movie: "/{P}/movie/{tmdb}?tmdb={tmdb}"
+    //        tv:    "/{P}/series?episode={e}&season={s}&tmdb={tmdb}"
+    //      (params sorted alphabetically; "tv"/id-in-path variants all 404.)
+    //
+    //  PLAY-OUT GATES (the no-2004 / no-3003 guarantee), all live-probed:
+    //    • help.earthcleaner.cc (Lisbon): 418 without it — needs exactly
+    //      Referer: https://cinejoy.to/ (any UA, or none, passes). Master
+    //      is SPLIT-AUDIO (#EXT-X-MEDIA) → keepMaster (v93's AniZone fix).
+    //    • ibm.earthcleaner.cc (Solara): 403 without that same Referer.
+    //    • api.shegu.st/synthetic/… (Sakura): same Referer needed.
+    //    • api.shegu.st/subtitles/…: open (200 bare) — safe subtitle tracks.
+    //  Every emitted link carries Referer https://cinejoy.to/ and STILL
+    //  passes the device-side probePlayable check before it can be listed.
+    //  The scrypt below is a self-contained RFC-7914 implementation (byte-
+    //  checked against the RFC vectors) — no external crypto dependency.
+    // ════════════════════════════════════════════════════════════════════════
+
+    internal object CineJoyResolver : SourceResolver {
+        private const val SITE = "https://cinejoy.to"
+        private const val API = "https://api.shegu.st"
+        private const val LABEL = "CineJoy"
+        private const val INFO_PREFIX = "lumen-wire-v2|"
+
+        private val PROVIDERS = listOf("Lisbon", "Solara", "Joy", "Arrow", "Sakura")
+        private val REF_HEADERS = mapOf("Referer" to "$SITE/")
+
+        // IKM unwrapped from the site's own bundle (z6 ^ U6, byte-wise XOR).
+        private val IKM: ByteArray = run {
+            val z6 = intArrayOf(208,332*26+2103+-10712,-10078+3413*3,239,-7*1145+-6651*-1+1606*1,-1306*3+7304+2*-1693,14837+-1*14681,4751*1+-158+-4348,209,-1*8131+-383*21+-902*-18,215,57,1*6031+-6695+725,152,2493+1*-2473,3127+7*-790+2622,-739*2+-4576+8*760,5619+-2919*-2+17*-661,-1084*6+3677+2950,207,-5729+449*13,3094+-5*1277+-1165*-3,-1*-274+4211+-1*4413,757*1+131+-666,105,1*-7062+-1035+-6*-1361,255,225+1*-4204+4131,9086+16*-563,1579*1+-9221*-1+10765*-1,1765*-2+4426+-712*1,991*9+-4252+-4431)
+            val u6 = intArrayOf(-1*-7911+7293+-15046,-3977*-1+-4010+114,4059*-1+-3274*1+7360,101,2070+577*-1+-1387,-3203+19*397+-4113,1*-8339+-2186+-10537*-1,-5607+962*6,-1*615+-1287*-2+-1865,-8639+910*-8+16068,-8543+10*-563+14377,8116*-1+11*557+2213*1,29,4147+1306*-3,4*268+-1*1613+542,1541*3+1871*-3+1128,431*-22+-2*-1164+7267,48,106,119,1*9004+1*2917+11717*-1,1381*6+-8188+28,-11*-511+1*-7053+1519,-134+9449*-1+9664,9897*1+1*-4231+-5498,470+7034*-1+6728,1674*-2+1291+2082,244,1*-947+-572+1727,182,19,-9571+1*-7311+16885)
+            ByteArray(32) { i -> ((z6[i] xor u6[i]) and 0xff).toByte() }
+        }
+        private val RNG = SecureRandom()
+
+        private val SUB_LANG_NAMES = mapOf(
+            "en" to "English", "es" to "Spanish", "pt" to "Portuguese",
+            "fr" to "French", "de" to "German", "ar" to "Arabic",
+            "it" to "Italian", "ru" to "Russian", "hi" to "Hindi",
+            "id" to "Indonesian", "tr" to "Turkish", "vi" to "Vietnamese",
+            "th" to "Thai", "ms" to "Malay", "pl" to "Polish",
+            "nl" to "Dutch", "ja" to "Japanese", "ko" to "Korean",
+            "zh" to "Chinese", "ro" to "Romanian", "cs" to "Czech",
+            "hu" to "Hungarian", "el" to "Greek", "sv" to "Swedish",
+            "da" to "Danish", "fi" to "Finnish", "no" to "Norwegian",
+            "fa" to "Persian", "he" to "Hebrew", "uk" to "Ukrainian",
+            "bn" to "Bengali", "ur" to "Urdu",
+        )
+
+        // ── scrypt (RFC 7914) — vector-checked, zero dependencies ────────
+        private fun rotl(a: Int, b: Int): Int = (a shl b) or (a ushr (32 - b))
+
+        private fun qr(v: IntArray, a: Int, b: Int, c: Int, d: Int) {
+            v[b] = v[b] xor rotl(v[a] + v[d], 7)
+            v[c] = v[c] xor rotl(v[b] + v[a], 9)
+            v[d] = v[d] xor rotl(v[c] + v[b], 13)
+            v[a] = v[a] xor rotl(v[d] + v[c], 18)
+        }
+
+        private fun salsa208(block: ByteArray) {
+            val x = IntArray(16) { i ->
+                (block[i * 4].toInt() and 0xff) or
+                    ((block[i * 4 + 1].toInt() and 0xff) shl 8) or
+                    ((block[i * 4 + 2].toInt() and 0xff) shl 16) or
+                    ((block[i * 4 + 3].toInt() and 0xff) shl 24)
+            }
+            val z = x.copyOf()
+            repeat(4) {
+                qr(x, 0, 4, 8, 12); qr(x, 5, 9, 13, 1)
+                qr(x, 10, 14, 2, 6); qr(x, 15, 3, 7, 11)
+                qr(x, 0, 1, 2, 3); qr(x, 5, 6, 7, 4)
+                qr(x, 10, 11, 8, 9); qr(x, 15, 12, 13, 14)
+            }
+            for (i in 0 until 16) {
+                val w = x[i] + z[i]
+                block[i * 4] = w.toByte()
+                block[i * 4 + 1] = (w ushr 8).toByte()
+                block[i * 4 + 2] = (w ushr 16).toByte()
+                block[i * 4 + 3] = (w ushr 24).toByte()
+            }
+        }
+
+        private fun blockMix(x: ByteArray, r: Int): ByteArray {
+            val xw = x.copyOfRange(x.size - 64, x.size)
+            val y = ByteArray(x.size)
+            for (i in 0 until 2 * r) {
+                for (k in 0 until 64) xw[k] = (xw[k].toInt() xor x[i * 64 + k].toInt()).toByte()
+                salsa208(xw)
+                val off = if (i % 2 == 0) (i / 2) * 64 else (r + i / 2) * 64
+                System.arraycopy(xw, 0, y, off, 64)
+            }
+            return y
+        }
+
+        private fun pbkdf2(pass: ByteArray, salt: ByteArray, iter: Int, dkLen: Int): ByteArray {
+            // HMAC zero-pads short keys to its block size, so a 64-byte zero
+            // key is bit-identical to an empty one (kept for the RFC vector
+            // path; cinejoy passwords are never empty).
+            val key = if (pass.isEmpty()) ByteArray(64) else pass
+            val mac = Mac.getInstance("HmacSHA256")
+            mac.init(SecretKeySpec(key, "HmacSHA256"))
+            val blocks = (dkLen + 31) / 32
+            val outAll = ByteArray(blocks * 32)
+            var written = 0
+            for (i in 1..blocks) {
+                val msg = ByteArray(salt.size + 4)
+                System.arraycopy(salt, 0, msg, 0, salt.size)
+                msg[salt.size] = (i ushr 24).toByte()
+                msg[salt.size + 1] = (i ushr 16).toByte()
+                msg[salt.size + 2] = (i ushr 8).toByte()
+                msg[salt.size + 3] = i.toByte()
+                var u = mac.doFinal(msg)
+                val t = u.copyOf()
+                for (c in 2..iter) {
+                    u = mac.doFinal(u)
+                    for (k in t.indices) t[k] = (t[k].toInt() xor u[k].toInt()).toByte()
+                }
+                System.arraycopy(t, 0, outAll, written, 32)
+                written += 32
+            }
+            return outAll.copyOf(dkLen)
+        }
+
+        private fun scrypt(
+            pass: ByteArray, salt: ByteArray,
+            n: Int, r: Int, p: Int, dkLen: Int,
+        ): ByteArray {
+            val blockSize = 128 * r
+            val b = pbkdf2(pass, salt, 1, p * blockSize)
+            val v = ByteArray(n * blockSize)
+            var x = ByteArray(blockSize)
+            for (i in 0 until p) {
+                System.arraycopy(b, i * blockSize, x, 0, blockSize)
+                for (j in 0 until n) {
+                    System.arraycopy(x, 0, v, j * blockSize, blockSize)
+                    x = blockMix(x, r)
+                }
+                for (j in 0 until n) {
+                    // Integerify: LE u64 = first 8 bytes of the last 64B block
+                    var integ = 0L
+                    for (k in 0 until 8) {
+                        integ = integ or ((x[blockSize - 64 + k].toLong() and 0xff) shl (8 * k))
+                    }
+                    val vIdx = (integ and (n - 1).toLong()).toInt() * blockSize
+                    for (k in 0 until blockSize) {
+                        x[k] = (x[k].toInt() xor v[vIdx + k].toInt()).toByte()
+                    }
+                    x = blockMix(x, r)
+                }
+                System.arraycopy(x, 0, b, i * blockSize, blockSize)
+            }
+            return pbkdf2(pass, b, 1, dkLen)
+        }
+
+        // ── lumen-wire-v2 ────────────────────────────────────────────────
+        private fun hkdf(salt: ByteArray, info: ByteArray, len: Int): ByteArray {
+            val mac = Mac.getInstance("HmacSHA256")
+            mac.init(SecretKeySpec(if (salt.isEmpty()) ByteArray(32) else salt, "HmacSHA256"))
+            val prk = mac.doFinal(IKM)
+            mac.init(SecretKeySpec(prk, "HmacSHA256"))
+            val okm = ByteArray(len)
+            var t = ByteArray(0)
+            var pos = 0
+            var i = 1
+            while (pos < len) {
+                mac.reset()
+                mac.update(t)
+                mac.update(info)
+                mac.update(i.toByte())
+                t = mac.doFinal()
+                val take = minOf(t.size, len - pos)
+                System.arraycopy(t, 0, okm, pos, take)
+                pos += take
+                i++
+            }
+            return okm
+        }
+
+        private class WireKeys(val gcm: SecretKeySpec, val ctr: SecretKeySpec, val ctrIv: ByteArray)
+
+        private fun s7(t: ByteArray, ns: String): WireKeys {
+            val kk = hkdf(t, (INFO_PREFIX + ns).toByteArray(Charsets.UTF_8), 80)
+            return WireKeys(
+                SecretKeySpec(kk, 0, 32, "AES"),
+                SecretKeySpec(kk, 32, 32, "AES"),
+                kk.copyOfRange(64, 80),
+            )
+        }
+
+        private fun b64url(b: ByteArray): String =
+            Base64.getUrlEncoder().withoutPadding().encodeToString(b)
+
+        private fun ub64(s0: String): ByteArray {
+            var s = s0.replace('-', '+').replace('_', '/')
+            while (s.length % 4 != 0) s += "="
+            return Base64.getDecoder().decode(s)
+        }
+
+        private fun wk(payload: ByteArray, ns: String): String {
+            val t = ByteArray(16).also { RNG.nextBytes(it) }
+            val m = ByteArray(12).also { RNG.nextBytes(it) }
+            val k = s7(t, ns)
+            val aad = (INFO_PREFIX + ns).toByteArray(Charsets.UTF_8)
+            val aes = Cipher.getInstance("AES/GCM/NoPadding")
+            aes.init(Cipher.ENCRYPT_MODE, k.gcm, GCMParameterSpec(128, m))
+            aes.updateAAD(aad)
+            val ct = aes.doFinal(payload)
+            val u = ByteArray(1 + 12 + ct.size)
+            u[0] = 2
+            System.arraycopy(m, 0, u, 1, 12)
+            System.arraycopy(ct, 0, u, 13, ct.size)
+            val ctr = Cipher.getInstance("AES/CTR/NoPadding")
+            ctr.init(Cipher.ENCRYPT_MODE, k.ctr, IvParameterSpec(k.ctrIv))
+            val masked = ctr.doFinal(u)
+            val out = ByteArray(16 + masked.size)
+            System.arraycopy(t, 0, out, 0, 16)
+            System.arraycopy(masked, 0, out, 16, masked.size)
+            return b64url(out)
+        }
+
+        private fun ck(text: String, ns: String): ByteArray {
+            val t2 = ub64(text.trim())
+            val m2 = t2.copyOfRange(0, 16)
+            val k = s7(m2, ns)
+            val aad = (INFO_PREFIX + ns).toByteArray(Charsets.UTF_8)
+            val ctr = Cipher.getInstance("AES/CTR/NoPadding")
+            ctr.init(Cipher.DECRYPT_MODE, k.ctr, IvParameterSpec(k.ctrIv))
+            val b = ctr.doFinal(t2.copyOfRange(16, t2.size))
+            if (b.isEmpty() || b[0].toInt() != 2) {
+                throw IllegalStateException("malformed packet")
+            }
+            val iv = b.copyOfRange(1, 13)
+            val ct = b.copyOfRange(13, b.size)
+            val aes = Cipher.getInstance("AES/GCM/NoPadding")
+            aes.init(Cipher.DECRYPT_MODE, k.gcm, GCMParameterSpec(128, iv))
+            aes.updateAAD(aad)
+            return aes.doFinal(ct)
+        }
+
+        private fun leadingZeroBits(u: ByteArray): Int {
+            var n = 0
+            for (d in u) {
+                val v = d.toInt() and 0xff
+                if (v == 0) { n += 8; continue }
+                n += Integer.numberOfLeadingZeros(v) - 24
+                break
+            }
+            return n
+        }
+
+        private data class CjStream(
+            val playlist: String,
+            val captions: List<Pair<String, String>>,   // (langLabel, url)
+        )
+
+        /** One provider end-to-end; null when it doesn't carry the title. */
+        private suspend fun fetchProvider(
+            app: Requests,
+            provider: String,
+            canonical: String,
+        ): List<CjStream>? {
+            val rid = runCatching {
+                wk(canonical.toByteArray(Charsets.UTF_8), "c2s")
+            }.getOrNull() ?: return null
+            val chResp = runCatching {
+                app.get(
+                    "$API/challenge?rid=${encodeUrl(rid)}",
+                    headers = mapOf("User-Agent" to UA), timeout = 12_000,
+                )
+            }.getOrNull() ?: return null
+            if (chResp.code !in 200..299) return null
+            val ch = runCatching { JSONObject(chResp.text) }.getOrNull() ?: return null
+            val n = ch.optInt("n", 0)
+            val rr = ch.optInt("r", 0)
+            val pp = ch.optInt("p", 0)
+            val dd = ch.optInt("d", -1)
+            val bS = ch.optStringOrNullCp("b") ?: return null
+            val sS = ch.optStringOrNullCp("s") ?: return null
+            // old-TV safety rails: anything outside observed parameters → bail
+            if (n <= 1 || (n and (n - 1)) != 0 || n > (1 shl 17)) return null
+            if (rr <= 0 || rr > 16 || pp <= 0 || pp > 8 || dd < 0 || dd > 32) return null
+            val salt = MessageDigest.getInstance("SHA-256")
+                .digest("pow2-salt|$sS|$bS".toByteArray(Charsets.UTF_8))
+            var q = -1L
+            var i = 0L
+            while (i < 2_000_000L) {
+                val h = scrypt(
+                    "pow2|$bS|$sS|$i".toByteArray(Charsets.UTF_8),
+                    salt, n, rr, pp, 32,
+                )
+                if (leadingZeroBits(h) >= dd) { q = i; break }
+                i++
+            }
+            if (q < 0) return null
+            ch.put("c", q)
+            val token = Base64.getEncoder()
+                .encodeToString(ch.toString().toByteArray(Charsets.UTF_8))
+            val wResp = runCatching {
+                app.get(
+                    "$API/$rid",
+                    headers = mapOf("User-Agent" to UA, "X-At" to token),
+                    timeout = 15_000,
+                )
+            }.getOrNull() ?: return null
+            if (wResp.code !in 200..299) return null   // 404 = provider lacks it
+            val pt = runCatching {
+                String(ck(wResp.text.trim(), "s2c"), Charsets.UTF_8)
+            }.getOrNull() ?: return null
+            val j = runCatching { JSONObject(pt) }.getOrNull() ?: return null
+            val streams = j.optJSONArray("stream") ?: return null
+            val out = mutableListOf<CjStream>()
+            for (si in 0 until streams.length()) {
+                val st = streams.optJSONObject(si) ?: continue
+                val pl = st.optStringOrNullCp("playlist") ?: continue
+                if (!pl.startsWith("http")) continue
+                val caps = mutableListOf<Pair<String, String>>()
+                st.optJSONArray("captions")?.let { arr ->
+                    for (ci in 0 until arr.length()) {
+                        val co = arr.optJSONObject(ci) ?: continue
+                        val cu = co.optStringOrNullCp("url") ?: continue
+                        if (!cu.startsWith("http")) continue
+                        val code = co.optStringOrNullCp("language")
+                            ?: co.optStringOrNullCp("id") ?: ""
+                        val lang = SUB_LANG_NAMES[code.lowercase().substringBefore('-')]
+                            ?: code.uppercase().ifBlank { "Subtitle" }
+                        caps += lang to cu
+                    }
+                }
+                out += CjStream(pl, caps)
+            }
+            return out.takeIf { it.isNotEmpty() }
+        }
+
+        override suspend fun resolve(
+            app: Requests,
+            title: String,
+            year: Int?,
+            isMovie: Boolean,
+            season: Int?,
+            episode: Int?,
+            labelPrefix: String,
+            subtitleCallback: (SubtitleFile) -> Unit,
+            callback: (ExtractorLink) -> Unit,
+            tmdbId: Int?,
+            imdbId: String?,
+        ): Boolean {
+            // The whole API is keyed by TMDB id — without it there is no
+            // path in (same rule as Cineby).
+            if (tmdbId == null || tmdbId <= 0) return false
+            val srcLabel = "$labelPrefix • $LABEL"
+            val seasonNo = season ?: 1
+            val episodeNo = if (isMovie) 1 else (episode ?: 1)
+            val canonicals = PROVIDERS.map { p ->
+                p to (
+                    if (isMovie) "/$p/movie/$tmdbId?tmdb=$tmdbId"
+                    else "/$p/series?episode=$episodeNo&season=$seasonNo&tmdb=$tmdbId"
+                    )
+            }
+
+            // Parallel provider fan-out (3 at a time — each does its own
+            // proof-of-work, so parallelism hides most of the scrypt
+            // wall-clock too: one resolve ≈ one PoW, not five serial ones).
+            val cands = java.util.Collections.synchronizedList(
+                mutableListOf<WizstreamAnimeSources.MediaCandidate>(),
+            )
+            val capAcc = java.util.Collections.synchronizedList(
+                mutableListOf<Pair<String, String>>(),
+            )
+            val gate = Semaphore(3)
+            coroutineScope {
+                canonicals.map { (p, canonical) ->
+                    async(Dispatchers.IO) {
+                        gate.withPermit {
+                            runCatching {
+                                fetchProvider(app, p, canonical)
+                            }.onFailure {
+                                Log.d(TAG, "CineJoy: $p failed: ${it.message}")
+                            }.getOrNull()?.forEach { st ->
+                                capAcc.addAll(st.captions)
+                                val name = "$srcLabel · $p"
+                                cands += WizstreamAnimeSources.MediaCandidate(
+                                    url = st.playlist,
+                                    sourceLabel = name, name = name,
+                                    referer = "$SITE/",
+                                    headers = REF_HEADERS,
+                                    // split-audio masters (Lisbon/earthcleaner)
+                                    // — the v93 AniZone keep-master fix applies
+                                    keepMaster = true,
+                                )
+                            }
+                        }
+                    }
+                }.awaitAll()
+            }
+            if (cands.isEmpty()) {
+                Log.d(TAG, "CineJoy: no provider carried tmdb=$tmdbId")
+                return false
+            }
+            // api-hosted subtitle tracks (header-free — verified 200 bare),
+            // deduped; then the probe-gated emission: a dead or non-media
+            // playlist can never reach a row.
+            val seenSubs = mutableSetOf<String>()
+            capAcc.forEach { (lang, u) ->
+                if (seenSubs.add(u)) subtitleCallback(SubtitleFile(lang, u))
+            }
+            return WizstreamAnimeSources.emitMediaCandidates(
+                cands.toList(), subtitleCallback, callback,
+            )
         }
     }
 }

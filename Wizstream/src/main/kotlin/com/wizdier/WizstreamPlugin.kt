@@ -12,6 +12,7 @@ import com.wizdier.WizstreamSources.MediaserverResolver
 import com.wizdier.WizstreamSources.CinebyResolver
 import com.wizdier.WizstreamSources.BingrResolver
 import com.wizdier.WizstreamSources.MoonflixResolver
+import com.wizdier.WizstreamSources.CineJoyResolver
 
 /**
  * WizstreamPlugin — ONE extension hosting BOTH catalogues,
@@ -64,6 +65,8 @@ class WizstreamPlugin : Plugin() {   // (v68) app-side Plugin ⇒ openSettings b
             WizSourcePrefs.src(CinebyResolver, "WEB SOURCES", "www.cineby.at"),
             WizSourcePrefs.src(BingrResolver, "WEB SOURCES", "bingr.one"),
             WizSourcePrefs.src(MoonflixResolver, "WEB SOURCES", "Moonflix · web"),
+            // (v94) cinejoy.to — movies & series (TMDB-keyed, PoW-gated API)
+            WizSourcePrefs.src(CineJoyResolver, "WEB SOURCES", "cinejoy.to"),
             // (v70) anime streaming sources — the de-stacked anime pages
             // ("CircleFTP structure") resolve through these too. Mirrored
             // from the WizstreamAnime module; same shared pref keys, so a
@@ -79,6 +82,9 @@ class WizstreamPlugin : Plugin() {   // (v68) app-side Plugin ⇒ openSettings b
             WizSourcePrefs.src(WizstreamAnimeSources.AnimeStreamResolver, "ANIME-WEB SOURCES", "anime.uniquestream.net"),
             WizSourcePrefs.src(WizstreamAnimeSources.AnibdResolver, "ANIME-WEB SOURCES", "anibd.app"),
             WizSourcePrefs.src(WizstreamAnimeSources.AnidbResolver, "ANIME-WEB SOURCES", "anidb.app"),
+            // (v94, user request) anihq.cc + 2dhive.com
+            WizSourcePrefs.src(WizstreamAnimeSources.AnihqResolver, "ANIME-WEB SOURCES", "anihq.cc"),
+            WizSourcePrefs.src(WizstreamAnimeSources.DhiveResolver, "ANIME-WEB SOURCES", "2dhive.com"),
         )
         openSettings = {
                 ctx -> WizstreamSources.WizSourcePrefs.openDialog(ctx, toggleSources)
