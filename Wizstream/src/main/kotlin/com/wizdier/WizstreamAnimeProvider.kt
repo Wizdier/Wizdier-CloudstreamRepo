@@ -12,6 +12,7 @@ import com.lagradost.cloudstream3.syncproviders.SyncIdName
 import com.lagradost.cloudstream3.syncproviders.AccountManager
 import com.lagradost.cloudstream3.syncproviders.SyncRepo
 import com.lagradost.cloudstream3.utils.*
+import com.lagradost.nicehttp.Requests
 import kotlinx.coroutines.*
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
@@ -1173,6 +1174,86 @@ class WizstreamAnimeProvider : MainAPI() {
     }
 
     private val kitsuCoverCache = HashMap<String, String?>()
+    /** (v95) ids for the legacy-TV ani.zip fallback. */
+    private data class TmdbIds(val tmdb: Int, val imdb: String?)
+
+    /** Resolve tmdb/imdb ids straight out of TMDB's own catalogue. */
+    private suspend fun resolveTmdbIds(
+        app: Requests,
+        title: String?,
+        altTitle: String?,
+        year: Int?,
+        movie: Boolean,
+    ): TmdbIds? {
+        if (title.isNullOrBlank() && altTitle.isNullOrBlank()) return null
+        val kind = if (movie) "movie" else "tv"
+        val nameKey = if (movie) "title" else "name"
+        val origKey = if (movie) "original_title" else "original_name"
+        val dateKey = if (movie) "release_date" else "first_air_date"
+
+        suspend fun search(q: String?): Int? {
+            if (q.isNullOrBlank()) return null
+            val text = runCatching {
+                app.get(
+                    "https://api.themoviedb.org/3/search/$kind" +
+                        "?api_key=98ae14df2b8d8f8f8136499daf79f0e0" +
+                        "&include_adult=true" +
+                        "&query=${URLEncoder.encode(q, "UTF-8")}",
+                    headers = mapOf("User-Agent" to A_UA), timeout = 8000,
+                ).text
+            }.getOrNull() ?: return null
+            val results = runCatching {
+                JSONObject(text).optJSONArray("results")
+            }.getOrNull() ?: return null
+            var bestId = 0
+            var bestSim = 0.0
+            var bestYearHit = false
+            var bestScore = -1.0
+            for (i in 0 until minOf(results.length(), 8)) {
+                val o = results.optJSONObject(i) ?: continue
+                val cid = o.optInt("id", 0)
+                if (cid <= 0) continue
+                val n1 = o.aOptStr(nameKey)
+                val n2 = o.aOptStr(origKey)
+                val s1 = title?.let { t ->
+                    maxOf(
+                        n1?.let { WizstreamAnimeSources.titleSimilarity(it, t) } ?: 0.0,
+                        n2?.let { WizstreamAnimeSources.titleSimilarity(it, t) } ?: 0.0,
+                    )
+                } ?: 0.0
+                val s2 = altTitle?.let { t ->
+                    maxOf(
+                        n1?.let { WizstreamAnimeSources.titleSimilarity(it, t) } ?: 0.0,
+                        n2?.let { WizstreamAnimeSources.titleSimilarity(it, t) } ?: 0.0,
+                    )
+                } ?: 0.0
+                val sim = maxOf(s1, s2)
+                val cy = o.aOptStr(dateKey)?.take(4)?.toIntOrNull()
+                val yearHit = year == null || cy == null ||
+                    kotlin.math.abs(cy - year) <= 1
+                val score = sim + (if (yearHit) 0.1 else 0.0)
+                if (score > bestScore) {
+                    bestScore = score; bestId = cid; bestSim = sim; bestYearHit = yearHit
+                }
+            }
+            if (bestId <= 0) return null
+            // wrong-show guard: strong fuzzy match, or decent + year agrees
+            return if (bestSim >= 0.72 || (bestYearHit && bestSim >= 0.45)) bestId else null
+        }
+
+        val tmdb = search(title) ?: search(altTitle) ?: return null
+        val imdb = runCatching {
+            JSONObject(
+                app.get(
+                    "https://api.themoviedb.org/3/$kind/$tmdb/external_ids" +
+                        "?api_key=98ae14df2b8d8f8f8136499daf79f0e0",
+                    headers = mapOf("User-Agent" to A_UA), timeout = 8000,
+                ).text,
+            ).aOptStr("imdb_id")
+        }.getOrNull()
+        return TmdbIds(tmdb, imdb)
+    }
+
     private suspend fun fetchKitsuCoverArt(
         kitsuId: String,
         expectedTitles: List<String> = emptyList(),
@@ -1349,6 +1430,35 @@ class WizstreamAnimeProvider : MainAPI() {
             kitsuId = mappings.aOptStr("kitsu_id")
             aniEps = WizAniZip.parse(mapJson)
             true
+        }
+
+        // (v95, user report 08-03 — old Android TV, WebView v70: anime
+        // sources resolve but Cineby/Moonflix/Bingr/CineJoy show ZERO
+        // links) LEGACY-TV ID FALLBACK. Those four web APIs are all gated
+        // on a TMDB id, and on anime pages that id comes ONLY from
+        // api.ani.zip — a Cloudflare zone; with some network/old-stack
+        // combos (exactly this TV's) it 403s instead of answering, so the
+        //  page builds fine (AniList GraphQL is open) while every
+        // tmdb-gated web resolver skips silently. api.themoviedb.org is
+        // the one host even ~2018 Android builds still reach cleanly
+        // (Amazon edge, no CF — the same host the main catalogue lives
+        // on), so on an ani.zip miss we resolve the same two ids out of
+        // TMDB's own catalogue: search by title, accept only a fuzzy-
+        // title match backed (softly) by the year, then one external_ids
+        // call for imdb. Wrong-show binds are rejected by the 0.72 gate
+        // (validated live: Frieren/AoT/Solo-Leveling/Vinland/One Piece
+        // all accept the correct entry; pure-romaji misses degrade to the
+        // old null behaviour, never to a wrong id).
+        if (tmdbId == null) {
+            wizRetryOnce("tmdb ids $id") {
+                resolveTmdbIds(
+                    app, title, altTitle, year,
+                    movie = format == "MOVIE",
+                )?.let { ids ->
+                    tmdbId = ids.tmdb
+                    if (imdbId == null) imdbId = ids.imdb
+                } != null
+            }
         }
 
         // (v55, PURE ANILIST) AniList itself supplies all metadata — the

@@ -70,6 +70,16 @@ object WizstreamSources {
         // below, one filtered logcat answers "which source answered THIS
         // (season, episode) ask" in one glance (JJK S3 report, 07-31).
         Log.i(TAG, "resolveAll req '$title' s=$season e=$episode tmdb=$tmdbId entryEp=$entryEpisode")
+        if (tmdbId == null) {
+            // (v95) legacy-TV diagnosis: the four TMDB-gated web APIs
+            // (cineby/bingr/moonflix/cinejoy) SKIP SILENTLY without an id,
+            // so a null here must be loud — one filtered TV logcat then
+            // separates "no id" (id-map unreachable) from "api failed".
+            val skipped = TOGGLE_WEB_RESOLVERS
+                .filter { WizSourcePrefs.isEnabled(it.toggleId) }
+                .joinToString { it.toggleId }
+            Log.i(TAG, "resolveAll: tmdbId null — web APIs skip: $skipped")
+        }
 
         // (v61) BDIX vs web bookkeeping kept separate: rescue passes below
         // exist to fix BDIX catalog mismatch (cours splits, franchise
@@ -6816,10 +6826,18 @@ override suspend fun resolve(
             val rid = runCatching {
                 wk(canonical.toByteArray(Charsets.UTF_8), "c2s")
             }.getOrNull() ?: return null
+            // (v95) browser-parity headers on the api calls too — shegu is
+            // Cloudflare-fronted, and the closer the request looks to the
+            // site's own SPA the friendlier the edge is to old clients.
+            val apiHeaders = mapOf(
+                "User-Agent" to UA,
+                "Referer" to "$SITE/",
+                "Origin" to SITE,
+            )
             val chResp = runCatching {
                 app.get(
                     "$API/challenge?rid=${encodeUrl(rid)}",
-                    headers = mapOf("User-Agent" to UA), timeout = 12_000,
+                    headers = apiHeaders, timeout = 12_000,
                 )
             }.getOrNull() ?: return null
             if (chResp.code !in 200..299) return null
@@ -6852,7 +6870,7 @@ override suspend fun resolve(
             val wResp = runCatching {
                 app.get(
                     "$API/$rid",
-                    headers = mapOf("User-Agent" to UA, "X-At" to token),
+                    headers = apiHeaders + ("X-At" to token),
                     timeout = 15_000,
                 )
             }.getOrNull() ?: return null
