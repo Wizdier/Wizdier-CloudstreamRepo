@@ -963,6 +963,9 @@ object WizstreamSources {
         // (v94, user: "add cinejoy.to, 2dhive.com, anihq.cc") +CineJoy —
         // the two anime-keyed newcomers are toggled from the anime engine.
         CinebyResolver, BingrResolver, MoonflixResolver, CineJoyResolver,
+        // (v96, user: "add shuttletv.su") TMDB-keyed web source via
+        // cinesrc.st embed (2-stage PoW incl. WASM — loadExtractor-only).
+        ShuttletvResolver,
     )
 
     private val TOGGLE_LABELS: Map<String, String> = mapOf(
@@ -994,6 +997,9 @@ object WizstreamSources {
         "cinejoy" to "CineJoy",
         "anihq" to "AniHQ",
         "dhive" to "2Dhive",
+        // (v96, user: "add shuttletv.su, anikage.cc")
+        "shuttletv" to "ShuttleTV",
+        "anikage" to "Anikage",
         // (v78) integrations — not video sources; both need a user API key.
         "wyziesubs" to "Wyzie Subs",
         "mdblist" to "MDBList ratings",
@@ -1024,6 +1030,9 @@ object WizstreamSources {
         "cinejoy" to "Web · 5 providers · subs · links verified before listing",
         "anihq" to "Anime site · sub + dub · VOE HLS · links verified",
         "dhive" to "Anime site · sub + dub · MegaPlay HLS · links verified",
+        // (v96) ShuttleTV via cinesrc.st embed — heavy PoW incl. WASM
+        "shuttletv" to "Web · movies + TV via cinesrc.st embed · needs modern WebView",
+        "anikage" to "Anime site · AniList-keyed · 5 providers · sub + dub",
     )
 
     object WizSourcePrefs {
@@ -6978,6 +6987,121 @@ override suspend fun resolve(
             return WizstreamAnimeSources.emitMediaCandidates(
                 cands.toList(), subtitleCallback, callback,
             )
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    //  (v96, user: "add shuttletv.su") Resolver 11: ShuttleTV
+    //  TMDB-keyed web source via cinesrc.st embed.
+    // ════════════════════════════════════════════════════════════════════════
+    //
+    // Recon (live-verified 2026-08-05, sandbox):
+    //  • shuttletv.su is a Next.js App Router catalogue that uses TMDB
+    //    directly (their public TMDB key ea021b3b0775c8531592713ab727f254
+    //    is in the bundle).
+    //  • The /api/* endpoints on shuttletv.su (/api/folders, /api/watchlist,
+    //    /api/watch-progress, /api/settings, /api/recommendations,
+    //    /api/upcoming) are all USER-features gated by Better Auth (signup
+    //    is open) — NOT needed for streaming.
+    //  • The actual stream is served by cinesrc.st — a self-described
+    //    "Free video streaming API ... Built by the ShuttleTV team" — a
+    //    TMDB-id-keyed embed service analogous to vidsrc.to / 2embed.cc.
+    //  • Watch URLs:
+    //      Movie: https://cinesrc.st/embed/movie/{tmdbId}
+    //      TV:    https://cinesrc.st/embed/tv/{tmdbId}?s={season}&e={episode}
+    //  • The embed page is a Next.js SPA that fetches the m3u8 via a
+    //    2-stage PoW flow:
+    //      1. POST /api/c/bootstrap with x-cs-q header
+    //         (= base64url(JSON.stringify([type,id,season,episode])))
+    //         → {v:1, r:"v1...", p:"..."} (auth tokens)
+    //      2. GET /api/c/issue with x-cs-r + x-cs-q + x-cs-p headers
+    //         → {w, t, n, s} (hashcash-style PoW challenge)
+    //      3. GET /api/c/stage2/issue with x-cs-r + x-cs-q headers
+    //         → {pack:[hash, difficulty, base64, hash, base64]}
+    //         (WASM-based PoW via /pow-v3.wasm — too complex for Kotlin port)
+    //      4. Solve both PoWs client-side, construct token, fetch m3u8.
+    //    The m3u8 is played by Shaka Player (DASH) or HLS.js (HLS).
+    //
+    // HONEST CAVEAT (delivered to user, do NOT over-promise):
+    //   The cinesrc.st PoW (especially the WASM stage2) is too complex to
+    //   port to Kotlin server-side. This resolver emits the embed URL via
+    //   loadExtractor, which means Cloudstream's WebView loads the page
+    //   client-side, solves the PoW in JS, and the m3u8 is intercepted
+    //   from network traffic. This works on modern Android phone WebViews
+    //   but MAY fail on older Android TV WebViews (the v95 ani.zip/CF
+    //   challenge class of issue). If loadExtractor returns nothing, the
+    //   user should test in TV-browser:
+    //     https://cinesrc.st/embed/movie/550
+    //   If that page plays video, the resolver failure is Cloudstream
+    //   WebView not handling the PoW (need a WebView update). If the page
+    //   shows "Just a moment…" or a CF challenge, the user's IP/TV stack
+    //   is blocked at the CF edge (NOT code-fixable our side).
+    internal object ShuttletvResolver : SourceResolver {
+        private const val SITE = "https://shuttletv.su"
+        private const val EMBED_HOST = "https://cinesrc.st"
+        private const val LABEL = "ShuttleTV"
+        private val REF_HEADERS = mapOf(
+            "User-Agent" to UA,
+            "Referer" to "$SITE/",
+        )
+
+        override suspend fun resolve(
+            app: Requests,
+            title: String,
+            year: Int?,
+            isMovie: Boolean,
+            season: Int?,
+            episode: Int?,
+            labelPrefix: String,
+            subtitleCallback: (SubtitleFile) -> Unit,
+            callback: (ExtractorLink) -> Unit,
+            tmdbId: Int?,
+            imdbId: String?,
+        ): Boolean {
+            // TMDB-keyed — no id, no resolve (matches the Cineby/Bingr/Moonflix
+            // doctrine; the v95 fallback covers id-mapping failures).
+            if (tmdbId == null || tmdbId <= 0) {
+                Log.d(TAG, "ShuttleTV: skip — tmdbId null")
+                return false
+            }
+
+            // Construct the cinesrc.st embed URL.
+            val (kind, embedUrl) = if (season != null && episode != null && season > 0 && episode > 0) {
+                "tv" to "$EMBED_HOST/embed/tv/$tmdbId?s=$season&e=$episode&back=close"
+            } else {
+                "movie" to "$EMBED_HOST/embed/movie/$tmdbId?back=close"
+            }
+            Log.i(TAG, "ShuttleTV: resolve $kind tmdb=$tmdbId s=${season ?: '-'} e=${episode ?: '-'} → $embedUrl")
+
+            // Emit ONE link via loadExtractor. Cloudstream's WebView will:
+            //   1. Load the cinesrc.st embed page
+            //   2. Run the Next.js SPA + 2-stage PoW client-side
+            //   3. Intercept the m3u8 URL from network traffic
+            //   4. Emit it as an ExtractorLink via our callback
+            //
+            // If loadExtractor returns false (no video URL found within the
+            // timeout), the resolver silently skips — never emits a broken
+            // link (the v93 doctrine: no 2004/3003 errors).
+            var emitted = false
+            runCatching {
+                loadExtractor(embedUrl, SITE + "/", subtitleCallback) { link ->
+                    val tag = if (kind == "tv") "S${season}E${episode}" else "Movie"
+                    callback(
+                        link.relabel(
+                            "$labelPrefix $LABEL",
+                            "$labelPrefix $LABEL · $tag",
+                        )
+                    )
+                    emitted = true
+                }
+            }.onFailure { t ->
+                Log.w(TAG, "ShuttleTV: loadExtractor failed for $embedUrl — ${t.message}")
+            }
+            if (!emitted) {
+                Log.d(TAG, "ShuttleTV: no links extracted from $embedUrl " +
+                    "(cinesrc.st PoW may have failed in WebView, or CF challenge blocked the page)")
+            }
+            return emitted
         }
     }
 }

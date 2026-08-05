@@ -13,6 +13,7 @@ import com.wizdier.WizstreamSources.CinebyResolver
 import com.wizdier.WizstreamSources.BingrResolver
 import com.wizdier.WizstreamSources.MoonflixResolver
 import com.wizdier.WizstreamSources.CineJoyResolver
+import com.wizdier.WizstreamSources.ShuttletvResolver
 
 /**
  * WizstreamPlugin — ONE extension hosting BOTH catalogues,
@@ -67,6 +68,9 @@ class WizstreamPlugin : Plugin() {   // (v68) app-side Plugin ⇒ openSettings b
             WizSourcePrefs.src(MoonflixResolver, "WEB SOURCES", "Moonflix · web"),
             // (v94) cinejoy.to — movies & series (TMDB-keyed, PoW-gated API)
             WizSourcePrefs.src(CineJoyResolver, "WEB SOURCES", "cinejoy.to"),
+            // (v96) shuttletv.su — movies & series (TMDB-keyed via cinesrc.st
+            // embed; 2-stage PoW incl. WASM — loadExtractor-only)
+            WizSourcePrefs.src(ShuttletvResolver, "WEB SOURCES", "shuttletv.su"),
             // (v70) anime streaming sources — the de-stacked anime pages
             // ("CircleFTP structure") resolve through these too. Mirrored
             // from the WizstreamAnime module; same shared pref keys, so a
@@ -85,6 +89,8 @@ class WizstreamPlugin : Plugin() {   // (v68) app-side Plugin ⇒ openSettings b
             // (v94, user request) anihq.cc + 2dhive.com
             WizSourcePrefs.src(WizstreamAnimeSources.AnihqResolver, "ANIME-WEB SOURCES", "anihq.cc"),
             WizSourcePrefs.src(WizstreamAnimeSources.DhiveResolver, "ANIME-WEB SOURCES", "2dhive.com"),
+            // (v96, user request) anikage.cc — AniList-keyed, 5 providers
+            WizSourcePrefs.src(WizstreamAnimeSources.AnikageResolver, "ANIME-WEB SOURCES", "anikage.cc"),
         )
         openSettings = {
                 ctx -> WizstreamSources.WizSourcePrefs.openDialog(ctx, toggleSources)

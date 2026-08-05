@@ -103,6 +103,8 @@ object WizstreamAnimeSources {
             // movie/TV web resolvers in WizstreamSources.
             AnihqResolver,
             DhiveResolver,
+            // (v96, user: "add anikage.cc") AniList-keyed, 5 providers.
+            AnikageResolver,
         ).filter { WizstreamSources.WizSourcePrefs.isEnabled(it.toggleId) }
 
         val gate = Semaphore(5)
@@ -3232,6 +3234,207 @@ object WizstreamAnimeSources {
             val ok = emitMediaCandidates(cands, subtitleCallback, callback)
             if (ok) Log.d(TAG, "2dhive: served mal=$malId ep=$epToUse")
             return ok
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    //  (v96, user: "add anikage.cc") Resolver 12: Anikage
+    //  AniList-keyed anime-web source via open API (no auth, no PoW).
+    // ════════════════════════════════════════════════════════════════════════
+    //
+    // Recon (live-verified 2026-08-05, sandbox):
+    //  • anikage.cc is a SvelteKit SPA built for TV (TV detection script,
+    //    data-device='tv' attribute, TV-friendly focus styles). Cloudflare-
+    //    fronted. 100% AniList-id-keyed catalogue — fully open API, NO auth,
+    //    NO PoW. The SvelteKit config exposes PUBLIC_AUTH_URL=auth.anikage.cc,
+    //    PUBLIC_PROXY_URL=prox.anicore.tv, PUBLIC_TURNSTILE_SITE_KEY=
+    //    0x4AAAAAADSSJelc3kV7t2Y2 — the Turnstile only fires when a user
+    //    clicks "play" on E-Ken/E-Koto embeds in a browser; this resolver
+    //    never hits that path.
+    //
+    //  • API contract (all GET, UA + Referer only):
+    //    1. /api/media/anime/{anilistId} → {anime:{slug, anilistId, malId,
+    //       title{native,romaji,english,userPreferred}, synonyms, description}}
+    //       (anilistId-keyed DIRECT access — no search step needed)
+    //    2. /api/media/anime/{slug}/episodes/{N}/servers → {servers:[
+    //       {id, default, label, subTypes:["sub","dub"]}], embeds:[...]}
+    //       (5 servers: neko default, megg, dib, wave, koto)
+    //    3. /api/media/anime/{slug}/episodes/{N}/sources?provider={p}
+    //       &type={sub|dub} → {sources:[{url(XOR-encoded), quality, isM3U8,
+    //       embedUrl?, type?}], subtitles:[{file(XOR-encoded), label, kind,
+    //       default, embedUrl?}], embeds:[{url, type, server, status?}],
+    //       intro:{start,end}, outro:{start,end}, headers:{}, cached:bool}
+    //
+    //  • For each source/embed with embedUrl: emit via loadExtractor.
+    //    All embed hosts are ALREADY in the v92+ extractor stack:
+    //      - vivibebe.site        (KAA/AnimeX — JWPlayer, master.m3u8)
+    //      - megaplay.buzz        (2dhive/Anikoto — getSources endpoint)
+    //      - otakuhg.site         (AniNeko — Dean-Edwards unpacked)
+    //      - playmogo.com         (DoodStream)
+    //      - otakuvid.online      (Earnvids — loadExtractor fallback)
+    //      - playeng.animeapps.top (AniBD — CF-gated on datacenter IPs,
+    //                               works on user device)
+    //      - play.echovideo.ru    (Vidplay clone — Aniwaves-style)
+    //      - gn1r5n.org           (Byse family — FULLY cracked in v91)
+    //      - myvidplay.com        (DGHG — DoodStream behind CF)
+    //      - vidtube.site         (NEW host — loadExtractor fallback)
+    //
+    //  • The `url` field is XOR-encoded with key prefix "aproxy20" (length
+    //    unknown). Megg is the ONLY provider that ships encoded URLs without
+    //    an embedUrl (direct mp4). Skipped in favor of embedUrl fallback
+    //    from the other 4 providers.
+    //
+    //  • prox.anicore.tv POST /watch /embed endpoints need a specific
+    //    payload format (returns 400 "invalid payload" for our test shapes)
+    //    — NOT needed because the /sources endpoint returns plain embedUrl
+    //    on known hosts.
+    internal object AnikageResolver : AnimeSourceResolver {
+        private const val SITE = "https://anikage.cc"
+        private const val API = "https://anikage.cc/api/media/anime"
+        private const val LABEL = "Anikage"
+
+        /** Five streaming providers (live-verified 2026-08-05). neko default. */
+        private val PROVIDERS = listOf("neko", "koto", "wave", "dib", "megg")
+
+        /** Server labels (for nicer link names). */
+        private val PROVIDER_LABELS = mapOf(
+            "neko" to "Neko",
+            "megg" to "Megg",
+            "dib" to "Dib",
+            "wave" to "Wave",
+            "koto" to "Koto",
+        )
+
+        private val API_HEADERS = mapOf(
+            "User-Agent" to UA,
+            "Referer" to "$SITE/",
+            "Accept" to "application/json, text/plain, */*",
+        )
+
+        /** Map anilistId → slug via /api/media/anime/{anilistId}. */
+        private suspend fun fetchSlug(app: Requests, anilistId: Int): String? {
+            val url = "$API/$anilistId"
+            val res = runCatching {
+                app.get(url, headers = API_HEADERS, timeout = 12_000)
+            }.getOrNull() ?: return null
+            if (res.code !in 200..299) return null
+            val root = runCatching { JSONObject(res.text) }.getOrNull() ?: return null
+            return root.optJSONObject("anime")?.optStringOrNull("slug")?.takeIf { it.isNotBlank() }
+        }
+
+        /** Fetch sources for one provider+type combination. */
+        private suspend fun fetchSources(
+            app: Requests, slug: String, episode: Int,
+            provider: String, type: String,
+        ): JSONObject? {
+            val url = "$API/$slug/episodes/$episode/sources?provider=$provider&type=$type"
+            val res = runCatching {
+                app.get(url, headers = API_HEADERS, timeout = 12_000)
+            }.getOrNull() ?: return null
+            if (res.code !in 200..299) return null
+            return runCatching { JSONObject(res.text) }.getOrNull()
+        }
+
+        override suspend fun resolve(
+            app: Requests,
+            title: String,
+            altTitle: String?,
+            anilistId: Int?,
+            malId: Int?,
+            isMovie: Boolean,
+            season: Int?,
+            episode: Int?,
+            labelPrefix: String,
+            subtitleCallback: (SubtitleFile) -> Unit,
+            callback: (ExtractorLink) -> Unit,
+        ): Boolean = coroutineScope {
+            // AniList-keyed — no id, no resolve.
+            if (anilistId == null || anilistId <= 0) return@coroutineScope false
+            // Movies on AniList usually have episode==1; series need a real
+            // episode number. Bail on neither.
+            val ep = episode?.takeIf { it > 0 } ?: 1
+
+            // 1. anilistId → slug
+            val slug = fetchSlug(app, anilistId) ?: run {
+                Log.d(TAG, "anikage: anilist $anilistId not in catalogue")
+                return@coroutineScope false
+            }
+
+            // 2. Fan out across PROVIDERS × (sub, dub) in parallel.
+            //    Each provider returns sources[] (with embedUrl) and embeds[]
+            //    (alternative servers). Collect every embedUrl; loadExtractor
+            //    handles each. Providers that fail or return empty sources
+            //    are silently skipped.
+            val gate = Semaphore(5)
+            val jobs = PROVIDERS.flatMap { provider ->
+                listOf("sub", "dub").map { type ->
+                    async(Dispatchers.IO) {
+                        gate.withPermit {
+                            val src = fetchSources(app, slug, ep, provider, type) ?: return@withPermit emptyList<Triple<String, String, String>>()
+                            val out = mutableListOf<Triple<String, String, String>>()
+                            // Primary: sources[].embedUrl
+                            val sArr = src.optJSONArray("sources")
+                            for (i in 0 until (sArr?.length() ?: 0)) {
+                                val s = sArr?.optJSONObject(i) ?: continue
+                                val embedUrl = s.optStringOrNull("embedUrl") ?: continue
+                                if (!embedUrl.startsWith("http")) continue
+                                val quality = s.optStringOrNull("quality") ?: type
+                                val label = "$LABEL · ${PROVIDER_LABELS[provider] ?: provider} · $quality"
+                                out += Triple(embedUrl, label, provider)
+                            }
+                            // Fallback: embeds[].url (alternative servers)
+                            val eArr = src.optJSONArray("embeds")
+                            for (i in 0 until (eArr?.length() ?: 0)) {
+                                val e = eArr?.optJSONObject(i) ?: continue
+                                val status = e.optStringOrNull("status")
+                                if (status == "blocked") continue
+                                val url = e.optStringOrNull("url") ?: continue
+                                if (!url.startsWith("http")) continue
+                                val server = e.optStringOrNull("server") ?: "alt"
+                                val type2 = e.optStringOrNull("type") ?: type
+                                val label = "$LABEL · ${PROVIDER_LABELS[provider] ?: provider} · $server · $type2"
+                                out += Triple(url, label, provider)
+                            }
+                            // Subtitles: emit any plain .vtt/.srt from embedUrl
+                            val subArr = src.optJSONArray("subtitles")
+                            for (i in 0 until (subArr?.length() ?: 0)) {
+                                val s = subArr?.optJSONObject(i) ?: continue
+                                val subUrl = s.optStringOrNull("embedUrl") ?: continue
+                                if (subUrl.endsWith(".vtt", true) || subUrl.endsWith(".srt", true)) {
+                                    val lab = s.optStringOrNull("label") ?: "English"
+                                    runCatching { subtitleCallback(SubtitleFile(lab, subUrl)) }
+                                }
+                            }
+                            out
+                        }
+                    }
+                }
+            }
+
+            // 3. Dedupe by URL, then loadExtractor each.
+            val seen = HashSet<String>()
+            var emitted = false
+            for (job in jobs) {
+                val targets = job.await()
+                for ((url, label, _) in targets) {
+                    if (!seen.add(url)) continue
+                    runCatching {
+                        loadExtractor(url, "$SITE/", subtitleCallback) { link ->
+                            callback(link.relabel("$labelPrefix $LABEL", "$labelPrefix $label"))
+                            emitted = true
+                        }
+                    }.onFailure { t ->
+                        Log.d(TAG, "anikage: loadExtractor failed for $url — ${t.message}")
+                    }
+                }
+            }
+
+            if (emitted) {
+                Log.i(TAG, "anikage: served anilist=$anilistId ep=$ep")
+            } else {
+                Log.d(TAG, "anikage: no links for anilist=$anilistId ep=$ep")
+            }
+            emitted
         }
     }
 
