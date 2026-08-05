@@ -6760,45 +6760,55 @@ override suspend fun resolve(
             return Base64.getDecoder().decode(s)
         }
 
-        private fun wk(payload: ByteArray, ns: String): String {
-            val t = ByteArray(16).also { RNG.nextBytes(it) }
-            val m = ByteArray(12).also { RNG.nextBytes(it) }
-            val k = s7(t, ns)
-            val aad = (INFO_PREFIX + ns).toByteArray(Charsets.UTF_8)
-            val aes = Cipher.getInstance("AES/GCM/NoPadding")
-            aes.init(Cipher.ENCRYPT_MODE, k.gcm, GCMParameterSpec(128, m))
-            aes.updateAAD(aad)
-            val ct = aes.doFinal(payload)
-            val u = ByteArray(1 + 12 + ct.size)
-            u[0] = 2
-            System.arraycopy(m, 0, u, 1, 12)
-            System.arraycopy(ct, 0, u, 13, ct.size)
-            val ctr = Cipher.getInstance("AES/CTR/NoPadding")
-            ctr.init(Cipher.ENCRYPT_MODE, k.ctr, IvParameterSpec(k.ctrIv))
-            val masked = ctr.doFinal(u)
-            val out = ByteArray(16 + masked.size)
-            System.arraycopy(t, 0, out, 0, 16)
-            System.arraycopy(masked, 0, out, 16, masked.size)
-            return b64url(out)
+        private fun wk(payload: ByteArray, ns: String): String? {
+            return try {
+                val t = ByteArray(16).also { RNG.nextBytes(it) }
+                val m = ByteArray(12).also { RNG.nextBytes(it) }
+                val k = s7(t, ns)
+                val aad = (INFO_PREFIX + ns).toByteArray(Charsets.UTF_8)
+                val aes = Cipher.getInstance("AES/GCM/NoPadding")
+                aes.init(Cipher.ENCRYPT_MODE, k.gcm, GCMParameterSpec(128, m))
+                aes.updateAAD(aad)
+                val ct = aes.doFinal(payload)
+                val u = ByteArray(1 + 12 + ct.size)
+                u[0] = 2
+                System.arraycopy(m, 0, u, 1, 12)
+                System.arraycopy(ct, 0, u, 13, ct.size)
+                val ctr = Cipher.getInstance("AES/CTR/NoPadding")
+                ctr.init(Cipher.ENCRYPT_MODE, k.ctr, IvParameterSpec(k.ctrIv))
+                val masked = ctr.doFinal(u)
+                val out = ByteArray(16 + masked.size)
+                System.arraycopy(t, 0, out, 0, 16)
+                System.arraycopy(masked, 0, out, 16, masked.size)
+                b64url(out)
+            } catch (t: Throwable) {
+                Log.d(TAG, "CineJoy wk failed: ${t.message}")
+                null
+            }
         }
 
-        private fun ck(text: String, ns: String): ByteArray {
-            val t2 = ub64(text.trim())
-            val m2 = t2.copyOfRange(0, 16)
-            val k = s7(m2, ns)
-            val aad = (INFO_PREFIX + ns).toByteArray(Charsets.UTF_8)
-            val ctr = Cipher.getInstance("AES/CTR/NoPadding")
-            ctr.init(Cipher.DECRYPT_MODE, k.ctr, IvParameterSpec(k.ctrIv))
-            val b = ctr.doFinal(t2.copyOfRange(16, t2.size))
-            if (b.isEmpty() || b[0].toInt() != 2) {
-                throw IllegalStateException("malformed packet")
+        private fun ck(text: String, ns: String): ByteArray? {
+            return try {
+                val t2 = ub64(text.trim())
+                val m2 = t2.copyOfRange(0, 16)
+                val k = s7(m2, ns)
+                val aad = (INFO_PREFIX + ns).toByteArray(Charsets.UTF_8)
+                val ctr = Cipher.getInstance("AES/CTR/NoPadding")
+                ctr.init(Cipher.DECRYPT_MODE, k.ctr, IvParameterSpec(k.ctrIv))
+                val b = ctr.doFinal(t2.copyOfRange(16, t2.size))
+                if (b.isEmpty() || b[0].toInt() != 2) {
+                    return null
+                }
+                val iv = b.copyOfRange(1, 13)
+                val ct = b.copyOfRange(13, b.size)
+                val aes = Cipher.getInstance("AES/GCM/NoPadding")
+                aes.init(Cipher.DECRYPT_MODE, k.gcm, GCMParameterSpec(128, iv))
+                aes.updateAAD(aad)
+                aes.doFinal(ct)
+            } catch (t: Throwable) {
+                Log.d(TAG, "CineJoy ck failed: ${t.message}")
+                null
             }
-            val iv = b.copyOfRange(1, 13)
-            val ct = b.copyOfRange(13, b.size)
-            val aes = Cipher.getInstance("AES/GCM/NoPadding")
-            aes.init(Cipher.DECRYPT_MODE, k.gcm, GCMParameterSpec(128, iv))
-            aes.updateAAD(aad)
-            return aes.doFinal(ct)
         }
 
         private fun leadingZeroBits(u: ByteArray): Int {
@@ -6823,9 +6833,7 @@ override suspend fun resolve(
             provider: String,
             canonical: String,
         ): List<CjStream>? {
-            val rid = runCatching {
-                wk(canonical.toByteArray(Charsets.UTF_8), "c2s")
-            }.getOrNull() ?: return null
+            val rid = wk(canonical.toByteArray(Charsets.UTF_8), "c2s") ?: return null
             // (v95) browser-parity headers on the api calls too — shegu is
             // Cloudflare-fronted, and the closer the request looks to the
             // site's own SPA the friendlier the edge is to old clients.
@@ -6875,8 +6883,9 @@ override suspend fun resolve(
                 )
             }.getOrNull() ?: return null
             if (wResp.code !in 200..299) return null   // 404 = provider lacks it
+            val ptBytes = ck(wResp.text.trim(), "s2c") ?: return null
             val pt = runCatching {
-                String(ck(wResp.text.trim(), "s2c"), Charsets.UTF_8)
+                String(ptBytes, Charsets.UTF_8)
             }.getOrNull() ?: return null
             val j = runCatching { JSONObject(pt) }.getOrNull() ?: return null
             val streams = j.optJSONArray("stream") ?: return null
