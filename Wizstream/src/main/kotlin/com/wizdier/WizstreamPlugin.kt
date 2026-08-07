@@ -91,6 +91,8 @@ class WizstreamPlugin : Plugin() {   // (v68) app-side Plugin ⇒ openSettings b
             WizSourcePrefs.src(WizstreamAnimeSources.DhiveResolver, "ANIME-WEB SOURCES", "2dhive.com"),
             // (v96, user request) anikage.cc — AniList-keyed, 5 providers
             WizSourcePrefs.src(WizstreamAnimeSources.AnikageResolver, "ANIME-WEB SOURCES", "anikage.cc"),
+            // (v98, user request) toon-stream.site — cartoons/anime, Hindi+multi dubs
+            WizSourcePrefs.src(WizstreamAnimeSources.ToonStreamResolver, "ANIME-WEB SOURCES", "toon-stream.site"),
         )
         openSettings = {
                 ctx -> WizstreamSources.WizSourcePrefs.openDialog(ctx, toggleSources)

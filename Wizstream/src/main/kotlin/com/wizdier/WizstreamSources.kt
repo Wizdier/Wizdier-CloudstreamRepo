@@ -1000,6 +1000,8 @@ object WizstreamSources {
         // (v96, user: "add shuttletv.su, anikage.cc")
         "shuttletv" to "ShuttleTV",
         "anikage" to "Anikage",
+        // (v98, user: "add https://toon-stream.site/home")
+        "toonstream" to "ToonStream",
         // (v78) integrations — not video sources; both need a user API key.
         "wyziesubs" to "Wyzie Subs",
         "mdblist" to "MDBList ratings",
@@ -1033,6 +1035,8 @@ object WizstreamSources {
         // (v96) ShuttleTV via cinesrc.st embed — heavy PoW incl. WASM
         "shuttletv" to "Web · movies + TV via cinesrc.st embed · needs modern WebView",
         "anikage" to "Anime site · AniList-keyed · 5 providers · sub + dub",
+        // (v98) ToonStream — verified VidMoly lane + app-extractor fallback
+        "toonstream" to "Cartoon/anime site · Hindi & multi dubs · VidMoly lanes verified",
     )
 
     object WizSourcePrefs {
@@ -1096,13 +1100,24 @@ object WizstreamSources {
         fun openDialog(context: android.content.Context, sources: List<Src>) {
             val dm = context.resources.displayMetrics.density
             fun dp(v: Int) = (v * dm).toInt()
-            val accent = 0xFF9C6BFF.toInt()      // Cloudstream-ish violet
-            val accentDim = 0x339C6BFF.toInt()
-            val textPrimary = 0xFFF1F1F1.toInt()
-            val textMuted = 0xFF9AA0A6.toInt()
-            val cardBg = 0xFF17181C.toInt()
-            val chipOn = 0xFF1F6F43.toInt()
-            val chipOff = 0xFF5A2230.toInt()
+
+            // ── (v98, user: "astronomical dark, not violet, no emojis") ─────
+            //  Deep-space palette: near-black navy canvas, moonlit navy cards,
+            //  starlight text, and FOUR celestial accents used as section
+            //  tints (amber star, ice planet, nebula coral, aurora teal) —
+            //  zero violet, zero emoji; icons are drawn monogram chips.
+            val accent = 0xFF8ED1FF.toInt()       // ice-planet blue — primary accent
+            val accentDim = 0x338ED1FF.toInt()
+            val starAmber = 0xFFF2C97D.toInt()    // BDIX (home-base starlight)
+            val nebulaCoral = 0xFFF4A988.toInt()  // Anime-web (nebula warmth)
+            val auroraTeal = 0xFF5CE6C8.toInt()   // Web sources (aurora)
+            val cometPearl = 0xFFD9E2EC.toInt()   // Integrations (comet pearl)
+            val textPrimary = 0xFFF0F4FA.toInt()  // starlight
+            val textMuted = 0xFF98A3B8.toInt()    // blue-grey moon dust
+            val cardBg = 0xFF131724.toInt()       // deep-space navy card
+            val fieldBg = 0xFF0D1018.toInt()      // void-black input field
+            val chipOn = 0xFF1E5C46.toInt()
+            val chipOff = 0xFF592B34.toInt()
 
             /** Rounded card container — the extension ships no XML/drawables,
              *  so every shape is built with GradientDrawable at runtime. */
@@ -1132,17 +1147,56 @@ object WizstreamSources {
                     }
                 }
 
+            /** (v98) Monogram chip — the emoji replacement: a small rounded
+             *  square with a 1-2 letter glyph, tinted per section. Drawn
+             *  programmatically (the extension ships no drawables), so it
+             *  renders identically on phone, tablet and the old TV. */
+            fun chip(letters: String, tint: Int, sizeDp: Int = 26): android.view.View =
+                android.widget.TextView(context).apply {
+                    text = letters
+                    setTextColor(tint)
+                    textSize = if (letters.length > 1) 10.5f else 13f
+                    setTypeface(typeface, android.graphics.Typeface.BOLD)
+                    gravity = android.view.Gravity.CENTER
+                    background = android.graphics.drawable.GradientDrawable().apply {
+                        shape = android.graphics.drawable.GradientDrawable.RECTANGLE
+                        cornerRadius = dp(8).toFloat()
+                        setColor(tint and 0x00FFFFFF or 0x1F000000)   // 12% tint fill
+                        setStroke(dp(1), tint and 0x00FFFFFF or 0x59000000) // 35% rim
+                    }
+                    layoutParams = android.widget.LinearLayout.LayoutParams(
+                        dp(sizeDp), dp(sizeDp),
+                    ).apply { rightMargin = dp(9) }
+                }
+
             val root = android.widget.LinearLayout(context).apply {
                 orientation = android.widget.LinearLayout.VERTICAL
                 setPadding(dp(18), dp(14), dp(18), dp(6))
             }
 
             // ── Header ────────────────────────────────────────────────
-            root.addView(android.widget.TextView(context).apply {
-                text = "⚙  Wizstream Settings"
-                setTextColor(textPrimary)
-                textSize = 21f
-                setTypeface(typeface, android.graphics.Typeface.BOLD)
+            root.addView(android.widget.LinearLayout(context).apply {
+                orientation = android.widget.LinearLayout.HORIZONTAL
+                gravity = android.view.Gravity.CENTER_VERTICAL
+                addView(chip("W", accent, 34))
+                addView(android.widget.LinearLayout(context).apply {
+                    orientation = android.widget.LinearLayout.VERTICAL
+                    addView(android.widget.TextView(context).apply {
+                        text = "Wizstream"
+                        setTextColor(textPrimary)
+                        textSize = 21f
+                        setTypeface(typeface, android.graphics.Typeface.BOLD)
+                        letterSpacing = 0.02f
+                    })
+                    addView(android.widget.TextView(context).apply {
+                        text = "SETTINGS"
+                        setTextColor(accent)
+                        textSize = 10.5f
+                        letterSpacing = 0.30f
+                        setTypeface(typeface, android.graphics.Typeface.BOLD)
+                        setPadding(0, dp(1), 0, 0)
+                    })
+                })
             })
             val summary = android.widget.TextView(context).apply {
                 setTextColor(textMuted)
@@ -1166,7 +1220,7 @@ object WizstreamSources {
                 setSingleLine(true)
                 setPadding(dp(12), dp(8), dp(12), dp(8))
                 background = android.graphics.drawable.GradientDrawable().apply {
-                    setColor(cardBg)
+                    setColor(fieldBg)
                     cornerRadius = dp(10).toFloat()
                     setStroke(dp(1), accentDim)
                 }
@@ -1176,6 +1230,21 @@ object WizstreamSources {
                 ).apply { topMargin = dp(10) }
             }
             root.addView(search)
+
+            /** (v98) Switch tinted to the palette — stock green/purple clashed
+             *  with the deep-space sheet. Track dimmed when off, ice-blue on. */
+            fun styleSwitch(sw: android.widget.Switch, on: Boolean) {
+                runCatching {
+                    if (android.os.Build.VERSION.SDK_INT >= 23) {
+                        sw.thumbTintList = android.content.res.ColorStateList.valueOf(
+                            if (on) accent else 0xFF6B7488.toInt(),
+                        )
+                        sw.trackTintList = android.content.res.ColorStateList.valueOf(
+                            if (on) accentDim else 0xFF2A2F3D.toInt(),
+                        )
+                    }
+                }
+            }
 
             val switches = mutableListOf<android.widget.Switch>()
             val keyEditors = mutableListOf<Pair<String, android.widget.EditText>>()
@@ -1201,17 +1270,18 @@ object WizstreamSources {
                     orientation = android.widget.LinearLayout.HORIZONTAL
                     gravity = android.view.Gravity.CENTER_VERTICAL
                 }
-                // (v87) section icons — instant visual scanning instead of
-                // reading grey section text.
-                val sectionIcon = when {
-                    section.contains("BDIX") -> "📡 "
-                    section.contains("ANIME") -> "🎌 "
-                    section.contains("WEB") -> "🌐 "
-                    else -> "▸ "
+                // (v98) section monogram chips — instant visual scanning,
+                // zero emoji; each section owns one celestial tint.
+                val (secGlyph, secTint) = when {
+                    section.contains("BDIX") -> ("BD" to starAmber)
+                    section.contains("ANIME") -> ("AN" to nebulaCoral)
+                    section.contains("WEB") -> ("WB" to auroraTeal)
+                    else -> ("▸" to accent)
                 }
+                head.addView(chip(secGlyph, secTint))
                 head.addView(android.widget.TextView(context).apply {
-                    text = sectionIcon + section
-                    setTextColor(accent)
+                    text = section
+                    setTextColor(secTint)
                     textSize = 12f
                     letterSpacing = 0.10f
                     setTypeface(typeface, android.graphics.Typeface.BOLD)
@@ -1278,9 +1348,11 @@ object WizstreamSources {
                     labels.addView(host)
                     val sw = android.widget.Switch(context).apply {
                         isChecked = on
+                        styleSwitch(this, on)
                         setOnCheckedChangeListener { _, checked ->
                             setEnabled(src.id, checked)
                             name.setTextColor(if (checked) textPrimary else textMuted)
+                            styleSwitch(this, checked)
                             refreshSummary()
                         }
                     }
@@ -1294,10 +1366,13 @@ object WizstreamSources {
                 bulk.setOnClickListener {
                     val allOn = group.all { isEnabled(it.id) }
                     group.forEach { setEnabled(it.id, !allOn) }
-                    switches.forEachIndexed { _, _ -> }
-                    rowIndex.filter { it.first.section == section }.forEach { (s, r, _) ->
+                    rowIndex.filter { it.first.section == section }.forEach { (s, r, n) ->
                         val v = (r as android.widget.LinearLayout).getChildAt(1)
-                        if (v is android.widget.Switch) v.isChecked = isEnabled(s.id)
+                        if (v is android.widget.Switch) {
+                            v.isChecked = isEnabled(s.id)
+                            styleSwitch(v, v.isChecked)
+                            n.setTextColor(if (v.isChecked) textPrimary else textMuted)
+                        }
                     }
                     refreshSummary()
                 }
@@ -1306,12 +1381,17 @@ object WizstreamSources {
 
             // ── INTEGRATIONS card ─────────────────────────────────────
             val intCard = card()
-            intCard.addView(android.widget.TextView(context).apply {
-                text = "🔑 INTEGRATIONS"
-                setTextColor(accent)
-                textSize = 12f
-                letterSpacing = 0.10f
-                setTypeface(typeface, android.graphics.Typeface.BOLD)
+            intCard.addView(android.widget.LinearLayout(context).apply {
+                orientation = android.widget.LinearLayout.HORIZONTAL
+                gravity = android.view.Gravity.CENTER_VERTICAL
+                addView(chip("KEY", cometPearl))
+                addView(android.widget.TextView(context).apply {
+                    text = "INTEGRATIONS"
+                    setTextColor(cometPearl)
+                    textSize = 12f
+                    letterSpacing = 0.10f
+                    setTypeface(typeface, android.graphics.Typeface.BOLD)
+                })
             })
             intCard.addView(android.widget.TextView(context).apply {
                 text = "Your own API key, stored on this device only. Leave blank to keep off."
@@ -1353,9 +1433,11 @@ object WizstreamSources {
                 )
                 val sw = android.widget.Switch(context).apply {
                     isChecked = on
+                    styleSwitch(this, on)
                     setOnCheckedChangeListener { _, checked ->
                         setEnabled(toggleId, checked)
                         name.setTextColor(if (checked) textPrimary else textMuted)
+                        styleSwitch(this, checked)
                     }
                 }
                 head.addView(labels)
@@ -1373,9 +1455,9 @@ object WizstreamSources {
                     setSingleLine(true)
                     setPadding(dp(10), dp(7), dp(10), dp(7))
                     background = android.graphics.drawable.GradientDrawable().apply {
-                        setColor(0xFF101114.toInt())
+                        setColor(fieldBg)
                         cornerRadius = dp(9).toFloat()
-                        setStroke(dp(1), 0x33FFFFFF)
+                        setStroke(dp(1), accentDim)
                     }
                     layoutParams = android.widget.LinearLayout.LayoutParams(
                         android.widget.LinearLayout.LayoutParams.MATCH_PARENT,

@@ -1,4 +1,4 @@
-version = 96
+version = 97
 
 cloudstream {
     description = "Wizstream — ONE install, BOTH catalogues (v85). " +
@@ -11,7 +11,7 @@ cloudstream {
         "FM FTP, Mediaserver), web sources (Cineby, Bingr, Moonflix, " +
         "CineJoy, ShuttleTV), the Vid[x] embed family and the AniNeko, KickAssAnime, " +
         "AnimeX, Aniwaves, Anikoto, AniZone, AnimeStream, AniBD, AniDB.app, " +
-        "AniHQ, 2Dhive and Anikage anime sites. Dead links are " +
+        "AniHQ, 2Dhive, Anikage and ToonStream anime sites. Dead links are " +
         "probed and pruned before playback. AniList/MAL/Kitsu/Simkl " +
         "tracking. Optional Wyzie Subs (subtitles for BDIX .mkv files) and " +
         "MDBList ratings — add your own free key in Open Settings."
