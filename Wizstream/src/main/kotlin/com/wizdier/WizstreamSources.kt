@@ -966,7 +966,7 @@ object WizstreamSources {
         // (v96, user: "add shuttletv.su") TMDB-keyed web source via
         // cinesrc.st embed (2-stage PoW incl. WASM — loadExtractor-only).
         ShuttletvResolver,
-        // (v99, user: "add ww1.m4uhd.to + cinemaos.live, no 2004/3003") —
+        // (v98, user: "add ww1.m4uhd.to + cinemaos.live, no 2004/3003") —
         // M4UHD's 9stream lane is fully in-repo (AES-cracked, verified);
         // CinemaOS walks its live lineage ladder, emit-on-verify only.
         M4uHdResolver, CinemaOsResolver,
@@ -1006,7 +1006,7 @@ object WizstreamSources {
         "anikage" to "Anikage",
         // (v98, user: "add https://toon-stream.site/home")
         "toonstream" to "ToonStream",
-        // (v99, user: "add ww1.m4uhd.to + cinemaos.live")
+        // (v98, user: "add ww1.m4uhd.to + cinemaos.live")
         "m4uhd" to "M4UHD",
         "cinemaos" to "CinemaOS",
         // (v78) integrations — not video sources; both need a user API key.
@@ -1044,9 +1044,9 @@ object WizstreamSources {
         "anikage" to "Anime site · AniList-keyed · 5 providers · sub + dub",
         // (v98) ToonStream — verified VidMoly lane + app-extractor fallback
         "toonstream" to "Cartoon/anime site · Hindi & multi dubs · VidMoly lanes verified",
-        // (v99) M4UHD — in-repo 9stream 1080p HLS + EN subs, verified
+        // (v98) M4UHD — in-repo 9stream 1080p HLS + EN subs, verified
         "m4uhd" to "Web · movies & series · 9stream 1080p HLS + EN subs · links verified",
-        // (v99) CinemaOS — TMDB-keyed ladder; quiet while their backend is down
+        // (v98) CinemaOS — TMDB-keyed ladder; quiet while their backend is down
         "cinemaos" to "Web · TMDB-keyed CinemaOS lanes · links verified before listing",
     )
 
@@ -7199,7 +7199,7 @@ override suspend fun resolve(
     }
 
     // ════════════════════════════════════════════════════════════════════════
-    //  Resolver 12: M4UHD  (https://ww1.m4uhd.to)   — v99, user request
+    //  Resolver 12: M4UHD  (https://ww1.m4uhd.to)   — v98, user request
     //
     //  Full chain reverse-engineered from the LIVE site on 2026-08-07
     //  (every step verified from this sandbox, no browser):
@@ -7255,7 +7255,7 @@ override suspend fun resolve(
     internal object M4uHdResolver : SourceResolver {
         private const val SITE = "https://ww1.m4uhd.to"
         private const val LABEL = "M4UHD"
-        // (v99) if9/9stream protocol keys — see protocol notes above.
+        // (v98) if9/9stream protocol keys — see protocol notes above.
         private const val PW_IDUSER = "PZZ3J3LDbLT0GY7qSA5wW5vchqgpO36O"
         private const val PW_REQ = "vlVbUQhkOhoSfyteyzGeeDzU0BHoeTyZ"
         private const val SIG_SECRET = "KRWN3AdgmxEMcd2vLN1ju9qKe8Feco5h"
@@ -7362,13 +7362,26 @@ override suspend fun resolve(
 
         private data class NStreamResult(val m3u8: String, val subsFile: String?)
 
+        /** Warm-lane memory (v98 fix): a served 9stream playlist is reused for
+         *  ~100 min so re-taps during a signing-API outage don't re-run the
+         *  whole chain (and re-poke the cold endpoint that hangs the row scan). */
+        private val laneCache = HashMap<String, Pair<Long, NStreamResult>>()
+        private const val LANE_TTL = 100L * 60L * 1000L
+
         /** Walk one if9.ppzj-youtube.cfd player page down to its playable
-         *  9stream HLS playlist + optional EN SRT (the v99 cracked chain). */
+         *  9stream HLS playlist + optional EN SRT (the v98 cracked chain).
+         *  [fastFail] = the API already cold-hung this resolve: one short try. */
         private suspend fun resolve9Stream(
-            app: Requests, if9Url: String, watchPageUrl: String
+            app: Requests, if9Url: String, watchPageUrl: String, fastFail: Boolean = false,
         ): NStreamResult? {
             val fileId = if9Url.trimEnd('/').substringAfterLast('/')
             if (fileId.isBlank()) return null
+            laneCache[fileId]?.let { (t, cached) ->
+                if (System.currentTimeMillis() - t < LANE_TTL) {
+                    Log.d(TAG, "M4UHD: 9stream lane cache hit $fileId")
+                    return cached
+                }
+            }
             val page = runCatching {
                 app.get(if9Url, headers = mapOf("User-Agent" to UA, "Referer" to watchPageUrl),
                     cacheTime = 0, timeout = 20_000)
@@ -7409,30 +7422,61 @@ override suspend fun resolve(
             val dataField = ctHex + "|" + md5Hex(ctHex + SIG_SECRET)
 
             val origin9 = Regex("""^(https?://[^/?#]+)""").find(if9Url)?.groupValues?.get(1) ?: ""
-            val apiResp = runCatching {
-                app.post(
-                    "$domainApi/playiframe",
-                    headers = mapOf(
-                        "User-Agent" to UA,
-                        "Referer" to if9Url,
-                        "Origin" to origin9,
-                        "Content-Type" to "application/json",
-                    ),
-                    requestBody = JSONObject().put("data", dataField).toString()
-                        .toRequestBody("application/json".toMediaTypeOrNull()),
-                    cacheTime = 0,
-                    timeout = 25_000,
-                )
-            }.getOrNull() ?: return null
-            if (apiResp.code !in 200..299 || apiResp.text.isBlank()) return null
-            val jo = runCatching { JSONObject(apiResp.text) }.getOrNull() ?: return null
+            val playHeaders = mapOf(
+                "User-Agent" to UA,
+                "Referer" to if9Url,
+                "Origin" to origin9,
+                "Content-Type" to "application/json",
+            )
+            val playBody = JSONObject().put("data", dataField).toString()
+                .toRequestBody("application/json".toMediaTypeOrNull())
+            // v98 resilience fix (user report 2026-08-08): the 9stream signing
+            // origin periodically cold-hangs — Cloudflare returns 504 at ~60s,
+            // and the site's own player hangs identically (server-side issue,
+            // our keys are unchanged — reverified same day). A cold attempt
+            // wakes the origin, so a single follow-up after a short pause
+            // wins whenever the hiccup is short; anything longer is a real
+            // outage and the lane fails CLOSED (no rows, no 2004).
+            val maxTries = if (fastFail) 1 else 2
+            var apiText: String? = null
+            var tryN = 0
+            while (apiText == null && tryN < maxTries) {
+                tryN++
+                val t0 = System.currentTimeMillis()
+                val resp = runCatching {
+                    app.post(
+                        "$domainApi/playiframe",
+                        headers = playHeaders,
+                        requestBody = playBody,
+                        cacheTime = 0,
+                        timeout = if (fastFail) 12_000 else if (tryN == 1) 25_000 else 40_000,
+                    )
+                }.getOrNull()
+                val ms = System.currentTimeMillis() - t0
+                if (resp == null) {
+                    Log.d(TAG, "M4UHD: playiframe try$tryN no-response after ${ms}ms")
+                } else if (resp.code !in 200..299 || resp.text.isBlank()) {
+                    Log.d(TAG, "M4UHD: playiframe try$tryN http ${resp.code} after ${ms}ms (origin cold-hang if 504)")
+                } else {
+                    Log.d(TAG, "M4UHD: playiframe try$tryN http 200 after ${ms}ms")
+                    apiText = resp.text
+                }
+                if (apiText == null && tryN < maxTries) {
+                    Log.d(TAG, "M4UHD: retrying playiframe once — origin cold-sign wake-up")
+                    delay(6_000)
+                }
+            }
+            val jo = runCatching { JSONObject(apiText ?: return null) }.getOrNull() ?: return null
             if (jo.optInt("status", 0) != 1) return null
             val encData = jo.optString("data", "")
             val encBytes = hexToBytes(encData) ?: return null
             val m3u8 = saltedDecrypt(encBytes, PW_RESP)?.trim()
                 ?.takeIf { it.startsWith("http") && (it.contains(".m3u8") || it.contains("/m3u8/")) }
                 ?: return null
-            return NStreamResult(m3u8, subsFile)
+            val res9 = NStreamResult(m3u8, subsFile)
+            laneCache[fileId] = System.currentTimeMillis() to res9
+            if (laneCache.size > 60) laneCache.clear()
+            return res9
         }
 
         /** Shared 9stream emission path — probe the playlist device-side,
@@ -7533,6 +7577,8 @@ override suspend fun resolve(
             }
 
             var any = false
+            var nineCold = false   // v98: once the 9stream API cold-hangs in
+            // this resolve, remaining candidates probe it once and briefly
             for ((pageUrl, siteTitle) in candidates) {
                 // year soft-gate when we know it
                 if (year != null) {
@@ -7613,11 +7659,14 @@ override suspend fun resolve(
                             // verified attempt is enough — skip further if9 dupes.
                             if (got9) continue
                             got9 = true
-                            val res = runCatching { resolve9Stream(app, iframe, pageUrl) }.getOrNull()
+                            val res = runCatching {
+                                resolve9Stream(app, iframe, pageUrl, nineCold)
+                            }.getOrNull()
                             if (res != null) {
                                 any = emit9Stream(app, res, labelPrefix, seTag, subtitleCallback, callback) || any
                                 if (any) Log.i(TAG, "M4UHD: 9stream lane served $siteTitle")
                             } else {
+                                nineCold = true
                                 Log.d(TAG, "M4UHD: 9stream chain failed for $iframe")
                             }
                         }
@@ -7636,7 +7685,7 @@ override suspend fun resolve(
     }
 
     // ════════════════════════════════════════════════════════════════════════
-    //  Resolver 13: CinemaOS  (https://cinemaos.live)  — v99, user request
+    //  Resolver 13: CinemaOS  (https://cinemaos.live)  — v98, user request
     //
     //  HONEST 2026-08-07 RECON SUMMARY (all live-verified):
     //   • The site is a Next.js 15 fork of the "Rive" project, TMDB-keyed:
@@ -7799,7 +7848,7 @@ override suspend fun resolve(
             }
             if (!any) {
                 Log.d(TAG, "CinemaOS: all lanes empty for tmdb=$tmdbId " +
-                    "(site player chunks 404 and provider API empty — see v99 notes)")
+                    "(site player chunks 404 and provider API empty — see v98 notes)")
             }
             return any
         }
