@@ -14,6 +14,8 @@ import com.wizdier.WizstreamSources.BingrResolver
 import com.wizdier.WizstreamSources.MoonflixResolver
 import com.wizdier.WizstreamSources.CineJoyResolver
 import com.wizdier.WizstreamSources.ShuttletvResolver
+import com.wizdier.WizstreamSources.M4uHdResolver
+import com.wizdier.WizstreamSources.CinemaOsResolver
 
 /**
  * WizstreamPlugin — ONE extension hosting BOTH catalogues,
@@ -71,6 +73,12 @@ class WizstreamPlugin : Plugin() {   // (v68) app-side Plugin ⇒ openSettings b
             // (v96) shuttletv.su — movies & series (TMDB-keyed via cinesrc.st
             // embed; 2-stage PoW incl. WASM — loadExtractor-only)
             WizSourcePrefs.src(ShuttletvResolver, "WEB SOURCES", "shuttletv.su"),
+            // (v99, user request) ww1.m4uhd.to — 9stream 1080p HLS in-repo
+            // (AES chain ported; links verified before listing) + EN subs
+            WizSourcePrefs.src(M4uHdResolver, "WEB SOURCES", "m4uhd.to"),
+            // (v99, user request) cinemaos.live — TMDB-keyed ladder
+            // (quiet until the CinemaOS backend serves again)
+            WizSourcePrefs.src(CinemaOsResolver, "WEB SOURCES", "cinemaos.live"),
             // (v70) anime streaming sources — the de-stacked anime pages
             // ("CircleFTP structure") resolve through these too. Mirrored
             // from the WizstreamAnime module; same shared pref keys, so a

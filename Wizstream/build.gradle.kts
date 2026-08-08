@@ -1,4 +1,4 @@
-version = 97
+version = 99
 
 cloudstream {
     description = "Wizstream — ONE install, BOTH catalogues (v85). " +
@@ -9,7 +9,7 @@ cloudstream {
         "to install and no second module in the repo. Links resolve through the shared WizstreamSources " +
         "engine: BDIX servers (Circle FTP, Cineplex BD, FTPBD, CTGMovies, " +
         "FM FTP, Mediaserver), web sources (Cineby, Bingr, Moonflix, " +
-        "CineJoy, ShuttleTV), the Vid[x] embed family and the AniNeko, KickAssAnime, " +
+        "CineJoy, ShuttleTV, M4UHD, CinemaOS), the Vid[x] embed family and the AniNeko, KickAssAnime, " +
         "AnimeX, Aniwaves, Anikoto, AniZone, AnimeStream, AniBD, AniDB.app, " +
         "AniHQ, 2Dhive, Anikage and ToonStream anime sites. Dead links are " +
         "probed and pruned before playback. AniList/MAL/Kitsu/Simkl " +

@@ -966,6 +966,10 @@ object WizstreamSources {
         // (v96, user: "add shuttletv.su") TMDB-keyed web source via
         // cinesrc.st embed (2-stage PoW incl. WASM — loadExtractor-only).
         ShuttletvResolver,
+        // (v98, user: "add ww1.m4uhd.to + cinemaos.live, no 2004/3003") —
+        // M4UHD's 9stream lane is fully in-repo (AES-cracked, verified);
+        // CinemaOS walks its live lineage ladder, emit-on-verify only.
+        M4uHdResolver, CinemaOsResolver,
     )
 
     private val TOGGLE_LABELS: Map<String, String> = mapOf(
@@ -1002,6 +1006,9 @@ object WizstreamSources {
         "anikage" to "Anikage",
         // (v98, user: "add https://toon-stream.site/home")
         "toonstream" to "ToonStream",
+        // (v98, user: "add ww1.m4uhd.to + cinemaos.live")
+        "m4uhd" to "M4UHD",
+        "cinemaos" to "CinemaOS",
         // (v78) integrations — not video sources; both need a user API key.
         "wyziesubs" to "Wyzie Subs",
         "mdblist" to "MDBList ratings",
@@ -1037,6 +1044,10 @@ object WizstreamSources {
         "anikage" to "Anime site · AniList-keyed · 5 providers · sub + dub",
         // (v98) ToonStream — verified VidMoly lane + app-extractor fallback
         "toonstream" to "Cartoon/anime site · Hindi & multi dubs · VidMoly lanes verified",
+        // (v98) M4UHD — in-repo 9stream 1080p HLS + EN subs, verified
+        "m4uhd" to "Web · movies & series · 9stream 1080p HLS + EN subs · links verified",
+        // (v98) CinemaOS — TMDB-keyed ladder; quiet while their backend is down
+        "cinemaos" to "Web · TMDB-keyed CinemaOS lanes · links verified before listing",
     )
 
     object WizSourcePrefs {
@@ -7184,6 +7195,688 @@ override suspend fun resolve(
                     "(cinesrc.st PoW may have failed in WebView, or CF challenge blocked the page)")
             }
             return emitted
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    //  Resolver 12: M4UHD  (https://ww1.m4uhd.to)   — v98, user request
+    //
+    //  Full chain reverse-engineered from the LIVE site on 2026-08-07
+    //  (every step verified from this sandbox, no browser):
+    //
+    //  MOVIES
+    //    1. GET  /search/{slug}.html                    (slug = site's own
+    //       simpler() JS port: lowercase, strip quotes, punct/space → '-')
+    //       → `.movie-item a[href^=watch-]` + `title="Name (Year) "` attrs.
+    //    2. GET  watch page (cookies) → inline `_token` (Laravel CSRF) +
+    //       `.play-movie` span tokens (3 = primary / VidSrc / Abyss backup).
+    //    3. POST /ajax  {m4u:<span token>, _token} (Cookie + Referer)
+    //       → tiny HTML with ONE iframe src:
+    //         • if9.ppzj-youtube.cfd/play/{fileId}  ← site-built 9stream HLS
+    //         • vidsrcme.ru/embed/movie/tt…          ← loadExtractor lane
+    //         • abyssplayer.com/?v=…                 ← loadExtractor lane
+    //
+    //  TV SERIES
+    //    2a. Series page embeds `const seasons = {"1":[{epi_name:"S01-E01",
+    //        idepisode:"fyc7i"},…]}` — full season/episode map inline.
+    //    2b. POST /ajaxtv {idepisode, _token} → the same `.play-movie`
+    //        token trio for that episode → step 3 identical.
+    //
+    //  THE 9STREAM (if9) LANE — fully cracked, in-repo, zero WebView:
+    //    The if9 page ships obfuscated JS (javascript-obfuscator) that was
+    //    executed headlessly here to extract its whole protocol:
+    //      consts: idfile_enc / idUser_enc (hex of OpenSSL-Salted AES-256-
+    //      CBC, EVP_BytesToKey-MD5 KDF), DOMAIN_API, data_subs (EN SRT).
+    //      idUser = AES-dec(idUser_enc, PW_IDUSER)   (24-hex site user id)
+    //      payload = {"idfile":<path id>,"iduser":…,"domain_play":
+    //                 "https://ww1.m4uhd.to","platform":"Win32",
+    //                 "hlsSupport":false}
+    //      body    = hex(AES-enc(json, PW_REQ)) + "|" +
+    //                md5(hex + SIG_SECRET)
+    //      POST {DOMAIN_API}/playiframe {"data": body}
+    //        → {"status":1,"type":"url-m3u8-encv1","data":<hex salted>}
+    //      m3u8    = AES-dec(resp.data, PW_RESP)
+    //        → https://9str-m3u8-play-….ppzj-youtube.cfd/m3u8/tp1-rdv1/1080/…
+    //    The playlist plays 200 with ZERO headers (plain UA only) — verified
+    //    — so it is safe on the old Android TV WebView too.
+    //
+    //    The five passphrases are baked into the site's static player
+    //    script; they were confirmed STABLE across different movie pages
+    //    on 2026-08-07. If the site ever re-obfuscates with new keys, the
+    //    chain fails CLOSED (no rows, no 2004) — never emits garbage.
+    //
+    //  NO-2004 DOCTRINE: the 9stream m3u8 is emitted only after a device-
+    //  side GET proves #EXTM3U (200/206); EN SRT only after a 200/206
+    //  probe. VidSrc/Abyss lanes go through loadExtractor (app-side
+    //  WebView) and are emitted only when the extractor actually finds a
+  //    video. If nothing verifies, the resolver returns false and the
+    //  player row simply stays absent.
+    // ════════════════════════════════════════════════════════════════════════
+    internal object M4uHdResolver : SourceResolver {
+        private const val SITE = "https://ww1.m4uhd.to"
+        private const val LABEL = "M4UHD"
+        // (v98) if9/9stream protocol keys — see protocol notes above.
+        // (v99) PW_IDFILE re-verified live 2026-08-08: still decrypts every
+        // ifXX page's idfile_enc to the true file id (both URL shapes).
+        private const val PW_IDFILE = "jcLycoRJT6OWjoWspgLMOZwS3aSS0lEn"
+        private const val PW_IDUSER = "PZZ3J3LDbLT0GY7qSA5wW5vchqgpO36O"
+        private const val PW_REQ = "vlVbUQhkOhoSfyteyzGeeDzU0BHoeTyZ"
+        private const val SIG_SECRET = "KRWN3AdgmxEMcd2vLN1ju9qKe8Feco5h"
+        private const val PW_RESP = "oJwmvmVBajMaRCTklxbfjavpQO7SZpsL"
+        private val HEADERS = mapOf("User-Agent" to UA, "Referer" to "$SITE/")
+
+        // ── OpenSSL-Salted AES-256-CBC (EVP_BytesToKey MD5 KDF) ────────────
+        private fun evpBytesToKey(pass: ByteArray, salt: ByteArray): Pair<ByteArray, ByteArray> {
+            var out = byteArrayOf()
+            var prev = byteArrayOf()
+            val md = MessageDigest.getInstance("MD5")
+            while (out.size < 32 + 16) {
+                md.reset(); md.update(prev); md.update(pass); md.update(salt)
+                prev = md.digest(); out += prev
+            }
+            return out.copyOfRange(0, 32) to out.copyOfRange(32, 48)
+        }
+
+        private fun saltedEncrypt(plain: String, pass: String): ByteArray {
+            val salt = ByteArray(8).also { SecureRandom().nextBytes(it) }
+            val (k, iv) = evpBytesToKey(pass.toByteArray(Charsets.UTF_8), salt)
+            val c = Cipher.getInstance("AES/CBC/PKCS5Padding")
+            c.init(Cipher.ENCRYPT_MODE, SecretKeySpec(k, "AES"), IvParameterSpec(iv))
+            return "Salted__".toByteArray(Charsets.UTF_8) + salt + c.doFinal(plain.toByteArray(Charsets.UTF_8))
+        }
+
+        private fun saltedDecrypt(saltedBytes: ByteArray, pass: String): String? {
+            if (saltedBytes.size < 33) return null
+            if (!String(saltedBytes.copyOfRange(0, 8), Charsets.UTF_8).equals("Salted__")) return null
+            val salt = saltedBytes.copyOfRange(8, 16)
+            val (k, iv) = evpBytesToKey(pass.toByteArray(Charsets.UTF_8), salt)
+            return runCatching {
+                val c = Cipher.getInstance("AES/CBC/PKCS5Padding")
+                c.init(Cipher.DECRYPT_MODE, SecretKeySpec(k, "AES"), IvParameterSpec(iv))
+                String(c.doFinal(saltedBytes.copyOfRange(16, saltedBytes.size)), Charsets.UTF_8)
+            }.getOrNull()
+        }
+
+        private fun hexToBytes(hex: String): ByteArray? {
+            val h = hex.trim()
+            if (h.length % 2 != 0) return null
+            return runCatching {
+                ByteArray(h.length / 2) { i -> h.substring(i * 2, i * 2 + 2).toInt(16).toByte() }
+            }.getOrNull()
+        }
+
+        private fun bytesToHex(b: ByteArray): String {
+            val sb = StringBuilder(b.size * 2)
+            for (x in b) sb.append(String.format("%02x", x.toInt() and 0xFF))
+            return sb.toString()
+        }
+
+        private fun md5Hex(s: String): String =
+            bytesToHex(MessageDigest.getInstance("MD5").digest(s.toByteArray(Charsets.UTF_8)))
+
+        // site's simpler() slug — see js-min-v1.js
+        private fun m4uSlug(title: String): String {
+            var s = title.lowercase().replace("'", "")
+            s = s.replace(Regex("[!@%^*()+=<>?/,.:; \"&#\\[\\]~\$_]+"), "-")
+            s = s.replace(Regex("-+"), "-").trim('-')
+            return s
+        }
+
+        private fun normTitle(s: String): String =
+            s.lowercase().replace(Regex("\\((19|20)\\d{2}\\)"), " ")
+                .replace(Regex("[^a-z0-9]+"), " ").trim()
+
+        private fun titleHits(ask: String, cand: String): Boolean {
+            val a = normTitle(ask); val c = normTitle(cand)
+            if (a.isBlank() || c.isBlank()) return false
+            if (a == c || a.startsWith(c) || c.startsWith(a) || a.contains(c) || c.contains(a)) return true
+            val at = a.split(" ").toSet(); val ct = c.split(" ").toSet()
+            val inter = at.intersect(ct).size.toDouble()
+            val minSize = minOf(at.size, ct.size).toDouble()
+            return minSize > 0 && inter / minSize >= 0.66
+        }
+
+        private suspend fun searchCandidates(
+            app: Requests, title: String, extra: String?
+        ): List<Pair<String, String>> {
+            val terms = listOfNotNull(title, extra).filter { it.isNotBlank() }.distinct()
+            for (term in terms) {
+                val slug = m4uSlug(term)
+                if (slug.isBlank()) continue
+                val resp = runCatching {
+                    app.get("$SITE/search/$slug.html", headers = HEADERS, cacheTime = 0, timeout = 15_000)
+                }.getOrNull() ?: continue
+                if (resp.code !in 200..299) continue
+                val doc = Jsoup.parse(resp.text)
+                val out = mutableListOf<Pair<String, String>>()   // (pageUrl, siteTitle)
+                doc.select(".movie-item a[href], a[href*='watch-']").forEach { a ->
+                    val href = a.attr("href").trim()
+                    if (!href.contains("watch-")) return@forEach
+                    val siteTitle = a.attr("title").ifBlank { a.selectFirst("h3")?.text() ?: a.text() }
+                    if (siteTitle.isBlank()) return@forEach
+                    if (!titleHits(term, siteTitle) && !titleHits(title, siteTitle)) return@forEach
+                    val page = if (href.startsWith("http")) href else "$SITE/${href.trimStart('/')}"
+                    if (out.none { it.first == page }) out += page to siteTitle
+                }
+                if (out.isNotEmpty()) return out.take(4)
+            }
+            return emptyList()
+        }
+
+        private data class NStreamResult(val m3u8: String, val subsFile: String?)
+
+        /** Warm-lane memory (v98 fix): a served 9stream playlist is reused for
+         *  ~100 min so re-taps during a signing-API outage don't re-run the
+         *  whole chain (and re-poke the cold endpoint that hangs the row scan). */
+        private val laneCache = HashMap<String, Pair<Long, NStreamResult>>()
+        private const val LANE_TTL = 100L * 60L * 1000L
+
+        /** Walk one if9.ppzj-youtube.cfd player page down to its playable
+         *  9stream HLS playlist + optional EN SRT (the v98 cracked chain).
+         *  [fastFail] = the API already cold-hung this resolve: one short try. */
+        private suspend fun resolve9Stream(
+            app: Requests, if9Url: String, watchPageUrl: String, fastFail: Boolean = false,
+        ): NStreamResult? {
+            val tailId = if9Url.trimEnd('/').substringAfterLast('/')
+            if (tailId.isBlank()) return null
+            laneCache[tailId]?.let { (t, cached) ->
+                if (System.currentTimeMillis() - t < LANE_TTL) {
+                    Log.d(TAG, "M4UHD: 9stream lane cache hit $tailId")
+                    return cached
+                }
+            }
+            val page = runCatching {
+                app.get(if9Url, headers = mapOf("User-Agent" to UA, "Referer" to watchPageUrl),
+                    cacheTime = 0, timeout = 20_000)
+            }.getOrNull() ?: return null
+            if (page.code !in 200..299) return null
+            val html = page.text
+
+            // (v99) idfile ground truth = the page's OWN idfile_enc, decrypted
+            // with the static PW_IDFILE key. v98 trusted the iframe URL tail —
+            // the site now serves some titles via a two-segment ifXX frame
+            // (/play/{idfile}/{per-load-token}.html) whose tail is NOT the file
+            // id; signing with it makes the origin hang to a CF 504 (fails the
+            // lane CLOSED — user report 2026-08-08: "M4UHD still not working").
+            // Live-verified: Beastmaster if6 page idfile_enc decrypts to the
+            // FIRST path segment and the API then answers 200 in ~0.6 s;
+            // single-segment if9 pages decrypt to the tail exactly (BB S1E1).
+            val fileId = Regex("""idfile_enc = "([0-9a-fA-F]+)""").find(html)?.groupValues?.get(1)
+                ?.let { hexToBytes(it) }?.let { saltedDecrypt(it, PW_IDFILE) }
+                ?.trim()?.takeIf { it.matches(Regex("^[0-9a-f]{16,64}$")) }
+                ?: tailId
+            if (fileId != tailId) {
+                Log.i(TAG, "M4UHD: idfile url-tail '$tailId' wrong — using page idfile '$fileId'")
+                laneCache[fileId]?.let { (t, cached) ->
+                    if (System.currentTimeMillis() - t < LANE_TTL) {
+                        Log.d(TAG, "M4UHD: 9stream lane cache hit $fileId")
+                        return cached
+                    }
+                }
+            }
+
+            val idUserEnc = Regex("""idUser_enc = "([0-9a-fA-F]+)""").find(html)?.groupValues?.get(1)
+                ?: return null
+            val domainApi = Regex("""DOMAIN_API = '([^']+)'""").find(html)?.groupValues?.get(1)
+                ?: return null
+            val subsFile = Regex("""data_subs = '(\[.*?\])'""", RegexOption.DOT_MATCHES_ALL)
+                .find(html)?.groupValues?.get(1)?.let { arrStr ->
+                    runCatching {
+                        val arr = JSONArray(arrStr)
+                        (0 until arr.length()).asSequence()
+                            .map { arr.optJSONObject(it) }
+                            .filterNotNull()
+                            .firstOrNull { it.optString("kind") == "captions" }
+                            ?.optString("file")?.takeIf { it.startsWith("http") }
+                    }.getOrNull()
+                }
+
+            val idUserBytes = hexToBytes(idUserEnc) ?: return null
+            val idUser = saltedDecrypt(idUserBytes, PW_IDUSER)
+                ?.trim()?.takeIf { it.matches(Regex("[0-9a-f]{16,32}")) } ?: return null
+
+            val domainPlay = Regex("""^(https?://[^/?#]+)""").find(watchPageUrl)?.groupValues?.get(1)
+                ?: SITE
+            val payload = JSONObject()
+                .put("idfile", fileId)
+                .put("iduser", idUser)
+                .put("domain_play", domainPlay)
+                .put("platform", "Win32")
+                .put("hlsSupport", false)
+                .toString()
+            val ctHex = bytesToHex(saltedEncrypt(payload, PW_REQ))
+            val dataField = ctHex + "|" + md5Hex(ctHex + SIG_SECRET)
+
+            val origin9 = Regex("""^(https?://[^/?#]+)""").find(if9Url)?.groupValues?.get(1) ?: ""
+            val playHeaders = mapOf(
+                "User-Agent" to UA,
+                "Referer" to if9Url,
+                "Origin" to origin9,
+                "Content-Type" to "application/json",
+            )
+            val playBody = JSONObject().put("data", dataField).toString()
+                .toRequestBody("application/json".toMediaTypeOrNull())
+            // v98 resilience fix (user report 2026-08-08): the 9stream signing
+            // origin periodically cold-hangs — Cloudflare returns 504 at ~60s,
+            // and the site's own player hangs identically (server-side issue,
+            // our keys are unchanged — reverified same day). A cold attempt
+            // wakes the origin, so a single follow-up after a short pause
+            // wins whenever the hiccup is short; anything longer is a real
+            // outage and the lane fails CLOSED (no rows, no 2004).
+            val maxTries = if (fastFail) 1 else 2
+            var apiText: String? = null
+            var tryN = 0
+            while (apiText == null && tryN < maxTries) {
+                tryN++
+                val t0 = System.currentTimeMillis()
+                val resp = runCatching {
+                    app.post(
+                        "$domainApi/playiframe",
+                        headers = playHeaders,
+                        requestBody = playBody,
+                        cacheTime = 0,
+                        timeout = if (fastFail) 12_000 else if (tryN == 1) 25_000 else 40_000,
+                    )
+                }.getOrNull()
+                val ms = System.currentTimeMillis() - t0
+                if (resp == null) {
+                    Log.d(TAG, "M4UHD: playiframe try$tryN no-response after ${ms}ms")
+                } else if (resp.code !in 200..299 || resp.text.isBlank()) {
+                    Log.d(TAG, "M4UHD: playiframe try$tryN http ${resp.code} after ${ms}ms (origin cold-hang if 504)")
+                } else {
+                    Log.d(TAG, "M4UHD: playiframe try$tryN http 200 after ${ms}ms")
+                    apiText = resp.text
+                }
+                if (apiText == null && tryN < maxTries) {
+                    Log.d(TAG, "M4UHD: retrying playiframe once — origin cold-sign wake-up")
+                    delay(6_000)
+                }
+            }
+            val jo = runCatching { JSONObject(apiText ?: return null) }.getOrNull() ?: return null
+            if (jo.optInt("status", 0) != 1) return null
+            val encData = jo.optString("data", "")
+            val encBytes = hexToBytes(encData) ?: return null
+            val m3u8 = saltedDecrypt(encBytes, PW_RESP)?.trim()
+                ?.takeIf { it.startsWith("http") && (it.contains(".m3u8") || it.contains("/m3u8/")) }
+                ?: return null
+            val res9 = NStreamResult(m3u8, subsFile)
+            laneCache[fileId] = System.currentTimeMillis() to res9
+            if (laneCache.size > 60) laneCache.clear()
+            return res9
+        }
+
+        /** Shared 9stream emission path — probe the playlist device-side,
+         *  expand variants when it's a master, attach the verified EN SRT. */
+        private suspend fun emit9Stream(
+            app: Requests, res: NStreamResult, labelPrefix: String, seTag: String?,
+            subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit,
+        ): Boolean {
+            val probe = runCatching {
+                app.get(res.m3u8, headers = mapOf("User-Agent" to UA),
+                    cacheTime = 0, timeout = 20_000)
+            }.getOrNull() ?: return false
+            if (probe.code !in 200..299 && probe.code != 206) return false
+            val text = probe.text
+            if (!text.contains("#EXTM3U")) return false
+
+            val srcLabel = "$labelPrefix $LABEL"
+            val suffix = if (seTag != null) " · $seTag" else ""
+            var any = false
+
+            if (text.contains("#EXT-X-STREAM-INF")) {
+                val variants = parseHlsMasterVariants(text, res.m3u8)
+                if (variants.isNotEmpty()) {
+                    variants.distinctBy { it.url }.forEach { v ->
+                        val skip = DeviceDecoderProbe.skipReason(videoCodecOf(v.codecs), v.width, v.height)
+                        if (skip != null) {
+                            Log.d(TAG, "M4UHD: skipped ${v.width}x${v.height} (${v.codecs}) — $skip")
+                            return@forEach
+                        }
+                        callback(
+                            newExtractorLink(
+                                source = srcLabel,
+                                name = "$srcLabel · 9stream ${v.height}p$suffix",
+                                url = v.url,
+                                type = ExtractorLinkType.M3U8,
+                            ) {
+                                this.referer = ""
+                                this.quality = if (v.height > 0) qualityFromDimensions(v.width, v.height)
+                                    else qualityFromName("1080")
+                                this.headers = emptyMap()
+                            }
+                        )
+                        any = true
+                    }
+                }
+            }
+            if (!any) {
+                // single-rendition media playlist (observed: /1080/ lane)
+                val q = Regex("""/(\d{3,4})/""").find(res.m3u8)?.groupValues?.get(1) ?: "1080"
+                callback(
+                    newExtractorLink(
+                        source = srcLabel,
+                        name = "$srcLabel · 9stream ${q}p$suffix",
+                        url = res.m3u8,
+                        type = ExtractorLinkType.M3U8,
+                    ) {
+                        this.referer = ""
+                        this.quality = qualityFromName(q)
+                        this.headers = emptyMap()
+                    }
+                )
+                any = true
+            }
+
+            // verified EN subtitle
+            val sub = res.subsFile
+            if (any && sub != null) {
+                val subProbe = runCatching {
+                    app.get(sub, headers = mapOf("User-Agent" to UA, "Range" to "bytes=0-127"),
+                        cacheTime = 0, timeout = 8_000)
+                }.getOrNull()
+                if (subProbe != null && (subProbe.code in 200..299 || subProbe.code == 206 || subProbe.code == 416)) {
+                    runCatching { subtitleCallback(SubtitleFile("M4UHD · EN", sub)) }
+                }
+            }
+            return any
+        }
+
+        override suspend fun resolve(
+            app: Requests,
+            title: String,
+            year: Int?,
+            isMovie: Boolean,
+            season: Int?,
+            episode: Int?,
+            labelPrefix: String,
+            subtitleCallback: (SubtitleFile) -> Unit,
+            callback: (ExtractorLink) -> Unit,
+            tmdbId: Int?,
+            imdbId: String?,
+        ): Boolean {
+            val asks = ((season ?: 0) > 0 && (episode ?: 0) > 0)
+            Log.i(TAG, "M4UHD: resolve '$title' y=$year s=$season e=$episode")
+            val candidates = searchCandidates(app, title, null)
+            if (candidates.isEmpty()) {
+                Log.d(TAG, "M4UHD: search '$title' no candidates")
+                return false
+            }
+
+            var any = false
+            var nineCold = false   // v98: once the 9stream API cold-hangs in
+            // this resolve, remaining candidates probe it once and briefly
+            for ((pageUrl, siteTitle) in candidates) {
+                // year soft-gate when we know it
+                if (year != null) {
+                    val yIn = Regex("""\((19|20)\d{2}\)""").find(siteTitle)?.value
+                        ?.trim('(', ')')?.toIntOrNull()
+                    if (yIn != null && kotlin.math.abs(yIn - year) > 1) continue
+                }
+                val page = runCatching {
+                    app.get(pageUrl, headers = HEADERS, cacheTime = 0, timeout = 20_000)
+                }.getOrNull() ?: continue
+                if (page.code !in 200..299) continue
+                val html = page.text
+                val cookies = page.cookies.entries.joinToString("; ") { "${it.key}=${it.value}" }
+                val token = Regex(""""_token: ?['"]([A-Za-z0-9]+)['"]""").find(html)?.groupValues?.get(1)
+                    ?: continue
+                val xh = HEADERS + mapOf(
+                    "Cookie" to cookies,
+                    "X-Requested-With" to "XMLHttpRequest",
+                    "Referer" to pageUrl,
+                )
+
+                // ── TV: seasons map → ajaxtv → episode-level server tokens ──
+                val playTokens = mutableListOf<String>()
+                var seTag: String? = null
+                if (asks) {
+                    val seasonsJson = Regex("""const seasons = (\{.+?\});""", RegexOption.DOT_MATCHES_ALL)
+                        .find(html)?.groupValues?.get(1)
+                    if (seasonsJson == null) continue   // a movie page can't help a series ask
+                    var idepisode: String? = null
+                    runCatching {
+                        val root = JSONObject(seasonsJson)
+                        val want = "S%02d-E%02d".format(season, episode)
+                        for (sk in root.keys()) {
+                            val arr = root.optJSONArray(sk) ?: continue
+                            for (i in 0 until arr.length()) {
+                                val o = arr.optJSONObject(i) ?: continue
+                                if (o.optString("epi_name").equals(want, ignoreCase = true)) {
+                                    idepisode = o.optString("idepisode").takeIf { it.isNotBlank() }
+                                    break
+                                }
+                            }
+                            if (idepisode != null) break
+                        }
+                    }
+                    if (idepisode == null) {
+                        Log.d(TAG, "M4UHD: S${season}E${episode} not in seasons map for $pageUrl")
+                        continue
+                    }
+                    val epHtml = runCatching {
+                        app.post("$SITE/ajaxtv", headers = xh,
+                            data = mapOf("idepisode" to idepisode!!, "_token" to token),
+                            cacheTime = 0, timeout = 20_000)
+                    }.getOrNull() ?: continue
+                    if (epHtml.code !in 200..299) continue
+                    seTag = "S${season}E${episode}"
+                    Regex("""class="play-movie[^"]*"[^>]*data="([^"\s>]+)""")
+                        .findAll(epHtml.text).forEach { playTokens += it.groupValues[1] }
+                } else {
+                    Regex("""class="play-movie[^"]*"[^>]*data="([^"\s>]+)""")
+                        .findAll(html).forEach { playTokens += it.groupValues[1] }
+                }
+                if (playTokens.isEmpty()) continue
+
+                // ── server tokens → iframe lanes (site order: primary first) ──
+                var got9 = false
+                for (tok in playTokens.take(3)) {
+                    val ajax = runCatching {
+                        app.post("$SITE/ajax", headers = xh,
+                            data = mapOf("m4u" to tok, "_token" to token),
+                            cacheTime = 0, timeout = 20_000)
+                    }.getOrNull() ?: continue
+                    if (ajax.code !in 200..299) continue
+                    val iframe = Regex("""src="(https?://[^"\s<>']+)""").find(ajax.text)
+                        ?.groupValues?.get(1)?.trim() ?: continue
+                    when {
+                        iframe.contains("ppzj-youtube.cfd/play/") -> {
+                            // in-repo 9stream lane (the no-2004 guarantee): ONE
+                            // verified attempt is enough — skip further if9 dupes.
+                            if (got9) continue
+                            got9 = true
+                            val res = runCatching {
+                                resolve9Stream(app, iframe, pageUrl, nineCold)
+                            }.getOrNull()
+                            if (res != null) {
+                                any = emit9Stream(app, res, labelPrefix, seTag, subtitleCallback, callback) || any
+                                if (any) Log.i(TAG, "M4UHD: 9stream lane served $siteTitle")
+                            } else {
+                                nineCold = true
+                                Log.d(TAG, "M4UHD: 9stream chain failed for $iframe")
+                            }
+                        }
+                        else -> {
+                            // Abyss / VidSrc / other hosts: app-side extractor lane
+                            any = emitDirect(app, iframe, "$labelPrefix $LABEL", pageUrl,
+                                emptyMap(), subtitleCallback, callback) || any
+                        }
+                    }
+                }
+                if (any) break   // first verified candidate wins
+            }
+            if (!any) Log.d(TAG, "M4UHD: nothing verified for '$title'")
+            return any
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    //  Resolver 13: CinemaOS  (https://cinemaos.live)  — v98, user request
+    //
+    //  HONEST 2026-08-07 RECON SUMMARY (all live-verified):
+    //   • The site is a Next.js 15 fork of the "Rive" project, TMDB-keyed:
+    //     /watch/movie/{tmdbId} and /watch/tv/{tmdbId}?s=&e= — the old
+    //     /movie/watch/{id} 308-redirects to the new form.
+    //   • Its own video player is currently BROKEN site-wide: the lazy
+    //     player chunks the watch page imports (webpack chunks 6220/4099)
+    //     HTTP 404 for everyone (deploy bug server-side), so not even the
+    //     site's visitors in a real browser can see the source list right
+    //     now. Nothing about that is fixable from our side.
+    //   • Its upstream provider family (vidsrc-api-* "simple-scrape-api"
+    //     FastAPI: /vidsrc /vsrcme /streams /subs) is reachable but returns
+    //     empty payloads today.
+    //
+    //  DESIGN: TMDB-keyed (same doctrine as ShuttleTV/Cineby — tmdbId
+    //  required; v95's TMDB fallback covers id-mapping). We walk the whole
+    //  CinemaOS lineage ladder with SHORT timeouts and parse GENERICALLY
+    //  (any JSON we can reach gets scanned for media/embed URLs):
+    //     1. site APIs  (a few /api/* guesses — 404 today, kept for the day
+    //        they add one; silent miss costs nothing)
+    //     2. the watch page HTML itself (media tags/iframes — none today)
+    //     3. the provider API used by the upstream project
+    //        (vidsrc-api-pearl /vsrcme /vidsrc /streams × {tmdb, imdb})
+    //  Every media URL found is device-side PROBED before listing (range
+    //  512B must answer 200/206, m3u8 must contain #EXTM3U) and every
+    //  embed URL goes through loadExtractor. If all lanes are empty the
+  //    resolver returns false quietly — the no-2004/3003 contract holds:
+    //  NO unverifiable link is ever emitted. When the CinemaOS backend
+    //  comes back to life, rows appear automatically with zero code change.
+    // ════════════════════════════════════════════════════════════════════════
+    internal object CinemaOsResolver : SourceResolver {
+        private const val SITE = "https://cinemaos.live"
+        private const val LABEL = "CinemaOS"
+        private const val LEGACY_API = "https://vidsrc-api-pearl.vercel.app"
+        private val HEADERS = mapOf("User-Agent" to UA)
+
+        /** Recursively collect http(s) strings that look like media or
+         *  embed targets out of any JSON shape a backend returns. */
+        private fun collectUrls(node: Any?, media: MutableList<String>, embeds: MutableList<String>) {
+            when (node) {
+                is JSONObject -> {
+                    val ks = node.keys()
+                    while (ks.hasNext()) collectUrls(node.opt(ks.next()), media, embeds)
+                }
+                is JSONArray -> for (i in 0 until node.length()) collectUrls(node.opt(i), media, embeds)
+                is String -> {
+                    val s = node.trim()
+                    if (!s.startsWith("http")) return
+                    if (isDirectMedia(s) || s.contains(".m3u8", true)) media += s
+                    else if (s.contains("embed", true) || s.contains("/play", true) ||
+                        s.contains("/e/", true) || s.contains("watch", true)) embeds += s
+                }
+            }
+        }
+
+        private suspend fun probeAndEmit(
+            app: Requests,
+            url: String,
+            srcLabel: String,
+            referer: String,
+            subtitleCallback: (SubtitleFile) -> Unit,
+            callback: (ExtractorLink) -> Unit,
+        ): Boolean {
+            val clean = url.trim()
+            if (clean.isBlank()) return false
+            // direct media must answer a device-side range probe
+            if (isDirectMedia(clean) || clean.contains(".m3u8", true)) {
+                val probe = runCatching {
+                    app.get(clean, headers = HEADERS + ("Range" to "bytes=0-512"),
+                        cacheTime = 0, timeout = 12_000)
+                }.getOrNull() ?: return false
+                if (probe.code !in 200..299 && probe.code != 206) return false
+                if (clean.contains(".m3u8", true) && !probe.text.contains("#EXTM3U")) return false
+                return emitDirect(app, clean, srcLabel, referer, HEADERS, subtitleCallback, callback)
+            }
+            // embed pages: app-side extractor, emitted only when it finds video
+            return emitDirect(app, clean, srcLabel, referer, HEADERS, subtitleCallback, callback)
+        }
+
+        override suspend fun resolve(
+            app: Requests,
+            title: String,
+            year: Int?,
+            isMovie: Boolean,
+            season: Int?,
+            episode: Int?,
+            labelPrefix: String,
+            subtitleCallback: (SubtitleFile) -> Unit,
+            callback: (ExtractorLink) -> Unit,
+            tmdbId: Int?,
+            imdbId: String?,
+        ): Boolean {
+            if (tmdbId == null || tmdbId <= 0) {
+                Log.d(TAG, "CinemaOS: skip — tmdbId null")
+                return false
+            }
+            val s = season ?: 0; val e = episode ?: 0
+            val isTvAsk = s > 0 && e > 0
+            Log.i(TAG, "CinemaOS: resolve tmdb=$tmdbId imdb=$imdbId tv=$isTvAsk")
+            val media = mutableListOf<String>()
+            val embeds = mutableListOf<String>()
+
+            fun scanJsonBody(body: String) {
+                val trimmed = body.trim()
+                if (trimmed.isEmpty()) return
+                runCatching { collectUrls(JSONObject(trimmed), media, embeds) }
+                    .onFailure { runCatching { collectUrls(JSONArray(trimmed), media, embeds) } }
+            }
+
+            // lane 1 — site's own API (guessed routes, silent 404s today)
+            for (u in listOf(
+                "$SITE/api/stream?tmdb=$tmdbId&type=" + (if (isTvAsk) "tv&s=$s&e=$e" else "movie"),
+                "$SITE/api/sources?tmdb=$tmdbId" + if (isTvAsk) "&s=$s&e=$e" else "",
+                "$SITE/api/watch?movie=$tmdbId" + if (isTvAsk) "&season=$s&episode=$e" else "",
+            )) {
+                runCatching {
+                    val r = app.get(u, headers = HEADERS, cacheTime = 0, timeout = 8_000)
+                    if (r.code in 200..299) scanJsonBody(r.text)
+                }
+            }
+
+            // lane 2 — the watch page itself (media tags / iframes inside)
+            val watchUrl = if (isTvAsk) "$SITE/watch/tv/$tmdbId" else "$SITE/watch/movie/$tmdbId"
+            runCatching {
+                val r = app.get(watchUrl, headers = HEADERS, cacheTime = 0, timeout = 15_000)
+                if (r.code in 200..299) {
+                    extractMediaUrlsFromHtml(r.text, watchUrl).forEach { u ->
+                        if (isDirectMedia(u) || u.contains(".m3u8", true)) media += u else embeds += u
+                    }
+                }
+            }
+
+            // lane 3 — upstream project's provider API (empty payloads today)
+            val idForms = buildList {
+                add(tmdbId.toString())
+                if (!imdbId.isNullOrBlank()) add(imdbId)
+            }
+            for (id in idForms) {
+                for (path in listOf("/vsrcme/", "/vidsrc/", "/streams/")) {
+                    runCatching {
+                        val r = app.get(
+                            LEGACY_API + path + id + if (isTvAsk && path == "/streams/") "/$s/$e" else "",
+                            headers = HEADERS, cacheTime = 0, timeout = 10_000)
+                        if (r.code in 200..299) scanJsonBody(r.text)
+                    }
+                }
+            }
+
+            val watchRef = watchUrl
+            var any = false
+            media.distinct().take(6).forEach { u ->
+                val host = Regex("""^https?://([^/?#]+)""").find(u)?.groupValues?.get(1) ?: "web"
+                any = probeAndEmit(app, u, "$labelPrefix $LABEL · $host",
+                    watchRef, subtitleCallback, callback) || any
+            }
+            embeds.distinct().take(6).forEach { u ->
+                val host = Regex("""^https?://([^/?#]+)""").find(u)?.groupValues?.get(1) ?: "web"
+                any = probeAndEmit(app, u, "$labelPrefix $LABEL · $host",
+                    watchRef, subtitleCallback, callback) || any
+            }
+            if (!any) {
+                Log.d(TAG, "CinemaOS: all lanes empty for tmdb=$tmdbId " +
+                    "(site player chunks 404 and provider API empty — see v98 notes)")
+            }
+            return any
         }
     }
 }
